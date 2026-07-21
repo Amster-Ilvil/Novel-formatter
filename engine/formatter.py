@@ -11,7 +11,7 @@ Novel Formatter Engine
     1.  reading_order            — GapTree 阅读顺序恢复（竖排日文右→左）
     2.  clean_metadata_blocks    — 删除残留的页眉/页脚块（位置+频率双重检测）
     3.  merge_broken_sentences   — 合并竖排 OCR 产生的跨行断句（日语接续词感知）
-    4.  remove_duplicates        — 删除重复段落和重复对白（含章节标题模糊去重）
+    4.  remove_semantic_duplicates — 近邻语义去重，保留替换后/更完整文本
     5.  fix_ocr_dash_artifacts   — 修复破折号被误读成「/｜的 OCR 错字
     6.  restore_dialogue_breaks  — 对白独立换行（迭代拆分混合段落）
     7.  restore_indents_and_breaks — 缩进和分节符恢复
@@ -100,6 +100,8 @@ RUBY_RE = re.compile(r'[｜\|]([^《]+)《([^》]+)》')
 BARE_NUMBER_RE = re.compile(r'^[\d\s]{1,6}$')
 
 DEDUP_EXACT = True
+SEMANTIC_DUP_WINDOW = 4
+SEMANTIC_DUP_SIMILARITY = 0.95
 MAX_MERGE_LINES = 8
 # 跨页页眉模糊聚类阈值。页眉可能有一两个 OCR 错字，仍应被识别为同一文本。
 HEADER_SIMILARITY = 0.6
@@ -560,6 +562,16 @@ def _normalize_for_dedup(text: str) -> str:
     return re.sub(r'[\s　]+', '', text)
 
 
+def _normalize_for_semantic_dedup(text: str) -> str:
+    """近邻语义去重用规范化：忽略空白、全半角、轻微标点和项目符号差异。"""
+    import unicodedata
+    text = unicodedata.normalize("NFKC", text or "")
+    text = re.sub(r'^[◆※☆★●○＊◇■□▼▽△▲・･\-—–ー\s　]+', '', text)
+    text = re.sub(r'[\s　]+', '', text)
+    text = re.sub(r'[。．、，,.！？!?…‥・･:：;；「」『』（）()\[\]【】《》〈〉"''“”’‘、]+', '', text)
+    return text
+
+
 def _text_similarity(a: str, b: str) -> float:
     import difflib
     return difflib.SequenceMatcher(None, a, b).ratio()
@@ -572,49 +584,80 @@ def _is_protected_title(block: Block, normalized_text: str) -> bool:
     )
 
 
-def remove_duplicates(doc: UnifiedDocument) -> UnifiedDocument:
+def _dedup_quality(block: Block) -> tuple[int, float, int, int]:
+    text = (block.text or "").strip()
+    punctuation = sum(1 for ch in text if ch in "。！？!?」』）……")
+    replacement_bonus = 1 if block.ocr_raw and block.ocr_raw != block.text else 0
+    return (len(_normalize_for_semantic_dedup(text)), block.confidence, punctuation, replacement_bonus)
+
+
+def _is_near_duplicate(a: str, b: str) -> bool:
+    if not a or not b:
+        return False
+    if a == b:
+        return True
+    shorter, longer = sorted((a, b), key=len)
+    if len(shorter) >= 6 and shorter in longer:
+        return True
+    return _text_similarity(a, b) >= SEMANTIC_DUP_SIMILARITY
+
+
+def remove_semantic_duplicates(doc: UnifiedDocument) -> UnifiedDocument:
     """
-    去重：
-        - 对白全文去重（同一句对白整本书只保留第一次）
-        - 相邻块去重，按去除空白后的规范化文本比较（而不是精确字符串比较），
-          避免「序章」「序章 」「 序章」这类因空格不同而被判定为"不同"从而
-          都被保留
-        - 章节/分节标题一律保留，即使相邻文本完全相同；标题重复可能是
-          原书的结构，而非 OCR 噪声，不能由去重步骤擅自删除
+    近邻 Duplicate Resolver。
+
+    仅在连续/近邻文本块的滑动窗口内检测，避免误删小说中有意重复的对白、
+    回环修辞、目录/标题重复。判断时会忽略空白、全半角和轻微标点差异，并
+    结合 Levenshtein/SequenceMatcher 相似度与包含关系；保留更长、更完整、
+    标点更完整、置信度更高或经过替换的版本。
     """
     doc = copy.deepcopy(doc)
-
+    text_types = {BlockType.PARAGRAPH, BlockType.DIALOGUE, BlockType.RUBY}
     removed = 0
+    removal_notes: list[str] = []
     result: list[Block] = []
-    seen_dialogues: set[str] = set()
 
     for b in doc.blocks:
-        if b.type == BlockType.DIALOGUE:
-            if b.text in seen_dialogues:
-                removed += 1
-                continue
-            seen_dialogues.add(b.text)
+        normalized = _normalize_for_semantic_dedup(b.text)
+        if b.type not in text_types or not normalized or _is_protected_title(b, normalized):
+            result.append(b)
+            continue
 
-        normalized = _normalize_for_dedup(b.text)
-        if normalized:
-            is_title = _is_protected_title(b, normalized)
-            previous_is_title = bool(result) and _is_protected_title(
-                result[-1], _normalize_for_dedup(result[-1].text)
-            )
+        duplicate_idx = None
+        for idx in range(len(result) - 1, max(-1, len(result) - SEMANTIC_DUP_WINDOW - 1), -1):
+            prev = result[idx]
+            prev_norm = _normalize_for_semantic_dedup(prev.text)
             if (
-                result
-                and not is_title
-                and not previous_is_title
-                and _normalize_for_dedup(result[-1].text) == normalized
+                prev.type in text_types
+                and not _is_protected_title(prev, prev_norm)
+                and _is_near_duplicate(prev_norm, normalized)
             ):
-                removed += 1
-                continue
+                duplicate_idx = idx
+                break
 
-        result.append(b)
+        if duplicate_idx is None:
+            result.append(b)
+            continue
+
+        previous = result[duplicate_idx]
+        keep_new = _dedup_quality(b) >= _dedup_quality(previous)
+        removed_block = previous if keep_new else b
+        if keep_new:
+            result[duplicate_idx] = b
+        removed += 1
+        if len(removal_notes) < 5:
+            removal_notes.append(removed_block.text.strip()[:40])
 
     doc.blocks = result
-    doc.add_log("remove_duplicates", f"删除 {removed} 个重复块", removed)
+    detail = "；".join(removal_notes)
+    suffix = f"（示例：{detail}）" if detail else ""
+    doc.add_log("remove_duplicates", f"Duplicate Resolver 删除 {removed} 个近邻重复块{suffix}", removed)
     return doc
+
+
+def remove_duplicates(doc: UnifiedDocument) -> UnifiedDocument:
+    """兼容旧步骤名的包装；实际执行近邻语义 Duplicate Resolver。"""
+    return remove_semantic_duplicates(doc)
 
 
 # ── 步骤 5：修复破折号被误读成引号/竖线 ────────────────────────────────────────

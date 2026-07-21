@@ -1,11 +1,41 @@
-QMainWindow { background:#eef6ff; }
-QWidget { background:#eef6ff; }
-QPushButton, QToolButton, QDialogButtonBox QPushButton {
- background:#dbeafe;
- color:#1e3a8a;
- border:none;
- border-radius:12px;
- padding:8px 18px;
+QMainWindow { background: #F6F7F9; }
+QWidget {
+  background: #F6F7F9;
+  color: #1D1D1F;
+  font-family: "SF Pro Text", "PingFang SC", "Segoe UI", "Noto Sans", sans-serif;
+  font-size: 13px;
 }
-QPushButton:hover, QToolButton:hover { background:#bfdbfe; }
-QPushButton:pressed { background:#93c5fd; }
+QFrame, QGroupBox, QScrollArea, QTreeWidget, QPlainTextEdit, QTextEdit {
+  background: #FFFFFF;
+  border: 1px solid #E5E5EA;
+  border-radius: 12px;
+}
+QPushButton, QToolButton, QDialogButtonBox QPushButton {
+  background: #FFFFFF;
+  color: #4F7FFF;
+  border: 1px solid #E5E5EA;
+  border-radius: 10px;
+  padding: 9px 18px;
+  min-height: 18px;
+  font-weight: 600;
+}
+QPushButton:hover, QToolButton:hover { background: #F0F5FF; }
+QPushButton:pressed { background: #DCE8FF; }
+QPushButton[danger="true"] { background: #E85D5D; color: white; border: none; }
+QLineEdit, QComboBox {
+  background: #FFFFFF;
+  border: 1px solid #E5E5EA;
+  border-radius: 10px;
+  padding: 7px 11px;
+}
+QProgressBar {
+  background: #E5E5EA;
+  border: none;
+  border-radius: 999px;
+  min-height: 8px;
+  max-height: 10px;
+}
+QProgressBar::chunk {
+  background: qlineargradient(x1:0,y1:0,x2:1,y2:0, stop:0 #6EA8FF, stop:1 #4F7FFF);
+  border-radius: 999px;
+}
