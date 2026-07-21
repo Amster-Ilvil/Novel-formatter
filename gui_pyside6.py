@@ -49,16 +49,16 @@ from models.format_profile import FormatProfile, FormatProfileStore
 
 # ── 配色常量（macOS 系统色板）───────────────────────────────────────────────────
 
-BG          = "#F5F5F7"   # 内容区背景（对应 macOS 窗口浅灰背景）
-SIDEBAR_BG  = "#EBEBF0"   # 左侧边栏背景（比内容区略深，营造分层感）
+BG          = "#F6F7F9"   # 内容区背景（对应 macOS 窗口浅灰背景）
+SIDEBAR_BG  = "#FFFFFF"   # 左侧边栏背景（比内容区略深，营造分层感）
 CARD        = "#FFFFFF"   # 卡片/输入控件背景
 INK         = "#1D1D1F"   # 主文字色（Apple 标准近黑）
 MUTED       = "#86868B"   # 次要文字色（Apple 标准灰）
 BORDER      = "#E5E5EA"   # 分隔线/边框
-ACC         = "#0071E3"   # 强调色（Apple 蓝）
-ACC_BG      = "#E8F1FE"   # 强调色浅底
-DANGER      = "#FF3B30"   # 系统红
-SUCCESS     = "#34C759"   # 系统绿
+ACC         = "#4F7FFF"   # 强调色（Apple 蓝）
+ACC_BG      = "#F0F5FF"   # 强调色浅底
+DANGER      = "#E85D5D"   # 系统红
+SUCCESS     = "#2BB673"   # 系统绿
 
 PAGE_TYPES = [
     ("cover",        "封面",     "#C0542F"),
@@ -93,7 +93,7 @@ FORMATTER_STEPS = [
     ("split_embedded_titles", "内嵌标题拆分", "规则", "拆出跟正文粘连在一起的章节标题"),
     ("strip_chapter_notes", "逐章备注剥离", "规则",  "删除每话附带的（前書）/（後書き）编辑备注"),
     ("merge_sentences",   "断句修复",   "规则+AI",  "合并OCR错误换行，恢复连续段落"),
-    ("remove_duplicates", "重复删除",   "自动",     "删除OCR扫描产生的重复段落和对白"),
+    ("remove_duplicates", "Duplicate Resolver", "自动", "近邻语义去重，保留替换后和更完整文本"),
     ("fix_dash_artifacts","破折号修复", "自动",     "修复OCR把破折号误读成「/｜的错字"),
     ("dialogue_restore",  "对白恢复",   "规则",     "识别对白行，恢复单独换行排版"),
     ("restore_indents",   "缩进分节",   "规则",     "恢复段首缩进和分节符检测"),
@@ -225,30 +225,30 @@ QToolButton:checked {{ background: {ACC}; color: white; font-weight: 600; }}
 STYLE = f"""
 QMainWindow {{ background-color: {BG}; }}
 QWidget {{
-    font-family: -apple-system, "SF Pro Text", "Helvetica Neue", "Hiragino Sans", sans-serif;
+    font-family: "SF Pro Text", "PingFang SC", "Segoe UI", "Noto Sans", "Helvetica Neue", sans-serif;
     font-size: 13px; color: {INK};
 }}
 QPushButton {{
     background-color: {ACC}; color: white; border: none;
-    border-radius: 8px; padding: 8px 16px; font-weight: 500;
+    border-radius: 10px; padding: 9px 18px; font-weight: 600; min-height: 18px;
 }}
-QPushButton:hover {{ background-color: #0077ED; }}
-QPushButton:pressed {{ background-color: #0058B8; }}
+QPushButton:hover {{ background-color: #3F6FE8; }}
+QPushButton:pressed {{ background-color: #3159C9; }}
 QPushButton:disabled {{ background-color: #D2D2D7; color: #98989D; }}
 QPushButton[flat="true"] {{
-    background-color: transparent; color: {ACC}; font-weight: normal;
+    background-color: {CARD}; color: {ACC}; font-weight: 600; border: 1px solid {BORDER};
 }}
 QPushButton[flat="true"]:hover {{ background-color: {ACC_BG}; border-radius: 6px; }}
 QLineEdit, QComboBox {{
     background-color: {CARD}; border: 1px solid {BORDER};
-    border-radius: 8px; padding: 6px 10px; selection-background-color: {ACC};
+    border-radius: 10px; padding: 7px 11px; selection-background-color: {ACC};
 }}
 QLineEdit:focus, QComboBox:focus {{ border: 1.5px solid {ACC}; }}
 QComboBox::drop-down {{ border: none; width: 20px; }}
 QPlainTextEdit, QTextEdit {{
     background-color: {CARD}; border: 1px solid {BORDER};
-    border-radius: 8px; padding: 10px;
-    font-family: "SF Mono", "Menlo", monospace; font-size: 12px;
+    border-radius: 12px; padding: 12px;
+    font-family: "JetBrains Mono", "Consolas", "Menlo", monospace; font-size: 12px;
     selection-background-color: {ACC_BG};
 }}
 QGroupBox {{
@@ -269,9 +269,9 @@ QRadioButton::indicator {{
 }}
 QRadioButton::indicator:checked {{ background-color: {ACC}; border-color: {ACC}; }}
 QProgressBar {{
-    background-color: #E5E5EA; border: none; border-radius: 3px; height: 6px; text-align: center;
+    background-color: #E5E5EA; border: none; border-radius: 999px; min-height: 8px; max-height: 10px; text-align: center;
 }}
-QProgressBar::chunk {{ background-color: {ACC}; border-radius: 3px; }}
+QProgressBar::chunk {{ background-color: qlineargradient(x1:0,y1:0,x2:1,y2:0, stop:0 #6EA8FF, stop:1 {ACC}); border-radius: 999px; }}
 QSlider::groove:horizontal {{ background: #E5E5EA; height: 4px; border-radius: 2px; }}
 QSlider::handle:horizontal {{
     background: {ACC}; width: 16px; height: 16px; margin: -6px 0; border-radius: 8px;
@@ -295,8 +295,8 @@ QMessageBox QPushButton, QDialogButtonBox QPushButton {{
     background-color: {ACC}; color: white; border: none;
     border-radius: 6px; padding: 6px 14px; font-weight: 600; min-width: 64px;
 }}
-QMessageBox QPushButton:hover, QDialogButtonBox QPushButton:hover {{ background-color: #0077ED; }}
-QMessageBox QPushButton:pressed, QDialogButtonBox QPushButton:pressed {{ background-color: #0058B8; }}
+QMessageBox QPushButton:hover, QDialogButtonBox QPushButton:hover {{ background-color: #3F6FE8; }}
+QMessageBox QPushButton:pressed, QDialogButtonBox QPushButton:pressed {{ background-color: #3159C9; }}
 """
 
 
@@ -343,7 +343,9 @@ class PageManagerTab(QWidget):
 
         # ── 左侧：类型筛选列表 ────────────────────────────────────────────────
         left = QWidget()
-        left.setFixedWidth(180)
+        left.setMinimumWidth(180)
+        left.setMaximumWidth(280)
+        left.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Expanding)
         left.setStyleSheet(f"background: {CARD};")
         left_layout = QVBoxLayout(left)
         left_layout.setContentsMargins(0, 12, 0, 12)
@@ -393,7 +395,8 @@ class PageManagerTab(QWidget):
 
         # ── 右侧主区域 ────────────────────────────────────────────────────────
         right = QWidget()
-        right.setMinimumWidth(760)
+        right.setMinimumWidth(420)
+        right.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
         right_layout = QVBoxLayout(right)
         right_layout.setContentsMargins(0, 0, 0, 0)
         right_layout.setSpacing(0)
@@ -984,7 +987,9 @@ class OCRTab(QWidget):
 
         # ── 左侧：适配器列表 + 设置 + 底部常驻「开始OCR」按钮 ──────────────────
         left_container = QWidget()
-        left_container.setFixedWidth(340)
+        left_container.setMinimumWidth(220)
+        left_container.setMaximumWidth(360)
+        left_container.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Expanding)
         left_container.setStyleSheet(f"background: {CARD}; border-right: 1px solid {BORDER};")
         left_outer = QVBoxLayout(left_container)
         left_outer.setContentsMargins(0, 0, 0, 0)
@@ -1213,7 +1218,8 @@ class OCRTab(QWidget):
 
         self._prog = QProgressBar()
         self._prog.setVisible(False)
-        self._prog.setFixedHeight(6)
+        self._prog.setMinimumHeight(8)
+        self._prog.setMaximumHeight(10)
         rl.addWidget(self._prog)
 
         self._log_view = QPlainTextEdit()
@@ -1510,8 +1516,9 @@ class FormatterTab(QWidget):
 
         # ── 左侧：步骤卡片 ────────────────────────────────────────────────────
         left = QWidget()
-        left.setMinimumWidth(320)
+        left.setMinimumWidth(220)
         left.setMaximumWidth(360)
+        left.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Expanding)
         left.setStyleSheet(f"background: {CARD};")
         ll = QVBoxLayout(left)
         ll.setContentsMargins(0, 0, 0, 0)
@@ -1579,7 +1586,8 @@ class FormatterTab(QWidget):
 
         # ── 右侧：工具栏 + 对比区 ─────────────────────────────────────────────
         right = QWidget()
-        right.setMinimumWidth(760)
+        right.setMinimumWidth(420)
+        right.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
         right.setStyleSheet(f"background: {CARD};")
         rl = QVBoxLayout(right)
         rl.setContentsMargins(0, 0, 0, 0)
@@ -1701,16 +1709,19 @@ class FormatterTab(QWidget):
         al.addWidget(QLabel("AI 校正:"))
         self._ai_provider = QComboBox()
         self._ai_provider.addItems(["openai", "deepseek", "gemini"])
-        self._ai_provider.setFixedWidth(100)
+        self._ai_provider.setMinimumWidth(90)
+        self._ai_provider.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Fixed)
         al.addWidget(self._ai_provider)
         self._ai_model = QLineEdit()
         self._ai_model.setPlaceholderText("模型 (留空=默认)")
-        self._ai_model.setFixedWidth(140)
+        self._ai_model.setMinimumWidth(120)
+        self._ai_model.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Fixed)
         al.addWidget(self._ai_model)
         self._ai_key = QLineEdit()
         self._ai_key.setEchoMode(QLineEdit.Password)
         self._ai_key.setPlaceholderText("API Key")
-        self._ai_key.setFixedWidth(180)
+        self._ai_key.setMinimumWidth(140)
+        self._ai_key.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
         al.addWidget(self._ai_key)
         ai_run = accent_button("运行 AI 校正", color="#AF52DE")
         ai_run.clicked.connect(self._run_ai)
@@ -2315,7 +2326,9 @@ class FormatProfileDialog(QDialog):
 
         # ── 左侧：格式列表 ────────────────────────────────────────────────────
         left = QWidget()
-        left.setFixedWidth(230)
+        left.setMinimumWidth(200)
+        left.setMaximumWidth(280)
+        left.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Expanding)
         ll = QVBoxLayout(left)
         ll.setContentsMargins(0, 0, 0, 0)
         ll.setSpacing(8)
@@ -2340,7 +2353,8 @@ class FormatProfileDialog(QDialog):
 
         # ── 右侧：详情/编辑 ───────────────────────────────────────────────────
         right = QWidget()
-        right.setMinimumWidth(760)
+        right.setMinimumWidth(420)
+        right.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
         rl = QVBoxLayout(right)
         rl.setContentsMargins(0, 0, 0, 0)
         rl.setSpacing(8)
@@ -2641,8 +2655,9 @@ class EPUBTab(QWidget):
 
         # ── 左侧：结构树 + 设置 ───────────────────────────────────────────────
         left = QWidget()
-        left.setMinimumWidth(320)
+        left.setMinimumWidth(220)
         left.setMaximumWidth(360)
+        left.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Expanding)
         left.setStyleSheet(f"background: {CARD};")
         ll = QVBoxLayout(left)
         ll.setContentsMargins(0, 0, 0, 0)
@@ -2743,7 +2758,8 @@ class EPUBTab(QWidget):
 
         # ── 右侧：元数据条 + 源码/预览 ────────────────────────────────────────
         right = QWidget()
-        right.setMinimumWidth(760)
+        right.setMinimumWidth(420)
+        right.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
         right.setStyleSheet(f"background: {CARD};")
         rl = QVBoxLayout(right)
         rl.setContentsMargins(0, 0, 0, 0)
@@ -3168,7 +3184,8 @@ class PdfTextLayerTab(QWidget):
         root.addWidget(left, 0)
 
         right = QWidget()
-        right.setMinimumWidth(760)
+        right.setMinimumWidth(420)
+        right.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
         right.setStyleSheet(f"background: {CARD};")
         rl = QVBoxLayout(right)
         rl.setContentsMargins(0, 0, 0, 0)
@@ -3270,7 +3287,9 @@ class Sidebar(QWidget):
 
     def __init__(self, parent=None):
         super().__init__(parent)
-        self.setFixedWidth(200)
+        self.setMinimumWidth(180)
+        self.setMaximumWidth(240)
+        self.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Expanding)
         self.setStyleSheet(f"background-color: {SIDEBAR_BG};")
 
         layout = QVBoxLayout(self)
@@ -3322,7 +3341,7 @@ class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle(f"Novel Formatter Studio v{VERSION}")
-        self.setMinimumSize(1100, 700)
+        self.setMinimumSize(900, 620)
         self.resize(1320, 840)
 
         self._doc: Optional[UnifiedDocument] = None
@@ -3341,7 +3360,8 @@ class MainWindow(QMainWindow):
 
         # 右侧：内容堆叠 + 底部历史滑块
         right = QWidget()
-        right.setMinimumWidth(760)
+        right.setMinimumWidth(420)
+        right.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
         right_layout = QVBoxLayout(right)
         right_layout.setContentsMargins(0, 0, 0, 0)
         right_layout.setSpacing(0)

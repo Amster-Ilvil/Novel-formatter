@@ -132,3 +132,46 @@ def test_preserve_ocr_layout_flag_round_trips_json():
     loaded = UnifiedDocument.from_json(doc.to_json())
 
     assert loaded.metadata.preserve_ocr_layout is True
+
+
+def test_semantic_duplicate_resolver_keeps_corrected_replacement():
+    doc = _document(
+        Block(BlockType.PARAGRAPH, "◼ とっとと終わらせるべく、俺はキノープと共にフエール家の邸宅に向かった", page=1),
+        Block(BlockType.PARAGRAPH, "◼ とっとと終わらせるべく、俺はキノープと共にフェール家の邸宅に向かった。", page=1, ocr_raw="フエール家"),
+    )
+
+    result = remove_duplicates(doc)
+
+    assert [block.text for block in result.blocks] == [
+        "◼ とっとと終わらせるべく、俺はキノープと共にフェール家の邸宅に向かった。"
+    ]
+    assert result.processing_log[-1]["count"] == 1
+
+
+def test_semantic_duplicate_resolver_keeps_longer_containing_sentence():
+    doc = _document(
+        Block(BlockType.PARAGRAPH, "キノープはどこか驚いた様子だ。", page=1),
+        Block(BlockType.PARAGRAPH, "キノープはどこか驚いた様子だ。何だ？俺が無能な父親を消す心配しているのか？", page=1),
+    )
+
+    result = remove_duplicates(doc)
+
+    assert [block.text for block in result.blocks] == [
+        "キノープはどこか驚いた様子だ。何だ？俺が無能な父親を消す心配しているのか？"
+    ]
+
+
+def test_semantic_duplicate_resolver_only_checks_nearby_blocks():
+    repeated = "「待って。」"
+    doc = _document(
+        Block(BlockType.DIALOGUE, repeated, page=1),
+        Block(BlockType.PARAGRAPH, "彼は走った。", page=1),
+        Block(BlockType.PARAGRAPH, "角を曲がった。", page=1),
+        Block(BlockType.PARAGRAPH, "雨が降り出した。", page=2),
+        Block(BlockType.PARAGRAPH, "息を整えた。", page=2),
+        Block(BlockType.DIALOGUE, repeated, page=3),
+    )
+
+    result = remove_duplicates(doc)
+
+    assert [block.text for block in result.blocks].count(repeated) == 2
