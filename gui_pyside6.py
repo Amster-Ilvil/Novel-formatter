@@ -44,6 +44,8 @@ from PySide6.QtGui import (
 )
 
 from models.document import UnifiedDocument, Block, BlockType, TocEntry
+from ui.responsive import apply_light_log_style, preserve_button_text, configure_combo
+from ui.widgets import ColorSwatch, PAGE_TYPE_COLORS, ProgressStatusWidget
 from utils.paddle_importer import import_paddle_json, import_paddle_md
 from models.format_profile import FormatProfile, FormatProfileStore
 
@@ -92,6 +94,7 @@ FORMATTER_STEPS = [
     ("clean_metadata",    "清理模块",   "自动",     "删除页码、页眉、出版信息"),
     ("split_embedded_titles", "内嵌标题拆分", "规则", "拆出跟正文粘连在一起的章节标题"),
     ("strip_chapter_notes", "逐章备注剥离", "规则",  "删除每话附带的（前書）/（後書き）编辑备注"),
+    ("cross_page_merge",  "跨页断句",   "页码规则", "仅合并上一页最后一列/行与下一页第一列/行；要求文档保留页码信息"),
     ("merge_sentences",   "断句修复",   "规则+AI",  "合并OCR错误换行，恢复连续段落"),
     ("remove_duplicates", "Duplicate Resolver", "自动", "近邻语义去重，保留替换后和更完整文本"),
     ("fix_dash_artifacts","破折号修复", "自动",     "修复OCR把破折号误读成「/｜的错字"),
@@ -365,10 +368,7 @@ class PageManagerTab(QWidget):
             row.setCursor(QCursor(Qt.PointingHandCursor))
             rl = QHBoxLayout(row)
             rl.setContentsMargins(14, 4, 8, 4)
-            dot = QLabel("●")
-            dot.setStyleSheet(f"color: {color}; font-size: 10px;")
-            dot.setFixedWidth(16)
-            rl.addWidget(dot)
+            rl.addWidget(ColorSwatch(color))
             btn = QPushButton(label)
             btn.setFlat(True)
             btn.setStyleSheet(f"background: transparent; color: {INK}; text-align: left; padding: 4px; font-size: 12px; border: none;")
@@ -395,7 +395,6 @@ class PageManagerTab(QWidget):
 
         # ── 右侧主区域 ────────────────────────────────────────────────────────
         right = QWidget()
-        right.setMinimumWidth(420)
         right.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
         right_layout = QVBoxLayout(right)
         right_layout.setContentsMargins(0, 0, 0, 0)
@@ -404,7 +403,6 @@ class PageManagerTab(QWidget):
         # 顶部工具栏
         toolbar = QWidget()
         toolbar.setStyleSheet(f"background: {CARD};")
-        toolbar.setFixedHeight(48)
         tb_layout = QHBoxLayout(toolbar)
         tb_layout.setContentsMargins(14, 0, 14, 0)
         self._file_icon = QLabel("📄")
@@ -431,7 +429,6 @@ class PageManagerTab(QWidget):
 
         # 批量标签栏
         tagbar = QWidget()
-        tagbar.setFixedHeight(44)
         tagbar.setStyleSheet(f"background: #FAFAF7;")
         tag_layout = QHBoxLayout(tagbar)
         tag_layout.setContentsMargins(10, 0, 10, 0)
@@ -494,13 +491,10 @@ class PageManagerTab(QWidget):
 
         # 底部统计条
         stat_bar = QWidget()
-        stat_bar.setFixedHeight(28)
         stat_bar.setStyleSheet(f"background: #FAFAF7; border-top: 1px solid {BORDER};")
-        stat_layout = QHBoxLayout(stat_bar)
-        stat_layout.setContentsMargins(14, 0, 14, 0)
-        self._stat_label = QLabel("")
-        self._stat_label.setStyleSheet(f"color: {MUTED}; font-size: 11px;")
-        stat_layout.addWidget(self._stat_label)
+        self._stat_layout = QHBoxLayout(stat_bar)
+        self._stat_layout.setContentsMargins(14, 4, 14, 4)
+        self._stat_layout.setSpacing(10)
         right_layout.addWidget(stat_bar)
 
         root_layout.addWidget(right, 1)
@@ -817,12 +811,31 @@ class PageManagerTab(QWidget):
 
     def _update_stat_bar(self):
         counts = Counter(self._ptype(i + 1) for i in range(len(self.page_images)))
-        parts = []
-        for t, l, c in PAGE_TYPES:
+        while self._stat_layout.count():
+            item = self._stat_layout.takeAt(0)
+            widget = item.widget()
+            if widget is not None:
+                widget.deleteLater()
+        added = False
+        for t, label, color in PAGE_TYPES:
             n = counts.get(t, 0)
-            if n > 0:
-                parts.append(f"● {l} {n}页")
-        self._stat_label.setText("  ".join(parts) if parts else "")
+            if n <= 0:
+                continue
+            item = QWidget()
+            row = QHBoxLayout(item)
+            row.setContentsMargins(0, 0, 0, 0)
+            row.setSpacing(5)
+            row.addWidget(ColorSwatch(color))
+            text = QLabel(f"{label} {n}页")
+            text.setStyleSheet(f"color: {MUTED}; font-size: 11px;")
+            row.addWidget(text)
+            self._stat_layout.addWidget(item)
+            added = True
+        if not added:
+            empty = QLabel("")
+            self._stat_layout.addWidget(empty)
+        self._stat_layout.addStretch()
+
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -843,8 +856,15 @@ class OCRCropPreview(QLabel):
         super().__init__(parent)
         self.setMinimumHeight(200)
         self.setAlignment(Qt.AlignCenter)
-        self.setStyleSheet(
-            f"background: #1B1B1D; color: {MUTED}; border: 1px solid {BORDER}; border-radius: 6px;")
+        self.setStyleSheet("""
+            QLabel {
+                background: #FFFFFF;
+                color: #6E6E73;
+                border: 1px solid #DCDDE2;
+                border-radius: 10px;
+                padding: 12px;
+            }
+        """)
         self.setText("选择输入后在此显示图片，可拖框选定识别区域")
         self.setWordWrap(True)
         self.setCursor(QCursor(Qt.CrossCursor))
@@ -855,7 +875,7 @@ class OCRCropPreview(QLabel):
         self._rubber_band = QRubberBand(QRubberBand.Rectangle, self)
 
         self._overlay = QFrame(self)
-        self._overlay.setStyleSheet(f"background: rgba(74,99,211,60); border: 2px solid {ACC};")
+        self._overlay.setStyleSheet(f"background: rgba(79, 127, 255, 35); border: 2px solid #4F7FFF;")
         # 让点击穿透到底下的 QLabel，否则已经框选过一次之后，想在旧框内重新拖拽
         # 会被这个纯展示用的覆盖层"吃掉"鼠标事件，看起来就像只能拖一次改不了。
         self._overlay.setAttribute(Qt.WA_TransparentForMouseEvents)
@@ -1016,10 +1036,7 @@ class OCRTab(QWidget):
             cl = QVBoxLayout(card)
             cl.setContentsMargins(10, 8, 10, 8)
             top_line = QHBoxLayout()
-            dot = QLabel("●")
-            dot.setStyleSheet(f"color: {color}; font-size: 10px;")
-            dot.setFixedWidth(14)
-            top_line.addWidget(dot)
+            top_line.addWidget(ColorSwatch(color))
             nlbl = QLabel(name)
             nlbl.setStyleSheet(f"font-weight: bold; font-size: 12px;")
             top_line.addWidget(nlbl)
@@ -1041,29 +1058,19 @@ class OCRTab(QWidget):
 
         ll.addWidget(make_separator())
 
-        # Apple Vision 识别方式（只在选中 apple_vision 适配器时显示）——
-        # "快捷指令" App 是最早的实现，ocrmac（pip install ocrmac）不依赖
-        # 那层中间 App，直接调 Vision/VisionKit 框架，还能拿到坐标/置信度。
         self._vision_backend_widget = QWidget()
         vbw = QVBoxLayout(self._vision_backend_widget)
         vbw.setContentsMargins(10, 0, 10, 0)
-        vbw.setSpacing(2)
-        vb_lbl = QLabel("识别方式")
-        vb_lbl.setStyleSheet(f"color: {MUTED}; font-size: 11px;")
-        vbw.addWidget(vb_lbl)
-        self._vision_backend_combo = QComboBox()
-        self._vision_backend_combo.addItem("自动选择（推荐）", "auto")
-        self._vision_backend_combo.addItem("ocrmac · accurate 模式（有坐标/置信度）", "ocrmac-vision")
-        self._vision_backend_combo.addItem("ocrmac · livetext（竖排文字实验性更好，无置信度）", "ocrmac-livetext")
-        self._vision_backend_combo.addItem("快捷指令 App（原方案）", "shortcut")
-        self._vision_backend_combo.setCurrentIndex(3)  # 默认原方案（快捷指令 App）
-        self._vision_backend_combo.currentIndexChanged.connect(self._on_vision_backend_changed)
-        vbw.addWidget(self._vision_backend_combo)
+        vbw.setSpacing(4)
+        self._vision_backend_combo = None
         self._vision_vertical_check = QCheckBox("竖排文字（右→左排序）")
         self._vision_vertical_check.setChecked(False)
-        vbw.addWidget(self._vision_vertical_check)
-        vb_hint = QLabel("")
-        vb_hint.setStyleSheet(f"color: #B7B6AF; font-size: 10px;")
+        self._vision_vertical_check.setVisible(False)
+        vb_title = QLabel("Apple Vision OCR")
+        vb_title.setStyleSheet("font-weight: bold; font-size: 12px;")
+        vbw.addWidget(vb_title)
+        vb_hint = QLabel("通过 macOS「快捷指令」App 调用 Live Text\n快捷指令名称：ExtractText")
+        vb_hint.setStyleSheet(f"color: {MUTED}; font-size: 11px;")
         vb_hint.setWordWrap(True)
         vbw.addWidget(vb_hint)
         self._vision_backend_hint = vb_hint
@@ -1196,7 +1203,6 @@ class OCRTab(QWidget):
 
         # ── 底部：日志/识别结果，收窄成常驻小面板 ───────────────────────────────
         bottom = QWidget()
-        bottom.setMaximumHeight(170)
         bottom.setStyleSheet(f"background: {CARD}; border-top: 1px solid {BORDER};")
         rl = QVBoxLayout(bottom)
         rl.setContentsMargins(0, 0, 0, 0)
@@ -1218,15 +1224,11 @@ class OCRTab(QWidget):
 
         self._prog = QProgressBar()
         self._prog.setVisible(False)
-        self._prog.setMinimumHeight(8)
-        self._prog.setMaximumHeight(10)
         rl.addWidget(self._prog)
 
         self._log_view = QPlainTextEdit()
         self._log_view.setReadOnly(True)
-        self._log_view.setStyleSheet(
-            f"background: #1B1B1D; color: #CFCFC6; font-family: 'Menlo', monospace; "
-            f"font-size: 11px; border: none; border-radius: 0;")
+        apply_light_log_style(self._log_view)
         rl.addWidget(self._log_view, 1)
 
         self._result_view = QTextEdit()
@@ -1254,30 +1256,9 @@ class OCRTab(QWidget):
             self._shortcut_widget.setVisible(False)
 
     def _on_vision_backend_changed(self):
-        """切换识别方式：只在选了"快捷指令 App"时才显示快捷指令名称输入框，
-        其余方式在下面用一行文字标出这个 backend 实际具备的能力（坐标/
-        置信度），能力信息直接从 BackendFactory 里查，不是写死的文案，
-        换了实现也不会跟实际能力对不上。"""
-        backend_id = self._vision_backend_combo.currentData()
-        self._shortcut_widget.setVisible(backend_id == "shortcut")
+        self._shortcut_widget.setVisible(True)
+        self._vision_backend_hint.setText("通过 macOS「快捷指令」App 调用 Live Text\n快捷指令名称：ExtractText")
 
-        if backend_id == "auto":
-            self._vision_backend_hint.setText("自动挑选当前环境下可用、能力最好的识别方式")
-            return
-        try:
-            from adapters.vision_backends import BackendFactory
-            backend = BackendFactory.create(backend_id)
-            available, reason = backend.is_available()
-            if not available:
-                self._vision_backend_hint.setText(f"⚠️ 当前不可用：{reason}")
-                return
-            caps = backend.capabilities
-            parts = []
-            parts.append("坐标✓" if caps.bbox else "无坐标")
-            parts.append("置信度✓" if caps.confidence else "无置信度")
-            self._vision_backend_hint.setText("　".join(parts))
-        except Exception as e:
-            self._vision_backend_hint.setText(f"⚠️ {e}")
 
     def _highlight_adapter(self, aid):
         for a, card in self._adapter_cards.items():
@@ -1436,7 +1417,7 @@ class OCRTab(QWidget):
                     from adapters.apple_vision_adapter import run as ocr_run
                     doc = ocr_run(
                         shortcut_name=self._shortcut_edit.text().strip(),
-                        backend=self._vision_backend_combo.currentData(),
+                        backend="shortcut",
                         vertical=self._vision_vertical_check.isChecked(),
                         **common_kwargs,
                     )
@@ -1525,7 +1506,6 @@ class FormatterTab(QWidget):
 
         # 顶部
         top = QWidget()
-        top.setFixedHeight(48)
         top.setStyleSheet(f"background: {CARD};")
         tl = QHBoxLayout(top)
         tl.setContentsMargins(14, 0, 10, 0)
@@ -1586,7 +1566,6 @@ class FormatterTab(QWidget):
 
         # ── 右侧：工具栏 + 对比区 ─────────────────────────────────────────────
         right = QWidget()
-        right.setMinimumWidth(420)
         right.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
         right.setStyleSheet(f"background: {CARD};")
         rl = QVBoxLayout(right)
@@ -1595,7 +1574,6 @@ class FormatterTab(QWidget):
 
         # 工具栏
         toolbar = QWidget()
-        toolbar.setFixedHeight(48)
         tbl = QHBoxLayout(toolbar)
         tbl.setContentsMargins(14, 0, 14, 0)
 
@@ -1863,6 +1841,7 @@ class FormatterTab(QWidget):
             "clean_metadata": ["页码正则 /^\\d{1,6}$/", "页眉位置检测 y<0.15", "跨页重复行检测"],
             "split_embedded_titles": ["块内搜索章节关键词", "只在句子边界后才拆分"],
             "strip_chapter_notes": ["数字＋（前書）/（後書き）标记触发", "裸数字块才算备注结束"],
+            "cross_page_merge": ["Page N 最后一块 + Page N+1 第一块", "相邻页且无句末符", "标题/列表/新对白不合并"],
             "merge_sentences": ["末尾无句末符→合并", "接续词感知（て/で/から）", "章节标题不合并"],
             "remove_duplicates": ["相邻规范化匹配", "章节标题模糊去重", "对白全文去重"],
             "fix_dash_artifacts": ["孤立「→——", "非ruby的｜/|→——"],
@@ -2353,7 +2332,6 @@ class FormatProfileDialog(QDialog):
 
         # ── 右侧：详情/编辑 ───────────────────────────────────────────────────
         right = QWidget()
-        right.setMinimumWidth(420)
         right.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
         rl = QVBoxLayout(right)
         rl.setContentsMargins(0, 0, 0, 0)
@@ -2758,7 +2736,6 @@ class EPUBTab(QWidget):
 
         # ── 右侧：元数据条 + 源码/预览 ────────────────────────────────────────
         right = QWidget()
-        right.setMinimumWidth(420)
         right.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
         right.setStyleSheet(f"background: {CARD};")
         rl = QVBoxLayout(right)
@@ -2767,7 +2744,6 @@ class EPUBTab(QWidget):
 
         # 元数据信息条
         pills_bar = QWidget()
-        pills_bar.setFixedHeight(44)
         pills_bar.setStyleSheet(f"background: {CARD};")
         pbl = QHBoxLayout(pills_bar)
         pbl.setContentsMargins(14, 0, 14, 0)
@@ -3130,7 +3106,8 @@ class PdfTextLayerTab(QWidget):
         root = wrap_in_card(self)
 
         left = QWidget()
-        left.setFixedWidth(340)
+        left.setMinimumWidth(220)
+        left.setMaximumWidth(360)
         left.setStyleSheet(f"background: {CARD}; border-right: 1px solid {BORDER};")
         left_outer = QVBoxLayout(left)
         left_outer.setContentsMargins(0, 0, 0, 0)
@@ -3184,7 +3161,6 @@ class PdfTextLayerTab(QWidget):
         root.addWidget(left, 0)
 
         right = QWidget()
-        right.setMinimumWidth(420)
         right.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
         right.setStyleSheet(f"background: {CARD};")
         rl = QVBoxLayout(right)
@@ -3202,9 +3178,7 @@ class PdfTextLayerTab(QWidget):
 
         self._log_view = QPlainTextEdit()
         self._log_view.setReadOnly(True)
-        self._log_view.setStyleSheet(
-            f"background: #1B1B1D; color: #CFCFC6; font-family: 'Menlo', monospace; "
-            f"font-size: 12px; border: none; border-radius: 0;")
+        apply_light_log_style(self._log_view)
         rl.addWidget(self._log_view, 1)
 
         root.addWidget(right, 1)
@@ -3287,8 +3261,9 @@ class Sidebar(QWidget):
 
     def __init__(self, parent=None):
         super().__init__(parent)
+        self._compact = False
         self.setMinimumWidth(180)
-        self.setMaximumWidth(240)
+        self.setMaximumWidth(220)
         self.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Expanding)
         self.setStyleSheet(f"background-color: {SIDEBAR_BG};")
 
@@ -3307,6 +3282,7 @@ class Sidebar(QWidget):
         for icon, label in self.ITEMS:
             btn = QToolButton()
             btn.setText(f"  {icon}   {label}")
+            btn.setToolTip(label)
             btn.setCheckable(True)
             btn.setAutoExclusive(True)
             btn.setCursor(QCursor(Qt.PointingHandCursor))
@@ -3323,6 +3299,17 @@ class Sidebar(QWidget):
         footer = QLabel(f"v{VERSION}")
         footer.setStyleSheet(f"color: {MUTED}; font-size: 10px; padding: 0 6px;")
         layout.addWidget(footer)
+
+    def set_compact(self, compact: bool):
+        if self._compact == compact:
+            return
+        self._compact = compact
+        self.setMinimumWidth(60 if compact else 180)
+        self.setMaximumWidth(64 if compact else 220)
+        for index, button in enumerate(self._buttons):
+            icon, label = self.ITEMS[index]
+            button.setText(icon if compact else f"  {icon}   {label}")
+            button.setToolTip(label)
 
     def _on_click(self, idx: int):
         self.section_changed.emit(idx)
@@ -3341,7 +3328,7 @@ class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle(f"Novel Formatter Studio v{VERSION}")
-        self.setMinimumSize(900, 620)
+        self.setMinimumSize(760, 560)
         self.resize(1320, 840)
 
         self._doc: Optional[UnifiedDocument] = None
@@ -3360,7 +3347,6 @@ class MainWindow(QMainWindow):
 
         # 右侧：内容堆叠 + 底部历史滑块
         right = QWidget()
-        right.setMinimumWidth(420)
         right.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
         right_layout = QVBoxLayout(right)
         right_layout.setContentsMargins(0, 0, 0, 0)
@@ -3450,6 +3436,16 @@ class MainWindow(QMainWindow):
 
 
 # ══════════════════════════════════════════════════════════════════════════════
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        width = event.size().width()
+        if hasattr(self, "_sidebar"):
+            self._sidebar.set_compact(width < 1050)
+        if hasattr(self, "_stack"):
+            current = self._stack.currentWidget()
+            if hasattr(current, "apply_responsive_layout"):
+                current.apply_responsive_layout(width)
+
 
 def main():
     app = QApplication(sys.argv)

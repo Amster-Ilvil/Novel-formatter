@@ -136,7 +136,7 @@ def crop_for_ocr(image_path: str, crop_top: float = 0.0, crop_bottom: float = 0.
     return str(dest)
 
 
-# OCR 识别本身（快捷指令 / ocrmac-vision / ocrmac-livetext）已经拆到
+# OCR 识别本身（快捷指令）已经拆到
 # adapters/vision_backends/ 包里，走 BackendFactory 统一调用——新增一种
 # 识别方式只需要在那边加一个 backend，这里完全不用改。
 from adapters.vision_backends import BackendFactory, OCRConfig
@@ -305,19 +305,17 @@ def run(
         crop_bottom:    同上，裁掉底部（页脚区域）。
         crop_rect:      手动框选的识别区域 (x0,y0,x1,y1)，归一化坐标，优先于
                         crop_top/crop_bottom（GUI 拖框选工具产生的参数）。
-        backend:        "shortcut"（默认，走"快捷指令" App）/ "ocrmac-vision"
-                        （纯 Python 调用 VNRecognizeTextRequest accurate 模式）/
-                        "ocrmac-livetext"（纯 Python 调用 VisionKit ImageAnalyzer，
-                        对竖排东亚文字支持更好，但没有置信度、速度更慢）。
-                        后两者需要 pip install ocrmac，不依赖"快捷指令" App。
-        vertical:       竖排（右→左列、列内上→下）还是横排——只影响
-                        backend="ocrmac-*" 时的阅读顺序重建，"shortcut"
-                        后端的顺序由快捷指令本身的识别结果决定，不受此参数影响。
+        backend:        仅支持 "shortcut"（走 macOS「快捷指令」App）。
+        vertical:       保留为兼容参数；快捷指令后端的顺序由系统识别结果决定。
 
     Returns:
         UnifiedDocument
     """
     global SHORTCUT_NAME
+    if backend not in {"shortcut", "auto", None, ""}:
+        raise ValueError("Apple Vision OCR 目前仅支持 macOS 快捷指令后端")
+    backend = "shortcut"
+
     SHORTCUT_NAME = shortcut_name
 
     overrides = {int(k): v for k, v in (page_overrides or {}).items()}
@@ -533,14 +531,9 @@ def main():
     )
     parser.add_argument(
         "--backend", "-b",
-        help="OCR backend：auto（默认，自动挑可用的，优先 ocrmac-vision）/ "
-             "ocrmac-vision（pip install ocrmac）/ ocrmac-livetext（竖排实验性）/ "
-             "shortcut（旧方案，走快捷指令 App）",
-        default="auto",
-    )
-    parser.add_argument(
-        "--horizontal", action="store_true",
-        help="横排文字（默认竖排右→左），只影响 backend=ocrmac-* 的阅读顺序重建",
+        choices=["shortcut"],
+        default="shortcut",
+        help="OCR backend：仅支持 shortcut（macOS 快捷指令 Apple Vision OCR）",
     )
     parser.add_argument("--quiet", "-q", action="store_true")
     args = parser.parse_args()
@@ -555,7 +548,7 @@ def main():
         page_overrides=overrides,
         shortcut_name=args.shortcut,
         backend=args.backend,
-        vertical=not args.horizontal,
+        vertical=True,
         verbose=not args.quiet,
     )
 
