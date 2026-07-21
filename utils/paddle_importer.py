@@ -171,13 +171,32 @@ def import_paddle_json(
         if is_blank:
             continue
 
-        # ---- 关键修改：按行拆分，每行一个 Block ----
-        if plain_text and not is_special:
+        parsing_blocks = _as_dict(p.get("prunedResult")).get("parsing_res_list") or p.get("parsing_res_list")
+        if isinstance(parsing_blocks, list) and not is_special:
+            for block_index, raw_block in enumerate(parsing_blocks):
+                if not isinstance(raw_block, dict):
+                    continue
+                raw_text = raw_block.get("block_content") or raw_block.get("text") or raw_block.get("content") or ""
+                for line in _strip_html(raw_text).splitlines():
+                    line = line.strip()
+                    if line:
+                        doc.blocks.append(Block(
+                            type=page_type,
+                            text=line,
+                            page=page,
+                            page_index=norm_idx,
+                            page_number=page,
+                            order_in_page=raw_block.get("block_order") or block_index,
+                            source_format="json",
+                            metadata={"bbox": raw_block.get("block_bbox")},
+                        ))
+        # ---- 按行拆分，每行一个 Block，并保留页码元数据 ----
+        elif plain_text and not is_special:
             lines = plain_text.splitlines()
-            for line in lines:
+            for block_index, line in enumerate(lines):
                 line = line.strip()
                 if line:
-                    doc.blocks.append(Block(type=page_type, text=line, page=page))
+                    doc.blocks.append(Block(type=page_type, text=line, page=page, page_index=norm_idx, page_number=page, order_in_page=block_index, source_format="json"))
 
         # ---- 处理图片 ----
         if local_image:
@@ -204,16 +223,21 @@ def import_paddle_json(
                     for line in str(text).splitlines():
                         line = line.strip()
                         if line:
-                            doc.blocks.append(Block(type=page_type, text=line, page=page))
+                            doc.blocks.append(Block(type=page_type, text=line, page=page, page_index=norm_idx, page_number=page, source_format="json"))
 
     return doc
 
 
 def import_paddle_md(md_path, image_folder, page_overrides=None, offset=0):
+    md_path = Path(md_path)
+    sibling_json = md_path.with_suffix(".json")
+    if sibling_json.exists():
+        return import_paddle_json(sibling_json, image_folder, page_overrides=page_overrides, offset=offset)
+
     doc = UnifiedDocument()
     page = offset
 
-    for line in Path(md_path).read_text(encoding="utf-8").splitlines():
+    for line in md_path.read_text(encoding="utf-8").splitlines():
         s = line.strip()
         if not s:
             continue

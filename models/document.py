@@ -93,6 +93,13 @@ class Block:
     page: int = 0
     bbox: Optional[BoundingBox] = None
     reading_order: int = 0
+    page_index: Optional[int] = None
+    page_number: Optional[int] = None
+    order_in_page: Optional[int] = None
+    text_direction: Optional[str] = None
+    source_format: Optional[str] = None
+    metadata: dict = field(default_factory=dict)
+    id: str = field(default_factory=lambda: uuid.uuid4().hex)
 
     # 质量信息
     confidence: float = 1.0
@@ -114,6 +121,20 @@ class Block:
             "reading_order": self.reading_order,
             "confidence": round(self.confidence, 4),
         }
+        if self.page_index is not None:
+            d["page_index"] = self.page_index
+        if self.page_number is not None:
+            d["page_number"] = self.page_number
+        if self.order_in_page is not None:
+            d["order_in_page"] = self.order_in_page
+        if self.text_direction is not None:
+            d["text_direction"] = self.text_direction
+        if self.source_format is not None:
+            d["source_format"] = self.source_format
+        if self.metadata:
+            d["metadata"] = self.metadata
+        if self.id:
+            d["id"] = self.id
         if self.bbox:
             d["bbox"] = {"x": self.bbox.x, "y": self.bbox.y,
                          "w": self.bbox.w, "h": self.bbox.h}
@@ -149,6 +170,20 @@ class PageInfo:
             "height": self.height,
             "confidence": round(self.confidence, 4),
         }
+        if self.page_index is not None:
+            d["page_index"] = self.page_index
+        if self.page_number is not None:
+            d["page_number"] = self.page_number
+        if self.order_in_page is not None:
+            d["order_in_page"] = self.order_in_page
+        if self.text_direction is not None:
+            d["text_direction"] = self.text_direction
+        if self.source_format is not None:
+            d["source_format"] = self.source_format
+        if self.metadata:
+            d["metadata"] = self.metadata
+        if self.id:
+            d["id"] = self.id
 
 
 @dataclass
@@ -409,6 +444,13 @@ class UnifiedDocument:
                 image_path=b.get("image_path", ""),
                 image_anchor=b.get("image_anchor", ""),
                 chapter_index=b.get("chapter_index", 0),
+                page_index=b.get("page_index"),
+                page_number=b.get("page_number"),
+                order_in_page=b.get("order_in_page"),
+                text_direction=b.get("text_direction"),
+                source_format=b.get("source_format"),
+                metadata=b.get("metadata", {}),
+                id=b.get("id", uuid.uuid4().hex),
             ))
         for t in d.get("toc", []):
             doc.toc.append(TocEntry(

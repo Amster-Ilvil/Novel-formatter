@@ -24,6 +24,8 @@ from __future__ import annotations
 
 import re
 import copy
+import difflib
+import unicodedata
 from pathlib import Path
 from typing import Optional, Callable
 import sys
@@ -100,7 +102,7 @@ RUBY_RE = re.compile(r'[｜\|]([^《]+)《([^》]+)》')
 BARE_NUMBER_RE = re.compile(r'^[\d\s]{1,6}$')
 
 DEDUP_EXACT = True
-SEMANTIC_DUP_WINDOW = 4
+SEMANTIC_DUP_WINDOW = 8
 SEMANTIC_DUP_SIMILARITY = 0.95
 MAX_MERGE_LINES = 8
 # 跨页页眉模糊聚类阈值。页眉可能有一两个 OCR 错字，仍应被识别为同一文本。
@@ -452,6 +454,175 @@ def strip_chapter_notes(doc: UnifiedDocument) -> UnifiedDocument:
     doc.add_log("strip_chapter_notes", f"删除 {removed} 个逐章前书/后书备注块", removed)
     return doc
 
+# ── 步骤 2.5：基于页码信息修复跨页断句 ─────────────────────────────────────
+CROSS_PAGE_TEXT_TYPES = {BlockType.PARAGRAPH, BlockType.DIALOGUE, BlockType.RUBY}
+STRONG_SENTENCE_ENDINGS = ("。", "！", "？", "!", "?", "‼", "⁉", "…", "‥", "」", "』", "）", ")", "】", "》")
+CONTINUATION_PREFIXES = ("が", "を", "に", "へ", "と", "で", "も", "は", "の", "や", "から", "まで", "より", "って", "ので", "のに", "けれど", "ながら", "つつ", "たり", "て", "し")
+QUOTE_PAIRS = {"「": "」", "『": "』", "（": "）", "(": ")", "【": "】", "《": "》"}
+CROSS_PAGE_AUTO_MERGE_THRESHOLD = 8
+
+
+def _append_modified_by(existing: str, step: str) -> str:
+    parts = [p for p in (existing or "").split(",") if p]
+    if step not in parts:
+        parts.append(step)
+    return ",".join(parts)
+
+
+def _block_page_index(block: Block) -> int | None:
+    value = getattr(block, "page_index", None)
+    if value is not None:
+        return value
+    page = getattr(block, "page", 0)
+    return int(page) if page else None
+
+
+def _block_order_in_page(block: Block) -> int:
+    value = getattr(block, "order_in_page", None)
+    if value is not None:
+        return int(value)
+    return int(getattr(block, "reading_order", 0) or 0)
+
+
+def _get_page_text_blocks(blocks: list[Block]) -> dict[int, list[Block]]:
+    pages: dict[int, list[Block]] = {}
+    for block in blocks:
+        page_index = _block_page_index(block)
+        if page_index is None or block.type not in CROSS_PAGE_TEXT_TYPES:
+            continue
+        if not (block.text or "").strip():
+            continue
+        pages.setdefault(page_index, []).append(block)
+    for page_blocks in pages.values():
+        page_blocks.sort(key=_block_order_in_page)
+    return pages
+
+
+def _has_strong_sentence_ending(text: str) -> bool:
+    text = (text or "").rstrip()
+    if not text:
+        return True
+    return text.endswith(STRONG_SENTENCE_ENDINGS)
+
+
+def _has_unclosed_quote(text: str) -> bool:
+    text = text or ""
+    for opening, closing in QUOTE_PAIRS.items():
+        if text.count(opening) > text.count(closing):
+            return True
+    return False
+
+
+def _starts_with_japanese_character(text: str) -> bool:
+    text = (text or "").lstrip(" 　")
+    if not text:
+        return False
+    first = text[0]
+    return "\u3040" <= first <= "\u30ff" or "\u3400" <= first <= "\u9fff"
+
+
+def _looks_like_continuation_start(text: str) -> bool:
+    text = (text or "").lstrip(" 　")
+    return bool(text) and (text.startswith(CONTINUATION_PREFIXES) or _starts_with_japanese_character(text))
+
+
+def _looks_like_list_item(text: str) -> bool:
+    text = (text or "").lstrip(" 　")
+    return bool(re.match(r"^([-*+]|\d+[.)．、]|[・●◼])", text))
+
+
+def _looks_like_title(block: Block, text: str) -> bool:
+    if block.type in {BlockType.CHAPTER, BlockType.SECTION, BlockType.TOC_ENTRY}:
+        return True
+    text = (text or "").strip()
+    return text.startswith("#") or bool(CHAPTER_RE.match(re.sub(r"[\s　]+", "", text)))
+
+
+def _join_cross_page_text(left: str, right: str) -> str:
+    return (left or "").rstrip(" \t\r\n　") + (right or "").lstrip(" \t\r\n　")
+
+
+def _cross_page_merge_score(previous: Block, next_block: Block) -> int:
+    score = 0
+    left = (previous.text or "").rstrip()
+    right = (next_block.text or "").lstrip()
+    previous_page = _block_page_index(previous)
+    next_page = _block_page_index(next_block)
+    if previous_page is not None:
+        score += 2
+    if previous_page is not None and next_page == previous_page + 1:
+        score += 4
+    else:
+        return -100
+    if previous.type not in CROSS_PAGE_TEXT_TYPES or next_block.type not in CROSS_PAGE_TEXT_TYPES:
+        return -100
+    if not _has_strong_sentence_ending(left):
+        score += 4
+    else:
+        score -= 10
+    if _has_unclosed_quote(left):
+        score += 4
+    if right.startswith(CONTINUATION_PREFIXES):
+        score += 3
+    if _starts_with_japanese_character(right):
+        score += 1
+    if _looks_like_title(next_block, right):
+        score -= 10
+    if _looks_like_list_item(right):
+        score -= 8
+    if right.startswith(("「", "『")) and not _has_unclosed_quote(left):
+        score -= 6
+    return score
+
+
+def merge_cross_page_sentences(doc: UnifiedDocument) -> UnifiedDocument:
+    """仅合并相邻页的上一页最后正文块和下一页第一正文块。"""
+    doc = copy.deepcopy(doc)
+    pages = _get_page_text_blocks(doc.blocks)
+    if not pages:
+        doc.add_log("cross_page_merge", "文档没有可靠页码信息，跳过跨页断句恢复", 0)
+        return doc
+
+    removed_ids: set[int] = set()
+    merged_count = 0
+    details: list[str] = []
+    for page_index in sorted(pages):
+        if page_index + 1 not in pages:
+            continue
+        previous = pages[page_index][-1]
+        next_block = pages[page_index + 1][0]
+        if id(previous) in removed_ids or id(next_block) in removed_ids:
+            continue
+        score = _cross_page_merge_score(previous, next_block)
+        if score < CROSS_PAGE_AUTO_MERGE_THRESHOLD:
+            continue
+        original_left = previous.text
+        original_right = next_block.text
+        previous.text = _join_cross_page_text(original_left, original_right)
+        previous.modified_by = _append_modified_by(previous.modified_by, "merge_cross_page_sentences")
+        source_pages = list(dict.fromkeys((previous.metadata or {}).get("source_pages", []) + [page_index, page_index + 1]))
+        previous.metadata = {
+            **(previous.metadata or {}),
+            "cross_page_merged": True,
+            "source_pages": source_pages,
+            "source_block_ids": [(previous.id or str(id(previous))), (next_block.id or str(id(next_block)))],
+            "cross_page_merge": {
+                "from_page": page_index,
+                "to_page": page_index + 1,
+                "left_text": original_left,
+                "right_text": original_right,
+                "score": score,
+            },
+        }
+        removed_ids.add(id(next_block))
+        merged_count += 1
+        if len(details) < 5:
+            details.append(f"Page {page_index} → Page {page_index + 1} 置信分:{score}")
+    doc.blocks = [block for block in doc.blocks if id(block) not in removed_ids]
+    suffix = "；" + "；".join(details) if details else ""
+    doc.add_log("cross_page_merge", f"恢复 {merged_count} 处跨页断句{suffix}", merged_count)
+    return doc
+
 
 # ── 步骤 3：合并断句（接续词感知）─────────────────────────────────────────────
 
@@ -562,19 +733,21 @@ def _normalize_for_dedup(text: str) -> str:
     return re.sub(r'[\s　]+', '', text)
 
 
+DEDUP_LEADING_MARKS_RE = re.compile(r"^[\s　◆※☆★●○＊◇■□▼▽△▲◼・･\-—–ー]+")
+DEDUP_PUNCT_RE = re.compile(
+    r"[。．、，,.！？!?…‥・･:：;；"
+    r"「」『』（）()\[\]【】《》〈〉"
+    r"\"'“”‘’]+"
+)
+
+
 def _normalize_for_semantic_dedup(text: str) -> str:
-    """近邻语义去重用规范化：忽略空白、全半角、轻微标点和项目符号差异。"""
-    import unicodedata
+    """近邻语义去重用规范化：忽略空白、全半角、项目符号和轻微标点差异。"""
     text = unicodedata.normalize("NFKC", text or "")
-    text = re.sub(r'^[◆※☆★●○＊◇■□▼▽△▲・･\-—–ー\s　]+', '', text)
-    text = re.sub(r'[\s　]+', '', text)
-    text = re.sub(r'[。．、，,.！？!?…‥・･:：;；「」『』（）()\[\]【】《》〈〉"''“”’‘、]+', '', text)
-    return text
-
-
-def _text_similarity(a: str, b: str) -> float:
-    import difflib
-    return difflib.SequenceMatcher(None, a, b).ratio()
+    text = DEDUP_LEADING_MARKS_RE.sub("", text)
+    text = re.sub(r"[\s　]+", "", text)
+    text = DEDUP_PUNCT_RE.sub("", text)
+    return text.casefold()
 
 
 def _is_protected_title(block: Block, normalized_text: str) -> bool:
@@ -584,11 +757,14 @@ def _is_protected_title(block: Block, normalized_text: str) -> bool:
     )
 
 
-def _dedup_quality(block: Block) -> tuple[int, float, int, int]:
+def _dedup_quality(block: Block) -> tuple:
     text = (block.text or "").strip()
-    punctuation = sum(1 for ch in text if ch in "。！？!?」』）……")
-    replacement_bonus = 1 if block.ocr_raw and block.ocr_raw != block.text else 0
-    return (len(_normalize_for_semantic_dedup(text)), block.confidence, punctuation, replacement_bonus)
+    normalized = _normalize_for_semantic_dedup(text)
+    was_replaced = bool(block.ocr_raw and block.ocr_raw.strip() and block.ocr_raw.strip() != text)
+    punctuation_score = sum(1 for ch in text if ch in "。！？!?」』）")
+    malformed_penalty = text.count("..") + text.count(".・") + text.count("・..") + text.count("�")
+    confidence = float(getattr(block, "confidence", 0.0) or 0.0)
+    return (1 if was_replaced else 0, -malformed_penalty, punctuation_score, len(normalized), confidence)
 
 
 def _is_near_duplicate(a: str, b: str) -> bool:
@@ -597,63 +773,71 @@ def _is_near_duplicate(a: str, b: str) -> bool:
     if a == b:
         return True
     shorter, longer = sorted((a, b), key=len)
-    if len(shorter) >= 6 and shorter in longer:
-        return True
-    return _text_similarity(a, b) >= SEMANTIC_DUP_SIMILARITY
-
+    if len(shorter) >= 12 and shorter in longer:
+        return len(shorter) / len(longer) >= 0.30
+    ratio = difflib.SequenceMatcher(None, a, b).ratio()
+    length = max(len(a), len(b))
+    if length >= 60:
+        return ratio >= 0.94
+    if length >= 30:
+        return ratio >= 0.95
+    if length >= 15:
+        return ratio >= 0.97
+    return False
 
 def remove_semantic_duplicates(doc: UnifiedDocument) -> UnifiedDocument:
-    """
-    近邻 Duplicate Resolver。
-
-    仅在连续/近邻文本块的滑动窗口内检测，避免误删小说中有意重复的对白、
-    回环修辞、目录/标题重复。判断时会忽略空白、全半角和轻微标点差异，并
-    结合 Levenshtein/SequenceMatcher 相似度与包含关系；保留更长、更完整、
-    标点更完整、置信度更高或经过替换的版本。
-    """
+    """仅在近邻窗口内删除语义重复块，优先保留替换后或更完整的版本。"""
     doc = copy.deepcopy(doc)
     text_types = {BlockType.PARAGRAPH, BlockType.DIALOGUE, BlockType.RUBY}
-    removed = 0
-    removal_notes: list[str] = []
     result: list[Block] = []
+    removed = 0
 
-    for b in doc.blocks:
-        normalized = _normalize_for_semantic_dedup(b.text)
-        if b.type not in text_types or not normalized or _is_protected_title(b, normalized):
-            result.append(b)
+    for block in doc.blocks:
+        normalized = _normalize_for_semantic_dedup(block.text)
+        if block.type not in text_types or not normalized or _is_protected_title(block, normalized):
+            result.append(block)
             continue
 
-        duplicate_idx = None
-        for idx in range(len(result) - 1, max(-1, len(result) - SEMANTIC_DUP_WINDOW - 1), -1):
-            prev = result[idx]
-            prev_norm = _normalize_for_semantic_dedup(prev.text)
-            if (
-                prev.type in text_types
-                and not _is_protected_title(prev, prev_norm)
-                and _is_near_duplicate(prev_norm, normalized)
-            ):
-                duplicate_idx = idx
+        candidate_indexes: list[int] = []
+        checked = 0
+        for index in range(len(result) - 1, -1, -1):
+            previous = result[index]
+            if previous.type not in text_types:
+                continue
+            checked += 1
+            if checked > SEMANTIC_DUP_WINDOW:
                 break
+            previous_normalized = _normalize_for_semantic_dedup(previous.text)
+            if _is_protected_title(previous, previous_normalized):
+                continue
+            if (
+                previous.type == BlockType.DIALOGUE
+                and block.type == BlockType.DIALOGUE
+                and getattr(previous, "page", 0) != getattr(block, "page", 0)
+            ):
+                continue
+            if _is_near_duplicate(previous_normalized, normalized):
+                candidate_indexes.append(index)
 
-        if duplicate_idx is None:
-            result.append(b)
+        if not candidate_indexes:
+            result.append(block)
             continue
 
-        previous = result[duplicate_idx]
-        keep_new = _dedup_quality(b) >= _dedup_quality(previous)
-        removed_block = previous if keep_new else b
-        if keep_new:
-            result[duplicate_idx] = b
-        removed += 1
-        if len(removal_notes) < 5:
-            removal_notes.append(removed_block.text.strip()[:40])
+        candidates = [(index, result[index]) for index in candidate_indexes]
+        candidates.append((-1, block))
+        best_index, best_block = max(candidates, key=lambda item: _dedup_quality(item[1]))
+        insert_at = min(candidate_indexes)
+        for index in sorted(candidate_indexes, reverse=True):
+            del result[index]
+            removed += 1
+        if best_index == -1:
+            result.insert(insert_at, block)
+        else:
+            result.insert(insert_at, best_block)
 
     doc.blocks = result
-    detail = "；".join(removal_notes)
-    suffix = f"（示例：{detail}）" if detail else ""
-    doc.add_log("remove_duplicates", f"Duplicate Resolver 删除 {removed} 个近邻重复块{suffix}", removed)
+    doc.add_log("remove_duplicates", f"删除 {removed} 个近邻重复块", removed)
     return doc
-
 
 def remove_duplicates(doc: UnifiedDocument) -> UnifiedDocument:
     """兼容旧步骤名的包装；实际执行近邻语义 Duplicate Resolver。"""
@@ -769,87 +953,79 @@ def _quote_close_open_types(text: str) -> dict[int, str]:
     return result
 
 
+def _is_dialogue_start(text: str, start: int) -> bool:
+    if start == 0:
+        return True
+    prefix = text[:start].rstrip()
+    if not prefix:
+        return True
+    return prefix[-1] in "。！？!?\n」"
+
+
 def restore_dialogue_breaks(doc: UnifiedDocument) -> UnifiedDocument:
     """
-    迭代拆分 PARAGRAPH 块中内嵌的对白。
-    支持多轮对白混合叙述的复杂场景。
+    拆分 PARAGRAPH/DIALOGUE 块中连续的「...」人物对白。
 
-    只拆「」（真正的人物对白），不拆『』——『』在日文轻小说里更常用来
-    标记书名/招式名/术语/强调等叙述内嵌引用（例如"…その使い手たる『勇者』
-    である。"是地の文，『勇者』只是被引用的称号，不是有人在说话）。
-    之前『』也会触发拆分，导致一整句连贯的叙述被硬切成好几段。
+    只拆「」对白，不拆『』术语引用；普通段落里的句中术语引用会保留原样。
     """
     doc = copy.deepcopy(doc)
-
-    # 「…」只有位于块首、或紧跟一句已结束的叙述时才视为独立对白。句中
-    # 的「何か」「理由」等是术语/强调，拆开会把完整叙述人为断成三块。
-    dialogue_re = re.compile(r'「[^」]*」', re.DOTALL)
-
+    dialogue_re = re.compile(r"「[^」]*」", re.DOTALL)
     split_count = 0
     result: list[Block] = []
 
-    for b in doc.blocks:
-        if b.type != BlockType.PARAGRAPH:
-            result.append(b)
+    for block in doc.blocks:
+        if block.type not in {BlockType.PARAGRAPH, BlockType.DIALOGUE}:
+            result.append(block)
             continue
 
-        text = b.text
-        # 按真实配对类型标注每个收尾符号，供下面判断"这个」是不是真的
-        # 结束了一段人物对白"，而不是被误读/误打的『术语引用』收尾。
-        close_open_types = _quote_close_open_types(text)
-        sub_blocks: list[Block] = []
+        text = block.text or ""
+        matches = list(dialogue_re.finditer(text))
+        if not matches:
+            result.append(block)
+            continue
+
+        pieces: list[Block] = []
         cursor = 0
-        for m in dialogue_re.finditer(text):
-            # 光有引号不足以说明是人物说话。若它前面不是句子边界，就保留
-            # 在当前叙述中；下一处真正的对白仍可在后续循环中被识别。
-            preceding = text[:m.start()].rstrip()
-            if not preceding:
-                is_dialogue = m.start() == 0
-            else:
-                last_ch = preceding[-1]
-                if last_ch in '。！？\n':
-                    is_dialogue = True
-                elif last_ch in '」』':
-                    # 只有真正配对自「的收尾符才算一段独立对白刚刚结束；
-                    # 配对自『的收尾符（哪怕字面上被误读/误打成」）只是
-                    # 术语引用结束，后面紧跟的引号仍属于同一句叙述，不
-                    # 应该被当成新对白拆出来。
-                    last_idx = len(preceding) - 1
-                    is_dialogue = close_open_types.get(last_idx) == '「'
-                else:
-                    is_dialogue = False
-            if not is_dialogue:
+        for match in matches:
+            valid = (
+                block.type == BlockType.DIALOGUE
+                or _is_dialogue_start(text, match.start())
+                or (match.start() > 0 and text[match.start() - 1] == "」")
+            )
+            if not valid:
                 continue
 
-            before = text[cursor:m.start()]
-            dialogue = m.group(0)
-            if before.strip():
-                nb = copy.copy(b)
-                nb.text = before.strip()
-                nb.type = BlockType.PARAGRAPH
-                nb.modified_by = "restore_dialogue_breaks"
-                sub_blocks.append(nb)
+            before = text[cursor:match.start()].strip()
+            if before:
+                paragraph = copy.copy(block)
+                paragraph.id = ""
+                paragraph.text = before
+                paragraph.type = BlockType.PARAGRAPH
+                paragraph.modified_by = "restore_dialogue_breaks"
+                pieces.append(paragraph)
 
-            db = copy.copy(b)
-            db.text = dialogue.strip()
-            db.type = BlockType.DIALOGUE
-            db.modified_by = "restore_dialogue_breaks"
-            sub_blocks.append(db)
+            dialogue = copy.copy(block)
+            dialogue.id = ""
+            dialogue.text = match.group(0).strip()
+            dialogue.type = BlockType.DIALOGUE
+            dialogue.modified_by = "restore_dialogue_breaks"
+            pieces.append(dialogue)
+            cursor = match.end()
             split_count += 1
-            cursor = m.end()
 
-        remainder = text[cursor:]
-        if remainder.strip():
-            nb = copy.copy(b)
-            nb.text = remainder.strip()
-            nb.type = BlockType.PARAGRAPH
-            nb.modified_by = "restore_dialogue_breaks"
-            sub_blocks.append(nb)
+        tail = text[cursor:].strip()
+        if tail:
+            paragraph = copy.copy(block)
+            paragraph.id = ""
+            paragraph.text = tail
+            paragraph.type = BlockType.PARAGRAPH
+            paragraph.modified_by = "restore_dialogue_breaks"
+            pieces.append(paragraph)
 
-        if len(sub_blocks) > 1:
-            result.extend(sub_blocks)
+        if len(pieces) >= 2:
+            result.extend(pieces)
         else:
-            result.append(b)
+            result.append(block)
 
     doc.blocks = result
     doc.add_log("dialogue_restore", f"分离 {split_count} 条对白", split_count)
@@ -1177,6 +1353,7 @@ PRESERVE_OCR_LAYOUT_SKIP_STEPS = {
     # 让文本替换后的块数量与原 OCR 版面保持一致。
     "split_embedded_titles",
     "strip_chapter_notes",
+    "cross_page_merge",
     "merge_sentences",
     "remove_duplicates",
     "dialogue_restore",
@@ -1196,6 +1373,7 @@ PIPELINE_STEPS = [
     ("clean_metadata",      clean_metadata_blocks),
     ("split_embedded_titles", split_embedded_chapter_titles),
     ("strip_chapter_notes", strip_chapter_notes),
+    ("cross_page_merge",    merge_cross_page_sentences),
     ("merge_sentences",     merge_broken_sentences),
     ("remove_duplicates",   remove_duplicates),
     ("fix_dash_artifacts",  fix_ocr_dash_artifacts),

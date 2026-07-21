@@ -175,3 +175,66 @@ def test_semantic_duplicate_resolver_only_checks_nearby_blocks():
     result = remove_duplicates(doc)
 
     assert [block.text for block in result.blocks].count(repeated) == 2
+
+
+def make_doc(items):
+    return UnifiedDocument(blocks=[Block(type=t, text=text) for t, text in items])
+
+
+def test_restore_three_consecutive_dialogues():
+    doc = make_doc([(
+        BlockType.PARAGRAPH,
+        "「魔王が人を殺すのを望まないのか？」"
+        "「当然だ。もっと言えば俺は人が死ぬのもいやなんだよ」"
+        "「な！？魔王が？そんなことを言うのか？」",
+    )])
+    result = restore_dialogue_breaks(doc)
+    assert [b.text for b in result.blocks] == [
+        "「魔王が人を殺すのを望まないのか？」",
+        "「当然だ。もっと言えば俺は人が死ぬのもいやなんだよ」",
+        "「な！？魔王が？そんなことを言うのか？」",
+    ]
+    assert all(b.type == BlockType.DIALOGUE for b in result.blocks)
+
+
+def test_split_consecutive_dialogues_inside_dialogue_block():
+    doc = make_doc([(BlockType.DIALOGUE, "「一つ目」「二つ目」「三つ目」")])
+    result = restore_dialogue_breaks(doc)
+    assert [b.text for b in result.blocks] == ["「一つ目」", "「二つ目」", "「三つ目」"]
+
+
+def test_do_not_split_inline_term_quote():
+    source = "俺は彼を「勇者」と呼んでいる。"
+    doc = make_doc([(BlockType.PARAGRAPH, source)])
+    result = restore_dialogue_breaks(doc)
+    assert len(result.blocks) == 1
+    assert result.blocks[0].text == source
+    assert result.blocks[0].type == BlockType.PARAGRAPH
+
+
+def test_remove_replacement_near_duplicate():
+    old_text = "その後、この娘、そして子々孫々にわたる腐れ縁が出来ることなぞ、この時の俺は想像だにしていなかったのだが。"
+    fixed_text = "その後、この娘、そして子々孫々にわたる腐れ縁が出来ることなど、この時の俺は想像だにしていなかったのだが。"
+    result = remove_duplicates(UnifiedDocument(blocks=[
+        Block(type=BlockType.PARAGRAPH, text=old_text),
+        Block(type=BlockType.PARAGRAPH, text=fixed_text, ocr_raw=old_text, modified_by="replacement_engine"),
+    ]))
+    assert len(result.blocks) == 1
+    assert result.blocks[0].text == fixed_text
+
+
+def test_keep_more_complete_nearby_block():
+    short_text = "キノープはどこか驚いた様子だ。"
+    full_text = "キノープはどこか驚いた様子だ。何だ？俺が無能な父親を消す心配しているのか？"
+    result = remove_duplicates(make_doc([(BlockType.PARAGRAPH, short_text), (BlockType.PARAGRAPH, full_text)]))
+    assert len(result.blocks) == 1
+    assert result.blocks[0].text == full_text
+
+
+def test_do_not_remove_distant_repeated_dialogue():
+    blocks = [Block(type=BlockType.DIALOGUE, text="「待って」")]
+    for index in range(20):
+        blocks.append(Block(type=BlockType.PARAGRAPH, text=f"これは通常の段落{index}です。"))
+    blocks.append(Block(type=BlockType.DIALOGUE, text="「待って」"))
+    result = remove_duplicates(UnifiedDocument(blocks=blocks))
+    assert sum(b.text == "「待って」" for b in result.blocks) == 2
