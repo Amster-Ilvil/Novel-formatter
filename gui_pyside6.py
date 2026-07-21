@@ -1527,6 +1527,10 @@ class FormatterTab(QWidget):
         ll.addWidget(top)
         ll.addWidget(make_separator())
 
+        self._preserve_ocr_layout_cb = QCheckBox("固定原 OCR 排版")
+        self._preserve_ocr_layout_cb.setToolTip("文本替换后保留原 OCR 块/段落结构；运行 Formatter 时跳过合并断句、对白拆分、缩进等重排步骤")
+        ll.addWidget(self._preserve_ocr_layout_cb)
+
         self._step_checks: dict[str, QCheckBox] = {}
         self._step_cards: dict[str, QWidget] = {}
         scroll = QScrollArea()
@@ -2072,8 +2076,10 @@ class FormatterTab(QWidget):
             try:
                 from adapters.text_extractors import extract_paragraphs
                 from engine.replacement_engine import replace_text
+                doc_for_replace = copy.deepcopy(doc)
+                doc_for_replace.metadata.preserve_ocr_layout = self._preserve_ocr_layout_cb.isChecked()
                 source_paragraphs = extract_paragraphs(path)
-                new_doc, report = replace_text(doc, source_paragraphs)
+                new_doc, report = replace_text(doc_for_replace, source_paragraphs)
                 signals.finished.emit({"doc": new_doc, "report": report})
             except Exception:
                 import traceback
@@ -2164,6 +2170,9 @@ class FormatterTab(QWidget):
         if base is None:
             QMessageBox.warning(self, "错误", "请先完成 OCR 或载入 JSON")
             return
+
+        base = copy.deepcopy(base)
+        base.metadata.preserve_ocr_layout = self._preserve_ocr_layout_cb.isChecked()
 
         self._show_doc(self._ocr_doc or base, self._before)
         self._progress.setVisible(True)

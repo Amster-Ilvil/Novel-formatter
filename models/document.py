@@ -162,6 +162,7 @@ class Metadata:
     isbn: str = ""
     description: str = ""
     source_engine: str = ""    # 使用的 OCR 引擎名称
+    preserve_ocr_layout: bool = False  # 固定原 OCR 块/段落结构，跳过会重排段落的 Formatter 步骤
 
     def to_dict(self) -> dict:
         return {k: v for k, v in self.__dict__.items() if v}

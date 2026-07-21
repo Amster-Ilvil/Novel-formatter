@@ -94,3 +94,41 @@ def test_does_not_merge_a_completed_ocr_sentence_across_pages():
     result = merge_broken_sentences(doc)
 
     assert [block.text for block in result.blocks] == ["第六页的句子结束。", "第七页的新段落。"]
+
+
+def test_preserve_ocr_layout_skips_structure_changing_steps(tmp_path):
+    from engine.formatter import run_pipeline
+
+    doc = _document(
+        Block(BlockType.PARAGRAPH, "途中で", page=1),
+        Block(BlockType.PARAGRAPH, "続く。", page=1),
+        Block(BlockType.PARAGRAPH, "彼は言った。「行こう」そして歩いた。", page=1),
+    )
+    doc.metadata.preserve_ocr_layout = True
+
+    result = run_pipeline(
+        doc,
+        steps=["merge_sentences", "dialogue_restore", "restore_indents"],
+        verbose=False,
+        repo_path=str(tmp_path / "repo"),
+    )
+
+    assert [(block.type, block.text) for block in result.blocks] == [
+        (BlockType.PARAGRAPH, "途中で"),
+        (BlockType.PARAGRAPH, "続く。"),
+        (BlockType.PARAGRAPH, "彼は言った。「行こう」そして歩いた。"),
+    ]
+    assert [log["step"] for log in result.processing_log[-3:]] == [
+        "merge_sentences",
+        "dialogue_restore",
+        "restore_indents",
+    ]
+
+
+def test_preserve_ocr_layout_flag_round_trips_json():
+    doc = _document(Block(BlockType.PARAGRAPH, "本文"))
+    doc.metadata.preserve_ocr_layout = True
+
+    loaded = UnifiedDocument.from_json(doc.to_json())
+
+    assert loaded.metadata.preserve_ocr_layout is True

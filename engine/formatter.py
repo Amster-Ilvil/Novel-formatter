@@ -1129,6 +1129,24 @@ def normalize_punctuation(doc: UnifiedDocument) -> UnifiedDocument:
 
 # ── Pipeline：组合所有步骤 ────────────────────────────────────────────────────
 
+PRESERVE_OCR_LAYOUT_SKIP_STEPS = {
+    # 这些步骤会合并、删除、拆分或缩进块。开启固定原 OCR 排版时跳过，
+    # 让文本替换后的块数量与原 OCR 版面保持一致。
+    "split_embedded_titles",
+    "strip_chapter_notes",
+    "merge_sentences",
+    "remove_duplicates",
+    "dialogue_restore",
+    "restore_indents",
+    "strip_boilerplate",
+}
+
+
+def is_preserve_ocr_layout_enabled(doc: UnifiedDocument) -> bool:
+    """是否启用「固定原 OCR 排版」模式。"""
+    return bool(getattr(doc.metadata, "preserve_ocr_layout", False))
+
+
 PIPELINE_STEPS = [
     ("reading_order",       reading_order_step),
     ("ai_correction",       ai_correction_step),
@@ -1190,6 +1208,21 @@ def run_pipeline(
         if fn is None:
             print(f"  ⚠️  未知步骤: {step_id}")
             continue
+        if is_preserve_ocr_layout_enabled(current) and step_id in PRESERVE_OCR_LAYOUT_SKIP_STEPS:
+            result = copy.deepcopy(current)
+            result.add_log(
+                step_id,
+                "固定原 OCR 排版：跳过会改变段落结构的步骤",
+                0,
+            )
+            result.repo = current.repo
+            result.commit_id = current.commit_id
+            last_log = result.processing_log[-1]
+            commit_id = result.commit(effective_repo_path, step_id, last_log.get("message", ""))
+            current = result
+            if verbose:
+                print(f"  ⏭  {step_id} ... [{commit_id[:8]}] {last_log.get('message', 'skipped')}")
+            continue
         if verbose:
             print(f"  ▶  {step_id} ...", end=" ")
 
@@ -1224,6 +1257,10 @@ if __name__ == "__main__":
     parser.add_argument("input_json",  help="输入 UnifiedDocument JSON")
     parser.add_argument("output_json", help="输出 JSON 路径")
     parser.add_argument(
+        "--preserve-ocr-layout", action="store_true",
+        help="固定原 OCR 块/段落结构，跳过合并断句、对白拆分、缩进等重排步骤"
+    )
+    parser.add_argument(
         "--steps", nargs="*",
         help="指定运行步骤（空=全部）：reading_order clean_metadata merge_sentences "
              "remove_duplicates fix_dash_artifacts dialogue_restore restore_indents "
@@ -1233,6 +1270,9 @@ if __name__ == "__main__":
 
     with open(args.input_json, encoding="utf-8") as f:
         doc = UnifiedDocument.from_json(f.read())
+
+    if args.preserve_ocr_layout:
+        doc.metadata.preserve_ocr_layout = True
 
     print(f"📥  读入: {len(doc.blocks)} 个块，{len(doc.pages)} 页")
     result = run_pipeline(doc, steps=args.steps)
