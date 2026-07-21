@@ -1,0 +1,11 @@
+QMainWindow { background:#eef6ff; }
+QWidget { background:#eef6ff; }
+QPushButton, QToolButton, QDialogButtonBox QPushButton {
+ background:#dbeafe;
+ color:#1e3a8a;
+ border:none;
+ border-radius:12px;
+ padding:8px 18px;
+}
+QPushButton:hover, QToolButton:hover { background:#bfdbfe; }
+QPushButton:pressed { background:#93c5fd; }

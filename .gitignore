@@ -1,0 +1,24 @@
+# Python
+__pycache__/
+*.pyc
+
+# 虚拟环境（PaddleOCR 专用，很大且是本地依赖，不是源码）
+.venv-paddle/
+
+# macOS
+.DS_Store
+
+
+# 运行时生成的临时文件
+_ocr_crop/
+_epub_images_*/
+_docx_images_*/
+*.epub
+*.json
+!ai/prompts/*.json
+
+# 测试/样例图片（非源码）
+*.jpeg
+*.jpg
+*.png
+!docs/**/*.png
