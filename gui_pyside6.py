@@ -1607,6 +1607,11 @@ class FormatterTab(QWidget):
         epub_btn.clicked.connect(self._import_epub)
         tbl.addWidget(epub_btn)
 
+        self._preserve_layout_cb = QCheckBox("固定原OCR排版")
+        self._preserve_layout_cb.setToolTip("文本替换时只替换文字内容，保留 OCR 原有段落结构，避免替换后乱分段")
+        self._preserve_layout_cb.setChecked(False)
+        tbl.addWidget(self._preserve_layout_cb)
+
         replace_btn = QPushButton("🔀 文本替换")   # ← 这里缩进与上面一致（4个空格）
         replace_btn.setProperty("flat", True)
         replace_btn.setToolTip("用外部高质量文本（docx/epub/json/txt/md/html）替换当前 OCR 正文，保留页面结构")
@@ -2073,8 +2078,16 @@ class FormatterTab(QWidget):
                 from adapters.text_extractors import extract_paragraphs
                 from engine.replacement_engine import replace_text
                 source_paragraphs = extract_paragraphs(path)
-                new_doc, report = replace_text(doc, source_paragraphs)
-                signals.finished.emit({"doc": new_doc, "report": report})
+                preserve_layout = self._preserve_layout_cb.isChecked()
+                new_doc, report = replace_text(
+                    doc, source_paragraphs,
+                    preserve_ocr_layout=preserve_layout,
+                )
+                signals.finished.emit({
+                    "doc": new_doc,
+                    "report": report,
+                    "preserve_layout": preserve_layout,
+                })
             except Exception:
                 import traceback
                 signals.error.emit(traceback.format_exc())
@@ -2087,9 +2100,12 @@ class FormatterTab(QWidget):
     def _on_text_replacement_done(self, payload):
         new_doc = payload["doc"]
         report = payload["report"]
+        preserve_layout = payload.get("preserve_layout", False)
+        mode = "固定 OCR 版式" if preserve_layout else "标准替换"
         self._on_run_done(new_doc)
         QMessageBox.information(
             self, "文本替换完成",
+            f"模式: {mode}\n"
             f"替换 {report.replaced} 段（低置信度跳过 {report.low_confidence} 段）\n"
             f"OCR 中未找到对应来源: {report.skipped_ocr} 段（原文保留）\n"
             f"来源中未找到对应 OCR 位置: {report.skipped_source} 段（未自动插入，见下方预览）\n"

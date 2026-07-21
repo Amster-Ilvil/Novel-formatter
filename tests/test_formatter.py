@@ -94,3 +94,27 @@ def test_does_not_merge_a_completed_ocr_sentence_across_pages():
     result = merge_broken_sentences(doc)
 
     assert [block.text for block in result.blocks] == ["第六页的句子结束。", "第七页的新段落。"]
+
+
+def test_splits_consecutive_dialogue_quotes():
+    result = restore_dialogue_breaks(_document(
+        Block(BlockType.PARAGRAPH, "「魔王が人を殺すのを望まないのか？」「当然だ。もっと言えば俺は人が死ぬのもいやなんだよ」「な！？ 魔王が？」")
+    ))
+
+    assert [(block.type, block.text) for block in result.blocks] == [
+        (BlockType.DIALOGUE, "「魔王が人を殺すのを望まないのか？」"),
+        (BlockType.DIALOGUE, "「当然だ。もっと言えば俺は人が死ぬのもいやなんだよ」"),
+        (BlockType.DIALOGUE, "「な！？ 魔王が？」"),
+    ]
+
+
+def test_splits_corner_bracket_dialogue_at_sentence_boundary():
+    result = restore_dialogue_breaks(_document(
+        Block(BlockType.PARAGRAPH, "彼はうなずいた。『任せて』そして走った。")
+    ))
+
+    assert [(block.type, block.text) for block in result.blocks] == [
+        (BlockType.PARAGRAPH, "彼はうなずいた。"),
+        (BlockType.DIALOGUE, "『任せて』"),
+        (BlockType.PARAGRAPH, "そして走った。"),
+    ]

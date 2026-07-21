@@ -188,6 +188,7 @@ def replace_text(
     source_paragraphs: list[Paragraph],
     match_threshold: float = 0.3,
     force_replace: bool = False,
+    preserve_ocr_layout: bool = False,
 ) -> tuple[UnifiedDocument, ReplacementReport]:
     t0 = time.time()
 
@@ -219,15 +220,28 @@ def replace_text(
                 block_index = ocr_paragraphs[pair.ocr_index].index
                 block = new_doc.blocks[block_index]
                 src_text = apply_ocr_corrections(source_paragraphs[pair.source_index].text)
-                if block.text != src_text:
+                if preserve_ocr_layout:
+                    # 固定 OCR 版式模式：只更新当前 OCR block 的文字内容，
+                    # 不插入、不删除、不合并任何 block。来源段落常含 Word/EPUB
+                    # 自带换行或缩进，这里先压扁为单行，避免把来源排版带入
+                    # OCR 的段落边界中。
+                    candidate = re.sub(r"[\s　\n]+", " ", src_text).strip()
+                else:
+                    candidate = src_text
+
+                if block.text != candidate:
                     if not block.ocr_raw:
                         block.ocr_raw = block.text
-                    candidate = replacer.replace(block.text, src_text)
-                    candidate, protected = _safe_replace_result(block.text, candidate)
-                    if protected:
-                        new_doc.add_log("safe_diff_guard", "检测到疑似长句误删除，保留 OCR 原文", 1)
+                    if not preserve_ocr_layout:
+                        candidate = replacer.replace(block.text, candidate)
+                        candidate, protected = _safe_replace_result(block.text, candidate)
+                        if protected:
+                            new_doc.add_log("safe_diff_guard", "检测到疑似长句误删除，保留 OCR 原文", 1)
                     block.text = candidate
-                    block.modified_by = "text_replacement"
+                    block.modified_by = (
+                        "text_replacement_preserve_layout"
+                        if preserve_ocr_layout else "text_replacement"
+                    )
                     block.confidence = pair.similarity
                     replaced += 1
             else:
@@ -238,7 +252,8 @@ def replace_text(
 
     new_doc.add_log(
         "text_replacement",
-        f"替换 {replaced} 段（低置信度跳过 {low_confidence} 段），"
+        f"替换 {replaced} 段（低置信度跳过 {low_confidence} 段，"
+        f"{'固定 OCR 版式' if preserve_ocr_layout else '标准替换'}），"
         f"{result.skipped_source} 段来源内容未在 OCR 中找到对应位置（未自动插入）",
         replaced,
     )
@@ -269,6 +284,8 @@ if __name__ == "__main__":
     parser.add_argument("output_json", help="替换后的 UnifiedDocument JSON 输出路径")
     parser.add_argument("--threshold", type=float, default=0.3, help="匹配相似度阈值（默认 0.3）")
     parser.add_argument("--force", action="store_true", help="强制替换所有匹配对，忽略阈值")
+    parser.add_argument("--preserve-ocr-layout", action="store_true",
+                        help="固定使用 OCR 原有段落结构，仅替换文字内容（推荐用于替换后排版混乱的情况）")
     parser.add_argument("--report", help="替换报告 JSON 输出路径")
     args = parser.parse_args()
 
@@ -283,7 +300,8 @@ if __name__ == "__main__":
     new_doc, report = replace_text(
         ocr_doc, source_paragraphs,
         match_threshold=args.threshold,
-        force_replace=args.force
+        force_replace=args.force,
+        preserve_ocr_layout=args.preserve_ocr_layout,
     )
 
     print(

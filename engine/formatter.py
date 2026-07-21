@@ -729,18 +729,19 @@ def _quote_close_open_types(text: str) -> dict[int, str]:
 def restore_dialogue_breaks(doc: UnifiedDocument) -> UnifiedDocument:
     """
     迭代拆分 PARAGRAPH 块中内嵌的对白。
-    支持多轮对白混合叙述的复杂场景。
 
-    只拆「」（真正的人物对白），不拆『』——『』在日文轻小说里更常用来
-    标记书名/招式名/术语/强调等叙述内嵌引用（例如"…その使い手たる『勇者』
-    である。"是地の文，『勇者』只是被引用的称号，不是有人在说话）。
-    之前『』也会触发拆分，导致一整句连贯的叙述被硬切成好几段。
+    增强点：
+    - 支持连续的「…」「…」/『…』『…』对白黏连；
+    - 优先在 `」[「『]`、`』[「『]`、`。！？[「『]` 等明确边界处拆分；
+    - 仍保留保护逻辑：句中术语/强调用引号（如「何か」）不拆。
     """
     doc = copy.deepcopy(doc)
 
-    # 「…」只有位于块首、或紧跟一句已结束的叙述时才视为独立对白。句中
-    # 的「何か」「理由」等是术语/强调，拆开会把完整叙述人为断成三块。
-    dialogue_re = re.compile(r'「[^」]*」', re.DOTALL)
+    # 同时识别「」和『』。是否真的作为独立对白拆出，仍由下面的上下文
+    # 边界判断决定，因此句中术语引用不会仅因使用引号而被拆段。
+    dialogue_re = re.compile(r'(「[^」]*」|『[^』]*』)', re.DOTALL)
+    sentence_boundary = set('。！？!?\n')
+    dialogue_open = set('「『')
 
     split_count = 0
     result: list[Block] = []
@@ -751,30 +752,35 @@ def restore_dialogue_breaks(doc: UnifiedDocument) -> UnifiedDocument:
             continue
 
         text = b.text
-        # 按真实配对类型标注每个收尾符号，供下面判断"这个」是不是真的
-        # 结束了一段人物对白"，而不是被误读/误打的『术语引用』收尾。
         close_open_types = _quote_close_open_types(text)
         sub_blocks: list[Block] = []
         cursor = 0
+
         for m in dialogue_re.finditer(text):
-            # 光有引号不足以说明是人物说话。若它前面不是句子边界，就保留
-            # 在当前叙述中；下一处真正的对白仍可在后续循环中被识别。
             preceding = text[:m.start()].rstrip()
+            following = text[m.end():].lstrip()
+
             if not preceding:
+                # 块首引号通常是被 OCR/替换黏住的对白。若后面还紧跟另一个
+                # 开引号，也明确属于连续对白场景。
                 is_dialogue = m.start() == 0
             else:
                 last_ch = preceding[-1]
-                if last_ch in '。！？\n':
+                if last_ch in sentence_boundary:
                     is_dialogue = True
                 elif last_ch in '」』':
-                    # 只有真正配对自「的收尾符才算一段独立对白刚刚结束；
-                    # 配对自『的收尾符（哪怕字面上被误读/误打成」）只是
-                    # 术语引用结束，后面紧跟的引号仍属于同一句叙述，不
-                    # 应该被当成新对白拆出来。
+                    # 连续对白：上一段对白的收尾后紧跟下一段开引号。
                     last_idx = len(preceding) - 1
-                    is_dialogue = close_open_types.get(last_idx) == '「'
+                    is_dialogue = close_open_types.get(last_idx) in dialogue_open
                 else:
                     is_dialogue = False
+
+            # 额外兜底：当前引号后紧跟另一个开引号时，当前片段也应作为
+            # 独立对白拆出，否则多个对白会继续黏在一个段落里。
+            if not is_dialogue and following[:1] in dialogue_open:
+                before = text[cursor:m.start()].strip()
+                is_dialogue = not before or before[-1:] in sentence_boundary or before[-1:] in '」』'
+
             if not is_dialogue:
                 continue
 
