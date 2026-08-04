@@ -1,17 +1,16 @@
 # Novel Formatter
 
-Novel Formatter is a macOS desktop application for OCR, text comparison,
-formatting, EPUB export, and Japanese image-text review.
+Novel Formatter 是一款 macOS 桌面排版工具，面向图片/PDF OCR、日文竖排文字处理、多模型 OCR 对比、人工校对、文本格式化和 EPUB 导出。
 
-## Run
+## 运行环境
 
-Requirements:
+- macOS 15 或更高版本
+- Python 3.10 或更高版本
+- `requirements.txt` 中列出的 Python 包
 
-- macOS 15 or newer
-- Python 3.10 or newer
-- PySide6 and the packages listed in `requirements.txt`
+## 启动程序
 
-Install the main runtime dependencies and start the GUI:
+推荐使用 macOS 终端运行：
 
 ```bash
 python3 -m venv .venv
@@ -20,27 +19,37 @@ python -m pip install -r requirements.txt
 python gui_pyside6.py
 ```
 
-On macOS, `run_novel_formatter.command` is the preferred launcher. The app
-shell can prepare its own Python runtime and apply source updates from the
-configured update directory. OCR model files are downloaded only when the
-corresponding OCR feature is explicitly selected; model files and caches are
-kept outside this repository.
+也可以双击 `run_novel_formatter.command` 启动。该脚本只负责检查 Python 和 PySide6，然后启动程序，不执行自动更新。
 
-## Included
+## 主要功能
 
-This repository contains the application source, runtime assets, native helper
-source, third-party notices required by the handwriting review feature, and
-startup/update scripts. It does not contain model weights, virtual
-environments, user documents, OCR results, logs, API keys, or local settings.
+- 图片和 PDF 输入
+- 日文竖排分列 OCR
+- Apple Vision、NDLOCR Lite、Manga OCR、PaddleOCR 等 OCR 适配器
+- 多模型结果对比和人工裁决
+- 图文对照与逐句校对
+- Ruby/振假名及残损文字清理
+- DOCX、EPUB、TXT 等格式导出
+- AI 辅助纠错与排版
 
-## Privacy
+OCR 模型只在用户主动选择对应功能时准备，模型权重和缓存不会存放在本仓库中。
 
-The application does not include credentials or personal data in this
-repository. AI provider credentials are entered by the user at runtime and
-are stored in the local application settings. Input documents and generated
-outputs remain local unless the user explicitly chooses an external OCR or AI
-provider.
+## 隐私
 
-## License
+本仓库不包含用户文档、OCR 结果、模型权重、运行日志、虚拟环境、本地配置或 API 密钥。
 
-See the included third-party notices before redistributing bundled assets.
+输入文件和导出文件默认保存在本机。只有用户主动选择外部 OCR 或 AI 服务时，相关内容才会发送给对应服务。AI 服务凭据由用户在本机运行时配置，不写入代码仓库。
+
+## 目录说明
+
+- `gui_pyside6.py`：PySide6 图形界面
+- `adapters/`：OCR、输入和导出适配器
+- `engine/`：对齐、纠错、排版和文档处理逻辑
+- `models/`：统一文档数据模型
+- `builder/`：DOCX/EPUB 构建器
+- `native/`：macOS 原生 OCR 辅助程序源码
+- `third_party/`：运行时使用的第三方资源和许可证
+
+## 许可证
+
+使用或再分发第三方资源前，请阅读 `third_party/` 中的许可证和说明文件。
