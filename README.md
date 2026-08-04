@@ -41,6 +41,19 @@ cd Novel-formatter
 
 不要把模型权重、虚拟环境或生成的 EPUB 文件复制到源码目录后再提交或重新打包。
 
+如果希望直接使用已整理好的安装包，请进入 [Releases](https://github.com/Amster-Ilvil/Novel-formatter/releases)，下载当前可用的 [Mac+win.zip](https://github.com/Amster-Ilvil/Novel-formatter/releases/download/1/Mac%2Bwin.zip)。该 ZIP 适合直接安装使用；源码 ZIP 更适合开发、检查代码或自行适配。
+
+### Release 安装包说明
+
+当前可用版本为 **Release 1 · Mac+win安装包**。安装包包含程序运行所需的核心源码和启动文件，但不包含 OCR 模型权重、模型缓存、Python 虚拟环境或用户生成的 EPUB。首次启动或首次使用某个 OCR 模型时，程序会根据系统和所选引擎在本机准备相应依赖及模型。
+
+- macOS：解压后运行 macOS 启动方式；Apple Vision 和 Swift 原生助手可用。
+- Windows：解压后使用 PowerShell 创建虚拟环境并运行 `gui_pyside6.py`；不使用 `.command` 文件。
+- 两个平台都可以使用 NDLOCR、Manga OCR、PaddleOCR、YomiToku 等对应的跨平台 OCR 引擎。
+- Apple Vision、Swift OCR Helper 和 Apple Pencil 手写识别属于 macOS 专属功能。
+
+后续版本会继续在同一个 [Releases 页面](https://github.com/Amster-Ilvil/Novel-formatter/releases) 发布新的 ZIP 安装包。下载时请优先选择带有明确版本号和平台说明的 Release 附件，不要下载模型缓存或个人数据文件。
+
 ### 三、创建独立 Python 环境
 
 在项目目录打开终端，创建项目专用虚拟环境：
