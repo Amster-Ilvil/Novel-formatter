@@ -10,6 +10,7 @@ from __future__ import annotations
 import os
 import subprocess
 import sys
+import time
 
 from .base import VisionBackend, OCRResult, OCRBlock, OCRConfig, BackendCapabilities
 
@@ -32,31 +33,68 @@ class ShortcutBackend(VisionBackend):
 
     def is_available(self) -> tuple[bool, str]:
         try:
-            subprocess.run(["which", "shortcuts"], capture_output=True, timeout=5)
+            probe = subprocess.run(
+                ["which", "shortcuts"], capture_output=True, text=True, timeout=5,
+            )
+            if probe.returncode != 0 or not str(probe.stdout or "").strip():
+                return False, "找不到 shortcuts 命令，请确认 macOS ≥ Monterey (12)"
             return True, ""
-        except Exception:
-            return False, "找不到 shortcuts 命令，请确认 macOS ≥ Monterey (12)"
+        except Exception as exc:
+            return False, f"无法检查 shortcuts 命令：{exc}"
 
     def recognize(self, image_path: str, config: OCRConfig) -> OCRResult:
+        shortcut_name = str(config.shortcut_name or "").strip()
+        if not shortcut_name:
+            raise RuntimeError("Apple OCR 快捷指令名称为空，请填写 ExtractText 或实际快捷指令名称")
+        cancel_check = getattr(self, "cancel_check", None)
         try:
-            result = subprocess.run(
-                ["shortcuts", "run", config.shortcut_name, "-i", image_path],
-                capture_output=True, text=True, timeout=config.timeout,
-            )
-        except subprocess.TimeoutExpired:
-            print(f"  ⚠️  超时: {os.path.basename(image_path)}")
-            return OCRResult(full_text="")
+            # 保持直接使用 backend 的旧调用兼容性；通过 OCR session 运行时会
+            # 注入 cancel_check，此时改用可轮询的 Popen，停止按钮无需等待整段超时。
+            if not callable(cancel_check):
+                try:
+                    result = subprocess.run(
+                        ["shortcuts", "run", shortcut_name, "-i", image_path],
+                        capture_output=True, text=True, timeout=max(1.0, float(config.timeout)),
+                    )
+                except subprocess.TimeoutExpired:
+                    print(f"  ⚠️  超时: {os.path.basename(image_path)}")
+                    return OCRResult(full_text="")
+                stdout = result.stdout
+                stderr = result.stderr
+                returncode = int(result.returncode or 0)
+            else:
+                from adapters.subprocess_watchdog import isolated_process_kwargs, terminate_process
+                process = subprocess.Popen(
+                    ["shortcuts", "run", shortcut_name, "-i", image_path],
+                    stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+                    **isolated_process_kwargs(),
+                )
+                deadline = time.monotonic() + max(1.0, float(config.timeout))
+                while True:
+                    if cancel_check():
+                        terminate_process(process)
+                        raise InterruptedError("Apple OCR 快捷指令已停止")
+                    try:
+                        stdout, stderr = process.communicate(timeout=0.25)
+                        break
+                    except subprocess.TimeoutExpired:
+                        if time.monotonic() >= deadline:
+                            terminate_process(process)
+                            print(f"  ⚠️  超时: {os.path.basename(image_path)}")
+                            return OCRResult(full_text="")
+                returncode = int(process.returncode or 0)
         except FileNotFoundError:
             print("  ❌  找不到 shortcuts 命令，请确认 macOS ≥ Monterey (12)")
             sys.exit(1)
 
-        if result.returncode != 0:
-            print(f"  ⚠️  识别失败: {os.path.basename(image_path)}")
-            if result.stderr:
-                print(f"      {result.stderr.strip()}")
-            return OCRResult(full_text="")
+        if returncode != 0:
+            detail = str(stderr or stdout or "未知错误").strip()
+            raise RuntimeError(
+                f"Apple OCR 快捷指令 {shortcut_name!r} 调用失败 "
+                f"({os.path.basename(image_path)}): {detail}"
+            )
 
-        text = result.stdout.strip()
+        text = str(stdout or "").strip()
         # 快捷指令只返回拼接好的纯文本，没有逐条坐标/置信度——按行拆成
         # OCRBlock，bbox/confidence 用默认值，不伪造这个 backend 没有的精度。
         blocks = [OCRBlock(text=line) for line in text.splitlines() if line.strip()]

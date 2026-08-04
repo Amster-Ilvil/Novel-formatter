@@ -17,6 +17,7 @@ from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from typing import Callable, Optional
 import sys
+import threading
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
@@ -36,6 +37,16 @@ class Suggestion:
 TEXT_TYPES = {BlockType.PARAGRAPH, BlockType.DIALOGUE}
 
 
+class AIOutputTruncatedError(RuntimeError):
+    """Provider completed because the output token limit was reached."""
+
+    output_truncated = True
+
+    def __init__(self, partial_content: str = ""):
+        super().__init__("AI output was truncated by max_tokens")
+        self.partial_content = str(partial_content or "")
+
+
 class AIProvider(ABC):
     """AI 校正器抽象基类"""
 
@@ -43,6 +54,16 @@ class AIProvider(ABC):
         self.api_key = api_key
         self.model = model
         self.kwargs = kwargs
+        self._usage_lock = threading.Lock()
+        self._usage = {
+            "requests": 0,
+            "prompt_tokens": 0,
+            "completion_tokens": 0,
+            "total_tokens": 0,
+            "cached_tokens": 0,
+            "cache_miss_tokens": 0,
+            "reasoning_tokens": 0,
+        }
 
     @property
     @abstractmethod
@@ -53,6 +74,46 @@ class AIProvider(ABC):
     def _call_llm(self, prompt: str, temperature: float) -> str:
         """把一个 prompt 发给具体模型 API，返回回复的纯文本。"""
         ...
+
+    def close(self) -> None:
+        """Release provider-owned network resources (idempotent by contract)."""
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc_value, exc_tb) -> bool:
+        self.close()
+        return False
+
+    def call_json(self, prompt: str, temperature: float) -> str:
+        """Request a JSON response when the provider supports native JSON mode."""
+        return self._call_llm(prompt, temperature)
+
+    def _record_usage(
+        self,
+        prompt_tokens: int = 0,
+        completion_tokens: int = 0,
+        total_tokens: int = 0,
+        cached_tokens: int = 0,
+        cache_miss_tokens: int = 0,
+        reasoning_tokens: int = 0,
+    ) -> None:
+        """Accumulate provider-reported usage across concurrent requests."""
+        prompt_tokens = max(0, int(prompt_tokens or 0))
+        completion_tokens = max(0, int(completion_tokens or 0))
+        total_tokens = max(0, int(total_tokens or 0)) or prompt_tokens + completion_tokens
+        with self._usage_lock:
+            self._usage["requests"] += 1
+            self._usage["prompt_tokens"] += prompt_tokens
+            self._usage["completion_tokens"] += completion_tokens
+            self._usage["total_tokens"] += total_tokens
+            self._usage["cached_tokens"] += max(0, int(cached_tokens or 0))
+            self._usage["cache_miss_tokens"] += max(0, int(cache_miss_tokens or 0))
+            self._usage["reasoning_tokens"] += max(0, int(reasoning_tokens or 0))
+
+    def usage_snapshot(self) -> dict:
+        with self._usage_lock:
+            return dict(self._usage)
 
     # ── 批次骨架（子类共用，不需要各自实现）───────────────────────────────────
 

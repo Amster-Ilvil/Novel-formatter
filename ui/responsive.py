@@ -9,7 +9,7 @@ QPlainTextEdit {
     border: none;
     border-radius: 0;
     padding: 10px 14px;
-    font-family: "SF Mono", "JetBrains Mono", "Menlo", "Consolas", monospace;
+    font-family: "Menlo", "Monaco", "Courier New";
     font-size: 12px;
     selection-background-color: #DCE8FF;
     selection-color: #1D1D1F;

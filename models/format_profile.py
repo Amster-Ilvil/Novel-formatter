@@ -76,6 +76,90 @@ class FormatProfile:
     def from_json(cls, s: str) -> FormatProfile:
         return cls.from_dict(json.loads(s))
 
+    @staticmethod
+    def infer_css_from_xhtml_structure(html: str) -> tuple[str, list[str]]:
+        """从 XHTML 的 class 命名约定与结构约定推断 CSS。
+
+        很多正版 EPUB（尤其被去 DRM 工具清空过 CSS 的书）的排版信息不在
+        样式表里，而是编码在 XHTML 的 class 名与标记结构中——电书协/出版社
+        的命名本身就写明了样式：``start-5em`` = 块前空 5em、``font-1em20`` =
+        1.20 倍字号、``fit`` = 插图自适应、``tcy`` = 縦中横。本函数按这些
+        约定生成等效 CSS，并返回 (css, 结构说明列表)。
+        """
+        import re
+
+        found: dict[str, int] = {}
+        for m in re.finditer(r'class="([^"]+)"', html):
+            for c in m.group(1).split():
+                found[c] = found.get(c, 0) + 1
+
+        rules: list[str] = []
+        notes: list[str] = []
+
+        def add(cls_name: str, css_body: str):
+            rules.append(f".{cls_name} {{ {css_body} }}  /* ×{found[cls_name]} */")
+
+        for c in sorted(found):
+            if c in ("koboSpan", "main", "vrtl", "hltr", "p-text", "p-image"):
+                continue  # 结构类，单独处理
+            m = re.fullmatch(r"(start|end)-(\d+(?:em)?)", c)
+            if m:
+                side = "start" if m.group(1) == "start" else "end"
+                val = m.group(2) if m.group(2).endswith("em") else m.group(2) + "em"
+                add(c, f"margin-block-{side}: {val};")
+                continue
+            m = re.fullmatch(r"indent-(\d+)em", c)
+            if m:
+                add(c, f"text-indent: {m.group(1)}em;")
+                continue
+            m = re.fullmatch(r"font-(\d)em(\d\d)", c)
+            if m:
+                add(c, f"font-size: {m.group(1)}.{m.group(2)}em;")
+                continue
+            m = re.fullmatch(r"font-(\d+)per", c)
+            if m:
+                add(c, f"font-size: {int(m.group(1))}%;")
+                continue
+            if c == "fit":
+                add(c, "width: auto; height: auto; max-width: 100%; max-height: 100%;")
+                continue
+            if c == "bold":
+                add(c, "font-weight: bold;")
+                continue
+            if c in ("center", "align-center"):
+                add(c, "text-align: center;")
+                continue
+            if c == "tcy":
+                add(c, "-webkit-text-combine: horizontal; -epub-text-combine: horizontal; text-combine-upright: all;")
+                continue
+
+        # 结构类
+        if "vrtl" in found or "hltr" in found:
+            rules.insert(0, (
+                "html.vrtl { -epub-writing-mode: vertical-rl; -webkit-writing-mode: vertical-rl; writing-mode: vertical-rl; }\n"
+                "html.hltr { -epub-writing-mode: horizontal-tb; -webkit-writing-mode: horizontal-tb; writing-mode: horizontal-tb; }"
+            ))
+            notes.append(
+                f"按页混排：竖排页 ×{found.get('vrtl', 0)}、横排页 ×{found.get('hltr', 0)}（html class 控制）"
+            )
+        if "main" in found:
+            rules.append("div.main { margin: 3% 2%; }  /* 正文容器 */")
+        if "p-image" in found:
+            rules.append("body.p-image { margin: 0; padding: 0; }  /* 整页插图 */")
+            notes.append(f"插图页模式：body.p-image + img.fit ×{found.get('fit', 0)}")
+
+        fullwidth_indents = len(re.findall(r"<p[^>]*>　", html))
+        if fullwidth_indents > 10:
+            rules.append("p { margin: 0; padding: 0; text-indent: 0; }  /* 缩进用全角空格，正文不加 CSS 缩进 */")
+            notes.append(f"段落缩进：正文用全角空格手动缩进（×{fullwidth_indents}），CSS 不应再加 text-indent")
+        if "<ruby" in html.lower():
+            rules.append("ruby rt { font-size: 0.5em; }")
+
+        css = ""
+        if rules:
+            css = "/* ── 从 XHTML class 命名约定推断的样式 ── */\n" + "\n".join(rules)
+        return css, notes
+
     @classmethod
     def from_reference_epub(cls, epub_path: str, name: str) -> FormatProfile:
         """从参考 EPUB 学习排版特征（CSS / XHTML / 结构分析）。"""
@@ -83,6 +167,7 @@ class FormatProfile:
         import zipfile
 
         css_content = ""
+        structure_notes: list[str] = []
         vertical = True
         dialogue_quote_style = "「」"
         paragraph_indent = "fullwidth_space"
@@ -120,7 +205,10 @@ class FormatProfile:
 
                 # B. <style> 标签
                 inline_chunks = []
-                # 不限制20页，避免轻小说前几页没有样式定义的问题
+                # 不限制20页，避免轻小说前几页没有样式定义的问题。
+                # 同一段 <style> 常在每个 xhtml 里原样重复（如 Kobo 的
+                # .koboSpan 样板），按规范化内容去重，只保留第一次出现。
+                seen_inline: set[str] = set()
                 for filename in xhtml_files:
                     try:
                         html = decode(zf.read(filename))
@@ -138,6 +226,10 @@ class FormatProfile:
                         ):
                             css = re.sub(r"<!--|-->", "", match).strip()
                             if css:
+                                key = re.sub(r"\s+", " ", css)
+                                if key in seen_inline:
+                                    continue
+                                seen_inline.add(key)
                                 inline_chunks.append(
                                     f"/* ===== {filename} style ===== */\n{css}"
                                 )
@@ -155,6 +247,10 @@ class FormatProfile:
                                 "font",
                                 "margin"
                             )):
+                                key = "inline:" + re.sub(r"\s+", " ", style)
+                                if key in seen_inline:
+                                    continue
+                                seen_inline.add(key)
                                 inline_chunks.append(
                                     f"/* ===== {filename} inline ===== */\n"
                                     f"* {{{style}}}"
@@ -171,11 +267,17 @@ class FormatProfile:
                 # D. 结构推断 CSS
                 structure_hints = []
                 sample_html = ""
-                for filename in xhtml_files[:30]:
+                for filename in xhtml_files[:300]:
                     try:
                         sample_html += decode(zf.read(filename))
                     except Exception:
                         pass
+
+                # D2. XHTML class 命名约定 → CSS（排版编码在标记里的书，
+                # 如被去 DRM 工具清空 CSS 的电书协 EPUB）
+                inferred_css, structure_notes = cls.infer_css_from_xhtml_structure(sample_html)
+                if inferred_css:
+                    structure_hints.append(inferred_css)
 
                 if re.search(
                     r"writing-mode\s*:\s*(vertical|vertical-rl|tb-rl)",
@@ -271,6 +373,8 @@ class FormatProfile:
                 else " ・ ⚠️ 未发现可提取样式"
             )
         )
+        if structure_notes:
+            notes += "\n结构约定：" + "；".join(structure_notes)
 
         return cls(
             name=name,

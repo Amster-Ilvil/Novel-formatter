@@ -27,6 +27,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 from models.document import UnifiedDocument, Repository
+from utils.atomic_io import atomic_write_text
 
 
 def cmd_init(args):
@@ -57,8 +58,7 @@ def cmd_commit(args):
     print(f"已提交: {commit_id}")
 
     # 把带有新 commit 指针的 JSON 写回原文件，方便下次继续从这里提交
-    with open(args.doc, "w", encoding="utf-8") as f:
-        f.write(doc.to_json())
+    atomic_write_text(args.doc, doc.to_json())
 
 
 def cmd_log(args):
@@ -96,8 +96,7 @@ def cmd_checkout(args):
     doc.commit_id = args.commit_id
 
     out_path = args.out or f"checkout_{args.commit_id[:8]}.json"
-    with open(out_path, "w", encoding="utf-8") as f:
-        f.write(doc.to_json())
+    atomic_write_text(out_path, doc.to_json())
     print(f"已还原提交 {args.commit_id[:8]} → {out_path}")
     print(f"  {len(doc.blocks)} 个块，{len(doc.toc)} 个章节")
 

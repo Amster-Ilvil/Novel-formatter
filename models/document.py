@@ -23,10 +23,10 @@ from enum import Enum
 from typing import Optional
 import hashlib
 import json
-import tempfile
 import time
 import uuid
 from pathlib import Path
+
 
 
 class BlockType(str, Enum):
@@ -170,20 +170,6 @@ class PageInfo:
             "height": self.height,
             "confidence": round(self.confidence, 4),
         }
-        if self.page_index is not None:
-            d["page_index"] = self.page_index
-        if self.page_number is not None:
-            d["page_number"] = self.page_number
-        if self.order_in_page is not None:
-            d["order_in_page"] = self.order_in_page
-        if self.text_direction is not None:
-            d["text_direction"] = self.text_direction
-        if self.source_format is not None:
-            d["source_format"] = self.source_format
-        if self.metadata:
-            d["metadata"] = self.metadata
-        if self.id:
-            d["id"] = self.id
 
 
 @dataclass
@@ -194,10 +180,60 @@ class Metadata:
     series: str = ""
     volume: str = ""
     language: str = "ja"
+    # OCR profile metadata keeps Japanese vertical and Simplified Chinese
+    # horizontal runs isolated throughout save/load, comparison and export.
+    ocr_mode: str = "ja_vertical"
+    writing_direction: str = "vertical-rl"
+    ocr_profile_version: int = 1
+    formatter_profile: str = "ja_light_novel"
     isbn: str = ""
     description: str = ""
     source_engine: str = ""    # 使用的 OCR 引擎名称
     preserve_ocr_layout: bool = False  # 固定原 OCR 块/段落结构，跳过会重排段落的 Formatter 步骤
+    pdf_text_layer_mode: bool = False  # PDF 可选文字层专用 Formatter；与普通图片 OCR 规则隔离
+    pdf_keep_afterwords: bool = False  # 默认不保留作者前书/后记；仅在界面明确勾选时保留
+    pdf_text_source_char_counts: dict = field(default_factory=dict)  # 无损字符保全基线（忽略布局空白）
+    pdf_text_source_chars: int = 0
+    pdf_text_output_chars: int = 0
+    pdf_text_missing_chars: int = 0
+    pdf_text_extra_chars: int = 0
+    pdf_text_character_guard_passed: bool = True
+    pdf_text_guard_report: dict = field(default_factory=dict)
+    ai_processing_mode: str = ""  # correction | typeset
+    ai_layout_locked: bool = False  # EPUB 必须优先使用 AI 返回的文本与段落结构
+    ai_epub_css: str = ""  # AI 纠错排版返回的完整 EPUB CSS；仅 typeset 版本使用
+    ai_epub_css_name: str = ""  # 保存到磁盘时使用的建议文件名
+    ai_epub_css_source: str = ""  # ai | fallback，便于界面提示和诊断
+    replacement_mode: str = ""  # strict_full | smart_patch | compare_only
+    replacement_source_hash: str = ""  # 严格覆盖来源正文 SHA-256
+    replacement_output_hash: str = ""  # 严格覆盖输出正文 SHA-256
+    replacement_exact_match: bool = False  # 结构化正文是否与来源 100% 一致
+    replacement_source_chars: int = 0
+    replacement_output_chars: int = 0
+    replacement_missing_chars: int = 0
+    replacement_extra_chars: int = 0
+    replacement_pending_images: int = 0
+    replacement_literal_exact_match: bool = False
+    replacement_layout_passed: bool = True
+    replacement_overlong_blocks: int = 0
+    replacement_mixed_dialogue_blocks: int = 0
+    replacement_unbalanced_dialogue_blocks: int = 0
+    replacement_reflowed_blocks: int = 0
+    replacement_unresolved_layout_blocks: int = 0
+    replacement_quote_repairs: int = 0
+    authoritative_text: bool = False
+    authoritative_report: dict = field(default_factory=dict)
+    authoritative_draft: bool = False
+    authoritative_indexed_protocol: int = 0
+    authoritative_checkpoint_dir: str = ""
+    ocr_repair_mode: str = ""  # readability | strict
+    column_sentence_reflow_applied: bool = False  # OCR 页已在进入 Formatter 前完成逐列成句
+    column_sentence_reflow_version: int = 0
+    column_sentence_reflow_max_columns: int = 0
+    column_ocr_audit: dict = field(default_factory=dict)  # per-page expected/recognized/model/DOCX column IDs
+    column_ocr_integrity_passed: bool = False
+    ocr_review_report: dict = field(default_factory=dict)  # OCR + 手动输入疑点筛查汇总
+    page_asset_sync_signature: str = ""  # Page Manager overlay signature; avoids redundant full-document sync
 
     def to_dict(self) -> dict:
         return {k: v for k, v in self.__dict__.items() if v}
@@ -380,7 +416,7 @@ class UnifiedDocument:
         """只返回正文类型的块"""
         TEXT_TYPES = {BlockType.PARAGRAPH, BlockType.DIALOGUE,
                       BlockType.CHAPTER, BlockType.SECTION, BlockType.RUBY}
-        return [b for b in self.blocks if b.type in TEXT_TYPES]
+        return [b for b in self.blocks if b.type in TEXT_TYPES and not (b.metadata or {}).get("consumed")]
 
     def image_blocks(self) -> list[Block]:
         return [b for b in self.blocks if b.type == BlockType.IMAGE_REF]
@@ -486,8 +522,13 @@ class UnifiedDocument:
 
 
 def new_temp_repo_path() -> str:
+    """Allocate a session-owned temporary history repository.
+
+    Repositories remain available for Undo/Redo during the current application
+    session, but are removed automatically on normal shutdown.  A crash leaves
+    only an application-marked session directory that is reclaimed on the next
+    launch.
     """
-    给一次 Formatter 运行分配一个临时仓库目录（GUI 不需要用户手动选仓库路径，
-    每次处理会话自动获得一个独立的历史仓库；同一份 doc 后续步骤会复用它）。
-    """
-    return str(Path(tempfile.gettempdir()) / f"novel_repo_{uuid.uuid4().hex[:12]}")
+    from utils.session_temp import session_temp_registry
+
+    return str(session_temp_registry().make_dir("document-repo"))

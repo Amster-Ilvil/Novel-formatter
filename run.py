@@ -45,7 +45,7 @@ from models.document import UnifiedDocument
 from core.temp_manager import TempCropManager
 
 
-def main():
+def main(argv=None) -> int:
     parser = argparse.ArgumentParser(
         description="Novel Formatter Studio — 图片文件夹 → EPUB3",
         formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -53,15 +53,16 @@ def main():
     )
 
     # 输入
-    parser.add_argument("input",       help="图片文件夹路径 或 --from-json 时的 JSON 文件")
-    parser.add_argument("output_epub", help="输出 EPUB 路径")
+    parser.add_argument("input", help="图片文件夹路径，或导入模式下的 JSON/EPUB 文件")
+    parser.add_argument("output_epub", nargs="?", help="输出 EPUB 路径（批量模式不需要）")
 
     # 模式
-    parser.add_argument("--from-json", dest="from_json", action="store_true",
-                        help="input 参数改为已有的 UnifiedDocument JSON，跳过 OCR")
-    parser.add_argument("--from-epub", dest="from_epub", action="store_true",
-                        help="input 参数改为已有的 .epub 文件，逆向导入后跳过 OCR "
-                             "（常配合 --steps detect_chapters strip_boilerplate 清理样板文字）")
+    source_mode = parser.add_mutually_exclusive_group()
+    source_mode.add_argument("--from-json", dest="from_json", action="store_true",
+                             help="input 参数改为已有的 UnifiedDocument JSON，跳过 OCR")
+    source_mode.add_argument("--from-epub", dest="from_epub", action="store_true",
+                             help="input 参数改为已有的 .epub 文件，逆向导入后跳过 OCR "
+                                  "（常配合 --steps detect_chapters strip_boilerplate 清理样板文字）")
 
     # OCR 选项
     parser.add_argument("--shortcut", default="ExtractText",
@@ -84,13 +85,16 @@ def main():
     parser.add_argument("--volume",    help="卷号，如 第1巻")
 
     # Formatter 选项
+    from engine.formatter import PIPELINE_STEPS
+    step_names = [name for name, _ in PIPELINE_STEPS]
+    step_help_lines = "\n".join(
+        "  " + "  ".join(step_names[i:i + 4]) for i in range(0, len(step_names), 4)
+    )
     parser.add_argument(
         "--steps", nargs="*",
         metavar="STEP",
-        help="指定 Formatter 步骤（默认全部）：\n"
-             "  reading_order  clean_metadata  merge_sentences  remove_duplicates\n"
-             "  dialogue_restore  restore_indents  recover_ruby\n"
-             "  detect_chapters  normalize_punct",
+        help="指定 Formatter 步骤（默认全部，列表自动与 engine.formatter.PIPELINE_STEPS 同步）：\n"
+             + step_help_lines,
     )
     parser.add_argument(
         "--repo", metavar="PATH", default=None,
@@ -123,26 +127,49 @@ def main():
 
     parser.add_argument("--quiet", "-q", action="store_true")
 
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
+
+    input_path = Path(args.input).expanduser()
+    if not input_path.exists():
+        parser.error(f"输入路径不存在: {input_path}")
+    if not 0.0 <= args.crop_top <= 0.3:
+        parser.error("--crop-top 必须在 0.0 到 0.3 之间")
+    if not 0.0 <= args.crop_bottom <= 0.3:
+        parser.error("--crop-bottom 必须在 0.0 到 0.3 之间")
+    if args.crop_top + args.crop_bottom >= 0.8:
+        parser.error("顶部和底部裁剪比例之和必须小于 0.8")
 
     if args.batch:
+        if args.from_json or args.from_epub or args.text_layer:
+            parser.error("--batch 不能与 --from-json、--from-epub 或 --text-layer 同时使用")
+        if not input_path.is_dir():
+            parser.error("批量模式的 input 必须是包含书籍子目录的文件夹")
         from core.batch_processor import BatchProcessor
         BatchProcessor(
             input_dir=args.input,
             output_dir=args.output_dir,
             preview_enabled=not args.no_preview,
         ).run()
-        return
+        return 0
+
+    if not args.output_epub:
+        parser.error("非批量模式必须提供 output_epub")
+    output_path = Path(args.output_epub).expanduser()
+    output_path.parent.mkdir(parents=True, exist_ok=True)
 
     verbose = not args.quiet
 
     # ── Step 1：获取 UnifiedDocument ─────────────────────────────────────────
     if args.from_json:
+        if not input_path.is_file():
+            parser.error("--from-json 的 input 必须是 JSON 文件")
         if verbose:
             print(f"📥  从 JSON 读取: {args.input}")
         with open(args.input, encoding="utf-8") as f:
             doc = UnifiedDocument.from_json(f.read())
     elif args.from_epub:
+        if not input_path.is_file():
+            parser.error("--from-epub 的 input 必须是 EPUB 文件")
         from adapters.epub_adapter import import_epub
         doc = import_epub(args.input, verbose=verbose)
         if args.title:     doc.metadata.title     = args.title
@@ -222,7 +249,7 @@ def main():
     from builder.epub_builder import build_epub
     build_epub(
         formatted,
-        output_path=args.output_epub,
+        output_path=str(output_path),
         css_template=args.template,
         vertical=args.vertical,
         verbose=verbose,
@@ -241,13 +268,15 @@ def main():
     if verbose:
         print(f"\n🎉  全部完成！")
         print(f"    输入: {args.input}")
-        print(f"    输出: {args.output_epub}")
+        print(f"    输出: {output_path}")
         if args.output_word:
             print(f"    Word: {args.output_word}")
         toc_items = "\n        ".join(t.title for t in formatted.toc)
         if toc_items:
             print(f"    目录:\n        {toc_items}")
 
+    return 0
+
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

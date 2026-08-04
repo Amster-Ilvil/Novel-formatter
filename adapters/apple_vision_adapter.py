@@ -38,6 +38,7 @@ import glob
 import json
 import subprocess
 import argparse
+import threading
 from collections import Counter
 from pathlib import Path
 
@@ -46,12 +47,35 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 from models.document import (
     UnifiedDocument, Block, BlockType, PageInfo, BoundingBox, Metadata
 )
+from engine.page_ocr_policy import should_skip_page_ocr
+from adapters.ocr_profiles import (
+    apply_profile_metadata, auto_classify_pages as auto_classify_pages_profile,
+    get_ocr_profile, is_chapter_title, is_chinese_horizontal, normalize_lines,
+    normalize_ocr_mode,
+)
 
 # ── 配置常量 ──────────────────────────────────────────────────────────────────
 
 SHORTCUT_NAME = "ExtractText"   # 快捷指令名称，与你在 Shortcuts App 中创建的保持一致
 
 IMAGE_EXTS = ('.png', '.jpg', '.jpeg', '.heic', '.tif', '.tiff', '.bmp', '.gif')
+
+# Multi-model column OCR can ask several model threads to prepare the exact same
+# fixed-region page at the same time.  Protect each destination so 400-page books
+# decode/encode every page once instead of once per OCR model (or, worse, race two
+# Pillow writers against the same PNG).
+_CROP_OUTPUT_LOCKS: dict[str, threading.Lock] = {}
+_CROP_OUTPUT_LOCKS_GUARD = threading.Lock()
+
+
+def _crop_output_lock(path: Path) -> threading.Lock:
+    key = str(path.expanduser().resolve())
+    with _CROP_OUTPUT_LOCKS_GUARD:
+        lock = _CROP_OUTPUT_LOCKS.get(key)
+        if lock is None:
+            lock = threading.Lock()
+            _CROP_OUTPUT_LOCKS[key] = lock
+        return lock
 
 # 页眉/页脚识别
 HEADER_MAX_LEN = 25         # 超过此长度的行不视为重复页眉
@@ -70,36 +94,57 @@ PAGE_NUMBER_RE = re.compile(r'^[\d\s]{1,6}$')
 
 # 章节标题正则（序章、第X章、幕間、後記、エピローグ 等）
 # フロローグ：竖排文字识别常见的"プロローグ"半浊点丢失错读，一并纳入识别。
+JP_CHAPTER_NUMBER = r'[一二三四五六七八九十百千〇零\d０-９]+'
+CHAPTER_UNIT = r'[章話節巻回幕篇編]'
+CHAPTER_CONTINUATION = r'(?:は|が|を|に|で|と|も|の|です|だ|という)'
 CHAPTER_RE = re.compile(
-    r'^(序章|終章|プロローグ|フロローグ|エピローグ|後記|あとがき|幕間|'
-    r'第[一二三四五六七八九十百\d]+章'
-    r'|Chapter\s*\d+)',
+    rf'^(序章|終章|プロローグ|フロローグ|ブロローグ|エピローグ|後記|あとがき|'
+    rf'幕間(?:[\s　:：・—―-].*)?|'
+    rf'第[\s　]*{JP_CHAPTER_NUMBER}[\s　]*{CHAPTER_UNIT}(?!{CHAPTER_CONTINUATION})|'
+    rf'{JP_CHAPTER_NUMBER}[\s　]*[話章節回](?=$|[\s　:：・—―「『【（(]|前編|後編|上編|中編|下編)|'
+    rf'(?:Chapter|Episode|EP)[\s　.．_-]*[\d０-９]+)',
     re.IGNORECASE
 )
 
 
 # ── OCR 调用 ──────────────────────────────────────────────────────────────────
 
+def _estimate_mask_background(image) -> tuple[int, int, int]:
+    """Estimate a light paper colour for fixed-region masking."""
+    rgb = image.convert("RGB")
+    try:
+        width, height = rgb.size
+        samples: list[tuple[int, int, int]] = []
+        step_x = max(1, width // 36)
+        step_y = max(1, height // 36)
+        border = max(2, round(min(width, height) * 0.03))
+        for y in range(0, height, step_y):
+            for x in range(0, width, step_x):
+                if x < border or x >= width - border or y < border or y >= height - border:
+                    pixel = rgb.getpixel((x, y))
+                    if sum(pixel) >= 570:
+                        samples.append(pixel)
+        if not samples:
+            return (255, 255, 255)
+        samples.sort(key=sum)
+        keep = samples[len(samples) // 2:]
+        return tuple(
+            round(sum(pixel[channel] for pixel in keep) / len(keep))
+            for channel in range(3)
+        )
+    finally:
+        if rgb is not image:
+            rgb.close()
+
+
 def crop_for_ocr(image_path: str, crop_top: float = 0.0, crop_bottom: float = 0.0,
                   crop_rect: tuple[float, float, float, float] | None = None,
-                  out_dir: str | None = None) -> str:
-    """
-    在送去 OCR 之前，把不需要识别的区域直接裁掉（而不是等 OCR 识别完再靠
-    文字规律去猜哪些是页眉）——从源头上让那部分文字压根不会被扫描进来，
-    最彻底也最省事。
+                  out_dir: str | None = None, *, reuse_existing: bool = False) -> str:
+    """Mask everything outside the selected OCR region without changing canvas size.
 
-    Args:
-        image_path: 原图路径
-        crop_top:   裁掉顶部的比例，0.0~0.3（比如 0.08 = 裁掉最上面 8%）
-        crop_bottom: 裁掉底部的比例，同上
-        crop_rect:  手动框选的识别区域 (x0, y0, x1, y1)，均为相对图片宽高的
-                    归一化坐标 [0,1]。传入时优先于 crop_top/crop_bottom
-                    （GUI 里拖框选出的矩形就是走这个参数，不再局限于只能
-                    裁上下两条带状区域）。
-        out_dir:    裁剪后图片的存放目录（默认原图同目录下的 _ocr_crop 子目录）
-
-    Returns:
-        裁剪后的图片路径；没有任何裁剪参数时原样返回 image_path，不产生额外文件。
+    In multi-model mode every OCR engine consumes byte-identical fixed-region
+    pages.  ``reuse_existing`` plus the per-destination lock makes that shared
+    cache safe even when model 1/2 start in parallel.
     """
     if crop_rect is None and crop_top <= 0 and crop_bottom <= 0:
         return image_path
@@ -107,7 +152,7 @@ def crop_for_ocr(image_path: str, crop_top: float = 0.0, crop_bottom: float = 0.
     try:
         from PIL import Image
     except ImportError:
-        print("  ⚠️  未安装 Pillow，无法裁剪 OCR 区域，将使用原图: pip3 install pillow")
+        print("  ⚠️  未安装 Pillow，无法生成 OCR 区域掩膜，将使用原图: pip3 install pillow")
         return image_path
 
     src = Path(image_path)
@@ -115,24 +160,59 @@ def crop_for_ocr(image_path: str, crop_top: float = 0.0, crop_bottom: float = 0.
     out_dir_path.mkdir(parents=True, exist_ok=True)
     dest = out_dir_path / src.name
 
-    with Image.open(image_path) as img:
-        w, h = img.size
-        if crop_rect is not None:
-            x0, y0, x1, y1 = crop_rect
-            box = (int(w * x0), int(h * y0), int(w * x1), int(h * y1))
-        else:
-            top_px = int(h * max(0.0, min(crop_top, 0.3)))
-            bottom_px = h - int(h * max(0.0, min(crop_bottom, 0.3)))
-            box = (0, top_px, w, bottom_px)
-        cropped = img.crop(box)
-        cropped.save(dest)
+    # Always serialize writers for the same destination.  The fast existence
+    # check is repeated inside the lock because another model may finish while
+    # this caller is waiting.
+    with _crop_output_lock(dest):
+        if reuse_existing and dest.exists() and dest.stat().st_size > 0:
+            return str(dest)
 
-    # 不受 verbose 控制——裁剪是"正文可能被切掉"这类问题最关键的排查信息，
-    # GUI 跑 OCR 时传的是 verbose=False，藏在 verbose 判断后面的话，真出问题
-    # 时日志里根本看不到裁剪发生过，没法确认是不是它把正文切没了。
-    print(f"  ✂️  裁剪: {src.name} 原图 {w}x{h} → 区域 {box} → 裁剪后 {cropped.size} "
-          f"→ {dest}")
+        with Image.open(image_path) as opened:
+            image = opened.convert("RGB")
+        try:
+            width, height = image.size
+            if crop_rect is not None:
+                x0, y0, x1, y1 = crop_rect
+                x0 = max(0.0, min(1.0, float(x0)))
+                y0 = max(0.0, min(1.0, float(y0)))
+                x1 = max(0.0, min(1.0, float(x1)))
+                y1 = max(0.0, min(1.0, float(y1)))
+                left = max(0, min(width - 1, int(round(width * min(x0, x1)))))
+                top = max(0, min(height - 1, int(round(height * min(y0, y1)))))
+                right = max(left + 1, min(width, int(round(width * max(x0, x1)))))
+                bottom = max(top + 1, min(height, int(round(height * max(y0, y1)))))
+            else:
+                top = int(height * max(0.0, min(float(crop_top), 0.3)))
+                bottom = height - int(height * max(0.0, min(float(crop_bottom), 0.3)))
+                left, right = 0, width
+                bottom = max(top + 1, min(height, bottom))
+            box = (left, top, right, bottom)
+            masked = Image.new("RGB", image.size, _estimate_mask_background(image))
+            region = image.crop(box)
+            try:
+                masked.paste(region, (left, top))
+                # Write to a sibling temporary file and atomically replace the
+                # final cache entry.  Interrupted OCR can never leave a partial
+                # PNG that a later model mistakes for a valid shared crop.
+                tmp = dest.with_name(dest.name + f".tmp-{threading.get_ident()}")
+                try:
+                    image_format = (dest.suffix.lstrip(".") or "PNG").upper()
+                    if image_format == "JPG":
+                        image_format = "JPEG"
+                    masked.save(tmp, format=image_format)
+                    tmp.replace(dest)
+                finally:
+                    tmp.unlink(missing_ok=True)
+            finally:
+                region.close()
+                masked.close()
+        finally:
+            image.close()
 
+    print(
+        f"  🎭  正文区域掩膜: {src.name} 保持 {width}x{height} → 保留区域 {box} "
+        f"→ 框外替换为纸白色 → {dest}"
+    )
     return str(dest)
 
 
@@ -180,6 +260,10 @@ def filter_lines(lines: list[str], running_headers: set[str]) -> list[str]:
 
 # ── 页面自动分类 ──────────────────────────────────────────────────────────────
 
+def _chapter_title_lines(lines: list[str]) -> list[str]:
+    """Return chapter/title lines that must survive low-text page filtering."""
+    return [str(line).strip() for line in lines if CHAPTER_RE.match(str(line).strip())]
+
 def classify_page(image_path: str, filtered_lines: list[str]) -> tuple[BlockType, float]:
     """
     根据过滤后的文字内容，自动判定页面类型。
@@ -199,6 +283,12 @@ def classify_page(image_path: str, filtered_lines: list[str]) -> tuple[BlockType
     joined = "".join(filtered_lines)
     char_count = len(joined)
     punct_count = sum(1 for ch in joined if ch in PUNCT_CHARS)
+
+    # A chapter opener is often a single short line with little punctuation.
+    # It is text, not an illustration, and must remain available to the normal
+    # title/section classifier instead of being discarded as IMAGE_REF.
+    if _chapter_title_lines(filtered_lines):
+        return BlockType.PARAGRAPH, 0.98
 
     if char_count < BLANK_THRESHOLD:
         return BlockType.BLANK, 0.95
@@ -233,7 +323,9 @@ def auto_classify_pages(
 
 # ── 正文块拆分 ────────────────────────────────────────────────────────────────
 
-def lines_to_blocks(lines: list[str], page_no: int, start_order: int) -> list[Block]:
+def lines_to_blocks(
+    lines: list[str], page_no: int, start_order: int, ocr_mode: str = "ja_vertical"
+) -> list[Block]:
     """
     把过滤后的文字行转换为 Block 列表。
     - 匹配章节正则 → BlockType.CHAPTER
@@ -248,9 +340,9 @@ def lines_to_blocks(lines: list[str], page_no: int, start_order: int) -> list[Bl
         if not s:
             continue
 
-        if CHAPTER_RE.match(s):
+        if is_chapter_title(s, ocr_mode):
             btype = BlockType.CHAPTER
-        elif s.startswith(('「', '『')) or s.endswith(('」', '』')):
+        elif s.startswith(('「', '『', '“', '‘')) or s.endswith(('」', '』', '”', '’')):
             btype = BlockType.DIALOGUE
         else:
             btype = BlockType.PARAGRAPH
@@ -262,6 +354,8 @@ def lines_to_blocks(lines: list[str], page_no: int, start_order: int) -> list[Bl
             page=page_no,
             reading_order=order,
             confidence=0.95,   # Apple Vision 典型置信度
+            text_direction=("horizontal" if is_chinese_horizontal(ocr_mode) else "vertical"),
+            source_format="ocr",
         ))
         order += 1
 
@@ -283,7 +377,19 @@ def run(
     crop_rect: tuple[float, float, float, float] | None = None,
     backend: str = "auto",
     vertical: bool = True,
+    recognition_level: str = "accurate",
+    recognition_languages: list[str] | None = None,
+    use_language_correction: bool = True,
+    automatically_detect_language: bool = False,
+    minimum_text_height_fraction: float = 0.005,
+    candidate_count: int = 3,
+    orientation: str = "auto",
+    vertical_preprocess: str = "none",
     temp_crop_dir: str | None = None,
+    reuse_existing_crops: bool = False,
+    filter_running_headers: bool = True,
+    ocr_mode: str = "ja_vertical",
+    merge_horizontal_fragments: bool = True,
 ) -> UnifiedDocument:
     """
     核心函数：对输入执行 OCR，返回 UnifiedDocument。
@@ -305,16 +411,30 @@ def run(
         crop_bottom:    同上，裁掉底部（页脚区域）。
         crop_rect:      手动框选的识别区域 (x0,y0,x1,y1)，归一化坐标，优先于
                         crop_top/crop_bottom（GUI 拖框选工具产生的参数）。
-        backend:        仅支持 "shortcut"（走 macOS「快捷指令」App）。
-        vertical:       保留为兼容参数；快捷指令后端的顺序由系统识别结果决定。
+        backend:        "live_text" 使用 VisionKit ImageAnalyzer；"native_helper" 使用 RecognizeTextRequest；"shortcut" 保留原快捷指令；"auto" 优先 Live Text、基础设施/可用性失败时回退快捷指令。
+        vertical:       竖排阅读顺序提示；Helper 会按右到左、上到下排序观察结果。
+        vertical_preprocess: "crop_rotate_left" 时仅对单个狭长竖列紧裁并左旋 90°后识别一次。
+        filter_running_headers: 是否在组装文档前自动删除跨页重复页眉/页脚。
+                        启用“逐列成句”时应传 False，避免误删页面边缘正文列。
 
     Returns:
         UnifiedDocument
     """
     global SHORTCUT_NAME
-    if backend not in {"shortcut", "auto", None, ""}:
-        raise ValueError("Apple Vision OCR 目前仅支持 macOS 快捷指令后端")
-    backend = "shortcut"
+    ocr_mode = normalize_ocr_mode(ocr_mode)
+    profile = get_ocr_profile(ocr_mode)
+    # Chinese horizontal mode is a hard profile boundary: no vertical sorting,
+    # rotation or Japanese language list can leak in from a previous run.
+    vertical = bool(vertical and profile.vertical)
+    if is_chinese_horizontal(ocr_mode):
+        recognition_languages = list(profile.apple_languages)
+        vertical_preprocess = "none"
+    elif not recognition_languages:
+        recognition_languages = list(profile.apple_languages)
+    if backend in {None, ""}:
+        backend = "auto"
+    if backend not in {"auto", "live_text", "native_helper", "shortcut"}:
+        raise ValueError(f"不支持的 Apple Vision backend: {backend}")
 
     SHORTCUT_NAME = shortcut_name
 
@@ -328,7 +448,9 @@ def run(
         raise ValueError("必须提供 image_folder 或 input_paths")
 
     work_dir = image_folder or str(Path(raw_inputs[0]).parent)
-    image_paths = expand_inputs(raw_inputs, work_dir=work_dir)
+    image_paths = expand_inputs(
+        raw_inputs, work_dir=work_dir, cancel_check=cancel_check
+    )
     image_paths = sorted(set(image_paths), key=natural_sort_key)
 
     if not image_paths:
@@ -344,8 +466,7 @@ def run(
     # 作为兜底。进度回调（含实时预览）只对"会实际 OCR 的页面"触发，分母也
     # 只算这些页——封面/插图等页不会出现在 GUI 的识别进度/预览里。
     def _skip_ocr(page_no: int) -> bool:
-        t = overrides.get(page_no)
-        return bool(t) and t != BlockType.PARAGRAPH.value
+        return should_skip_page_ocr(overrides.get(page_no))
 
     text_page_total = sum(1 for i in range(1, len(image_paths) + 1) if not _skip_ocr(i))
 
@@ -353,7 +474,18 @@ def run(
     available, reason = ocr_backend.is_available()
     if not available:
         raise RuntimeError(f"OCR backend {backend!r} 不可用：{reason}")
-    ocr_config = OCRConfig(shortcut_name=shortcut_name, vertical=vertical)
+    ocr_config = OCRConfig(
+        shortcut_name=shortcut_name,
+        vertical=vertical,
+        recognition_level=recognition_level,
+        languages=list(recognition_languages or profile.apple_languages),
+        use_language_correction=use_language_correction,
+        automatically_detect_language=automatically_detect_language,
+        minimum_text_height_fraction=minimum_text_height_fraction,
+        candidate_count=candidate_count,
+        orientation=orientation,
+        vertical_preprocess=vertical_preprocess,
+    )
 
     # ── 第一遍：OCR 所有页面 ─────────────────────────────────────────────────
     raw_lines_per_page: list[list[str]] = []
@@ -375,7 +507,14 @@ def run(
         else:
             if verbose:
                 print(f"  [{i:3d}/{len(image_paths)}] OCR: {os.path.basename(path)}", end=" ")
-            ocr_path = crop_for_ocr(path, crop_top=crop_top, crop_bottom=crop_bottom, crop_rect=crop_rect, out_dir=temp_crop_dir)
+            ocr_path = crop_for_ocr(
+                path,
+                crop_top=crop_top,
+                crop_bottom=crop_bottom,
+                crop_rect=crop_rect,
+                out_dir=temp_crop_dir,
+                reuse_existing=bool(reuse_existing_crops),
+            )
             # page 由调用方回填，不是 backend 自己知道的——backend.recognize()
             # 只认识"这一张图"，不知道自己在整本书里是第几页。
             ocr_result = ocr_backend.recognize(ocr_path, ocr_config)
@@ -389,31 +528,51 @@ def run(
             if progress_callback is not None:
                 progress_callback(ocr_progress, text_page_total, os.path.basename(path), path)
 
+    ocr_backend.close()
+
     if cancelled:
         # 只保留已经识别完成的页面，其余截断，避免下游按索引访问越界
         image_paths = image_paths[:len(raw_lines_per_page)]
 
-    # ── 检测并过滤页眉/页脚 ─────────────────────────────────────────────────
-    running_headers = detect_running_headers(raw_lines_per_page)
+    # ── 可选页眉/页脚过滤 ────────────────────────────────────────────────────
+    # 逐列成句开启时不允许在重建前凭文本频率删除任何列；否则页面边缘的正文
+    # 一旦误判为页眉，跨页接续阶段无法恢复。此模式只去除空行，页眉清理由
+    # Formatter 的可选“清理模块”承担。
+    running_headers = (
+        detect_running_headers(raw_lines_per_page) if filter_running_headers else set()
+    )
     if verbose and running_headers:
         print(f"\n🔍  检测到页眉/页脚（将过滤）：")
         for h in sorted(running_headers):
             print(f"    「{h}」")
+    elif verbose and not filter_running_headers:
+        print("\n🛡️  逐列成句保护：跳过自动页眉/页脚删除，保留 OCR 原始文字列")
 
-    filtered_lines_per_page = [
-        filter_lines(lines, running_headers)
-        for lines in raw_lines_per_page
-    ]
+    if filter_running_headers:
+        filtered_lines_per_page = [
+            normalize_lines(filter_lines(lines, running_headers), ocr_mode)
+            for lines in raw_lines_per_page
+        ]
+    else:
+        filtered_lines_per_page = [
+            normalize_lines(lines, ocr_mode)
+            for lines in raw_lines_per_page
+        ]
 
     # ── 自动页面分类 ─────────────────────────────────────────────────────────
-    auto_types = auto_classify_pages(image_paths, filtered_lines_per_page)
+    auto_types = (
+        auto_classify_pages_profile(image_paths, filtered_lines_per_page, ocr_mode)
+        if is_chinese_horizontal(ocr_mode)
+        else auto_classify_pages(image_paths, filtered_lines_per_page)
+    )
 
     # ── 构建 UnifiedDocument ─────────────────────────────────────────────────
     doc = UnifiedDocument()
     doc.metadata = Metadata(
         source_engine="apple_vision",
-        language="ja",
+        language=profile.language,
     )
+    apply_profile_metadata(doc, ocr_mode)
 
     order_counter = 0
     skipped_image_count = 0
@@ -474,7 +633,9 @@ def run(
 
         else:
             # 正文页（PARAGRAPH 类型 = 自动分类为正文）
-            new_blocks = lines_to_blocks(filtered_lines, page_no, order_counter)
+            new_blocks = lines_to_blocks(
+                filtered_lines, page_no, order_counter, ocr_mode=ocr_mode
+            )
 
             for b in new_blocks:
                 # 更新章节计数
@@ -497,12 +658,27 @@ def run(
                 print(f"  📄 正文  第{page_no}页: {fname}  → {len(new_blocks)} 块")
 
     # ── 写入处理日志 ─────────────────────────────────────────────────────────
+    doc.add_log(
+        "ocr_profile",
+        f"OCR 模式：{profile.label} · {profile.language} · {profile.writing_direction}",
+        len(image_paths),
+    )
     if cancelled:
         doc.add_log("apple_vision_adapter", f"OCR 已暂停，仅识别 {len(image_paths)} 页", len(image_paths))
     else:
         doc.add_log("apple_vision_adapter", "OCR完成", len(image_paths))
-    doc.add_log("header_filter", f"过滤页眉: {sorted(running_headers)}", len(running_headers))
+    if filter_running_headers:
+        doc.add_log("header_filter", f"过滤页眉: {sorted(running_headers)}", len(running_headers))
+    else:
+        doc.add_log("header_filter", "逐列成句保护：未执行自动页眉/页脚删除", 0)
     doc.add_log("page_classify", f"正文页{text_page_count}，图片页{skipped_image_count}，空白页{len(image_paths)-text_page_count-skipped_image_count}")
+    skipped_before_ocr = sum(1 for page_no in range(1, len(image_paths) + 1) if _skip_ocr(page_no))
+    if skipped_before_ocr:
+        doc.add_log(
+            "ocr_page_admission",
+            f"OCR 前置隔离 {skipped_before_ocr} 个已分类非正文页；未调用 Apple Vision",
+            skipped_before_ocr,
+        )
     doc.add_log("chapter_detect", f"识别章节 {chapter_index} 个", chapter_index)
 
     if verbose:
@@ -526,14 +702,14 @@ def main():
     )
     parser.add_argument(
         "--shortcut", "-s",
-        help=f"快捷指令名称（默认: {SHORTCUT_NAME}，backend=shortcut 时生效）",
+        help=f"快捷指令名称（默认: {SHORTCUT_NAME}）",
         default=SHORTCUT_NAME,
     )
     parser.add_argument(
         "--backend", "-b",
-        choices=["shortcut"],
-        default="shortcut",
-        help="OCR backend：仅支持 shortcut（macOS 快捷指令 Apple Vision OCR）",
+        choices=["auto", "live_text", "native_helper", "shortcut"],
+        default="auto",
+        help="OCR backend：auto / live_text / native_helper / shortcut",
     )
     parser.add_argument("--quiet", "-q", action="store_true")
     args = parser.parse_args()

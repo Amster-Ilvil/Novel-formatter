@@ -1,0 +1,21 @@
+# Core GUI / document support
+PySide6>=6.7,<7
+Pillow>=10,<13
+PyMuPDF>=1.24,<2
+python-docx>=1.1,<2
+pdf2image>=1.17,<2
+pillow-heif>=0.18,<2
+
+# AI providers (DeepSeek uses the OpenAI-compatible client)
+httpx>=0.27,<1
+openai>=1.50,<3
+anthropic>=0.40,<1
+google-generativeai>=0.8,<1
+
+# Faster / more accurate matching and token estimation
+diff-match-patch>=20230430
+rapidfuzz>=3.9,<4
+tiktoken>=0.8,<1
+
+# EPUB 构建后校验（W3C epubcheck 封装；运行时需要 Java，无 Java 自动跳过）
+epubcheck>=5.1,<6

@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 """
 Text Extractor —— 把各种格式的"高质量文本来源"统一转成 Paragraph 列表，
-供 engine/alignment.py 跟 OCR 结果对齐。
+供 engine/alignment_v2.py 跟 OCR 结果对齐。
 
 docx / epub / json 已经有对应的 adapter 能转成 UnifiedDocument（docx_adapter /
 epub_adapter / UnifiedDocument.from_json 本身），这里直接复用，不重新写一遍
@@ -37,8 +37,24 @@ def _paragraphs_from_unified_doc(doc: UnifiedDocument, source_name: str) -> list
         text = b.text.strip()
         if not text:
             continue
-        is_title = b.type in (BlockType.CHAPTER, BlockType.SECTION)
-        if b.type == BlockType.CHAPTER:
+        # A Markdown image/data URI is an asset reference, never novel prose.
+        # UnifiedDocument JSON imported from Markdown can contain it as a plain
+        # paragraph, so filter it here just like direct .md imports do.
+        if re.match(r'^!\[[^\]]*\]\(\s*(?:data:image/|[^)]*\.(?:png|jpe?g|webp|gif)(?:\?[^)]*)?)', text, re.I):
+            continue
+        markdown_heading = re.match(r'^#{1,6}\s*(.+?)\s*#*$', text)
+        if markdown_heading:
+            text = markdown_heading.group(1).strip()
+        is_title = b.type in (BlockType.CHAPTER, BlockType.SECTION) or bool(markdown_heading)
+        # Some imported JSON versions were saved before detect_chapters changed the
+        # block type.  Re-detect their short chapter line here so strict replacement
+        # can rebuild a real TOC instead of treating every heading as body prose.
+        if not is_title and len(text) < 40:
+            try:
+                is_title = _looks_like_title(text)
+            except NameError:
+                is_title = bool(CHAPTER_RE.match(text))
+        if is_title:
             current_chapter = text
         paragraphs.append(Paragraph(
             text=text, index=idx, chapter=current_chapter,
@@ -71,15 +87,26 @@ def _is_paddleocr_vl_export(data) -> bool:
 
 
 def extract_from_paddleocr_vl_export(path: str, data: list[dict] | None = None) -> list[Paragraph]:
-    """PaddleOCR-VL 在线服务导出的 JSON：每页一个 dict，`markdown.text` 已经是
-    干净的 markdown（`#`标题 + 空行分段），直接拼接全书页面复用 markdown 解析逻辑，
-    不用逐个 parsing_res_list block 去重建结构（那是给 OCR 主文档用的，这里只要
-    干净正文）。"""
-    if data is None:
-        data = json.loads(Path(path).read_text(encoding="utf-8"))
-    page_texts = [p.get("markdown", {}).get("text", "") for p in data]
-    combined = "\n\n".join(t for t in page_texts if t.strip())
-    return _paragraphs_from_markdown_text(combined, Path(path).name)
+    """导入 PaddleOCR-VL 原始 JSON，并保留物理 OCR block 边界。
+
+    不能使用 ``markdown.text`` 作为替换源：markdown 是面向展示的扁平结果，
+    会丢失 ``parsing_res_list`` 中的页码、block_order、竖排方向和独立短列边界。
+    这些边界正是 formatter 判断短对白补全、跨页断词和段落续接所必需的信息。
+
+    这里与 OCR 主流程统一复用 ``utils.paddle_importer.import_paddle_json``，保证
+    “刚完成 OCR”与“稍后手动导入同一 JSON”得到完全相同的文本单元。
+    ``data`` 参数仅用于 schema 识别阶段的向后兼容；实际解析始终从 path 读取，
+    避免维护第二套解析实现。
+    """
+    from utils.paddle_importer import import_paddle_json
+
+    doc = import_paddle_json(
+        json_path=path,
+        image_folder=str(Path(path).parent),
+        strip_special_text=True,
+        add_images_for_paragraph=False,
+    )
+    return _paragraphs_from_unified_doc(doc, Path(path).name)
 
 
 def extract_from_json(path: str) -> list[Paragraph]:

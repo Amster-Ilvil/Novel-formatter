@@ -22,12 +22,15 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent.parent))
 from models.document import UnifiedDocument, Block, BlockType, Metadata
 
+JP_CHAPTER_NUMBER = r'[一二三四五六七八九十百千〇零\d０-９]+'
+CHAPTER_UNIT = r'[章話節巻回幕篇編]'
+CHAPTER_CONTINUATION = r'(?:は|が|を|に|で|と|も|の|です|だ|という)'
 CHAPTER_RE = re.compile(
-    # フロローグ：常见的"プロローグ"半浊点丢失错读，一并纳入识别。
-    r'^(序章|終章|プロローグ|フロローグ|エピローグ|後記|あとがき|'
-    r'幕間[\s　]|幕間$|'
-    r'第[一二三四五六七八九十百〇零\d]+[章話節巻]'
-    r'|Chapter\s*\d+)',
+    rf'^(序章|終章|プロローグ|フロローグ|ブロローグ|エピローグ|後記|あとがき|'
+    rf'幕間(?:[\s　:：・—―-].*)?|'
+    rf'第[\s　]*{JP_CHAPTER_NUMBER}[\s　]*{CHAPTER_UNIT}(?!{CHAPTER_CONTINUATION})|'
+    rf'{JP_CHAPTER_NUMBER}[\s　]*[話章節回](?=$|[\s　:：・—―「『【（(]|前編|後編|上編|中編|下編)|'
+    rf'(?:Chapter|Episode|EP)[\s　.．_-]*[\d０-９]+)',
     re.IGNORECASE
 )
 

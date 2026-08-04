@@ -363,62 +363,6 @@ def import_epub(epub_path: str, verbose: bool = True) -> UnifiedDocument:
 
 # ── 参考 EPUB 排版特征提取（供 Format Profile 使用） ────────────────────────────
 
-def analyze_style(epub_path: str) -> dict:
-    """
-    从一本参考 EPUB 里提取排版特征，供 Format Profile 使用：
-        css                 —— 原样拼接的样式表内容（"参考其格式"最直接的落地：
-                                直接复用参考书的排版 CSS，而不是重新猜规则）
-        vertical            —— 从 CSS 的 writing-mode 判定是否竖排
-        font_family         —— 从 CSS body 规则里提取
-        line_height         —— 同上
-        paragraph_indent    —— "fullwidth_space"（正文字符本身带全角空格缩进）
-                                或 "css_text_indent"（缩进靠 CSS text-indent，字符本身不带）
-        dialogue_quote_style—— 抽样对白段落首字符，取样本里最常见的引号风格
-        sample_title / sample_author —— 参考书自身的元数据，仅用于展示
-    """
-    doc = import_epub(epub_path, verbose=False)
-
-    css_parts = []
-    with zipfile.ZipFile(epub_path) as zf:
-        for name in zf.namelist():
-            if name.lower().endswith(".css"):
-                try:
-                    css_parts.append(zf.read(name).decode("utf-8", errors="replace"))
-                except KeyError:
-                    continue
-    css = "\n\n".join(css_parts)
-
-    vertical = bool(re.search(r'writing-mode\s*:\s*vertical', css))
-
-    m = re.search(r'font-family\s*:\s*([^;]+);', css)
-    font_family = m.group(1).strip() if m else ""
-    m = re.search(r'line-height\s*:\s*([\d.]+)', css)
-    line_height = float(m.group(1)) if m else 1.8
-
-    paragraphs = [b.text for b in doc.blocks if b.type == BlockType.PARAGRAPH][:50]
-    indented = sum(1 for t in paragraphs if t[:1] in ("　", " "))
-    paragraph_indent = (
-        "fullwidth_space" if paragraphs and indented / len(paragraphs) > 0.5
-        else "css_text_indent"
-    )
-
-    dialogues = [b.text for b in doc.blocks if b.type == BlockType.DIALOGUE][:50]
-    bracket = sum(1 for t in dialogues if t[:1] in ("「", "『"))
-    curly_quote = sum(1 for t in dialogues if t[:1] in ("“", '"'))
-    dash = sum(1 for t in dialogues if t[:1] in ("—", "－", "-"))
-    counts = {"「」": bracket, "“”": curly_quote, "—": dash}
-    dialogue_quote_style = max(counts, key=counts.get) if any(counts.values()) else "「」"
-
-    return {
-        "css": css,
-        "vertical": vertical,
-        "font_family": font_family,
-        "line_height": line_height,
-        "paragraph_indent": paragraph_indent,
-        "dialogue_quote_style": dialogue_quote_style,
-        "sample_title": doc.metadata.title,
-        "sample_author": doc.metadata.author,
-    }
 
 
 if __name__ == "__main__":

@@ -29,6 +29,7 @@ class OCRBlock:
     confidence: float = 1.0
     bbox: Optional[tuple[float, float, float, float]] = None  # (x, y, w, h)，归一化坐标
     language: str = ""
+    candidates: list[tuple[str, float]] = field(default_factory=list)
 
 
 @dataclass
@@ -60,6 +61,14 @@ class OCRConfig:
     vertical: bool = True                 # 竖排（右→左列/列内上→下）还是横排，决定阅读顺序重建方式
     shortcut_name: str = "ExtractText"    # backend="shortcut" 时使用
     timeout: float = 90.0
+    use_language_correction: bool = True
+    automatically_detect_language: bool = False
+    minimum_text_height_fraction: float = 0.005
+    candidate_count: int = 3
+    orientation: str = "auto"
+    vertical_preprocess: str = "none"  # Novel-formatter-1 原有路径：Python 侧紧裁后左旋
+    vertical_compatibility_mode: bool = False  # 新路径：Swift helper 内紧裁/左旋并回映坐标
+    character_boxes: bool = False  # Apple Vision fast 模式逐 Character 返回真实字符框
 
 
 @dataclass
@@ -118,3 +127,7 @@ class VisionBackend(ABC):
         """检测这个 backend 当前环境下能不能用。返回 (可用, 不可用时的说明)。
         默认假设可用，需要额外依赖/外部程序的 backend 应该覆写这个方法。"""
         return True, ""
+
+    def close(self) -> None:
+        """Release a persistent helper process, if this backend owns one."""
+        return None

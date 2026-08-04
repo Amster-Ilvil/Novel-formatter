@@ -1,0 +1,11 @@
+JLect Japanese Handwriting Recognition Tool (JLect JHR)
+Copyright (c) Zachary Read / JLect.com
+
+Source: https://github.com/ZacharyRead/jlect-jhr
+Bundled file: jlect-jhr.compressed.js (unmodified upstream distribution)
+License: Creative Commons Attribution-ShareAlike 3.0 Unported (CC BY-SA 3.0)
+https://creativecommons.org/licenses/by-sa/3.0/
+
+This application uses JLect JHR only as an optional single-character candidate
+engine inside the handwriting trace review dialog. The original attribution and
+license header are retained in the JavaScript file.

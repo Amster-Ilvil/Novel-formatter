@@ -154,15 +154,6 @@ def clean_alignment_blocks(items):
     return result
 
 
-def cross_block_windows(items, start, window=3):
-    """生成跨 block 合并文本窗口，用于后续增强匹配。"""
-    out=[]
-    for size in range(1, window+1):
-        for i in range(start, min(len(items)-size+1, start+window)):
-            text="".join(getattr(x, "text", "") for x in items[i:i+size])
-            if text:
-                out.append((i, size, text))
-    return out
 
 
 class HybridAligner:

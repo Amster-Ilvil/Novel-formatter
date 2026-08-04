@@ -1,0 +1,3 @@
+# Optional independent handwriting recognizer
+numpy>=1.26,<3
+openvino>=2024.0,<2027

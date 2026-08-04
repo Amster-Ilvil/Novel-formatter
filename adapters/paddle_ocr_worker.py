@@ -37,7 +37,22 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
+
+try:
+    # Direct worker execution adds adapters/ to sys.path.
+    from paddle_ocr_models import (
+        PADDLE_OCR_VERSION,
+        PADDLE_DETECTION_MODEL,
+        PADDLE_RECOGNITION_MODEL,
+    )
+except ImportError:  # Imported as adapters.paddle_ocr_worker in tests/tools.
+    from adapters.paddle_ocr_models import (
+        PADDLE_OCR_VERSION,
+        PADDLE_DETECTION_MODEL,
+        PADDLE_RECOGNITION_MODEL,
+    )
 
 # PaddleOCRVL parsing_res_list 里这些 label 不是正文文字块，直接跳过
 _VL_SKIP_LABELS = {"table", "image", "figure", "chart", "formula", "seal"}
@@ -76,49 +91,100 @@ def _blocks_from_vl_result(res) -> list[dict]:
     return blocks
 
 
+def _medium_ocr_kwargs(lang: str) -> dict:
+    """Common PP-OCRv6 medium model selection shared by OCR and Structure."""
+    return dict(
+        lang=lang,
+        ocr_version=PADDLE_OCR_VERSION,
+        text_detection_model_name=PADDLE_DETECTION_MODEL,
+        text_recognition_model_name=PADDLE_RECOGNITION_MODEL,
+        use_doc_orientation_classify=False,
+        use_doc_unwarping=False,
+        use_textline_orientation=True,
+    )
+
+
 def build_engine(pipeline: str, lang: str):
     if pipeline == "structure":
         from paddleocr import PPStructureV3
-        # 默认配置会同时加载 7 个模型（含文档方向矫正、UVDoc 展平、layout
-        # "plus-L" 大模型、OCRv5 "server" 级文字检测/识别），在内存有限的机器
-        # 上很容易被系统直接杀掉。这里关掉不需要的方向矫正/展平，版面检测和
-        # 文字检测/识别都换成轻量级（S / mobile）模型，减少同时常驻内存的模型数量。
-        rec_model = f"{lang}_PP-OCRv3_mobile_rec" if lang == "japan" else "PP-OCRv5_mobile_rec"
-        engine = PPStructureV3(
-            use_doc_orientation_classify=False, use_doc_unwarping=False,
-            use_table_recognition=False, use_formula_recognition=False,
-            use_seal_recognition=False, use_chart_recognition=False,
+        # PP-Structure 保留版面分析，但文字检测与识别统一锁定到与普通 OCR
+        # 相同的 PP-OCRv6 medium 模型，避免两个 Paddle 入口得到不同文字结果。
+        common_kwargs = dict(
+            use_doc_orientation_classify=False,
+            use_doc_unwarping=False,
+            use_table_recognition=False,
+            use_formula_recognition=False,
+            use_seal_recognition=False,
+            use_chart_recognition=False,
             layout_detection_model_name="PP-DocLayout-S",
-            text_detection_model_name="PP-OCRv5_mobile_det",
-            text_recognition_model_name=rec_model,
+            text_detection_model_name=PADDLE_DETECTION_MODEL,
+            text_recognition_model_name=PADDLE_RECOGNITION_MODEL,
         )
+        try:
+            engine = PPStructureV3(**common_kwargs)
+        except Exception as exc:
+            raise RuntimeError(
+                f"无法加载 {PADDLE_DETECTION_MODEL} + {PADDLE_RECOGNITION_MODEL}。"
+                "请运行 repair_runtime.command 或删除 .venv-paddle 后重试；"
+                "程序不会再静默退回 PP-OCRv5。"
+            ) from exc
         return engine, "structure"
     elif pipeline == "vl":
         from paddleocr import PaddleOCRVL
-        # 显式锁定 v1.6，不依赖库的默认值（避免以后 paddleocr 升级默认版本时
-        # 悄悄换成别的模型）。
+        # 显式锁定 v1.6，不依赖库的默认值。
         return PaddleOCRVL(pipeline_version="v1.6"), "vl"
     else:
         from paddleocr import PaddleOCR
-        engine = PaddleOCR(
-            lang=lang,
-            use_doc_orientation_classify=False,
-            use_doc_unwarping=False,
-            use_textline_orientation=True,
-        )
+        try:
+            engine = PaddleOCR(**_medium_ocr_kwargs(lang))
+            setattr(engine, "_novel_formatter_model_profile", "ppocr_v6_medium")
+        except Exception as exc:
+            try:
+                engine = PaddleOCR(
+                    lang=lang,
+                    use_doc_orientation_classify=False,
+                    use_doc_unwarping=False,
+                    use_textline_orientation=True,
+                )
+                setattr(engine, "_novel_formatter_model_profile", "paddle_default")
+                print(
+                    "PaddleOCR warning: "
+                    f"{PADDLE_DETECTION_MODEL}+{PADDLE_RECOGNITION_MODEL} unavailable; "
+                    "fallback to PaddleOCR default Japanese models.",
+                    file=sys.stderr,
+                    flush=True,
+                )
+            except Exception as fallback_exc:
+                raise RuntimeError(
+                    f"无法加载 {PADDLE_DETECTION_MODEL} + {PADDLE_RECOGNITION_MODEL}，"
+                    "且 PaddleOCR 默认日文模型也不可用。请检查网络、删除 .venv-paddle 后重试，"
+                    "或改用 NDLOCR-Lite / Manga OCR。"
+                ) from fallback_exc
         return engine, "ocr"
 
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("images", nargs="+", help="图片路径列表")
+    parser.add_argument("--server", action="store_true")
+    parser.add_argument("--probe", action="store_true", help="只初始化模型并报告状态")
+    parser.add_argument("images", nargs="*", help="图片路径列表")
     parser.add_argument("--lang", default="japan")
     parser.add_argument("--pipeline", default="ocr", choices=["ocr", "structure", "vl"])
     args = parser.parse_args()
 
     engine, pipeline = build_engine(args.pipeline, args.lang)
 
-    for path in args.images:
+    if args.probe:
+        print(json.dumps({
+            "ok": True,
+            "probe": True,
+            "pipeline": pipeline,
+            "model_source": os.environ.get("PADDLE_PDX_MODEL_SOURCE", "huggingface"),
+            "model_profile": getattr(engine, "_novel_formatter_model_profile", pipeline),
+        }, ensure_ascii=False), flush=True)
+        return
+
+    def process_path(path: str, request_id=None) -> dict:
         try:
             results = engine.predict(path)
             blocks = []
@@ -126,13 +192,39 @@ def main():
                 if pipeline == "vl":
                     blocks.extend(_blocks_from_vl_result(res))
                 elif pipeline == "structure":
-                    blocks.extend(_blocks_from_ocr_result(res["overall_ocr_res"]))
+                    data = getattr(res, "json", None) or res
+                    if isinstance(data, dict) and "res" in data:
+                        data = data["res"]
+                    if isinstance(data, dict) and data.get("overall_ocr_res"):
+                        blocks.extend(_blocks_from_ocr_result(data["overall_ocr_res"]))
+                    else:
+                        blocks.extend(_blocks_from_ocr_result(res))
                 else:
                     blocks.extend(_blocks_from_ocr_result(res))
-            print(json.dumps({"ok": True, "path": path, "blocks": blocks}, ensure_ascii=False))
-        except Exception as e:
-            print(json.dumps({"ok": False, "path": path, "error": str(e)}, ensure_ascii=False))
-        sys.stdout.flush()
+            payload = {"ok": True, "path": path, "blocks": blocks}
+        except Exception as exc:
+            payload = {"ok": False, "path": path, "error": str(exc)}
+        if request_id is not None:
+            payload["request_id"] = request_id
+        return payload
+
+    if args.server:
+        for line in sys.stdin:
+            try:
+                request = json.loads(line)
+            except Exception:
+                continue
+            if request.get("command") == "close":
+                break
+            request_id = request.get("request_id")
+            for path in list(request.get("images") or []):
+                print(json.dumps(process_path(str(path), request_id), ensure_ascii=False), flush=True)
+            print(json.dumps({"batch_done": True, "request_id": request_id}, ensure_ascii=False), flush=True)
+    else:
+        if not args.images:
+            parser.error("至少提供一个图片路径，或使用 --server")
+        for path in args.images:
+            print(json.dumps(process_path(path), ensure_ascii=False), flush=True)
 
 
 if __name__ == "__main__":

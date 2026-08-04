@@ -10,7 +10,9 @@ class FlowLayout(QLayout):
         self._vspacing = vspacing
         self.setContentsMargins(margin, margin, margin, margin)
     def addItem(self, item): self._items.append(item)
-    def addWidget(self, widget): self.addItem(QWidgetItem(widget))
+    def addWidget(self, widget):
+        self.addChildWidget(widget)
+        self.addItem(QWidgetItem(widget))
     def count(self): return len(self._items)
     def itemAt(self, index): return self._items[index] if 0 <= index < len(self._items) else None
     def takeAt(self, index): return self._items.pop(index) if 0 <= index < len(self._items) else None
@@ -21,7 +23,9 @@ class FlowLayout(QLayout):
     def sizeHint(self): return self.minimumSize()
     def minimumSize(self):
         size = QSize()
-        for item in self._items: size = size.expandedTo(item.minimumSize())
+        for item in self._items:
+            if item.isEmpty(): continue
+            size = size.expandedTo(item.minimumSize())
         l,t,r,b = self.getContentsMargins(); size += QSize(l+r, t+b); return size
     def setHorizontalSpacing(self, spacing): self._hspacing = spacing
     def setVerticalSpacing(self, spacing): self._vspacing = spacing
@@ -34,6 +38,8 @@ class FlowLayout(QLayout):
         l,t,r,b = self.getContentsMargins(); effective = rect.adjusted(l,t,-r,-b)
         x, y, line_height = effective.x(), effective.y(), 0
         for item in self._items:
+            if item.isEmpty():  # 隐藏控件不占折行空间
+                continue
             hint = item.sizeHint(); space_x = self._hspacing if self._hspacing >= 0 else self._smart_spacing(QStyle.PM_LayoutHorizontalSpacing)
             space_y = self._vspacing if self._vspacing >= 0 else self._smart_spacing(QStyle.PM_LayoutVerticalSpacing)
             next_x = x + hint.width() + space_x

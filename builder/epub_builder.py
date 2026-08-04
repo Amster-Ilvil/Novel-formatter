@@ -9,7 +9,7 @@ EPUB Builder
     - 封面图片（cover-image metadata）
     - 章节自动分文件
     - 插图按锚点插入正文（而非统一放到最后）
-    - TOC 自动生成（nav.xhtml + content.opf spine）
+    - TOC 自动生成（nav.xhtml 进入 manifest，默认不进入 spine）
     - 元数据写入 content.opf（标题/作者/语言/ISBN）
 
 依赖：
@@ -28,13 +28,34 @@ import os
 import re
 import shutil
 import sys
+import tempfile
 import uuid
 import zipfile
+from functools import wraps
 from pathlib import Path
 from textwrap import dedent
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 from models.document import UnifiedDocument, Block, BlockType
+from utils.atomic_io import atomic_write_text
+
+def _workspace_for_output(output_path: str) -> Path:
+    out = Path(output_path).expanduser()
+    return out.parent / f"_epub_tmp_{out.stem}"
+
+
+def _cleanup_workspace(func):
+    """Remove stale and failed-build workspaces without masking build errors."""
+    @wraps(func)
+    def wrapper(doc, output_path: str, *args, **kwargs):
+        workspace = _workspace_for_output(output_path)
+        shutil.rmtree(workspace, ignore_errors=True)
+        try:
+            return func(doc, output_path, *args, **kwargs)
+        finally:
+            shutil.rmtree(workspace, ignore_errors=True)
+    return wrapper
+
 
 # ── CSS 模板 ─────────────────────────────────────────────────────────────────
 
@@ -53,13 +74,9 @@ CSS_TEMPLATES: dict[str, str] = {
             margin: 5%;
             font-family: "ヒラギノ明朝 Pro", "Hiragino Mincho Pro",
                          "游明朝", "YuMincho", "MS 明朝", serif;
-            font-size: 100%;
             line-height: 1.8;
-            color: #1a1a1a;
-            background-color: #fafaf8;
         }
         h1 {
-            font-size: 1.3em;
             font-weight: bold;
             margin-bottom: 2em;
             letter-spacing: 0.15em;
@@ -87,7 +104,6 @@ CSS_TEMPLATES: dict[str, str] = {
         }
         /* Ruby 振假名 */
         ruby rt {
-            font-size: 0.5em;
             -epub-ruby-position: right;
             ruby-position: under;
         }
@@ -126,15 +142,12 @@ CSS_TEMPLATES: dict[str, str] = {
         body {
             margin: 4% 5%;
             font-family: "游明朝", "YuMincho", "ヒラギノ明朝 Pro", serif;
-            font-size: 0.95em;
             line-height: 1.9;
-            color: #222;
         }
-        h1 { font-size: 1.2em; font-weight: bold; letter-spacing: 0.1em; }
+        h1 { font-weight: bold; letter-spacing: 0.1em; }
         p   { text-indent: 1em; margin: 0; }
         p.dialogue { text-indent: 0; }
         .tcy { text-combine-upright: all; }
-        ruby rt { font-size: 0.5em; }
     """),
 
     "web": dedent("""\
@@ -146,11 +159,9 @@ CSS_TEMPLATES: dict[str, str] = {
             max-width: 680px;
             font-family: "ヒラギノ角ゴ Pro", "Hiragino Kaku Gothic Pro",
                          "Noto Sans CJK JP", sans-serif;
-            font-size: 1em;
             line-height: 1.9;
-            color: #222;
         }
-        h1 { font-size: 1.4em; margin: 1.5em 0 1em; }
+        h1 { margin: 1.5em 0 1em; }
         p   { text-indent: 1em; margin: 0 0 0.5em; }
         p.dialogue { text-indent: 0; }
     """),
@@ -161,6 +172,173 @@ DEFAULT_TEMPLATE = "denki"
 # 第一个真正章节之前的内容（封面/扉页/目录扫描页/网站样板文字等）统一装进这个
 # 标题固定的桶里。它不是一个真正的章节标题，不应该出现在读者可见的目录里。
 FRONT_MATTER_TITLE = "前书页"
+
+_EPUB_IMAGE_MIME = {
+    ".jpg": "image/jpeg",
+    ".jpeg": "image/jpeg",
+    ".png": "image/png",
+    ".gif": "image/gif",
+    ".svg": "image/svg+xml",
+}
+
+
+def _same_file(left: str | Path, right: str | Path) -> bool:
+    try:
+        return Path(left).expanduser().resolve() == Path(right).expanduser().resolve()
+    except Exception:
+        return str(left) == str(right)
+
+
+def _sniff_epub_image(src: Path) -> tuple[str, str] | None:
+    """Return the real core image extension/MIME from file bytes.
+
+    OCR/image tools frequently save PNG bytes under a .jpg/.jpeg filename.
+    EPUB readers trust the manifest MIME and may reject that mismatch, so the
+    builder must not rely on the source suffix alone.
+    """
+    try:
+        head = src.read_bytes()[:32]
+    except Exception:
+        return None
+    if head.startswith(b"\x89PNG\r\n\x1a\n"):
+        return ".png", "image/png"
+    if head.startswith(b"\xff\xd8\xff"):
+        return ".jpg", "image/jpeg"
+    if head.startswith((b"GIF87a", b"GIF89a")):
+        return ".gif", "image/gif"
+    if head.lstrip().startswith(b"<svg") or b"<svg" in head.lower():
+        return ".svg", "image/svg+xml"
+    return None
+
+
+def _optimize_png_lossless(path: Path) -> int:
+    """无损重压 PNG（Pillow optimize，保留 ICC 配置）。
+
+    像素数据不变；仅当输出比原文件小才替换。返回节省的字节数。
+    借鉴 Calibre ebook-polish 的"最小改动"哲学：失败/变大都保留原文件。
+    """
+    try:
+        import io
+        from PIL import Image
+
+        original = path.read_bytes()
+        with Image.open(io.BytesIO(original)) as image:
+            image.load()
+            buf = io.BytesIO()
+            save_kwargs: dict = {"format": "PNG", "optimize": True}
+            icc = image.info.get("icc_profile")
+            if icc:
+                save_kwargs["icc_profile"] = icc
+            image.save(buf, **save_kwargs)
+        data = buf.getvalue()
+        if len(data) < len(original):
+            path.write_bytes(data)
+            return len(original) - len(data)
+    except Exception:
+        pass
+    return 0
+
+
+def _copy_epub_image(
+    src: Path,
+    image_dir: Path,
+    base_name: str,
+    *,
+    preserve_bytes: bool = False,
+) -> tuple[str, str]:
+    """Copy/convert an image to an EPUB core media type.
+
+    Safe formats are selected from their real bytes, not merely their suffix.
+    Everything else is converted to PNG with Pillow.
+    """
+    detected = _sniff_epub_image(src)
+    if detected is not None:
+        ext, media_type = detected
+        filename = f"{base_name}{ext}"
+        shutil.copy2(src, image_dir / filename)
+        if ext == ".png" and not preserve_bytes:
+            _optimize_png_lossless(image_dir / filename)
+        return filename, media_type
+
+    # Keep compatibility with already-core files whose tiny/test payload cannot
+    # be sniffed.  Real PNG/JPEG mismatches were handled above by magic bytes.
+    ext = src.suffix.lower()
+    if ext in _EPUB_IMAGE_MIME:
+        filename = f"{base_name}{ext}"
+        shutil.copy2(src, image_dir / filename)
+        return filename, _EPUB_IMAGE_MIME[ext]
+
+    try:
+        # Optional HEIC/HEIF support.  Importing registers an opener for Pillow.
+        try:
+            import pillow_heif
+            pillow_heif.register_heif_opener()
+        except Exception:
+            pass
+        from PIL import Image
+
+        with Image.open(src) as image:
+            image.load()
+            if image.mode not in ("RGB", "RGBA"):
+                image = image.convert("RGBA" if "transparency" in image.info else "RGB")
+            filename = f"{base_name}.png"
+            image.save(image_dir / filename, format="PNG", optimize=True)
+        return filename, "image/png"
+    except Exception as exc:
+        raise ValueError(
+            f"图片无法写入 EPUB：{src}\n"
+            "EPUB 仅直接支持 JPG/PNG/GIF/SVG；HEIC/TIFF/BMP 需要 Pillow"
+            "（HEIC 还需要 pillow-heif）进行转换。"
+        ) from exc
+
+
+def _css_is_usable(css: str) -> bool:
+    css = str(css or "").strip()
+    if not css or "{" not in css or "}" not in css:
+        return False
+    if css.count("{") != css.count("}"):
+        return False
+    # Reject truncated declarations such as the literal "-webkit-" that can
+    # otherwise survive into the final stylesheet and invalidate a rule block.
+    if re.search(r"(?m)^\s*-(?:webkit|epub)-?\s*$", css):
+        return False
+    for line in css.splitlines():
+        stripped = line.strip()
+        if not stripped or stripped.startswith(("/*", "*", "@", "}", "{")):
+            continue
+        if stripped.endswith("-") and ":" not in stripped:
+            return False
+    return True
+
+
+def document_ai_css(doc: UnifiedDocument) -> str:
+    """Return only a structurally usable locked AI stylesheet."""
+    meta = getattr(doc, "metadata", None)
+    if not meta:
+        return ""
+    if getattr(meta, "ai_processing_mode", "") != "typeset":
+        return ""
+    if not bool(getattr(meta, "ai_layout_locked", False)):
+        return ""
+    css = str(getattr(meta, "ai_epub_css", "") or "").strip()
+    return css if _css_is_usable(css) else ""
+
+
+def resolve_epub_css(
+    doc: UnifiedDocument,
+    css_template: str = DEFAULT_TEMPLATE,
+    custom_css: str | None = None,
+) -> tuple[str, str]:
+    """Resolve CSS without leaking AI styles into OCR/replacement/correction exports.
+
+    Returns ``(css, source)`` where source is ``ai`` / ``custom`` / ``template``.
+    """
+    ai_css = document_ai_css(doc)
+    if ai_css:
+        return ai_css, "ai"
+    if custom_css:
+        return custom_css, "custom"
+    return CSS_TEMPLATES.get(css_template, CSS_TEMPLATES[DEFAULT_TEMPLATE]), "template"
 
 
 # ── XHTML 生成辅助 ────────────────────────────────────────────────────────────
@@ -220,28 +398,98 @@ def _ruby_to_xhtml(text: str) -> str:
     return ''.join(parts)
 
 
+_ORPHAN_CLOSING_QUOTES = {"」", "』"}
+_MIXED_ELLIPSIS_RE = re.compile(r"(?=[.．・…]{2,})(?=[.．・…]*[.．…])[.．・…]{2,}")
+
+def _sanitize_export_text(text: str) -> str:
+    """EPUB 最终导出防线：统一省略号并清掉首尾无意义空白。"""
+    text = (text or "").strip(" \t\r\n")
+    text = _MIXED_ELLIPSIS_RE.sub("……", text)
+    return text
+
+
+def _repair_plain_to_xhtml(text: str) -> str:
+    """Preserve explicit OCR line breaks in AI-repair XHTML as <br/>."""
+    return "<br/>".join(_esc(part) for part in str(text or "").split("\n"))
+
+
+def _repair_ruby_to_xhtml(text: str) -> str:
+    """Ruby conversion with the same explicit newline preservation."""
+    return "<br/>".join(_ruby_to_xhtml(part) for part in str(text or "").split("\n"))
+
+def _repair_attrs(b: Block) -> str:
+    """Return opt-in stable AI-repair attributes without affecting normal EPUBs."""
+    metadata = b.metadata if isinstance(getattr(b, "metadata", None), dict) else {}
+    item_id = str(metadata.get("ai_repair_item_id", "") or "").strip()
+    html_id = str(metadata.get("ai_repair_html_id", "") or "").strip()
+    if not item_id or not html_id:
+        return ""
+    attrs = [
+        f'id="{_esc(html_id)}"',
+        f'data-item-id="{_esc(item_id)}"',
+        f'data-page="{int(getattr(b, "page", 0) or 0)}"',
+    ]
+    content_format = str(metadata.get("ai_repair_content_format", "") or "").strip()
+    if content_format:
+        attrs.append(f'data-content-format="{_esc(content_format)}"')
+    baseline_sha256 = str(metadata.get("ai_repair_baseline_sha256", "") or "").strip()
+    if baseline_sha256:
+        attrs.append(f'data-baseline-sha256="{_esc(baseline_sha256)}"')
+    export_revision = metadata.get("ai_repair_export_revision")
+    if export_revision not in (None, ""):
+        try:
+            attrs.append(f'data-export-revision="{int(export_revision)}"')
+        except (TypeError, ValueError, OverflowError):
+            pass
+    column_ids = metadata.get("ai_repair_column_ids") or metadata.get("source_column_ids") or []
+    if isinstance(column_ids, str):
+        column_ids = [column_ids]
+    if isinstance(column_ids, (list, tuple, set)):
+        value = ",".join(str(item) for item in column_ids if str(item))
+        if value:
+            attrs.append(f'data-column-ids="{_esc(value)}"')
+    bbox = metadata.get("ai_repair_bbox")
+    if isinstance(bbox, (list, tuple)) and len(bbox) >= 4:
+        try:
+            value = ",".join(f"{float(v):.8g}" for v in bbox[:4])
+        except (TypeError, ValueError, OverflowError):
+            value = ""
+        if value:
+            attrs.append(f'data-bbox="{_esc(value)}"')
+    if bool(metadata.get("ai_repair_delete_intentionally", False)):
+        attrs.append('data-delete-intentionally="true"')
+    return " " + " ".join(attrs)
+
+
 def _block_to_xhtml(b: Block) -> str:
     """
     把单个 Block 转成 XHTML 片段。
     
     检测段落开头是否有全角空格（\u3000），并将其转换为 CSS 缩进类。
     """
-    raw = b.text or ""
+    raw = _sanitize_export_text(b.text or "")
+    attrs = _repair_attrs(b)
 
     if b.type == BlockType.RUBY:
-        content = _ruby_to_xhtml(raw)
-        return f'    <p class="normal">{content}</p>\n'
+        content = _repair_ruby_to_xhtml(raw) if attrs else _ruby_to_xhtml(raw)
+        return f'    <p class="normal"{attrs}>{content}</p>\n'
 
     if b.type == BlockType.CHAPTER:
-        return f"    <h1>{_esc(raw)}</h1>\n"
+        # XHTML 已经使用 h1，不再保留 Markdown 标题前缀。
+        raw = re.sub(r"^\s*#+\s*", "", raw).strip()
+        content = _repair_plain_to_xhtml(raw) if attrs else _esc(raw)
+        return f"    <h1{attrs}>{content}</h1>\n"
 
     if b.type == BlockType.SECTION:
-        return f"    <h2>{_esc(raw)}</h2>\n"
+        raw = re.sub(r"^\s*#+\s*", "", raw).strip()
+        content = _repair_plain_to_xhtml(raw) if attrs else _esc(raw)
+        return f"    <h2{attrs}>{content}</h2>\n"
 
     if b.type == BlockType.DIALOGUE:
         # 对白去掉前导全角空格，但保留其他内容
         raw = raw.lstrip("　")
-        return f'    <p class="dialogue">{_esc(raw)}</p>\n'
+        content = _repair_plain_to_xhtml(raw) if attrs else _esc(raw)
+        return f'    <p class="dialogue"{attrs}>{content}</p>\n'
 
     # 普通段落：统计开头的全角空格数量
     indent_count = 0
@@ -255,11 +503,13 @@ def _block_to_xhtml(b: Block) -> str:
     else:
         cls = "normal"
 
-    return f'    <p class="{cls}">{_esc(raw)}</p>\n'
+    content = _repair_plain_to_xhtml(raw) if attrs else _esc(raw)
+    return f'    <p class="{cls}"{attrs}>{content}</p>\n'
 
 
 # ── 核心构建函数 ──────────────────────────────────────────────────────────────
 
+@_cleanup_workspace
 def build_epub(
     doc: UnifiedDocument,
     output_path: str,
@@ -267,6 +517,8 @@ def build_epub(
     vertical: bool = False,
     verbose: bool = True,
     custom_css: str | None = None,
+    preserve_image_bytes: bool = False,
+    include_nav_in_spine: bool = False,
 ) -> None:
     """
     从 UnifiedDocument 生成 EPUB3 文件。
@@ -278,6 +530,7 @@ def build_epub(
 
     custom_css: 传入时优先于 css_template——用于 Format Profile（从参考 EPUB 学习
     /手写的自定义排版），此时 css_template 只在 custom_css 为空时才生效。
+    include_nav_in_spine: 兼容极少数旧阅读器；默认 False，避免目录被当作正文翻到。
     """
     out = Path(output_path)
     tmp = out.parent / f"_epub_tmp_{out.stem}"
@@ -296,25 +549,43 @@ def build_epub(
     author = meta.author or "Unknown"
     lang   = meta.language or "ja"
 
-    css_content = custom_css if custom_css else CSS_TEMPLATES.get(css_template, CSS_TEMPLATES[DEFAULT_TEMPLATE])
+    css_content, css_source = resolve_epub_css(doc, css_template, custom_css)
 
-    # 追加缩进样式（用于处理 Formatter 添加的全角空格）
-    # 使用 !important 确保覆盖模板中的 p 样式
+    # AI 纠错排版版本同时保存一份可编辑的外部 CSS。EPUB 内仍写入标准的
+    # EPUB/styles/style.css；OCR、普通替换和“仅 AI 纠错”不会生成该伴随文件。
+    companion: Path | None = None
+    companion_css: str | None = None
+    if css_source == "ai":
+        css_name = str(getattr(meta, "ai_epub_css_name", "") or "ai_typeset.css")
+        css_suffix = Path(css_name).suffix or ".css"
+        companion = out.with_name(f"{out.stem}.ai-typeset{css_suffix}")
+        companion_css = css_content
+
+    # 正文统一首行缩进；对白和分节符不缩进。
+    # 不再用 p.normal { text-indent: 0 !important; } 覆盖模板默认值。
     css_content += """
 p.normal {
-    text-indent: 0 !important;
-}
-p.normal.indent {
     text-indent: 1em !important;
 }
-p.dialogue {
+p.dialogue,
+p.section-break {
     text-indent: 0 !important;
+}
+/* 竖排标点统一使用正文方向，避免混合句点/省略号产生基线错位。 */
+html, body, p {
+    text-orientation: mixed;
+    font-variant-east-asian: normal;
 }
 """
 
     if not vertical:
-        # 移除 writing-mode 相关声明
-        css_content = re.sub(r'[^{]*writing-mode[^;]*;', '', css_content)
+        # 移除完整的 writing-mode 声明。旧正则只识别 -epub- 前缀，
+        # 在 -webkit-writing-mode 上从中间开始匹配，留下无效的 "-webkit-"。
+        css_content = re.sub(
+            r'(?im)^\s*(?:-epub-|-webkit-)?writing-mode\s*:\s*[^;}]*(?:;)?\s*$',
+            '',
+            css_content,
+        )
 
     (oebps / "styles" / "style.css").write_text(css_content, encoding="utf-8")
 
@@ -322,14 +593,15 @@ p.dialogue {
     cover_page = next((p for p in doc.pages if p.page_type == BlockType.COVER), None)
     cover_img_id = None
     cover_img_href = None
+    cover_img_mime = None
 
     if cover_page and cover_page.image_path and Path(cover_page.image_path).exists():
         src = Path(cover_page.image_path)
-        ext = src.suffix.lower()
-        dest = oebps / "images" / f"cover{ext}"
-        shutil.copy2(src, dest)
+        filename, cover_img_mime = _copy_epub_image(
+            src, oebps / "images", "cover", preserve_bytes=preserve_image_bytes
+        )
         cover_img_id   = "cover-img"
-        cover_img_href = f"images/cover{ext}"
+        cover_img_href = f"images/{filename}"
         if verbose:
             print(f"  🖼️  封面: {src.name}")
 
@@ -339,41 +611,33 @@ p.dialogue {
 
     illus_idx = 0
     for block_index, b in enumerate(doc.blocks):
-        # ----- EPUB IMAGE DEBUG / COMPATIBLE IMAGE DETECTION -----
-        if verbose:
-            print(f"[EPUB DEBUG] block #{block_index}")
-            print(f"  type = {repr(getattr(b, 'type', None))}")
-            print(f"  image_path = {repr(getattr(b, 'image_path', None))}")
-
-        # 强制跳过没有图片路径的 block
-        if getattr(b, "image_path", None) is None:
-            if verbose:
-                print("  skip: no image_path")
+        # 强制跳过没有图片路径或不是图片引用的 block。
+        if not getattr(b, "image_path", None):
             continue
-
-        # 支持字符串类型和枚举类型
         if str(b.type) not in ("image_ref", "IMAGE_REF", "BlockType.IMAGE_REF"):
-            if verbose:
-                print(f"  skip: unsupported type {str(b.type)}")
             continue
 
         src = Path(b.image_path)
-        if verbose:
-            print(f"[EPUB IMAGE] {src} exists={src.exists()}")
         if not src.exists():
             if verbose:
-                print(f"[EPUB IMAGE MISS] {src}")
+                print(f"  ⚠️ 插图文件不存在，已跳过: {src}")
             continue
-        # 跳过封面（已单独处理）
-        page_info = next((p for p in doc.pages if p.image_path == b.image_path), None)
-        if page_info and page_info.page_type == BlockType.COVER:
+        # 只跳过“实际被选作 EPUB 封面”的那一张。页面管理有时会把
+        # 卷首彩页、扉页等连续多页都标为 cover；旧逻辑因此把第 2～N 张
+        # 也全部丢掉，导致插图数量和位置错乱。其余 IMAGE_REF 必须按
+        # UnifiedDocument.blocks 原始顺序进入 spine。
+        if cover_page and _same_file(b.image_path, cover_page.image_path):
             continue
 
         illus_idx += 1
-        ext  = src.suffix.lower()
-        fname = f"illus_{illus_idx:03d}{ext}"
-        shutil.copy2(src, oebps / "images" / fname)
+        fname, _mime = _copy_epub_image(
+            src, oebps / "images", f"illus_{illus_idx:03d}",
+            preserve_bytes=preserve_image_bytes,
+        )
         image_manifest[block_index] = (f"img-{illus_idx:03d}", f"images/{fname}")
+
+    # 按对象身份缓存索引，避免章节循环中反复执行 list.index 的 O(n²) 扫描。
+    block_index_by_identity = {id(block): index for index, block in enumerate(doc.blocks)}
 
     # ── 将 blocks 分组为章节 ─────────────────────────────────────────────────
     # chapter 0 = 书前（序言之前的内容）
@@ -396,6 +660,29 @@ p.dialogue {
     if current_blocks:
         chapters.append((current_title, current_blocks))
 
+    # AI/OCR 偶尔会在文档末尾留下一个只有章节标题、没有正文/插图的伪章节。
+    # 这种空壳章节不应进入 nav、manifest 或 spine。只从末尾连续清理，
+    # 不影响正文中有意存在的标题页。
+    def _has_substantive_chapter_content(blocks: list[Block]) -> bool:
+        for block in blocks:
+            if (block.metadata or {}).get("consumed"):
+                continue
+            if bool((block.metadata or {}).get("ai_repair_keep_empty", False)):
+                return True
+            if block.type == BlockType.IMAGE_REF:
+                return True
+            if block.type == BlockType.CHAPTER:
+                continue
+            text = _sanitize_export_text(block.text or "")
+            if text and text not in _ORPHAN_CLOSING_QUOTES:
+                return True
+        return False
+
+    while chapters and chapters[-1][0] != FRONT_MATTER_TITLE and not _has_substantive_chapter_content(chapters[-1][1]):
+        removed_title, _ = chapters.pop()
+        if verbose:
+            print(f"  ⚠️ 跳过末尾空章节: {removed_title}")
+
     # ── 生成每章 XHTML ───────────────────────────────────────────────────────
     # (id, href, title, in_toc) —— in_toc=False 的条目（插图页、章节续篇）
     # 仍然写入 spine/manifest 保证翻页顺序正确，但不出现在读者可见的目录里，
@@ -408,7 +695,7 @@ p.dialogue {
         xhtml = _xhtml_wrap(title, cover_body)
         fname = "content/cover.xhtml"
         (oebps / fname).write_text(xhtml, encoding="utf-8")
-        content_files.append(("cover-page", fname, "表紙", True))
+        content_files.append(("cover-page", fname, "表紙", False))
 
     # 正文章节
     # 关键：插图必须在 spine 中出现在它前面的正文之后、后面的正文之前，
@@ -446,16 +733,15 @@ p.dialogue {
             lines = []
 
         for b in blocks:
+            if (b.metadata or {}).get("consumed"):
+                continue
             if b.type == BlockType.IMAGE_REF:
                 # 插图前面攒的文字必须先落盘，保持它在 spine 中位于插图之前
                 _flush_text_fragment(is_first=(fragment_idx == 0))
 
                 # 使用 block 身份作为图片索引，避免 title_page/toc_page 等
                 # 无正文锚点的 IMAGE_REF 互相覆盖
-                try:
-                    block_index = doc.blocks.index(b)
-                except ValueError:
-                    block_index = -1
+                block_index = block_index_by_identity.get(id(b), -1)
                 img_info = image_manifest.get(block_index)
                 if img_info:
                     img_id, img_href = img_info
@@ -470,7 +756,13 @@ p.dialogue {
                     content_files.append((f"{ch_id}-{img_id}", illus_fname, "挿絵", False))
                     chapter_has_content = True
             else:
-                xhtml_piece = _block_to_xhtml(b)
+                clean_text = _sanitize_export_text(b.text or "")
+                keep_empty = bool((b.metadata or {}).get("ai_repair_keep_empty", False))
+                if (not clean_text and not keep_empty) or clean_text in _ORPHAN_CLOSING_QUOTES:
+                    continue
+                export_block = copy.copy(b)
+                export_block.text = clean_text
+                xhtml_piece = _block_to_xhtml(export_block)
                 lines.append(xhtml_piece)
                 chapter_has_content = True
 
@@ -515,28 +807,28 @@ p.dialogue {
         '    <item id="css" href="styles/style.css" media-type="text/css"/>',
     ]
     if cover_img_href:
-        ext = Path(cover_img_href).suffix.lower()
-        mime = "image/jpeg" if ext in (".jpg", ".jpeg") else "image/png"
         manifest_lines.append(
-            f'    <item id="{cover_img_id}" href="{cover_img_href}" media-type="{mime}" properties="cover-image"/>'
+            f'    <item id="{cover_img_id}" href="{cover_img_href}" media-type="{cover_img_mime}" properties="cover-image"/>'
         )
 
     for img_id, img_href in image_manifest.values():
         ext  = Path(img_href).suffix.lower()
-        mime = "image/jpeg" if ext in (".jpg", ".jpeg") else "image/png"
+        mime = _EPUB_IMAGE_MIME.get(ext, "image/png")
         manifest_lines.append(f'    <item id="{img_id}" href="{img_href}" media-type="{mime}"/>')
 
     for fid, href, _, _ in content_files:
-        props = ' properties="svg"' if "illus" in fid else ""
+        # Raster illustration XHTML is ordinary XHTML; properties="svg" is
+        # only legal when the content document actually contains embedded SVG.
         manifest_lines.append(
-            f'    <item id="{fid}" href="{href}" media-type="application/xhtml+xml"{props}/>'
+            f'    <item id="{fid}" href="{href}" media-type="application/xhtml+xml"/>'
         )
 
-    # spine items（页面顺序，包含插图页/续篇片段，保证翻页顺序正确）
-    # nav 插在"前书页"（封面/扉页/目录扫描页等）之后、第一章正文之前，
-    # 而不是无条件排在最前面（那样会跑到封面前面去）。
+    # spine items（页面顺序，包含插图页/续篇片段，保证翻页顺序正确）。
+    # EPUB 3 的 nav 文档只需进入 manifest；默认不进入 spine，避免部分阅读器
+    # 把“目次”当作正文页面翻到。仅在显式兼容旧阅读器时插入。
     spine_fids = [fid for fid, _, _, _ in content_files]
-    spine_fids.insert(nav_insert_index, "nav")
+    if include_nav_in_spine:
+        spine_fids.insert(nav_insert_index, "nav")
     spine_lines = [f'    <itemref idref="{fid}"/>' for fid in spine_fids]
 
     # cover meta
@@ -601,20 +893,46 @@ p.dialogue {
     """), encoding="utf-8")
 
     # ── 打包 EPUB（zip）─────────────────────────────────────────────────────
-    if out.exists():
-        out.unlink()
+    # Never delete/overwrite the user's previous book until a complete new ZIP
+    # has been written and reopened successfully.  A failed build therefore
+    # leaves the last known-good EPUB untouched.
+    out.parent.mkdir(parents=True, exist_ok=True)
+    fd, staged_name = tempfile.mkstemp(
+        prefix=f".{out.stem}.", suffix=".epub.tmp", dir=out.parent
+    )
+    os.close(fd)
+    staged_out = Path(staged_name)
+    try:
+        with zipfile.ZipFile(staged_out, "w", zipfile.ZIP_DEFLATED, allowZip64=True) as zf:
+            # mimetype 必须是第一个文件，且不压缩
+            zf.writestr(
+                zipfile.ZipInfo("mimetype"),
+                "application/epub+zip",
+                compress_type=zipfile.ZIP_STORED,
+            )
+            for fpath in tmp.rglob("*"):
+                if fpath.is_file():
+                    arcname = str(fpath.relative_to(tmp))
+                    zf.write(fpath, arcname)
 
-    with zipfile.ZipFile(out, "w", zipfile.ZIP_DEFLATED) as zf:
-        # mimetype 必须是第一个文件，且不压缩
-        zf.writestr(
-            zipfile.ZipInfo("mimetype"),
-            "application/epub+zip",
-            compress_type=zipfile.ZIP_STORED,
-        )
-        for fpath in tmp.rglob("*"):
-            if fpath.is_file():
-                arcname = str(fpath.relative_to(tmp))
-                zf.write(fpath, arcname)
+        # Reopen before commit to catch central-directory/truncation failures.
+        with zipfile.ZipFile(staged_out, "r") as check_zip:
+            names = check_zip.namelist()
+            if not names or names[0] != "mimetype":
+                raise RuntimeError("EPUB 打包失败：mimetype 不是 ZIP 第一项")
+            if check_zip.read("mimetype") != b"application/epub+zip":
+                raise RuntimeError("EPUB 打包失败：mimetype 内容无效")
+            bad_member = check_zip.testzip()
+            if bad_member:
+                raise RuntimeError(f"EPUB 打包失败：ZIP 成员损坏 {bad_member}")
+        os.replace(staged_out, out)
+        # The optional companion CSS belongs to the committed EPUB version.
+        if companion is not None and companion_css is not None:
+            atomic_write_text(companion, companion_css)
+            if verbose:
+                print(f"  🎨 AI 排版 CSS: {companion.name}")
+    finally:
+        staged_out.unlink(missing_ok=True)
 
     # ── 清理临时目录 ─────────────────────────────────────────────────────────
     shutil.rmtree(tmp)

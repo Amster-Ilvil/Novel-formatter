@@ -9,6 +9,26 @@ from html.parser import HTMLParser
 from models.document import UnifiedDocument, Block, BlockType, PageInfo
 
 
+_IGNORED_TEXT_LABELS = {
+    "number", "footnote", "header", "header_image",
+    "footer", "footer_image", "aside_text",
+}
+
+
+def _block_type_from_label(label, page_type):
+    """Map Paddle layout labels to the closest UnifiedDocument block type."""
+    normalized = str(label or "").strip().lower()
+    if normalized in {"doc_title", "title", "chapter_title"}:
+        return BlockType.CHAPTER
+    if normalized in {"section_title", "section", "sub_title"}:
+        return BlockType.SECTION
+    if normalized in {"footnote"}:
+        return BlockType.FOOTNOTE
+    if normalized in {"header", "footer", "number", "aside_text"}:
+        return BlockType.HEADER_FOOTER
+    return page_type
+
+
 def _safe_type(value):
     try:
         return BlockType(value)
@@ -177,18 +197,35 @@ def import_paddle_json(
                 if not isinstance(raw_block, dict):
                     continue
                 raw_text = raw_block.get("block_content") or raw_block.get("text") or raw_block.get("content") or ""
-                for line in _strip_html(raw_text).splitlines():
+                block_label = raw_block.get("block_label") or raw_block.get("label") or raw_block.get("type")
+                normalized_label = str(block_label or "").strip().lower()
+                if normalized_label in _IGNORED_TEXT_LABELS:
+                    continue
+                block_type = _block_type_from_label(block_label, page_type)
+                # A physical Paddle block may contain intentional paragraph breaks. Preserve each
+                # non-empty line as its own unit, but keep a shared physical_block_index so later
+                # stages can still distinguish intra-block lines from neighbouring OCR columns.
+                for line_index, line in enumerate(_strip_html(raw_text).splitlines()):
                     line = line.strip()
                     if line:
                         doc.blocks.append(Block(
-                            type=page_type,
+                            type=block_type,
                             text=line,
                             page=page,
                             page_index=norm_idx,
                             page_number=page,
                             order_in_page=raw_block.get("block_order") or block_index,
-                            source_format="json",
-                            metadata={"bbox": raw_block.get("block_bbox")},
+                            source_format="paddleocr_vl_json",
+                            text_direction="vertical" if normalized_label == "vertical_text" else None,
+                            metadata={
+                                "bbox": raw_block.get("block_bbox"),
+                                "polygon_points": raw_block.get("block_polygon_points"),
+                                "block_label": block_label,
+                                "physical_block_index": block_index,
+                                "line_index_in_block": line_index,
+                                "preserve_boundary": True,
+                                "source_schema": "paddleocr_vl",
+                            },
                         ))
         # ---- 按行拆分，每行一个 Block，并保留页码元数据 ----
         elif plain_text and not is_special:

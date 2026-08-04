@@ -39,14 +39,15 @@ from models.document import (
 COL_WIDTH = 20
 FURIGANA_SIZE_THRESHOLD = 8.0
 
+JP_CHAPTER_NUMBER = r'[一二三四五六七八九十百千〇零\d０-９]+'
+CHAPTER_UNIT = r'[章話節巻回幕篇編]'
+CHAPTER_CONTINUATION = r'(?:は|が|を|に|で|と|も|の|です|だ|という)'
 CHAPTER_RE = re.compile(
-    # フロローグ：竖排 PDF 字符提取常把"プ"的半浊点丢掉错读成"フ"，
-    # 「フロローグ」本身不是真实存在的日语词，只可能是"プロローグ"的错读，
-    # 一并纳入识别正则，避免序章因此漏检、跟正文粘连在一起。
-    r'^(序章|終章|プロローグ|フロローグ|エピローグ|後記|あとがき|'
-    r'幕間[\s　]?.*|'
-    r'第[一二三四五六七八九十百〇零\d]+[章話節巻](?!(は|が|を|に|で|と|も|の|です|だ|という))'
-    r'|Chapter\s*\d+)',
+    rf'^(序章|終章|プロローグ|フロローグ|ブロローグ|エピローグ|後記|あとがき|'
+    rf'幕間(?:[\s　:：・—―-].*)?|'
+    rf'第[\s　]*{JP_CHAPTER_NUMBER}[\s　]*{CHAPTER_UNIT}(?!{CHAPTER_CONTINUATION})|'
+    rf'{JP_CHAPTER_NUMBER}[\s　]*[話章節回](?=$|[\s　:：・—―「『【（(]|前編|後編|上編|中編|下編)|'
+    rf'(?:Chapter|Episode|EP)[\s　.．_-]*[\d０-９]+)',
     re.IGNORECASE
 )
 DIALOGUE_START = ('「', '『')
@@ -86,6 +87,44 @@ def _is_page_number(chars: list[dict], page_height: float) -> bool:
         return False
     avg_y = sum(ch["y"] for ch in chars) / len(chars)
     return avg_y > page_height * 0.80
+
+
+def _page_orientation(data: dict) -> str:
+    """按 PyMuPDF rawdict 的 line 级 wmode/dir + 字符几何判定页面书写方向。
+
+    返回 "vertical" 或 "horizontal"。判定极其保守：默认竖排（与旧行为一致），
+    只有 wmode/dir 与字符几何两类证据都强烈指向横排时才切换——避免把
+    "标了横排 dir 但实际按竖排逐字定位"的 PDF 误判而破坏原有正确输出。
+    """
+    vert_chars = 0
+    horiz_chars = 0
+    for block in data.get("blocks", []):
+        for line in block.get("lines", []):
+            n = sum(len(s.get("chars", [])) for s in line.get("spans", []))
+            if n == 0:
+                continue
+            if int(line.get("wmode", 0)) == 1:
+                vert_chars += n
+                continue
+            direction = line.get("dir", (1, 0))
+            dir_vertical = abs(direction[1]) > abs(direction[0])
+            if dir_vertical:
+                vert_chars += n
+                continue
+            # wmode=0 且 dir 水平：用该行字符实际散布方向佐证
+            xs, ys = [], []
+            for span in line.get("spans", []):
+                for ch in span.get("chars", []):
+                    xs.append(ch["origin"][0])
+                    ys.append(ch["origin"][1])
+            if len(xs) >= 3 and (max(ys) - min(ys)) > (max(xs) - min(xs)):
+                vert_chars += n  # 几何上是竖列，dir 标注不可信
+            else:
+                horiz_chars += n
+    # 横排需要压倒性多数（2:1）才切换；否则保持旧竖排路径
+    if horiz_chars > max(1, vert_chars) * 2:
+        return "horizontal"
+    return "vertical"
 
 
 def _detect_block_type(text: str) -> BlockType:
@@ -135,7 +174,9 @@ def extract_pdf_text_layer(
 
     pdf = fitz.open(pdf_path)
     doc = UnifiedDocument()
-    doc.metadata = Metadata(source_engine="pdf_text_layer", language="ja")
+    doc.metadata = Metadata(
+        source_engine="pdf_text_layer", language="ja", pdf_text_layer_mode=True
+    )
 
     order_counter = 0
     chapter_index = 0
@@ -187,12 +228,24 @@ def extract_pdf_text_layer(
                                 "size": font_size,
                             })
 
-        chars.sort(key=lambda ch: (-round(ch["x"] / col_width), ch["y"]))
+        # wmode/dir 硬化的方向判定：竖排页走原路径（右→左列、列内上→下），
+        # 横排页（版权页/奥付等）按行序（上→下行、行内左→右）输出，避免乱序。
+        orientation = _page_orientation(data)
+        if orientation == "horizontal":
+            sort_key = lambda ch: (round(ch["y"] / col_width), ch["x"])
+        else:
+            sort_key = lambda ch: (-round(ch["x"] / col_width), ch["y"])
+        group_key = (
+            (lambda ch: round(ch["y"] / col_width))
+            if orientation == "horizontal"
+            else (lambda ch: -round(ch["x"] / col_width))
+        )
+        chars.sort(key=sort_key)
 
         page_blocks: list[Block] = []
         page_w = page.rect.width
 
-        for _, group in groupby(chars, key=lambda ch: -round(ch["x"] / col_width)):
+        for _, group in groupby(chars, key=group_key):
             group = list(group)
 
             if _is_page_number(group, page_height):
