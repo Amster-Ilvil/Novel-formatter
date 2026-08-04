@@ -53,3 +53,20 @@ OCR 模型只在用户主动选择对应功能时准备，模型权重和缓存�
 ## 许可证
 
 使用或再分发第三方资源前，请阅读 `third_party/` 中的许可证和说明文件。
+
+## 参考项目与引用
+
+本项目的接口设计、运行适配或资源来源参考了以下公开项目和官方文档：
+
+- [Qt for Python / PySide6](https://doc.qt.io/qtforpython/)：桌面图形界面。
+- [Apple Vision](https://developer.apple.com/documentation/vision)：macOS 原生图像文字识别。
+- [PaddleOCR](https://github.com/PaddlePaddle/PaddleOCR)：可选的通用 OCR 适配器。
+- [NDLOCR-Lite](https://github.com/ndl-lab/ndlocr-lite)：日文 OCR 适配器。
+- [Manga Image Translator](https://github.com/zyddnys/manga-image-translator)：48px 日文 OCR 参考实现及模型接口。
+- [Open Model Zoo](https://github.com/openvinotoolkit/open_model_zoo)：可选手写识别模型来源。
+- [PyMuPDF](https://pymupdf.readthedocs.io/)：PDF 页面和文字层处理。
+- [python-docx](https://python-docx.readthedocs.io/)：DOCX 文档处理。
+- [Pillow](https://python-pillow.org/)：图像读取、裁切和预处理。
+- [jlect-jhr](https://github.com/ZacharyRead/jlect-jhr)：手写输入辅助资源，许可证见 `third_party/jlect_jhr/LICENSE.txt`。
+
+模型权重、第三方服务和外部项目的许可证分别由其原项目负责；本仓库不重新发布模型权重。
