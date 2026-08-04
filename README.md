@@ -1,6 +1,8 @@
 # Novel Formatter
 
-Novel Formatter 是一款 macOS 桌面排版工具，面向图片/PDF OCR、日文竖排文字处理、多模型 OCR 对比、人工校对、文本格式化和 EPUB 导出。
+Novel Formatter 是一款适配 macOS 和 Windows 的桌面排版工具，面向图片/PDF OCR、日文竖排文字处理、多模型 OCR 对比、人工校对、文本格式化和 EPUB 导出。
+
+Windows 已支持源码安装和主程序运行。macOS 专用的 Apple Vision、Swift OCR Helper 和 Apple Pencil 手写识别功能仅在 macOS 上可用；Windows 用户可以使用 NDLOCR、Manga OCR、PaddleOCR、YomiToku 等跨平台 OCR 引擎。
 
 本项目为非盈利、非商业性质，仅用于个人学习、研究和非商业用途。项目不提供商业服务，也不以软件、模型或相关资源进行商业销售。
 
@@ -8,9 +10,11 @@ Novel Formatter 是一款 macOS 桌面排版工具，面向图片/PDF OCR、日�
 
 ### 一、准备系统环境
 
-建议使用 macOS 15 或更高版本，并准备 Python 3.10 或更高版本。Apple Vision 和原生手写识别功能需要 macOS 的系统框架；如果要编译原生辅助程序，还需要 Xcode Command Line Tools。
+macOS 建议使用 macOS 15 或更高版本，并准备 Python 3.10 或更高版本。Windows 建议使用 Windows 10/11 64 位系统，并准备 Python 3.10 或更高版本。
 
-检查系统版本和 Python：
+Apple Vision 和原生手写识别功能需要 macOS 的系统框架；如果要编译原生辅助程序，还需要 Xcode Command Line Tools。Windows 不需要安装 Xcode。
+
+macOS 检查系统版本和 Python：
 
 ```bash
 sw_vers
@@ -18,6 +22,13 @@ python3 --version
 ```
 
 如果没有 Python，可从 [Python 官方网站](https://www.python.org/downloads/macos/) 安装。安装完成后重新打开终端，再执行上面的版本检查。
+
+Windows 用户可从 [Python 官方网站](https://www.python.org/downloads/windows/) 安装 Python。安装时务必勾选 **Add Python to PATH**，然后在 PowerShell 中检查：
+
+```powershell
+py --version
+python --version
+```
 
 ### 二、下载源码
 
@@ -56,7 +67,40 @@ deactivate
 
 如果只需要打开界面，也可以只安装核心依赖；但完整的 `requirements.txt` 能启用 PDF、DOCX、EPUB、AI 和图像处理功能。
 
-### 四、启动程序
+### 四、Windows 安装与启动
+
+Windows 用户在项目目录打开 PowerShell，执行：
+
+```powershell
+py -3 -m venv .venv
+.\.venv\Scripts\Activate.ps1
+python -m pip install --upgrade pip
+python -m pip install -r requirements.txt
+python gui_pyside6.py
+```
+
+如果 PowerShell 阻止虚拟环境脚本运行，可仅对当前用户允许本地脚本：
+
+```powershell
+Set-ExecutionPolicy -Scope CurrentUser RemoteSigned
+```
+
+然后重新执行：
+
+```powershell
+.\.venv\Scripts\Activate.ps1
+python gui_pyside6.py
+```
+
+也可以不使用 PowerShell 激活虚拟环境，直接调用虚拟环境中的 Python：
+
+```powershell
+.\.venv\Scripts\python.exe gui_pyside6.py
+```
+
+Windows 不使用项目中的 `.command` 启动脚本；这些脚本用于 macOS。首次使用 OCR 模型时，程序会在本机创建或准备对应的模型运行环境，模型权重不会上传到 GitHub。
+
+### 五、启动程序
 
 #### 方式 A：使用终端启动
 
@@ -87,7 +131,7 @@ python run.py /path/to/images/ output.epub --title "书名" --author "作者"
 
 输入路径和输出路径可以替换成实际文件夹或文件名。带空格的路径必须使用引号包裹。
 
-### 五、配置 Apple Vision 原生助手
+### 六、配置 Apple Vision 原生助手
 
 普通 Apple Vision OCR 可直接使用系统能力。若要启用项目附带的原生识别辅助程序，先安装 Xcode Command Line Tools：
 
@@ -104,7 +148,7 @@ chmod +x build_apple_vision_helper.command
 
 编译成功后重新启动程序。若当前 macOS 或 Xcode 不支持对应原生接口，程序会使用可用的回退路径，不影响其他 OCR 功能。
 
-### 六、准备可选 OCR 模型
+### 七、准备可选 OCR 模型
 
 模型权重不包含在 GitHub 仓库中。第一次使用某个 OCR 引擎时，程序会在本机准备对应运行环境或模型缓存。
 
@@ -125,7 +169,7 @@ chmod +x prepare_48px_ar.command
 
 模型准备过程中不要删除项目的本地缓存目录，也不要同时启动多个 OCR 任务。下载失败时重新打开程序，通常会从已完成的部分继续校验或重新准备。
 
-### 七、第一次使用流程
+### 八、第一次使用流程
 
 1. 启动 `gui_pyside6.py` 或 `run_novel_formatter.command`。
 2. 在页面管理中导入图片文件夹或 PDF。
