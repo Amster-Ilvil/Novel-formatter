@@ -23,6 +23,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 import uuid
+from contextlib import contextmanager
 from dataclasses import asdict, dataclass, replace
 from datetime import datetime, timezone
 from pathlib import Path
@@ -30,6 +31,12 @@ from typing import Callable, Iterable
 
 from utils.atomic_io import atomic_write_json
 from utils.safe_archive import safe_extract_zip
+from utils.platform_download import (
+    DownloadCancelled as PlatformDownloadCancelled,
+    DownloadError as PlatformDownloadError,
+    download_file as platform_download_file,
+    download_first as platform_download_first,
+)
 
 ROOT = Path(__file__).resolve().parents[1]
 STATE_DIR = ROOT / ".manual-model-updates"
@@ -155,6 +162,31 @@ class _UpdateLock:
 def _pid_is_running(pid: int) -> bool:
     if pid <= 0:
         return False
+    if os.name == "nt":
+        # ``os.kill(pid, 0)`` is not a portable existence probe on Windows.
+        # Query the process handle without sending a signal.
+        try:
+            import ctypes
+            from ctypes import wintypes
+
+            process_query_limited_information = 0x1000
+            still_active = 259
+            kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+            kernel32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+            kernel32.OpenProcess.restype = wintypes.HANDLE
+            kernel32.GetExitCodeProcess.argtypes = [wintypes.HANDLE, ctypes.POINTER(wintypes.DWORD)]
+            kernel32.GetExitCodeProcess.restype = wintypes.BOOL
+            kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+            handle = kernel32.OpenProcess(process_query_limited_information, False, int(pid))
+            if not handle:
+                return False
+            try:
+                code = wintypes.DWORD()
+                return bool(kernel32.GetExitCodeProcess(handle, ctypes.byref(code))) and code.value == still_active
+            finally:
+                kernel32.CloseHandle(handle)
+        except Exception:
+            return False
     try:
         os.kill(pid, 0)
     except ProcessLookupError:
@@ -578,32 +610,62 @@ def _download_file(
     cancel_check: CancelCheck | None,
     timeout: float = 120.0,
 ) -> Path:
-    destination.parent.mkdir(parents=True, exist_ok=True)
-    part = destination.with_suffix(destination.suffix + ".part")
-    part.unlink(missing_ok=True)
     try:
-        with urllib.request.urlopen(
-            _request(url, accept="application/octet-stream,*/*;q=0.8"),
+        return platform_download_file(
+            url,
+            destination,
+            label=label,
+            progress_callback=progress_callback,
+            cancel_check=cancel_check,
             timeout=timeout,
-        ) as response, part.open("wb") as output:
-            try:
-                total = int(response.headers.get("Content-Length") or 0)
-            except (TypeError, ValueError):
-                total = 0
-            current = 0
-            while True:
-                if _cancelled(cancel_check):
-                    raise ModelUpdateCancelled(f"用户取消下载 {label}")
-                chunk = response.read(1024 * 1024)
-                if not chunk:
-                    break
-                output.write(chunk)
-                current += len(chunk)
-                _emit(progress_callback, "download", current, total, label)
-        os.replace(part, destination)
-        return destination
+        )
+    except PlatformDownloadCancelled as exc:
+        raise ModelUpdateCancelled(str(exc)) from exc
+    except PlatformDownloadError as exc:
+        raise ModelUpdateError(str(exc)) from exc
+
+
+@contextmanager
+def _temporary_environment(values: dict[str, str]):
+    previous = {key: os.environ.get(key) for key in values}
+    try:
+        for key, value in values.items():
+            os.environ[key] = str(value)
+        yield
     finally:
-        part.unlink(missing_ok=True)
+        for key, value in previous.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
+
+
+def _replace_path(source: Path, destination: Path, *, attempts: int = 8) -> None:
+    """Rename a file/directory with short Windows antivirus retry boundaries."""
+    last_error: Exception | None = None
+    for attempt in range(max(1, attempts)):
+        try:
+            os.replace(source, destination)
+            return
+        except PermissionError as exc:
+            last_error = exc
+            if os.name != "nt" or attempt + 1 >= attempts:
+                raise
+            time.sleep(0.15 * (attempt + 1))
+    if last_error is not None:
+        raise last_error
+
+
+def _remove_tree(path: Path, *, attempts: int = 8) -> None:
+    for attempt in range(max(1, attempts)):
+        shutil.rmtree(path, ignore_errors=True)
+        if not path.exists():
+            return
+        if os.name != "nt" or attempt + 1 >= attempts:
+            break
+        time.sleep(0.15 * (attempt + 1))
+    if path.exists():
+        raise ModelUpdateError(f"无法清理旧运行目录，可能仍被其他进程占用：{path}")
 
 
 def _record_history(component_id: str, from_revision: str, to_revision: str, result: str) -> None:
@@ -656,31 +718,83 @@ def _update_manga_48px(
     progress_callback: ProgressCallback | None,
     cancel_check: CancelCheck | None,
 ) -> str:
-    from adapters.manga_48px_runtime import HF_REVISION, ensure_runtime_files
+    from adapters.manga_48px_runtime import (
+        DEFAULT_DICT_URLS,
+        DEFAULT_MODEL_URLS,
+        DICT_SHA256,
+        HF_REVISION,
+        MODEL_SHA256,
+        MODEL_SIZE,
+        ensure_runtime_files,
+    )
 
     cache_parent = ROOT / ".model-cache"
     cache_parent.mkdir(parents=True, exist_ok=True)
     live = cache_parent / "manga-48px-ar"
     stage = cache_parent / f".manga-48px-ar.update-{uuid.uuid4().hex}"
+    seed = cache_parent / f".manga-48px-ar.windows-seed-{uuid.uuid4().hex}"
     backup: Path | None = None
     try:
-        _emit(progress_callback, "prepare", 0, 1, "下载并校验 48px AR 兼容权重")
-        ensure_runtime_files(
-            stage,
-            progress_callback=progress_callback,
-            cancel_check=cancel_check,
-        )
+        if os.name == "nt":
+            # The OCR runtime itself remains unchanged. On Windows the manual
+            # updater pre-downloads large files through BITS/curl.exe and feeds
+            # them into the existing verified local-import path.
+            seed.mkdir(parents=True, exist_ok=True)
+            model_seed = seed / "ocr_ar_48px.ckpt"
+            dict_seed = seed / "alphabet-all-v7.txt"
+            try:
+                platform_download_first(
+                    DEFAULT_MODEL_URLS,
+                    model_seed,
+                    label="48px AR 官方权重（Windows）",
+                    progress_callback=progress_callback,
+                    cancel_check=cancel_check,
+                    timeout=1800.0,
+                )
+                platform_download_first(
+                    DEFAULT_DICT_URLS,
+                    dict_seed,
+                    label="48px AR 字符表（Windows）",
+                    progress_callback=progress_callback,
+                    cancel_check=cancel_check,
+                    timeout=300.0,
+                )
+            except PlatformDownloadCancelled as exc:
+                raise ModelUpdateCancelled(str(exc)) from exc
+            except PlatformDownloadError as exc:
+                raise ModelUpdateError(str(exc)) from exc
+            if model_seed.stat().st_size != MODEL_SIZE or _sha256(model_seed) != MODEL_SHA256:
+                raise ModelUpdateError("Windows 下载的 48px AR 权重大小或 SHA-256 校验失败")
+            if dict_seed.stat().st_size < 1_000 or _sha256(dict_seed) != DICT_SHA256:
+                raise ModelUpdateError("Windows 下载的 48px AR 字符表 SHA-256 校验失败")
+            environment = {
+                "NOVEL_FORMATTER_MANGA_48PX_MODEL_FILE": str(model_seed),
+                "NOVEL_FORMATTER_MANGA_48PX_DICT_FILE": str(dict_seed),
+            }
+            with _temporary_environment(environment):
+                ensure_runtime_files(
+                    stage,
+                    progress_callback=progress_callback,
+                    cancel_check=cancel_check,
+                )
+        else:
+            _emit(progress_callback, "prepare", 0, 1, "下载并校验 48px AR 兼容权重")
+            ensure_runtime_files(
+                stage,
+                progress_callback=progress_callback,
+                cancel_check=cancel_check,
+            )
         if _cancelled(cancel_check):
             raise ModelUpdateCancelled("用户取消 48px AR 模型更新")
         _emit(progress_callback, "replace", 0, 1, "原子替换 48px AR 模型目录")
         if live.exists():
             backup = _backup_path("manga-48px-ar")
-            os.replace(live, backup)
+            _replace_path(live, backup)
         try:
-            os.replace(stage, live)
+            _replace_path(stage, live)
         except Exception:
             if backup is not None and backup.exists() and not live.exists():
-                os.replace(backup, live)
+                _replace_path(backup, live)
             raise
         atomic_write_json(
             STATE_DIR / "manga_48px.json",
@@ -691,8 +805,14 @@ def _update_manga_48px(
         _emit(progress_callback, "done", 1, 1, "48px AR 兼容模型已手动安装并校验")
         return HF_REVISION
     finally:
-        if stage.exists():
-            shutil.rmtree(stage, ignore_errors=True)
+        for temporary in (stage, seed):
+            if temporary.exists():
+                try:
+                    _remove_tree(temporary)
+                except Exception:
+                    # A completed replacement must not be reported as failed
+                    # only because antivirus temporarily holds a staging file.
+                    shutil.rmtree(temporary, ignore_errors=True)
 
 
 def _find_hf_snapshot_python() -> Path:
@@ -725,15 +845,21 @@ def _update_manga_ocr(
     cache.mkdir(parents=True, exist_ok=True)
     script = (
         "from huggingface_hub import snapshot_download; "
-        "import sys; "
-        "path=snapshot_download(repo_id='kha-white/manga-ocr-base', "
-        "revision=sys.argv[1], cache_dir=sys.argv[2], resume_download=True); "
-        "print(path)"
+        "from pathlib import Path; import os,sys; "
+        "cache=Path(sys.argv[2]); local=cache/'manual-snapshots'/sys.argv[1]; "
+        "local.mkdir(parents=True, exist_ok=True); "
+        "kwargs=dict(repo_id='kha-white/manga-ocr-base', revision=sys.argv[1], "
+        "cache_dir=str(cache), local_dir=str(local), resume_download=True); "
+        "kwargs.update({'local_dir_use_symlinks': False}) if os.name=='nt' else None; "
+        "path=snapshot_download(**kwargs); print(path)"
     )
     _emit(progress_callback, "download", 0, 0, f"下载 Manga OCR {revision[:12]}")
     env = os.environ.copy()
     env.setdefault("HF_HUB_DISABLE_XET", "1")
     env.setdefault("HF_HUB_DISABLE_SYMLINKS_WARNING", "1")
+    if os.name == "nt":
+        env.setdefault("HF_HUB_DISABLE_XET", "1")
+        env.setdefault("HF_HUB_ENABLE_HF_TRANSFER", "0")
     try:
         process = subprocess.Popen(
             [str(python), "-c", script, revision, str(cache)],
@@ -857,7 +983,7 @@ def _prepare_ndlocr_source(
         if len([path for path in model_dir.glob("*.onnx") if _real_onnx(path)]) < 4:
             raise ModelUpdateError("NDLOCR-Lite ONNX 模型数量不足")
         prepared = runtime_root / f".ndlocr-lite.prepared-{uuid.uuid4().hex}"
-        os.replace(source, prepared)
+        _replace_path(source, prepared)
         return prepared
     finally:
         shutil.rmtree(work, ignore_errors=True)
@@ -880,11 +1006,11 @@ def _swap_ndlocr_runtime(
         _emit(progress_callback, "replace", 0, 3, "备份当前 NDLOCR-Lite 运行时")
         if live_source.exists():
             source_backup = _backup_path("ndlocr-lite-source")
-            os.replace(live_source, source_backup)
+            _replace_path(live_source, source_backup)
         if live_venv.exists():
             venv_backup = _backup_path("ndlocr-lite-venv")
-            os.replace(live_venv, venv_backup)
-        os.replace(prepared_source, live_source)
+            _replace_path(live_venv, venv_backup)
+        _replace_path(prepared_source, live_source)
         (live_source / ".novel-formatter-ndlocr-ref").write_text(revision + "\n", encoding="utf-8")
         _emit(progress_callback, "replace", 1, 3, "创建新的独立 NDLOCR-Lite 环境")
         ensure_venv(
@@ -903,9 +1029,9 @@ def _swap_ndlocr_runtime(
         shutil.rmtree(live_source, ignore_errors=True)
         shutil.rmtree(live_venv, ignore_errors=True)
         if source_backup is not None and source_backup.exists():
-            os.replace(source_backup, live_source)
+            _replace_path(source_backup, live_source)
         if venv_backup is not None and venv_backup.exists():
-            os.replace(venv_backup, live_venv)
+            _replace_path(venv_backup, live_venv)
         raise
     _prune_backups("ndlocr-lite-source", keep=1)
     _prune_backups("ndlocr-lite-venv", keep=1)

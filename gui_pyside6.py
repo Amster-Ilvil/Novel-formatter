@@ -26,6 +26,7 @@ import tempfile
 import shutil
 import time
 import subprocess
+import platform
 from pathlib import Path
 from collections import Counter, OrderedDict
 from bisect import bisect_left, bisect_right
@@ -21577,6 +21578,7 @@ class OCRModelUpdateDialog(QDialog):
             "本更新功能不会在启动时检查、不会后台轮询、不会自动下载更新包或替换已安装模型。"
             "打开本窗口只读取本地版本；必须点击“检查更新”，再选择模型并确认，才会联网更新。"
             "首次启用尚未安装的 OCR 引擎仍沿用原有的用户触发安装流程。"
+            + ("Windows 下载优先使用系统 BITS，失败后回退 curl.exe 和 Python HTTPS。" if os.name == "nt" else "macOS 下载继续使用现有 Python HTTPS / 系统 curl 路径。")
         )
         policy.setWordWrap(True)
         policy.setStyleSheet(
@@ -21930,6 +21932,9 @@ class SystemSettingsTab(QWidget):
     def __init__(self, parent=None):
         super().__init__(parent)
         self._settings = QSettings(self.SETTINGS_ORG, self.SETTINGS_APP)
+        self._device_detection_busy = False
+        self._device_detection_signals = None
+        self._device_report = None
         self._migrate_navigation_schema()
         if not self._settings.value(
             self.OCR_REVIEW_DEFAULT_CLOSED_MIGRATION_KEY, False, type=bool
@@ -22218,7 +22223,8 @@ class SystemSettingsTab(QWidget):
         manage_models = accent_button("管理 OCR 模型更新")
         manage_models.clicked.connect(self._open_ocr_model_updates)
         model_row.addWidget(manage_models)
-        model_note = QLabel("支持官方版本检查；仅对可安全独立替换的模型提供更新/修复。")
+        download_note = "Windows：BITS → curl.exe → Python HTTPS。" if os.name == "nt" else "macOS：保持 Python HTTPS / 系统 curl 下载路径。"
+        model_note = QLabel("支持官方版本检查；仅对可安全独立替换的模型提供更新/修复。" + download_note)
         model_note.setWordWrap(True)
         model_note.setObjectName("settingsCardSubtitle")
         model_row.addWidget(model_note, 1)
@@ -22236,12 +22242,38 @@ class SystemSettingsTab(QWidget):
         )
         for text, detail in (
             ("OCR 子进程 watchdog", "卡死或超时会结束异常子进程，并保留诊断信息。"),
-            ("MPS / CPU 安全回退", "模型加速不可用时按原有策略回退，避免整批任务崩溃。"),
+            ("跨平台加速安全回退", "CUDA、DirectML 或 MPS 不可用时按原有策略回退 CPU，检测结果不会自动改设置。"),
             ("后台任务代次隔离", "切书、清空或关闭窗口后，旧任务不能覆盖新界面。"),
             ("退出与清空时释放临时预览", "OCR 临时图只在工作区生命周期内保留。"),
         ):
             protection_box.addWidget(self._fixed_enabled_row(text, detail))
         layout.addWidget(protection_card)
+
+        device_card, device_box = self._make_card(
+            "设备与 GPU 检测",
+            "只在点击后读取本机硬件和已安装 OCR 独立环境；不会联网、不会安装驱动，也不会自动切换 OCR 设备。",
+        )
+        device_actions = QHBoxLayout()
+        self._detect_device_btn = accent_button("检测设备与 GPU")
+        self._detect_device_btn.clicked.connect(self._detect_devices)
+        device_actions.addWidget(self._detect_device_btn)
+        self._device_detection_status = QLabel("尚未检测。Windows 会检查 CIM、NVIDIA 驱动、CUDA/DirectML；Mac 会检查 Metal/MPS。")
+        self._device_detection_status.setWordWrap(True)
+        self._device_detection_status.setObjectName("settingsCardSubtitle")
+        device_actions.addWidget(self._device_detection_status, 1)
+        device_box.addLayout(device_actions)
+        self._device_detection_progress = QProgressBar()
+        self._device_detection_progress.setRange(0, 3)
+        self._device_detection_progress.setValue(0)
+        self._device_detection_progress.setVisible(False)
+        device_box.addWidget(self._device_detection_progress)
+        self._device_detection_output = QPlainTextEdit()
+        self._device_detection_output.setReadOnly(True)
+        self._device_detection_output.setMinimumHeight(180)
+        self._device_detection_output.setPlaceholderText("点击“检测设备与 GPU”后显示 CPU、内存、显卡、驱动以及各 OCR 运行时可用的 CUDA / DirectML / MPS 后端。")
+        self._device_detection_output.setStyleSheet(LIGHT_LOG_STYLE)
+        device_box.addWidget(self._device_detection_output)
+        layout.addWidget(device_card)
 
         long_book_card, long_book_box = self._make_card(
             "长篇书籍处理",
@@ -22261,7 +22293,7 @@ class SystemSettingsTab(QWidget):
         runtime_grid.setHorizontalSpacing(18)
         runtime_grid.setVerticalSpacing(7)
         runtime_rows = (
-            ("操作系统", f"{sys.platform} · {os.uname().machine if hasattr(os, 'uname') else 'unknown'}"),
+            ("操作系统", f"{platform.system() or sys.platform} {platform.release()} · {platform.machine() or 'unknown'}"),
             ("Python", sys.version.split()[0]),
             ("CPU 逻辑核心", str(os.cpu_count() or "未知")),
             ("程序目录", str(Path(__file__).resolve().parent)),
@@ -22279,6 +22311,122 @@ class SystemSettingsTab(QWidget):
         layout.addWidget(runtime_card)
         layout.addStretch(1)
         return scroll
+
+    def _detect_devices(self, _checked=False) -> None:
+        if self._device_detection_busy:
+            return
+        from utils.device_detection import detect_devices
+
+        self._device_detection_busy = True
+        self._detect_device_btn.setEnabled(False)
+        self._device_detection_progress.setVisible(True)
+        self._device_detection_progress.setRange(0, 3)
+        self._device_detection_progress.setValue(0)
+        self._device_detection_status.setText("正在检测本机设备和已安装 OCR 运行时…")
+        signals = WorkerSignals()
+        self._device_detection_signals = signals
+        signals.finished.connect(self._device_detection_finished)
+        signals.error.connect(self._device_detection_failed)
+        signals.overall_progress.connect(self._device_detection_progress_changed)
+
+        def callback(stage, current, total, detail):
+            signals.overall_progress.emit(
+                {"stage": stage, "current": current, "total": total, "detail": detail}
+            )
+
+        def worker():
+            try:
+                signals.finished.emit(detect_devices(progress_callback=callback))
+            except Exception as exc:
+                signals.error.emit(str(exc))
+
+        threading.Thread(target=worker, daemon=True, name="manual-device-gpu-detection").start()
+
+    def _device_detection_progress_changed(self, payload) -> None:
+        if not isinstance(payload, dict):
+            return
+        current = int(payload.get("current") or 0)
+        total = int(payload.get("total") or 0)
+        detail = str(payload.get("detail") or "正在检测…")
+        self._device_detection_status.setText(detail)
+        if total > 0:
+            self._device_detection_progress.setRange(0, total)
+            self._device_detection_progress.setValue(min(current, total))
+        else:
+            self._device_detection_progress.setRange(0, 0)
+
+    @staticmethod
+    def _format_device_report(report) -> str:
+        lines = [
+            f"系统：{report.platform_name} {report.platform_release} · {report.architecture}",
+            f"CPU：{report.cpu}",
+            f"逻辑核心：{report.logical_cores}",
+            f"内存：{report.memory_gb:.1f} GB" if report.memory_gb else "内存：未能读取",
+            "",
+            "GPU：",
+        ]
+        if report.gpus:
+            for index, gpu in enumerate(report.gpus, start=1):
+                details = [gpu.vendor, f"显存 {gpu.memory_mb} MB" if gpu.memory_mb else "", f"驱动 {gpu.driver}" if gpu.driver else "", gpu.source]
+                lines.append(f"  {index}. {gpu.name}" + (" · " + " · ".join(item for item in details if item) if any(details) else ""))
+        else:
+            lines.append("  未检测到可枚举的独立/集成 GPU。")
+        lines += ["", "OCR 运行时后端："]
+        if report.runtimes:
+            for runtime in report.runtimes:
+                backends = []
+                if runtime.cuda_available:
+                    backends.append("PyTorch CUDA")
+                if runtime.mps_available:
+                    backends.append("Apple MPS")
+                if "CUDAExecutionProvider" in runtime.onnx_providers:
+                    backends.append("ONNX CUDA")
+                if "DmlExecutionProvider" in runtime.onnx_providers:
+                    backends.append("ONNX DirectML")
+                if "CoreMLExecutionProvider" in runtime.onnx_providers:
+                    backends.append("ONNX CoreML")
+                if not backends:
+                    backends.append("CPU/未安装加速后端")
+                versions = []
+                if runtime.torch_version:
+                    versions.append("torch " + runtime.torch_version)
+                if runtime.onnxruntime_version:
+                    versions.append("onnxruntime " + runtime.onnxruntime_version)
+                suffix = " · ".join([*backends, *versions])
+                lines.append(f"  - {runtime.runtime}：{suffix}")
+                if runtime.cuda_devices:
+                    lines.append("    CUDA 设备：" + "、".join(runtime.cuda_devices))
+                if runtime.onnx_providers:
+                    lines.append("    ONNX Providers：" + "、".join(runtime.onnx_providers))
+                if runtime.detail:
+                    lines.append("    说明：" + runtime.detail)
+        else:
+            lines.append("  未发现可探测的 Python/OCR 运行环境。")
+        lines += ["", "结论：" + report.acceleration_summary]
+        if report.notes:
+            lines += ["", *["注意：" + note for note in report.notes]]
+        return "\n".join(lines)
+
+    def _device_detection_finished(self, report) -> None:
+        self._device_report = report
+        self._device_detection_busy = False
+        self._detect_device_btn.setEnabled(True)
+        self._device_detection_progress.setRange(0, 3)
+        self._device_detection_progress.setValue(3)
+        self._device_detection_progress.setVisible(True)
+        self._device_detection_status.setText(report.acceleration_summary)
+        self._device_detection_output.setPlainText(self._format_device_report(report))
+        self._device_detection_signals = None
+
+    def _device_detection_failed(self, message: str) -> None:
+        self._device_detection_busy = False
+        self._detect_device_btn.setEnabled(True)
+        self._device_detection_progress.setRange(0, 3)
+        self._device_detection_progress.setValue(0)
+        self._device_detection_status.setText("设备检测失败；未修改任何 OCR 设置。")
+        self._device_detection_output.setPlainText(str(message))
+        self._device_detection_signals = None
+        QMessageBox.critical(self, "设备检测失败", str(message))
 
     def _build_shortcuts_page(self) -> QWidget:
         scroll, _page, layout = self._scroll_page()
