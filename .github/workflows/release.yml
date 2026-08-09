@@ -1,0 +1,239 @@
+name: Build and publish Novel Formatter releases
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - "**/*.py"
+      - "requirements*.txt"
+      - "packaging/**"
+      - "scripts/**"
+      - "VERSION"
+      - ".gitignore"
+      - ".github/workflows/release.yml"
+  push:
+    branches: [main]
+    paths:
+      - "**/*.py"
+      - "requirements*.txt"
+      - "packaging/**"
+      - "scripts/**"
+      - "VERSION"
+      - ".gitignore"
+      - ".github/workflows/release.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: novel-formatter-release-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  metadata:
+    name: Privacy audit and version
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.meta.outputs.version }}
+      tag: ${{ steps.meta.outputs.tag }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+      - name: Privacy audit
+        run: python scripts/privacy_audit.py
+      - id: meta
+        name: Resolve version
+        shell: bash
+        run: |
+          set -euo pipefail
+          VERSION="$(tr -d '[:space:]' < VERSION)"
+          test -n "$VERSION"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "tag=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "Novel Formatter release: $VERSION"
+
+  windows:
+    name: Windows x64
+    needs: metadata
+    runs-on: windows-latest
+    timeout-minutes: 25
+    env:
+      VERSION: ${{ needs.metadata.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+          architecture: x64
+      - name: Privacy audit
+        run: python scripts/privacy_audit.py
+      - name: Compile public bootstrap
+        run: python -m py_compile bootstrap.py scripts/privacy_audit.py
+      - name: Build Windows package
+        shell: pwsh
+        run: ./packaging/build_windows_release.ps1 -Version $env:VERSION
+      - uses: actions/upload-artifact@v4
+        with:
+          name: NovelFormatter-Windows-x64
+          path: dist/NovelFormatter_${{ env.VERSION }}_Windows_x64.zip
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 30
+
+  macos:
+    name: macOS ${{ matrix.label }}
+    needs: metadata
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-15
+            label: AppleSilicon
+            arch: arm64
+          - os: macos-15-intel
+            label: Intel
+            arch: x86_64
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    env:
+      VERSION: ${{ needs.metadata.outputs.version }}
+      LABEL: ${{ matrix.label }}
+      EXPECTED_ARCH: ${{ matrix.arch }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+      - name: Confirm runner architecture
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "macOS: $(sw_vers -productVersion)"
+          echo "Architecture: $(uname -m)"
+          test "$(uname -m)" = "$EXPECTED_ARCH"
+      - name: Privacy audit
+        run: python scripts/privacy_audit.py
+      - name: Compile public bootstrap
+        run: python -m py_compile bootstrap.py scripts/privacy_audit.py
+      - name: Build app, sign and verify DMG
+        shell: bash
+        run: bash packaging/build_macos_dmg.sh
+      - uses: actions/upload-artifact@v4
+        with:
+          name: NovelFormatter-macOS-${{ matrix.label }}
+          path: |
+            package/NovelFormatter_${{ env.VERSION }}_macOS_${{ matrix.label }}.dmg
+            package/NovelFormatter_${{ env.VERSION }}_macOS_${{ matrix.label }}.app.zip
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 30
+
+  publish:
+    name: Publish GitHub Release
+    if: github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main')
+    needs: [metadata, windows, macos]
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: write
+    env:
+      VERSION: ${{ needs.metadata.outputs.version }}
+      RELEASE_TAG: ${{ needs.metadata.outputs.tag }}
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          path: downloaded
+      - name: Assemble release assets
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p release-assets
+          cp "downloaded/NovelFormatter-Windows-x64/NovelFormatter_${VERSION}_Windows_x64.zip" release-assets/
+          cp "downloaded/NovelFormatter-macOS-AppleSilicon/NovelFormatter_${VERSION}_macOS_AppleSilicon.dmg" release-assets/
+          cp "downloaded/NovelFormatter-macOS-AppleSilicon/NovelFormatter_${VERSION}_macOS_AppleSilicon.app.zip" release-assets/
+          cp "downloaded/NovelFormatter-macOS-Intel/NovelFormatter_${VERSION}_macOS_Intel.dmg" release-assets/
+          cp "downloaded/NovelFormatter-macOS-Intel/NovelFormatter_${VERSION}_macOS_Intel.app.zip" release-assets/
+
+          cat > release-assets/BUILD-INFO.txt <<EOF
+          Novel Formatter Studio ${VERSION}
+          Repository: ${GITHUB_REPOSITORY}
+          Commit: ${GITHUB_SHA}
+          Workflow run: ${GITHUB_RUN_ID}
+          Build source: clean GitHub Actions checkout (tracked files only)
+          Privacy audit: PASS
+          Windows x64: PASS
+          macOS Apple Silicon arm64 package: PASS
+          macOS Intel x86_64 package: PASS
+          macOS ad-hoc codesign: PASS
+          macOS hdiutil verification: PASS
+          OCR model weights bundled: no
+          OCR runtimes / virtual environments bundled: no
+          .env / API keys / logs / user documents bundled: no
+          EOF
+
+          cd release-assets
+          sha256sum \
+            "NovelFormatter_${VERSION}_Windows_x64.zip" \
+            "NovelFormatter_${VERSION}_macOS_AppleSilicon.dmg" \
+            "NovelFormatter_${VERSION}_macOS_AppleSilicon.app.zip" \
+            "NovelFormatter_${VERSION}_macOS_Intel.dmg" \
+            "NovelFormatter_${VERSION}_macOS_Intel.app.zip" \
+            > SHA256SUMS.txt
+          cat SHA256SUMS.txt
+
+      - name: Create or update release
+        shell: bash
+        run: |
+          set -euo pipefail
+          NOTES="$(mktemp)"
+          cat > "$NOTES" <<EOF
+          ## Novel Formatter Studio ${VERSION}
+
+          多平台隐私安全发布包：
+
+          - macOS Apple Silicon：DMG + app.zip
+          - macOS Intel：DMG + app.zip
+          - Windows x64：ZIP
+          - 发布包从 GitHub Actions 的干净 checkout 构建，只包含受 Git 管理的公开源码/资源。
+          - 不包含 OCR 模型权重、OCR 独立运行环境、虚拟环境、模型缓存、.env、API Key、日志、用户小说、OCR 结果、EPUB 或 DOCX。
+          - 首次启动只准备 Python 和主程序依赖；OCR 模型/专用依赖仍仅在用户实际启动对应 OCR 并确认后下载。
+
+          请使用 SHA256SUMS.txt 校验下载文件。
+          EOF
+
+          if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
+            gh release edit "$RELEASE_TAG" --title "Novel Formatter Studio ${VERSION}" --notes-file "$NOTES" --latest
+          else
+            gh release create "$RELEASE_TAG" --target "$GITHUB_SHA" --title "Novel Formatter Studio ${VERSION}" --notes-file "$NOTES" --latest
+          fi
+          gh release upload "$RELEASE_TAG" release-assets/* --clobber
+
+      - name: Verify published assets
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(gh release view "$RELEASE_TAG" --json isDraft --jq .isDraft)" = "false"
+          ASSETS="$(gh release view "$RELEASE_TAG" --json assets --jq '.assets[].name')"
+          for name in \
+            "NovelFormatter_${VERSION}_Windows_x64.zip" \
+            "NovelFormatter_${VERSION}_macOS_AppleSilicon.dmg" \
+            "NovelFormatter_${VERSION}_macOS_AppleSilicon.app.zip" \
+            "NovelFormatter_${VERSION}_macOS_Intel.dmg" \
+            "NovelFormatter_${VERSION}_macOS_Intel.app.zip" \
+            SHA256SUMS.txt BUILD-INFO.txt
+          do
+            grep -qx "$name" <<< "$ASSETS"
+          done
+          gh release view "$RELEASE_TAG" --json url,name,tagName,isDraft,isPrerelease,assets \
+            --jq '{url,name,tagName,isDraft,isPrerelease,assets:[.assets[].name]}'

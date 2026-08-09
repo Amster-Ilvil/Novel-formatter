@@ -2,12 +2,17 @@
 .venv*/
 venv/
 env/
+.runtime/
 .model-cache/
 .ocr-runtimes/
 .ocr-runtime-state/
+.manual-model-updates/
+.windows-runtime-state/
+.venv-app-windows/
 model_cache/
 models/cache/
 models/checkpoints/
+models/weights/
 
 # Local application state and generated files
 .env
@@ -15,6 +20,7 @@ models/checkpoints/
 .cache/
 .pytest_cache/
 __pycache__/
+debug/
 *.py[cod]
 *.db
 *.sqlite
@@ -24,6 +30,9 @@ output/
 outputs/
 dist/
 build/
+package/
+*.app/
+*.dmg
 *.epub
 *.docx
 epub_workspace/
