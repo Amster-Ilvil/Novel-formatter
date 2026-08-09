@@ -103,6 +103,23 @@ OCR 模型权重、缓存、虚拟环境、日志、数据库和用户输出不�
 | Swift OCR Helper | ✓ | — |
 | Apple Pencil 手写识别 | ✓ | — |
 
+## 参考项目与引用
+
+本项目的界面、OCR 适配、文档处理和手写识别能力参考或使用了以下公开项目与官方文档：
+
+- [Qt for Python / PySide6](https://doc.qt.io/qtforpython/)：桌面 GUI 框架。
+- [Apple Vision](https://developer.apple.com/documentation/vision)：macOS 原生 OCR 与视觉识别能力。
+- [PaddleOCR](https://github.com/PaddlePaddle/PaddleOCR)：通用 OCR 引擎与跨平台识别参考。
+- [NDLOCR-Lite](https://github.com/ndl-lab/ndlocr-lite)：日文书籍 OCR 与版面识别参考。
+- [Manga Image Translator](https://github.com/zyddnys/manga-image-translator)：漫画/日文 OCR、48px 模型接口与相关实现参考。
+- [Open Model Zoo](https://github.com/openvinotoolkit/open_model_zoo)：可选手写识别模型与推理参考。
+- [PyMuPDF](https://pymupdf.readthedocs.io/)：PDF 页面、图像与文字层处理。
+- [python-docx](https://python-docx.readthedocs.io/)：DOCX 读取与生成。
+- [Pillow](https://python-pillow.org/)：图像读取、裁切与预处理。
+- [jlect-jhr](https://github.com/ZacharyRead/jlect-jhr)：日文手写识别辅助资源；许可证见 `third_party/jlect_jhr/LICENSE.txt`。
+
+第三方项目、模型和资源仍适用其各自许可证；本仓库不重新发布 OCR 模型权重。
+
 ## 用途
 
 本项目为非盈利、非商业性质，仅用于个人学习、研究和非商业用途。
