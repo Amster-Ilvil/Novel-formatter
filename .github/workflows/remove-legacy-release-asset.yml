@@ -1,0 +1,29 @@
+name: Remove legacy release asset
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - ".github/workflows/remove-legacy-release-asset.yml"
+
+permissions:
+  contents: write
+
+jobs:
+  remove-legacy-asset:
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - name: Delete Mac+win.zip from Release 1.0
+        shell: bash
+        run: |
+          set -euo pipefail
+          if gh release view 1.0 --repo "$GITHUB_REPOSITORY" --json assets --jq '.assets[].name' | grep -Fxq 'Mac+win.zip'; then
+            gh release delete-asset 1.0 'Mac+win.zip' --repo "$GITHUB_REPOSITORY" --yes
+          fi
+          if gh release view 1.0 --repo "$GITHUB_REPOSITORY" --json assets --jq '.assets[].name' | grep -Fxq 'Mac+win.zip'; then
+            echo 'Mac+win.zip still exists' >&2
+            exit 1
+          fi
+          echo 'Mac+win.zip removed from Release 1.0.'
