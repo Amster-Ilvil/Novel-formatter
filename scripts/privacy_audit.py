@@ -17,6 +17,11 @@ from pathlib import Path, PurePosixPath
 
 ROOT = Path(__file__).resolve().parents[1]
 SELF = "scripts/privacy_audit.py"
+# This module intentionally contains generic /Users/... and /home/... regular
+# expressions because it redacts those paths from runtime logs. The expressions
+# themselves are not private data, so only the home-path check is skipped there;
+# credential scanning remains active.
+HOME_PATTERN_EXEMPT = {"utils/deployment_bootstrap.py"}
 
 FORBIDDEN_NAMES = {
     ".env",
@@ -115,12 +120,13 @@ def text_violations(paths: list[str]) -> list[str]:
         for label, pattern in SECRET_PATTERNS:
             if pattern.search(text):
                 problems.append(f"possible {label} in tracked file: {raw}")
-        if MAC_HOME.search(text):
-            problems.append(f"possible private macOS home path in tracked file: {raw}")
-        if LINUX_HOME.search(text):
-            problems.append(f"possible private Linux home path in tracked file: {raw}")
-        if WIN_HOME.search(text):
-            problems.append(f"possible private Windows home path in tracked file: {raw}")
+        if raw not in HOME_PATTERN_EXEMPT:
+            if MAC_HOME.search(text):
+                problems.append(f"possible private macOS home path in tracked file: {raw}")
+            if LINUX_HOME.search(text):
+                problems.append(f"possible private Linux home path in tracked file: {raw}")
+            if WIN_HOME.search(text):
+                problems.append(f"possible private Windows home path in tracked file: {raw}")
     return problems
 
 
