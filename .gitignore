@@ -17,6 +17,9 @@ models/weights/
 # Local application state and generated files
 .env
 .env.*
+!.env.example
+!.env.sample
+!.env.template
 .cache/
 .pytest_cache/
 __pycache__/
@@ -25,15 +28,33 @@ debug/
 *.db
 *.sqlite
 *.sqlite3
+*.sqlite-*
 *.log
 output/
 outputs/
+exports/
+backups/
+workspaces/
 dist/
 build/
 package/
+logs/
+cache/
+tmp/
+temp/
 *.app/
 *.dmg
 *.epub
 *.docx
 epub_workspace/
 .DS_Store
+Thumbs.db
+
+# Local credentials / signing material
+credentials*.json
+secrets*.json
+service-account*.json
+*.pem
+*.p12
+*.pfx
+*.key
