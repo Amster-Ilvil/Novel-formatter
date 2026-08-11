@@ -1,17 +1,34 @@
-# Novel Formatter
+<h1 align="center">Novel Formatter</h1>
 
-面向日文竖排书籍的 OCR、校对、排版与 EPUB 制作工具，支持 macOS 和 Windows。
+<p align="center">面向日文竖排书籍的 OCR、校对、排版与 EPUB 制作工具，重点优化 macOS，同时支持 Windows。</p>
 
-## 功能
+<p align="center">
+  <img alt="macOS" src="https://img.shields.io/badge/macOS-Apple%20Silicon%20%2F%20Intel-black?logo=apple">
+  <img alt="Windows" src="https://img.shields.io/badge/Windows-x64-0078D4?logo=windows11&logoColor=white">
+  <img alt="PySide6" src="https://img.shields.io/badge/UI-PySide6-41CD52?logo=qt&logoColor=white">
+  <img alt="Japanese OCR" src="https://img.shields.io/badge/OCR-Japanese-2f6feb">
+  <img alt="EPUB" src="https://img.shields.io/badge/Output-EPUB-8A2BE2">
+</p>
 
-- 图片、文件夹、PDF 导入
-- 日文竖排 OCR 与分列识别
-- 多模型 OCR 对比与融合
-- 图文对照、低置信度复核与人工校对
-- Ruby、页眉页码、跨列/跨页文本处理
-- Formatter 文本整理
-- EPUB 导出
-- AI 修复包导出，可交给大模型继续纠错与排版
+> 日文竖排 OCR · 多模型对比与融合 · 图文对照 · Formatter · EPUB · AI 修复包 · Apple Vision
+
+## 下载
+
+优先从仓库 **Releases** 下载对应平台的最新安装包。
+
+源码运行同样支持 macOS 与 Windows；部分 Apple 原生能力仅在 macOS 可用。
+
+## 主要特性
+
+- **图片 / PDF 导入**：支持图片、文件夹和 PDF 页面处理。
+- **日文竖排 OCR**：针对日文书籍纵排、分列和跨列内容处理。
+- **多模型 OCR 对比与融合**：可组合 Apple Vision、NDLOCR、Manga OCR、PaddleOCR、YomiToku 等结果进行复核。
+- **图文对照校对**：结合原始页面与 OCR 结果检查错字、漏字、低置信度文本和版面问题。
+- **Ruby / 页眉页码处理**：支持假名注音、页眉、页码、跨列和跨页文本整理。
+- **Formatter 文本整理**：对 OCR 文本进行段落、标点、标题和跨页接续等后处理。
+- **EPUB 制作**：从整理后的正文、结构和资源直接导出 EPUB。
+- **AI 修复包**：导出 OCR 证据、正文、结构和资源，交给 GPT、Claude 等大模型继续复核并生成接近出版成品的 EPUB。
+- **本地数据优先**：模型、缓存、日志、数据库和用户输出不作为项目源码提交。
 
 ## OCR 引擎
 
@@ -25,7 +42,29 @@
 
 Apple Vision、Swift OCR Helper、Apple Pencil 手写识别仅在 macOS 可用。
 
-## 安装
+## 推荐流程
+
+1. 导入 PDF、图片或图片文件夹。
+2. 标记封面、扉页、目录、插图、正文、后记等页面类型。
+3. 在 OCR 页面选择模型，并根据版面开启分列。
+4. 运行 OCR。
+5. 在 OCR 对比和图文对照中处理模型分歧、漏字、Ruby、页码和跨页连接。
+6. 应用融合结果并进行 Formatter 整理。
+7. 直接导出 EPUB，或导出 AI 修复包继续处理。
+
+## AI 修复包
+
+AI 修复包用于把 OCR 证据、文本、结构和资源交给大模型继续复核，而不是只提供一份脱离版面的纯文本。
+
+可以用于：
+
+- OCR 错字、漏字和标点修复
+- 人名、地名、术语一致性检查
+- 跨页、跨章节语境复核
+- EPUB 结构与排版检查
+- 生成接近出版成品的最终 EPUB
+
+## 安装与启动
 
 推荐使用 Python 3.10 或更高版本。
 
@@ -61,36 +100,6 @@ python gui_pyside6.py
 
 安装包可直接从 [Releases](https://github.com/Amster-Ilvil/Novel-formatter/releases) 下载。
 
-## 推荐流程
-
-1. 导入 PDF、图片或图片文件夹。
-2. 标记封面、扉页、目录、插图、正文、后记等页面类型。
-3. 在 OCR 页面选择模型，并根据版面开启分列。
-4. 运行 OCR。
-5. 在 OCR 对比和图文对照中处理模型分歧、漏字、Ruby、页码和跨页连接。
-6. 应用融合结果并进行 Formatter 整理。
-7. 直接导出 EPUB，或导出 AI 修复包继续处理。
-
-## AI 修复包
-
-AI 修复包用于把 OCR 证据、文本、结构和资源交给 GPT、Claude 等大模型继续复核。
-
-可以用于：
-
-- OCR 错字、漏字和标点修复
-- 人名、地名、术语一致性检查
-- 跨页、跨章节语境复核
-- EPUB 结构与排版检查
-- 生成接近出版成品的最终 EPUB
-
-## 模型与本地数据
-
-OCR 模型权重、缓存、虚拟环境、日志、数据库和用户输出不会作为项目源码提交。
-
-首次使用部分 OCR 引擎时，程序会在本机准备所需依赖或模型文件。
-
-仓库启用了隐私审计，PR 和 `main` 更新会自动检查常见密钥、本机用户路径、运行缓存和其他不应提交的数据。
-
 ## 平台说明
 
 | 功能 | macOS | Windows |
@@ -99,9 +108,23 @@ OCR 模型权重、缓存、虚拟环境、日志、数据库和用户输出不�
 | PDF / 图片 OCR | ✓ | ✓ |
 | 多模型 OCR | ✓ | ✓ |
 | Formatter / EPUB | ✓ | ✓ |
+| AI 修复包 | ✓ | ✓ |
 | Apple Vision | ✓ | — |
 | Swift OCR Helper | ✓ | — |
 | Apple Pencil 手写识别 | ✓ | — |
+
+## 模型与本地数据
+
+OCR 模型权重、缓存、虚拟环境、日志、数据库和用户输出不会作为项目源码提交。
+
+首次使用部分 OCR 引擎时，程序会在本机准备所需依赖或模型文件。
+
+## 隐私与源码卫生
+
+- 不应在公开仓库保存用户扫描页、书籍正文、OCR 结果、EPUB 成品、缓存或数据库。
+- 不应提交本机用户名、真实姓名、私人邮箱、访问令牌、API Key、SSH 私钥或用户主目录绝对路径。
+- 仓库启用了隐私审计，PR 和 `main` 更新会检查常见密钥、本机用户路径、运行缓存和其他不应提交的数据。
+- OCR 模型和大型运行依赖按需在本机准备，不作为源码仓库内容分发。
 
 ## 参考项目与引用
 
@@ -125,3 +148,13 @@ OCR 模型权重、缓存、虚拟环境、日志、数据库和用户输出不�
 本项目为非盈利、非商业性质，仅用于个人学习、研究和非商业用途。
 
 第三方 OCR、模型和依赖仍适用其各自许可证与使用条款。
+
+## About 推荐内容
+
+**Description**
+
+> 日文竖排书籍 OCR、校对、排版与 EPUB 制作工具｜多模型 OCR 融合｜图文对照｜AI 修复包｜macOS / Windows
+
+**Topics**
+
+`japanese` `ocr` `vertical-text` `ebook` `epub` `book-scanning` `document-processing` `pyside6` `macos` `apple-silicon` `windows` `apple-vision` `paddleocr` `ndlocr` `manga-ocr`
