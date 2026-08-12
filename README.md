@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="assets/novel_formatter_banner.svg" alt="Novel Formatter" width="100%">
+  <img src="assets/novel_formatter_banner.webp" alt="Novel Formatter" width="100%">
 </p>
 
 <h1 align="center">Novel Formatter</h1>
