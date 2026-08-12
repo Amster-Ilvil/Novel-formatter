@@ -1,0 +1,82 @@
+<svg width="1200" height="400" viewBox="0 0 1200 400" fill="none" xmlns="http://www.w3.org/2000/svg" role="img" aria-labelledby="title desc">
+  <title id="title">Novel Formatter Banner</title>
+  <desc id="desc">Blue and white banner for Novel Formatter with subtitle OCR · Formatting · EPUB.</desc>
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1200" y2="400" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#F9FBFF"/>
+      <stop offset="1" stop-color="#F2F6FF"/>
+    </linearGradient>
+    <linearGradient id="iconGrad" x1="110" y1="85" x2="260" y2="250" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#7EA4FF"/>
+      <stop offset="1" stop-color="#4A76D9"/>
+    </linearGradient>
+    <linearGradient id="lineGrad" x1="0" y1="0" x2="1" y2="0">
+      <stop stop-color="#7A9DFA"/>
+      <stop offset="1" stop-color="#A8BFFF"/>
+    </linearGradient>
+    <filter id="softShadow" x="0" y="0" width="1200" height="400" filterUnits="userSpaceOnUse" color-interpolation-filters="sRGB">
+      <feDropShadow dx="0" dy="8" stdDeviation="12" flood-color="#9CB3EA" flood-opacity="0.18"/>
+    </filter>
+  </defs>
+  <g filter="url(#softShadow)">
+    <rect x="10" y="10" width="1180" height="380" rx="34" fill="url(#bg)" stroke="#6F95F1" stroke-width="4"/>
+  </g>
+  <g opacity="0.16" stroke="#7A9DFA" stroke-width="2">
+    <path d="M56 54H112" stroke-dasharray="3 9"/>
+    <path d="M56 74H112" stroke-dasharray="3 9"/>
+    <path d="M56 94H112" stroke-dasharray="3 9"/>
+    <rect x="56" y="286" width="96" height="56" rx="10"/>
+    <rect x="990" y="64" width="120" height="84" rx="16"/>
+    <rect x="1026" y="272" width="108" height="74" rx="16"/>
+    <path d="M1008 90H1088"/>
+    <path d="M1008 114H1080"/>
+    <path d="M1044 298H1104"/>
+    <path d="M1044 320H1098"/>
+  </g>
+  <g opacity="0.28" fill="#7EA4FF">
+    <circle cx="1028" cy="182" r="6"/>
+    <circle cx="1068" cy="160" r="4"/>
+    <circle cx="1102" cy="204" r="5"/>
+    <circle cx="350" cy="304" r="4"/>
+    <circle cx="382" cy="304" r="4"/>
+    <circle cx="414" cy="304" r="4"/>
+  </g>
+  <g>
+    <rect x="104" y="110" width="126" height="150" rx="22" fill="url(#iconGrad)"/>
+    <rect x="122" y="126" width="126" height="150" rx="22" fill="#EAF0FF" opacity="0.5"/>
+    <path d="M138 133H198" stroke="white" stroke-width="10" stroke-linecap="round"/>
+    <path d="M138 156H194" stroke="white" stroke-width="10" stroke-linecap="round"/>
+    <path d="M138 179H190" stroke="white" stroke-width="10" stroke-linecap="round"/>
+    <path d="M138 202H186" stroke="white" stroke-width="10" stroke-linecap="round"/>
+    <path d="M127 243C155 231 189 231 217 243" stroke="white" stroke-width="8" stroke-linecap="round"/>
+    <path d="M160 133V225" stroke="white" stroke-width="8" stroke-linecap="round"/>
+    <path d="M138 133H182" stroke="white" stroke-width="8" stroke-linecap="round"/>
+  </g>
+  <g fill="#122655">
+    <text x="315" y="162" font-size="92" font-family="Georgia, 'Times New Roman', serif" font-weight="700">Novel</text>
+    <text x="315" y="254" font-size="92" font-family="Georgia, 'Times New Roman', serif" font-weight="700">Formatter</text>
+  </g>
+  <g>
+    <path d="M102 302H300" stroke="url(#lineGrad)" stroke-width="3" stroke-linecap="round"/>
+    <path d="M612 302H810" stroke="url(#lineGrad)" stroke-width="3" stroke-linecap="round"/>
+    <path d="M575 286V318" stroke="#89A8F8" stroke-width="3" stroke-linecap="round"/>
+    <path d="M575 286C566 289 559 293 552 299" stroke="#89A8F8" stroke-width="3" stroke-linecap="round"/>
+    <path d="M575 286C584 289 591 293 598 299" stroke="#89A8F8" stroke-width="3" stroke-linecap="round"/>
+    <path d="M575 318C566 315 559 311 552 305" stroke="#89A8F8" stroke-width="3" stroke-linecap="round"/>
+    <path d="M575 318C584 315 591 311 598 305" stroke="#89A8F8" stroke-width="3" stroke-linecap="round"/>
+  </g>
+  <text x="315" y="352" font-size="34" font-family="Inter, Arial, sans-serif" fill="#6B8EEA" font-weight="600">OCR · Formatting · EPUB</text>
+  <g opacity="0.22">
+    <rect x="846" y="86" width="176" height="224" rx="24" fill="#FFFFFF" stroke="#84A6F8" stroke-width="3"/>
+    <rect x="874" y="116" width="58" height="42" rx="8" fill="#E8EEFF" stroke="#84A6F8" stroke-width="2"/>
+    <path d="M952 124H998" stroke="#84A6F8" stroke-width="6" stroke-linecap="round"/>
+    <path d="M952 144H994" stroke="#84A6F8" stroke-width="6" stroke-linecap="round"/>
+    <rect x="874" y="178" width="124" height="72" rx="12" fill="#EDF3FF" stroke="#84A6F8" stroke-width="2"/>
+    <rect x="874" y="264" width="54" height="22" rx="6" fill="#DDE7FF"/>
+    <rect x="938" y="264" width="60" height="22" rx="6" fill="#DDE7FF"/>
+  </g>
+  <g opacity="0.22">
+    <path d="M860 320C900 264 972 246 1042 266" stroke="#84A6F8" stroke-width="3" stroke-dasharray="5 8"/>
+    <path d="M834 112C866 86 912 72 958 76" stroke="#84A6F8" stroke-width="3" stroke-dasharray="5 8"/>
+  </g>
+</svg>
