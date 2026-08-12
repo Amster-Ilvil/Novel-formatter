@@ -1,9 +1,5 @@
 <p align="center">
-  <img src="assets/novel_formatter_banner.jpg" alt="Novel Formatter" width="100%">
-</p>
-
-<p align="center">
-  <img src="assets/app_icon.jpg" alt="Novel Formatter App Icon" width="180">
+  <img src="assets/novel_formatter_banner.svg" alt="Novel Formatter" width="100%">
 </p>
 
 <h1 align="center">Novel Formatter</h1>
