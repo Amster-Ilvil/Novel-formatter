@@ -152,17 +152,3 @@ OCR 模型权重、缓存、虚拟环境、日志、数据库和用户输出不�
 本项目原创代码与文档以 [MIT License](LICENSE) 开源，可在遵守许可证的前提下用于个人、学习、研究或商业用途。
 
 第三方 OCR、模型、依赖和平台能力仍适用其各自许可证与使用条款；完整致谢见 [ACKNOWLEDGEMENTS.md](ACKNOWLEDGEMENTS.md)。
-
-## About 推荐内容
-
-**Description**
-
-> 开源的日文竖排书籍 OCR、校对、排版与 EPUB 工具｜本地优先｜多模型 OCR｜macOS / Windows｜欢迎贡献
-
-**Open-source spirit**
-
-Novel Formatter 希望保持简单而明确的开源方向：源码公开、过程透明、本地优先，并允许任何人在遵守许可证的前提下自由使用、研究、修改和改进。项目不会把核心能力锁在封闭服务后，也欢迎 Issue、Pull Request、文档改进、模型适配和实际使用反馈。
-
-**Topics**
-
-`open-source` `japanese` `japanese-ocr` `ocr` `vertical-text` `ebook` `epub` `book-scanning` `document-processing` `pyside6` `macos` `apple-silicon` `windows` `apple-vision` `paddleocr` `ndlocr` `manga-ocr`
