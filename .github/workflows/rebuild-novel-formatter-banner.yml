@@ -28,8 +28,7 @@ jobs:
             .github/banner_parts/part04.b64 \
             .github/banner_parts/part05.b64 \
             .github/banner_parts/part06.b64 \
-            .github/banner_parts/part07a.b64 \
-            .github/banner_parts/part07b.b64 \
+            .github/banner_parts/part07.b64 \
             .github/banner_parts/part08.b64 \
             | tr -d '\r\n' | base64 -d > assets/novel_formatter_banner.webp
 
