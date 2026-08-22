@@ -132,7 +132,6 @@ OCR 模型权重、缓存、虚拟环境、日志、数据库和用户输出不�
 - [Apple Vision](https://developer.apple.com/documentation/vision)：macOS 原生 OCR 与视觉识别能力。
 - [PaddleOCR](https://github.com/PaddlePaddle/PaddleOCR)：通用 OCR 引擎与跨平台识别参考。
 - [NDLOCR-Lite](https://github.com/ndl-lab/ndlocr-lite)：日文书籍 OCR 与版面识别参考。
-- [Manga Image Translator](https://github.com/zyddnys/manga-image-translator)：漫画/日文 OCR、48px 模型接口与相关实现参考。
 - [Open Model Zoo](https://github.com/openvinotoolkit/open_model_zoo)：可选手写识别模型与推理参考。
 - [PyMuPDF](https://pymupdf.readthedocs.io/)：PDF 页面、图像与文字层处理。
 - [python-docx](https://python-docx.readthedocs.io/)：DOCX 读取与生成。
