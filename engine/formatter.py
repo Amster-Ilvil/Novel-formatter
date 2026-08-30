@@ -296,10 +296,25 @@ def clean_metadata_blocks(doc: UnifiedDocument) -> UnifiedDocument:
             if cid is not None and cid in running_header_clusters and cluster_keep_idx.get(cid) != i:
                 removed += 1
                 continue
-            # 位置感知：bbox 靠近页面顶部或底部的短文本
+            # 位置感知：bbox 靠近页面顶部或底部的短文本。
+            #
+            # 竖排日文正文列本来就从页面上缘附近开始，单看 ``bbox.y < 0.15``
+            # 会把短正文列、对白和 Ruby 整列误删成页眉。竖排模式下只有
+            # “浅而横”的边缘条带才按位置删除；真正的竖排正文列（高度明显
+            # 大于宽度）必须保留。横排文档继续沿用原来的顶部/底部规则。
             if b.bbox and len(t) <= HEADER_MAX:
-                y = b.bbox.y
-                if y < 0.15 or y > 0.85:
+                y = float(b.bbox.y)
+                h = max(0.0, float(b.bbox.h))
+                w = max(0.0, float(b.bbox.w))
+                writing_direction = str(getattr(doc.metadata, "writing_direction", "") or "")
+                vertical = writing_direction.startswith("vertical")
+                edge_hit = y < 0.15 or y > 0.85
+                if vertical:
+                    shallow_horizontal_strip = h <= 0.10 and (w >= 0.10 or w >= h * 1.35)
+                    positional_header = edge_hit and shallow_horizontal_strip
+                else:
+                    positional_header = edge_hit
+                if positional_header:
                     removed += 1
                     continue
         kept.append(b)
@@ -615,10 +630,22 @@ def _cross_page_merge_score(previous: Block, next_block: Block) -> int:
     return score
 
 
+def _non_text_page_numbers(doc: UnifiedDocument) -> set[int]:
+    """Pages that must form a hard boundary for text-flow merging."""
+    non_text_types = {
+        BlockType.COVER, BlockType.COLOR_ILLUS, BlockType.BLANK, BlockType.TOC_PAGE,
+        BlockType.ILLUSTRATION, BlockType.COLOPHON, BlockType.TITLE_PAGE,
+        BlockType.FRONTISPIECE, BlockType.INSERT, BlockType.ADVERTISEMENT,
+        BlockType.INDEX_PAGE, BlockType.MAP_PAGE, BlockType.CHARACTER_SHEET,
+    }
+    return {int(page.page_no) for page in getattr(doc, "pages", []) if page.page_type in non_text_types}
+
+
 def merge_cross_page_sentences(doc: UnifiedDocument) -> UnifiedDocument:
-    """仅合并相邻页的上一页最后正文块和下一页第一正文块。"""
+    """仅合并相邻文本页的上一页最后正文块和下一页第一正文块。"""
     doc = copy.deepcopy(doc)
     pages = _get_page_text_blocks(doc.blocks)
+    non_text_pages = _non_text_page_numbers(doc)
     if not pages:
         doc.add_log("cross_page_merge", "文档没有可靠页码信息，跳过跨页断句恢复", 0)
         return doc
@@ -628,6 +655,8 @@ def merge_cross_page_sentences(doc: UnifiedDocument) -> UnifiedDocument:
     details: list[str] = []
     for page_index in sorted(pages):
         if page_index + 1 not in pages:
+            continue
+        if page_index in non_text_pages or page_index + 1 in non_text_pages:
             continue
         previous = pages[page_index][-1]
         next_block = pages[page_index + 1][0]
@@ -730,6 +759,7 @@ def merge_cross_page_sentences_layout_safe(doc: UnifiedDocument) -> UnifiedDocum
     """
     doc = copy.deepcopy(doc)
     pages = _get_page_layout_text_blocks(doc.blocks)
+    non_text_pages = _non_text_page_numbers(doc)
     if not pages:
         doc.add_log("cross_page_merge", "文档没有可靠页码信息，跳过安全跨页断句恢复", 0)
         return doc
@@ -739,6 +769,8 @@ def merge_cross_page_sentences_layout_safe(doc: UnifiedDocument) -> UnifiedDocum
     consumed_ids: set[str] = set()
     for page_index in sorted(pages):
         if page_index + 1 not in pages:
+            continue
+        if page_index in non_text_pages or page_index + 1 in non_text_pages:
             continue
         previous = pages[page_index][-1]
         next_block = pages[page_index + 1][0]

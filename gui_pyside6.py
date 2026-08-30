@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 """
 Novel Formatter 1.0 — PySide6 GUI
-六个主功能区：页面管理 / OCR 识别 / 格式处理 / 文字校对 / EPUB生成 / 系统设置。
+六个主功能区：页面管理 / OCR 识别 / 格式处理 / 文字校对 / EPUB生成 / 设置。
 九个原业务工作区通过顶部页签融合，macOS 简约风格，完整功能保留。
 
 用法: python3 gui_pyside6.py
@@ -362,6 +362,8 @@ OCR_ADAPTERS = [
      "dbnetv2_1 检测 + PARSeq 日文识别；快速模式启用动态宽度/批次分桶并可用 large 模型复核低置信度文字框", True),
     ("manga_48px",   "48px AR OCR",       "漫画行识别", "#7C3AED",
      "Manga Image Translator 自回归漫画 OCR；文字列校正后缩放到 48px，Beam Search 逐字生成；首次使用下载约 195 MB 权重", True),
+    ("hayai_ocr",    "Hayai OCR v2.1",    "高速 CJK", "#0F766E",
+     "Hayai OCR v2.1（约 150M）；NaFlex 多行/竖排识别，支持批处理、MPS/CUDA/CPU 与 INT4/INT8；页面强制先物理分列", True),
     ("manga_ocr",    "Manga OCR",         "日文专用", "#A23A6A",
      "kha-white/manga-ocr-base；页面输入会强制先做物理分列，禁止整页直接识别", True),
     ("google_vision", "Google Vision API", "云端",   "#93650D",
@@ -2929,6 +2931,69 @@ class OCRTab(QWidget):
         gvw.addWidget(gv_hint)
         self._engine_settings_layout.addWidget(self._google_vision_widget)
 
+        # Hayai OCR v2.1：crop recognizer；页面布局仍由 Formatter 管理。
+        self._hayai_widget = QWidget()
+        self._hayai_widget.setVisible(False)
+        hyv = QVBoxLayout(self._hayai_widget)
+        hyv.setContentsMargins(10, 8, 10, 0)
+        hyv.setSpacing(4)
+        hy_backend_row = QHBoxLayout()
+        hy_backend_lbl = QLabel("Hayai 后端")
+        hy_backend_lbl.setStyleSheet(f"color: {MUTED}; font-size: 11px;")
+        hy_backend_row.addWidget(hy_backend_lbl)
+        self._hayai_backend_combo = NoWheelComboBox()
+        self._hayai_backend_combo.addItem("PyTorch（推荐：CUDA / MPS / CPU）", "torch")
+        self._hayai_backend_combo.addItem("LiteRT（CPU / 边缘端，实验）", "litert")
+        self._hayai_backend_combo.currentIndexChanged.connect(self._update_hayai_option_state)
+        hy_backend_row.addWidget(self._hayai_backend_combo, 1)
+        hyv.addLayout(hy_backend_row)
+
+        hy_device_row = QHBoxLayout()
+        hy_device_lbl = QLabel("运行设备")
+        hy_device_lbl.setStyleSheet(f"color: {MUTED}; font-size: 11px;")
+        hy_device_row.addWidget(hy_device_lbl)
+        self._hayai_device_combo = NoWheelComboBox()
+        self._hayai_device_combo.addItem("自动（CUDA → MPS → CPU）", "auto")
+        self._hayai_device_combo.addItem("CUDA", "cuda")
+        self._hayai_device_combo.addItem("Apple MPS", "mps")
+        self._hayai_device_combo.addItem("CPU", "cpu")
+        hy_device_row.addWidget(self._hayai_device_combo, 1)
+        hyv.addLayout(hy_device_row)
+
+        hy_quant_row = QHBoxLayout()
+        hy_quant_lbl = QLabel("Torch 量化")
+        hy_quant_lbl.setStyleSheet(f"color: {MUTED}; font-size: 11px;")
+        hy_quant_row.addWidget(hy_quant_lbl)
+        self._hayai_quant_combo = NoWheelComboBox()
+        self._hayai_quant_combo.addItem("不量化（默认 / 最高兼容）", "none")
+        self._hayai_quant_combo.addItem("INT8 weight-only（约 2× 降显存）", "int8")
+        self._hayai_quant_combo.addItem("INT4 weight-only（约 4× 降显存）", "int4")
+        hy_quant_row.addWidget(self._hayai_quant_combo, 1)
+        hyv.addLayout(hy_quant_row)
+
+        hy_litert_row = QHBoxLayout()
+        hy_litert_lbl = QLabel("LiteRT 量化")
+        hy_litert_lbl.setStyleSheet(f"color: {MUTED}; font-size: 11px;")
+        hy_litert_row.addWidget(hy_litert_lbl)
+        self._hayai_litert_quant_combo = NoWheelComboBox()
+        self._hayai_litert_quant_combo.addItem("WI4（默认）", "wi4")
+        self._hayai_litert_quant_combo.addItem("WI8 AFP32", "wi8_afp32")
+        self._hayai_litert_quant_combo.addItem("Dynamic WI4", "dynamic_wi4")
+        self._hayai_litert_quant_combo.addItem("Dynamic WI8", "dynamic_wi8")
+        self._hayai_litert_quant_combo.addItem("Float", "none")
+        hy_litert_row.addWidget(self._hayai_litert_quant_combo, 1)
+        hyv.addLayout(hy_litert_row)
+
+        hy_hint = QLabel(
+            "Hayai 只负责已经分离的文字 crop，不做整页文字检测。Novel Formatter 会复用固定正文框、"
+            "右→左物理列、Ruby 清理、共享 crop 与多模型融合；每段默认约 24 字，减少旧 Manga OCR 的切段调用。"
+        )
+        hy_hint.setWordWrap(True)
+        hy_hint.setStyleSheet(f"color: #98A2B3; font-size: 10px;")
+        hyv.addWidget(hy_hint)
+        self._engine_settings_layout.addWidget(self._hayai_widget)
+        self._update_hayai_option_state()
+
         # YomiToku 模型组合（仅 OCR：DBNet + PARSeq，不加载版面/表格模型）
         self._yomitoku_widget = QWidget()
         self._yomitoku_widget.setVisible(False)
@@ -3812,6 +3877,10 @@ class OCRTab(QWidget):
             "vision_vertical": checked("_vision_vertical_check", True),
             "vision_vertical_compat": checked("_vision_vertical_compat_check", True),
             "vision_language_correction": checked("_vision_language_correction_check", True),
+            "hayai_backend": combo_data("_hayai_backend_combo", "torch"),
+            "hayai_device": combo_data("_hayai_device_combo", "auto"),
+            "hayai_quantize": combo_data("_hayai_quant_combo", "none"),
+            "hayai_litert_quant": combo_data("_hayai_litert_quant_combo", "wi4"),
             "paddle_pipeline": combo_data("_paddle_model_combo", "ocr"),
             "paddle_source": combo_data("_paddle_source_combo", "auto"),
             "google_language_hints": (
@@ -3849,6 +3918,10 @@ class OCRTab(QWidget):
                 "vision_vertical": False,
                 "vision_vertical_compat": False,
                 "vision_language_correction": True,
+                "hayai_backend": "torch",
+                "hayai_device": "auto",
+                "hayai_quantize": "none",
+                "hayai_litert_quant": "wi4",
                 "paddle_pipeline": "ocr",
                 "paddle_source": "auto",
                 "google_language_hints": "zh-CN, zh",
@@ -3898,6 +3971,19 @@ class OCRTab(QWidget):
             getattr(self, "_vision_backend_combo", None),
             state.get("vision_backend", "live_text"),
         )
+        self._set_combo_value(
+            getattr(self, "_hayai_backend_combo", None), state.get("hayai_backend", "torch")
+        )
+        self._set_combo_value(
+            getattr(self, "_hayai_device_combo", None), state.get("hayai_device", "auto")
+        )
+        self._set_combo_value(
+            getattr(self, "_hayai_quant_combo", None), state.get("hayai_quantize", "none")
+        )
+        self._set_combo_value(
+            getattr(self, "_hayai_litert_quant_combo", None), state.get("hayai_litert_quant", "wi4")
+        )
+        self._update_hayai_option_state()
         self._set_combo_value(
             getattr(self, "_paddle_model_combo", None),
             state.get("paddle_pipeline", "ocr"),
@@ -4092,7 +4178,7 @@ class OCRTab(QWidget):
             details.append(f"Apple Vision 快捷指令：{'可用' if shortcut_ok else '不可用'}（{shortcut_reason or '无需模型'}）")
         except Exception as exc:
             details.append(f"Apple Vision：检测失败（{exc}）")
-        for cid in ("yomitoku", "ndlocr_lite", "paddle_ocr", "paddle_structure", "paddle_vl", "manga_48px", "manga_ocr", "pdf_craft"):
+        for cid in ("hayai_ocr", "hayai_ocr_litert", "yomitoku", "ndlocr_lite", "paddle_ocr", "paddle_structure", "paddle_vl", "manga_48px", "manga_ocr", "pdf_craft"):
             probe = probe_runtime(cid, deep=deep, refresh=deep)
             state = "本地可用" if probe.ready else ("环境已安装，模型待确认" if probe.installed else "未安装")
             details.append(f"{cid}：{state}（{probe.detail}）")
@@ -4730,6 +4816,8 @@ class OCRTab(QWidget):
         self._active_adapter = aid
         if aid == "manga_ocr" and hasattr(self, "_column_split_check"):
             self._column_split_check.setChecked(True)
+        elif aid == "hayai_ocr" and hasattr(self, "_column_split_check"):
+            self._column_split_check.setChecked(True)
         elif aid == "manga_48px" and hasattr(self, "_column_split_check"):
             self._column_split_check.setChecked(True)
         elif aid == "yomitoku" and hasattr(self, "_column_split_check"):
@@ -4753,6 +4841,7 @@ class OCRTab(QWidget):
                     if mac_index >= 0:
                         self._multi_model3_combo.setCurrentIndex(mac_index)
         self._paddle_model_widget.setVisible(aid == "paddle_ocr")
+        self._hayai_widget.setVisible(aid == "hayai_ocr")
         self._yomitoku_widget.setVisible(aid == "yomitoku")
         self._pdf_craft_widget.setVisible(aid == "pdf_craft")
         self._google_vision_widget.setVisible(aid == "google_vision")
@@ -4761,6 +4850,18 @@ class OCRTab(QWidget):
             self._on_vision_backend_changed()
         else:
             self._update_shortcut_widget_visibility()
+
+    def _update_hayai_option_state(self, *_args):
+        if not hasattr(self, "_hayai_backend_combo"):
+            return
+        is_litert = str(self._hayai_backend_combo.currentData() or "torch") == "litert"
+        self._hayai_device_combo.setEnabled(not is_litert)
+        self._hayai_quant_combo.setEnabled(not is_litert)
+        self._hayai_litert_quant_combo.setEnabled(is_litert)
+        if is_litert:
+            self._hayai_device_combo.setToolTip("LiteRT 当前由 CPU interpreter 执行。")
+        else:
+            self._hayai_device_combo.setToolTip("")
 
     def _on_vision_backend_changed(self):
         backend_id = str(self._vision_backend_combo.currentData() or "auto")
@@ -5635,6 +5736,16 @@ class OCRTab(QWidget):
                 lang=profile.paddle_lang,
                 model_source=self._paddle_source_combo.currentData(),
             )
+        elif engine_id == "hayai_ocr":
+            opts.update(
+                backend=str(self._hayai_backend_combo.currentData() or "torch"),
+                device=str(self._hayai_device_combo.currentData() or "auto"),
+                quantize=str(self._hayai_quant_combo.currentData() or "none"),
+                litert_quant=str(self._hayai_litert_quant_combo.currentData() or "wi4"),
+                max_new_tokens=128,
+                segment_max_chars=24,
+                segment_max_aspect=16.0,
+            )
         elif engine_id == "yomitoku":
             opts.update(
                 mode=str(self._yomitoku_mode_combo.currentData() or "fast"),
@@ -5780,6 +5891,8 @@ class OCRTab(QWidget):
         if profile.allow_column_pipeline:
             if engine_id == "manga_ocr":
                 use_column_mask = True
+            elif engine_id == "hayai_ocr":
+                use_column_mask = True
             elif engine_id == "manga_48px":
                 use_column_mask = True
             elif engine_id == "yomitoku":
@@ -5817,6 +5930,9 @@ class OCRTab(QWidget):
         if engine_id == "manga_ocr":
             from adapters.manga_ocr_adapter import run as ocr_run
             return ocr_run(**common_kwargs)
+        if engine_id == "hayai_ocr":
+            from adapters.hayai_ocr_adapter import run as ocr_run
+            return ocr_run(engine_options=opts, **common_kwargs)
         if engine_id == "manga_48px":
             from adapters.manga_48px_adapter import run as ocr_run
             return ocr_run(**common_kwargs)
@@ -5858,6 +5974,7 @@ class OCRTab(QWidget):
                 engine_id,
                 paddle_pipeline=self._paddle_model_combo.currentData(),
                 recognition_engine=engine_id if self._column_split_check.isChecked() else "",
+                engine_options=self._engine_options(engine_id),
             ))
         ids = list(dict.fromkeys(ids))
         missing = missing_components(ids)
@@ -5918,7 +6035,10 @@ class OCRTab(QWidget):
         if not ocr_profile.allow_japanese_handwriting and hasattr(self, "_handwriting_trace_check"):
             self._handwriting_trace_check.setChecked(False)
 
-        engine_ids = self._selected_ocr_engines()
+        # Old QSettings snapshots can contain the same secondary engine twice.
+        # Preserve first-selection order but never run identical OCR engines more
+        # than once: duplicate evidence wastes memory and can bias consensus.
+        engine_ids = list(dict.fromkeys(self._selected_ocr_engines()))
         incompatible = [
             engine_id for engine_id in engine_ids
             if not is_engine_compatible(engine_id, ocr_mode_snapshot)
@@ -5932,10 +6052,11 @@ class OCRTab(QWidget):
             )
             return
         manga_column_required = "manga_ocr" in engine_ids
+        hayai_column_required = "hayai_ocr" in engine_ids
         manga_48px_column_required = "manga_48px" in engine_ids
         yomitoku_column_required = "yomitoku" in engine_ids
         physical_column_required = (
-            manga_column_required or manga_48px_column_required or yomitoku_column_required
+            manga_column_required or hayai_column_required or manga_48px_column_required or yomitoku_column_required
         )
         if physical_column_required and not self._column_split_check.isChecked():
             # Line/column recognizers must not receive an uncontrolled complete
@@ -5950,7 +6071,7 @@ class OCRTab(QWidget):
         if self._column_split_check.isChecked() and fixed_crop_rect is None:
             title = "日文列 OCR 必须先分列" if physical_column_required else "请先固定正文区域"
             detail = (
-                "Manga OCR 不能可靠处理整页多列版面；48px AR 与当前 YomiToku 小说模式也应在固定正文区域内按物理列识别。"
+                "Manga OCR / Hayai OCR 不能可靠处理整页多列版面；48px AR 与当前 YomiToku 小说模式也应在固定正文区域内按物理列识别。"
                 "请先在右侧预览图上拖框选定纯正文区域，程序会按右到左生成物理列后再逐列识别。"
                 if physical_column_required
                 else "分列掩膜必须先在右侧预览图上拖框选定纯正文区域。\n"
@@ -6042,6 +6163,11 @@ class OCRTab(QWidget):
             self._log_view.appendPlainText(
                 "🧭 Manga OCR 页面安全模式：整页输入已禁用；"
                 "先按固定正文区域生成右→左物理列，再逐列识别。"
+            )
+        if hayai_column_required:
+            self._log_view.appendPlainText(
+                "🧭 Hayai OCR v2.1 安全模式：整页输入已禁用；"
+                "复用固定正文区域与右→左物理列，紧裁后按较长 crop 批量识别，并启用输出长度/CJK 比例幻觉拦截。"
             )
         if manga_48px_column_required:
             self._log_view.appendPlainText(
@@ -6474,14 +6600,25 @@ class OCRTab(QWidget):
                 # one Apple GPU usually thrash unified memory and are slower than
                 # serial full batches. Keep true heterogeneous pairs parallel.
                 mps_heavy_engines = {
-                    "manga_ocr", "manga_48px", "yomitoku", "paddle_ocr"
+                    "manga_ocr", "hayai_ocr", "manga_48px", "yomitoku", "paddle_ocr"
                 }
+
+                def is_gpu_heavy_engine(engine_id: str) -> bool:
+                    key = str(engine_id or "").strip().lower()
+                    if key == "hayai_ocr":
+                        hayai_opts = frozen_engine_options.get("hayai_ocr", {})
+                        if str(hayai_opts.get("backend") or "torch").strip().lower() == "litert":
+                            return False
+                        if str(hayai_opts.get("device") or "auto").strip().lower() == "cpu":
+                            return False
+                    return key in mps_heavy_engines
+
                 parallel_first_runtime = bool(parallel_first_enabled)
                 if (
                     parallel_first_runtime
                     and len(engine_ids) >= 2
-                    and engine_ids[0] in mps_heavy_engines
-                    and engine_ids[1] in mps_heavy_engines
+                    and is_gpu_heavy_engine(engine_ids[0])
+                    and is_gpu_heavy_engine(engine_ids[1])
                 ):
                     parallel_first_runtime = False
                     signals.log.emit(
@@ -6570,6 +6707,13 @@ class OCRTab(QWidget):
 
                     def model_resource(engine_id: str) -> str:
                         key = str(engine_id or "").strip().lower()
+                        if key == "hayai_ocr":
+                            hayai_opts = frozen_engine_options.get("hayai_ocr", {})
+                            if str(hayai_opts.get("backend") or "torch").strip().lower() == "litert":
+                                return "cpu_model"
+                            if str(hayai_opts.get("device") or "auto").strip().lower() == "cpu":
+                                return "cpu_model"
+                            return "mps_model"
                         if key in {"manga_ocr", "manga_48px", "yomitoku", "paddle_ocr"}:
                             return "mps_model"
                         if key == "ndlocr_lite":
@@ -15479,6 +15623,11 @@ class OCRCompareTab(QWidget):
         self._ai_adjudication_output_paths: tuple[str, str] | None = None
         self._last_source_correction_report: dict | None = None
         self._source_correction_export_report: dict | None = None
+        # Repeated AI OCR adjudication imports are cumulative.  Stable-column
+        # rows retain the best/latest accepted verdict, while unresolved later
+        # packages never erase a previously accepted result.
+        self._source_correction_import_history: list[dict] = []
+        self._source_correction_imported_package_ids: set[str] = set()
         # Unique final OCR adjudications. Raw OCR documents remain immutable;
         # these decisions are synthetic fusion candidates keyed by stable columns.
         self._canonical_source_decisions: dict[tuple[str, ...], dict] = {}
@@ -15736,16 +15885,16 @@ class OCRCompareTab(QWidget):
         source_correction_row.addWidget(source_correction_label)
         self._export_source_correction_btn = accent_button("⇩ 导出 AI OCR 裁决包", color="#9333EA")
         self._export_source_correction_btn.setToolTip(
-            "导出唯一权威正文裁决包。三份原始 OCR 永久只读；AI 只填写 editable=true 行的"
-            " ai_verdict.final_text。此前已接受的旧逐模型/新裁决结果会自动预填并锁定，避免重复判断。"
+            "导出 AI OCR 裁决包。三份原始 OCR 永久只读；此前已接受的冲突裁决会作为只读参考重新开放复审，"
+            "AI 可保留旧结果，也可提交更好的 final_text；精确一致/共同候选仍锁定。"
         )
         self._export_source_correction_btn.setEnabled(False)
         self._export_source_correction_btn.clicked.connect(self._export_model_source_correction_package)
         source_correction_row.addWidget(self._export_source_correction_btn)
         self._import_source_correction_btn = accent_button("⇧ 导入 AI OCR 裁决", color="#0D9488")
         self._import_source_correction_btn.setToolTip(
-            "导入新版 AI OCR 裁决 JSON/ZIP，也兼容旧版逐模型 model_edits。AI 结果仅叠加到融合判断框，"
-            "独立的 AI 最终裁决，不改写 NDLOCR、48px 或 Apple Vision。"
+            "累积导入 AI OCR 裁决 JSON/ZIP，也兼容旧版逐模型 model_edits。后导入的已接受结果可改进同一稳定句；"
+            "缺失/未决行不会抹掉前一包的好结果，且绝不改写原始 OCR。"
         )
         self._import_source_correction_btn.setEnabled(False)
         self._import_source_correction_btn.clicked.connect(self._import_model_source_correction_result)
@@ -16371,6 +16520,10 @@ class OCRCompareTab(QWidget):
             "initial_payload": self._initial_payload,
             "fusion_states": self._fusion_states,
             "image_review_overrides": copy.deepcopy(self._image_review_overrides),
+            "canonical_source_decisions": copy.deepcopy(self._canonical_source_decisions),
+            "source_correction_import_history": copy.deepcopy(self._source_correction_import_history),
+            "source_correction_imported_package_ids": set(self._source_correction_imported_package_ids),
+            "last_source_correction_report": copy.deepcopy(self._last_source_correction_report),
             "current_row_index": self._current_row_index,
             "source_texts": [
                 self._source_text(index) for index in range(len(self._documents))
@@ -16391,6 +16544,10 @@ class OCRCompareTab(QWidget):
         self._initial_payload = state.get("initial_payload")
         self._fusion_states = list(state.get("fusion_states") or [])
         self._image_review_overrides = copy.deepcopy(state.get("image_review_overrides") or {})
+        self._canonical_source_decisions = copy.deepcopy(state.get("canonical_source_decisions") or {})
+        self._source_correction_import_history = copy.deepcopy(state.get("source_correction_import_history") or [])
+        self._source_correction_imported_package_ids = set(state.get("source_correction_imported_package_ids") or set())
+        self._last_source_correction_report = copy.deepcopy(state.get("last_source_correction_report"))
         self._current_row_index = int(state.get("current_row_index", 0) or 0)
         self._sources_dirty = bool(state.get("sources_dirty", False))
         source_texts = list(state.get("source_texts") or [])
@@ -16427,9 +16584,13 @@ class OCRCompareTab(QWidget):
         self._sync_review_mode_controls()
         self._image_review_mode_btn.setEnabled(True)
         summary = getattr(self._comparison, "summary", "多模型 OCR 对比")
+        restored_ai = sum(
+            1 for item in self._canonical_source_decisions.values()
+            if str(item.get("status", "") or "") == "accepted"
+        )
         self._summary.setText(
             f"已恢复多模型 OCR 对比：{' · '.join(self._labels)}。{summary}"
-            "切换前的人工选择和源文本修改均已保留。"
+            f"切换前的人工选择、源文本和累计 AI 裁决均已保留（有效 AI {restored_ai} 条）。"
         )
         self._choose_label.setVisible(True)
         self._row_state.setVisible(True)
@@ -17042,6 +17203,8 @@ class OCRCompareTab(QWidget):
         self._fusion_states = []
         self._image_review_overrides = {}
         self._canonical_source_decisions = {}
+        self._source_correction_import_history = []
+        self._source_correction_imported_package_ids = set()
         self._loading_text = True
         try:
             for index, editor in enumerate(self._source_editors):
@@ -17108,6 +17271,8 @@ class OCRCompareTab(QWidget):
         self._last_source_correction_report = None
         self._source_correction_export_report = None
         self._canonical_source_decisions = {}
+        self._source_correction_import_history = []
+        self._source_correction_imported_package_ids = set()
         self.clear(preserve_available_single=False)
 
     def shutdown_cleanup(self) -> None:
@@ -18152,7 +18317,7 @@ class OCRCompareTab(QWidget):
         recovery_row_index = int(self._current_row_index)
         output_path = str(path)
         self._set_source_correction_busy(
-            True, "正在后台同步物理列并导出逐模型纠错／最终裁决包；已完成裁决将自动预填并锁定…", lock_workspace=False,
+            True, "正在后台同步物理列并导出 AI OCR 裁决包；上一轮已接受结果将作为可复审参考保留…", lock_workspace=False,
         )
 
         def worker():
@@ -18170,6 +18335,7 @@ class OCRCompareTab(QWidget):
                     fusion_selections=recovery_selections,
                     fusion_selection_records=recovery_selection_records,
                     canonical_decisions=recovery_decisions,
+                    review_prior_decisions=True,
                     current_row_index=recovery_row_index,
                 )
                 signals.finished.emit(report)
@@ -18192,7 +18358,7 @@ class OCRCompareTab(QWidget):
         self._set_source_correction_busy(False)
         self._source_correction_progress.setValue(100)
         self._source_correction_state.setText(
-            f"已导出 · 已续用 {report.get('prefilled_prior_decision_rows', 0)} · "
+            f"已导出 · 复审旧结果 {report.get('prior_decision_review_rows', 0)} · "
             f"共同候选自动保留 {report.get('provisional_consensus_rows', 0)} · "
             f"本轮待审 {report.get('pending_review_rows', 0)} · "
             f"包ID {str(report.get('package_id', ''))[:8]}"
@@ -18201,7 +18367,8 @@ class OCRCompareTab(QWidget):
             self, "OCR 逐模型纠错／最终裁决包已导出",
             f"真正分歧总数：{report.get('editable_conflict_rows', 0)}\n"
             f"两模型共同候选（自动保留）：{report.get('provisional_consensus_rows', 0)}\n"
-            f"此前裁决已预填并锁定：{report.get('prefilled_prior_decision_rows', 0)}\n"
+            f"此前裁决保持锁定：{report.get('prefilled_prior_decision_rows', 0)}\n"
+            f"此前已接受结果重新开放复审：{report.get('prior_decision_review_rows', 0)}\n"
             f"其中旧逐模型结果迁移：{report.get('prefilled_legacy_migration_rows', 0)}\n"
             f"本轮真正分歧待审：{report.get('pending_conflict_rows', 0)}\n"
             f"本轮共同候选待审：0（按 v8 自动保留）\n"
@@ -18212,7 +18379,7 @@ class OCRCompareTab(QWidget):
             f"可恢复 OCR 会话：{'是' if report.get('recovery_snapshot_included') else '否'}\n\n"
             f"大模型可在 editable_conflict.model_edits 中只修正错误模型，"
             f"也可选填 ai_verdict.final_text 作为最终融合裁决；"
-            f"resolved_verdict 已完成且不可修改：\n{report.get('path', '')}",
+            f"上一轮 accepted 结果在新包中只作为参考，可由后续 AI 提交更好的 final_text：\n{report.get('path', '')}",
         )
 
     def set_recovery_page_image_provider(self, provider) -> None:
@@ -18574,10 +18741,18 @@ class OCRCompareTab(QWidget):
                     or []
                 ) if isinstance(item, dict)
             ]
+            from engine.multi_ocr_source_correction import (
+                apply_canonical_decisions_to_fusion_states, merge_canonical_decision_overlays,
+            )
+            existing_decisions = [dict(item) for item in self._canonical_source_decisions.values()]
+            merged_decisions, merge_stats = merge_canonical_decision_overlays(existing_decisions, decisions)
+            effective_decisions = [
+                dict(item) for item in (merge_stats.get("changed_accepted_decisions") or [])
+                if isinstance(item, dict)
+            ]
             affected_keys = {
                 tuple(str(value) for value in (item.get("column_ids") or []) if str(value))
-                for item in decisions
-                if str(item.get("status", "") or "") == "accepted"
+                for item in effective_decisions
             }
             preserved = sum(
                 1
@@ -18587,11 +18762,13 @@ class OCRCompareTab(QWidget):
             )
             self._canonical_source_decisions = {
                 tuple(str(value) for value in (item.get("column_ids") or []) if str(value)): dict(item)
-                for item in decisions if item.get("column_ids")
+                for item in merged_decisions if item.get("column_ids")
             }
-            from engine.multi_ocr_source_correction import apply_canonical_decisions_to_fusion_states
+            # Only newly accepted or genuinely improved rows are selected again.
+            # Re-importing an identical package is idempotent and cannot steal a
+            # later manual selection; unresolved later rows keep prior good AI.
             overlay_applied = apply_canonical_decisions_to_fusion_states(
-                self._fusion_states, self._comparison, decisions,
+                self._fusion_states, self._comparison, effective_decisions,
             )
             # Only the virtualised judgement window is rebuilt.  The three OCR
             # documents, source editors, alignment and full-text buffers are left
@@ -18603,10 +18780,38 @@ class OCRCompareTab(QWidget):
         except Exception as exc:
             self._on_source_correction_error(token, "载入 AI 纠错覆盖失败", str(exc))
             return
+        package_id = str(report.get("package_id", "") or "")
+        duplicate_package = bool(package_id and package_id in self._source_correction_imported_package_ids)
+        if package_id:
+            self._source_correction_imported_package_ids.add(package_id)
+        history_entry = {
+            "package_id": package_id,
+            "accepted_in_package": int(report.get("accepted_canonical_decisions", 0) or 0),
+            "new_accepted": int(merge_stats.get("new_accepted_rows", 0) or 0),
+            "replaced_accepted": int(merge_stats.get("replaced_accepted_rows", 0) or 0),
+            "preserved_prior": int(merge_stats.get("preserved_prior_rows", 0) or 0),
+            "effective_applied": int(overlay_applied or 0),
+            "duplicate_package": duplicate_package,
+        }
+        if not duplicate_package:
+            self._source_correction_import_history.append(history_entry)
+        # Persist cumulative audit state for later fusion/skeleton exports.
+        report["cumulative_import_count"] = len(self._source_correction_import_history)
+        report["cumulative_canonical_decisions"] = [
+            dict(item) for item in self._canonical_source_decisions.values()
+        ]
+        report["cumulative_accepted_canonical_decisions"] = sum(
+            1 for item in self._canonical_source_decisions.values()
+            if str(item.get("status", "") or "") == "accepted"
+        )
+        report["cumulative_merge_stats"] = {
+            key: value for key, value in merge_stats.items()
+            if key != "changed_accepted_decisions"
+        }
+        report["cumulative_import_history"] = copy.deepcopy(self._source_correction_import_history)
         self._last_source_correction_report = report
         self._set_source_correction_busy(False)
         self._source_correction_progress.setValue(100)
-        accepted = int(report.get("accepted_canonical_decisions", 0) or 0)
         unresolved_decisions = int(report.get("unresolved_canonical_decisions", 0) or 0)
         legacy_migrated = int(report.get("legacy_migrated_accepted_decisions", 0) or 0)
         resumed_locked = int(report.get("prefilled_resolved_decisions", 0) or 0)
@@ -18614,14 +18819,21 @@ class OCRCompareTab(QWidget):
         proposed_rows = int(report.get("proposed_model_rows", 0) or 0)
         normalized_provisional = int(report.get("normalized_legacy_provisional_rows", 0) or 0)
         visible_disagreements = int(report.get("resolved_history_rows_annotated", 0) or 0)
+        import_rounds = len(self._source_correction_import_history)
+        cumulative_accepted = sum(
+            1 for item in self._canonical_source_decisions.values()
+            if str(item.get("status", "") or "") == "accepted"
+        )
+        improved = int(merge_stats.get("replaced_accepted_rows", 0) or 0)
+        newly_added = int(merge_stats.get("new_accepted_rows", 0) or 0)
         self._source_correction_state.setText(
-            f"已导入覆盖层 · OCR回写 0 · AI候选 {overlay_applied} · "
-            f"原分歧保留 {visible_disagreements} · 待判断 {unresolved_decisions}"
+            f"AI裁决累计 {import_rounds} 包 · 当前有效 {cumulative_accepted} · "
+            f"本包新增 {newly_added} / 改进 {improved} · 待判断 {unresolved_decisions}"
         )
         self._summary.setText(
-            f"AI 纠错已作为非破坏式融合覆盖导入：生成 {overlay_applied} 条 AI 候选；"
-            f"原三模型 OCR、物理列和对齐均未修改；{visible_disagreements} 条原始分歧继续显示。"
-            f"未受影响的既有选择保留 {preserved} 条，仍待判断 {unresolved_decisions} 条。"
+            f"AI OCR 裁决已累积合并：当前保留 {cumulative_accepted} 条有效 AI 裁决；"
+            f"本包新增 {newly_added} 条、改进替换 {improved} 条。缺失/未决行不会清掉之前结果；"
+            f"原三模型 OCR、物理列和对齐均未修改。"
         )
         # Notify downstream workspaces without replacing/copying model documents.
         # The MainWindow recognises the overlay flag and deliberately skips the
@@ -18652,7 +18864,10 @@ class OCRCompareTab(QWidget):
             f"原始多模型对齐：保持不变\n"
             f"JSON 中逐模型修改建议：{proposed_cells} 列 / {proposed_rows} 模型行\n"
             f"涉及模型：{proposed_text}\n"
-            f"融合判断框新增并采用 AI 候选：{overlay_applied}\n"
+            f"本次真正新增/改进并采用 AI 候选：{overlay_applied}\n"
+            f"累计导入 AI 裁决包：{import_rounds}\n"
+            f"当前累计有效 AI 裁决：{cumulative_accepted}\n"
+            f"本包新增裁决：{newly_added}；改进替换：{improved}\n"
             f"继续可见的原始分歧：{visible_disagreements}\n"
             f"三方证据冲突（仅报告，不覆盖）：{merge_conflicts}\n"
             f"旧逐模型结果安全迁移：{legacy_migrated}\n"
@@ -18663,7 +18878,8 @@ class OCRCompareTab(QWidget):
             f"拒绝可疑拉丁字母裁决：{report.get('rejected_suspicious_ascii_decisions', 0)}\n"
             f"保留未受影响人工选择：{preserved}\n"
             f"{identity_note}\n\n"
-            "AI 结果是独立融合候选；NDLOCR、48px、Apple Vision 的原文和原分歧始终保留。",
+            "AI 结果按稳定列 ID 累积合并；后续已接受结果可替换同句旧 AI，未决结果不会反向清空。"
+            "NDLOCR、48px、Apple Vision 等原文和原分歧始终保留。",
         )
 
     def _export_fusion_and_skeleton(self):
@@ -21485,7 +21701,7 @@ REFERENCE_SECTION_ITEMS = (
     ("format", "格式处理"),
     ("compare", "文字校对"),
     ("export", "EPUB生成"),
-    ("settings", "系统设置"),
+    ("settings", "设置"),
 )
 SECTION_PAGE = 0
 SECTION_OCR = 1
@@ -21845,7 +22061,7 @@ class OCRModelUpdateDialog(QDialog):
         ordered = [
             self._statuses[key]
             for key in (
-                "apple_vision", "ndlocr_lite", "manga_48px", "manga_ocr",
+                "apple_vision", "ndlocr_lite", "hayai_ocr", "manga_48px", "manga_ocr",
                 "yomitoku", "paddle_ocr", "pdf_craft", "google_vision",
             )
             if key in self._statuses
@@ -21935,6 +22151,13 @@ class SystemSettingsTab(QWidget):
         self._device_detection_busy = False
         self._device_detection_signals = None
         self._device_report = None
+        # Source updater is opt-in only. No network call is made during startup.
+        self._source_update_info = None
+        self._source_update_check_busy = False
+        self._source_update_install_busy = False
+        self._source_update_signals = None
+        self._source_update_thread = None
+        self._source_update_busy_provider = None
         self._migrate_navigation_schema()
         if not self._settings.value(
             self.OCR_REVIEW_DEFAULT_CLOSED_MIGRATION_KEY, False, type=bool
@@ -22050,7 +22273,7 @@ class SystemSettingsTab(QWidget):
         outer.setSpacing(10)
 
         title_row = QHBoxLayout()
-        title = QLabel("系统设置")
+        title = QLabel("设置")
         title.setStyleSheet("font-size:15px;font-weight:700;")
         title_row.addWidget(title)
         title_row.addStretch(1)
@@ -22066,6 +22289,7 @@ class SystemSettingsTab(QWidget):
         self._tabs.addTab(self._build_ocr_page(), "OCR 设置")
         self._tabs.addTab(self._build_performance_page(), "性能设置")
         self._tabs.addTab(self._build_shortcuts_page(), "快捷键")
+        self._tabs.addTab(self._build_update_page(), "更新与诊断")
         self._tabs.addTab(self._build_about_page(), "关于")
         outer.addWidget(self._tabs, 1)
         root.addWidget(container, 1)
@@ -22444,7 +22668,7 @@ class SystemSettingsTab(QWidget):
             ("格式处理", f"{mod}3"),
             ("文字校对", f"{mod}4"),
             ("EPUB生成", f"{mod}5"),
-            ("系统设置", f"{mod}6"),
+            ("设置", f"{mod}6"),
             ("保存当前校对", "Ctrl + Enter"),
             ("上一句 / 下一句", "Ctrl + ↑ / ↓"),
             ("上一列 / 下一列", "Ctrl + ← / →"),
@@ -22461,6 +22685,285 @@ class SystemSettingsTab(QWidget):
         layout.addWidget(card)
         layout.addStretch(1)
         return scroll
+
+    def _build_update_page(self) -> QWidget:
+        """Manual source-update and diagnostic surface, isolated from business tabs."""
+        from utils.source_update import (
+            DEFAULT_BRANCH, DEFAULT_REPOSITORY, diagnostic_summary,
+            discover_project_root, read_project_version,
+        )
+
+        scroll, _page, layout = self._scroll_page()
+        update_card, update_box = self._make_card(
+            "Git 仓库更新",
+            "参考 Folirina 的安全更新思路：只在手动点击后联网；仓库与 main 分支锁定。"
+            "Git 工作区只允许 clean + fast-forward；便携源码包先下载到临时区、完整校验，再事务式替换程序文件，失败自动回滚。",
+        )
+        grid = QGridLayout()
+        grid.setHorizontalSpacing(14)
+        grid.setVerticalSpacing(8)
+        self._source_repo = QLineEdit(DEFAULT_REPOSITORY)
+        self._source_repo.setReadOnly(True)
+        self._source_repo.setToolTip("更新源已锁定，配置和界面都不能改到其它仓库。")
+        self._source_branch = QLineEdit(DEFAULT_BRANCH)
+        self._source_branch.setReadOnly(True)
+        self._source_branch.setToolTip("更新分支固定为 main。")
+        try:
+            root = discover_project_root(Path(__file__).resolve().parent)
+            local_version = read_project_version(root)
+        except Exception:
+            root = Path(__file__).resolve().parent
+            local_version = VERSION
+        self._source_root = QLineEdit(str(root))
+        self._source_root.setReadOnly(True)
+        grid.addWidget(QLabel("GitHub 仓库"), 0, 0)
+        grid.addWidget(self._source_repo, 0, 1)
+        grid.addWidget(QLabel("更新分支"), 1, 0)
+        grid.addWidget(self._source_branch, 1, 1)
+        grid.addWidget(QLabel("本地程序目录"), 2, 0)
+        grid.addWidget(self._source_root, 2, 1)
+        grid.addWidget(QLabel("当前版本"), 3, 0)
+        self._source_local_version = QLabel(f"v{local_version}")
+        self._source_local_version.setObjectName("settingsCardSubtitle")
+        grid.addWidget(self._source_local_version, 3, 1)
+        grid.setColumnStretch(1, 1)
+        update_box.addLayout(grid)
+
+        actions = QHBoxLayout()
+        self._source_check_btn = accent_button("检查 Git 更新")
+        self._source_check_btn.clicked.connect(self._check_source_update)
+        self._source_install_btn = accent_button("从 Git 更新程序")
+        self._source_install_btn.setEnabled(False)
+        self._source_install_btn.clicked.connect(self._install_source_update)
+        open_repo = QPushButton("打开 GitHub 仓库")
+        open_repo.clicked.connect(self._open_source_repository)
+        open_root = QPushButton("打开程序目录")
+        open_root.clicked.connect(self._open_source_root)
+        actions.addWidget(self._source_check_btn)
+        actions.addWidget(self._source_install_btn)
+        actions.addWidget(open_repo)
+        actions.addWidget(open_root)
+        actions.addStretch(1)
+        update_box.addLayout(actions)
+
+        self._source_update_status = QLabel("尚未检查更新。启动程序不会自动联网检查。")
+        self._source_update_status.setWordWrap(True)
+        self._source_update_status.setObjectName("settingsCardSubtitle")
+        update_box.addWidget(self._source_update_status)
+        self._source_remote_detail = QLabel("")
+        self._source_remote_detail.setWordWrap(True)
+        self._source_remote_detail.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        self._source_remote_detail.setObjectName("settingsCardSubtitle")
+        update_box.addWidget(self._source_remote_detail)
+        self._source_update_log = QPlainTextEdit()
+        self._source_update_log.setReadOnly(True)
+        self._source_update_log.setMaximumBlockCount(500)
+        self._source_update_log.setMinimumHeight(120)
+        self._source_update_log.setPlaceholderText("检查与更新过程会显示在这里。")
+        self._source_update_log.setStyleSheet(LIGHT_LOG_STYLE)
+        update_box.addWidget(self._source_update_log)
+        protection = QLabel(
+            "更新保护：不会自动更新、不会自动降级；Git 工作树有未提交修改时拒绝更新；"
+            "便携包同版本且没有可信 commit 基线时也拒绝覆盖。更新程序代码时不会删除 .venv、模型缓存、OCR 运行时、debug/logs、输出书籍或用户工作区。"
+        )
+        protection.setWordWrap(True)
+        protection.setObjectName("settingsCardSubtitle")
+        update_box.addWidget(protection)
+        layout.addWidget(update_card)
+
+        diag_card, diag_box = self._make_card(
+            "诊断信息",
+            "复制的内容只包含程序版本、平台、Python、程序目录和 Git 更新基线，不包含书籍正文、API 密钥或模型文件。",
+        )
+        diag_actions = QHBoxLayout()
+        copy_diag = QPushButton("复制诊断信息")
+        copy_diag.clicked.connect(self._copy_source_diagnostics)
+        open_debug = QPushButton("打开诊断目录")
+        open_debug.clicked.connect(self._open_debug_folder)
+        diag_actions.addWidget(copy_diag)
+        diag_actions.addWidget(open_debug)
+        diag_actions.addStretch(1)
+        diag_box.addLayout(diag_actions)
+        self._source_diag_preview = QPlainTextEdit()
+        self._source_diag_preview.setReadOnly(True)
+        self._source_diag_preview.setMaximumHeight(150)
+        try:
+            base = diagnostic_summary(root)
+        except Exception as exc:
+            base = f"诊断摘要暂不可用：{exc}"
+        self._source_diag_preview.setPlainText(
+            base + f"\n平台: {platform.system()} {platform.release()} · {platform.machine()}"
+            f"\nPython: {sys.version.split()[0]}"
+        )
+        self._source_diag_preview.setStyleSheet(LIGHT_LOG_STYLE)
+        diag_box.addWidget(self._source_diag_preview)
+        layout.addWidget(diag_card)
+        layout.addStretch(1)
+        return scroll
+
+    def set_source_update_busy_provider(self, provider) -> None:
+        self._source_update_busy_provider = provider if callable(provider) else None
+
+    def source_update_in_progress(self) -> bool:
+        return bool(self._source_update_check_busy or self._source_update_install_busy)
+
+    def _external_source_update_busy(self) -> bool:
+        try:
+            return bool(self._source_update_busy_provider and self._source_update_busy_provider())
+        except Exception:
+            return True
+
+    def _append_source_update_log(self, message: str) -> None:
+        text = str(message or "").strip()
+        if text and hasattr(self, "_source_update_log"):
+            self._source_update_log.appendPlainText(text)
+
+    def _check_source_update(self, _checked=False) -> None:
+        if self.source_update_in_progress():
+            return
+        self._source_update_info = None
+        self._source_update_check_busy = True
+        self._source_check_btn.setEnabled(False)
+        self._source_install_btn.setEnabled(False)
+        self._source_update_status.setText("正在连接 GitHub 检查 main 分支版本和 commit…")
+        self._source_remote_detail.setText("")
+        self._append_source_update_log("开始检查 Git 更新…")
+        signals = WorkerSignals()
+        self._source_update_signals = signals
+        signals.finished.connect(self._source_update_check_finished)
+        signals.error.connect(self._source_update_failed)
+
+        def worker():
+            try:
+                from utils.source_update import check_source_update
+                result = check_source_update(project_root=Path(__file__).resolve().parent)
+                signals.finished.emit(result)
+            except Exception as exc:
+                signals.error.emit(f"{type(exc).__name__}: {exc}")
+
+        thread = threading.Thread(target=worker, daemon=True, name="source-update-check")
+        self._source_update_thread = thread
+        thread.start()
+
+    def _source_update_check_finished(self, info) -> None:
+        self._source_update_check_busy = False
+        self._source_update_thread = None
+        self._source_update_signals = None
+        self._source_update_info = info
+        self._source_check_btn.setEnabled(True)
+        self._source_update_status.setText(str(getattr(info, "reason", "检查完成")))
+        local = str(getattr(info, "local_short", "未记录"))
+        remote = str(getattr(info, "remote_short", ""))
+        detail = (
+            f"本地：v{getattr(info, 'local_version', VERSION)} · commit {local}\n"
+            f"远端：v{getattr(info, 'remote_version', '未知')} · commit {remote} · {getattr(info, 'branch', 'main')}\n"
+            f"安装形态：{getattr(info, 'install_layout', '未知')}"
+        )
+        message = str(getattr(info, "remote_message", "") or "")
+        date = str(getattr(info, "remote_date", "") or "")
+        if message:
+            detail += f"\n最新提交：{message}" + (f" · {date}" if date else "")
+        self._source_remote_detail.setText(detail)
+        self._append_source_update_log(str(getattr(info, "reason", "检查完成")))
+        self._source_install_btn.setEnabled(bool(getattr(info, "available", False)) and not self._external_source_update_busy())
+
+    def _source_update_failed(self, message: str) -> None:
+        was_install = self._source_update_install_busy
+        self._source_update_check_busy = False
+        self._source_update_install_busy = False
+        self._source_update_thread = None
+        self._source_update_signals = None
+        self._source_check_btn.setEnabled(True)
+        self._source_install_btn.setEnabled(False)
+        self._source_update_status.setText("程序更新失败；现有版本保持不变。" if was_install else "检查更新失败；现有版本不受影响。")
+        self._source_remote_detail.setText(str(message))
+        self._append_source_update_log("失败：" + str(message))
+        QMessageBox.critical(self, "程序更新失败" if was_install else "检查更新失败", str(message))
+
+    def _install_source_update(self, _checked=False) -> None:
+        if self.source_update_in_progress():
+            return
+        if self._external_source_update_busy() or self._device_detection_busy:
+            QMessageBox.information(self, "任务进行中", "请先等待当前 OCR、排版、导出、模型或设备检测任务结束，再更新程序。")
+            return
+        info = self._source_update_info
+        if info is None:
+            QMessageBox.information(self, "请先检查更新", "请先点击“检查 Git 更新”。")
+            return
+        if not bool(getattr(info, "available", False)):
+            QMessageBox.information(self, "无需更新", str(getattr(info, "reason", "当前没有可安装更新")))
+            return
+        answer = QMessageBox.question(
+            self,
+            "确认更新程序",
+            f"将从 {getattr(info, 'repository', '')} / {getattr(info, 'branch', 'main')} 更新程序代码。\n\n"
+            f"本地：v{getattr(info, 'local_version', VERSION)}\n远端：v{getattr(info, 'remote_version', '')} · {getattr(info, 'remote_short', '')}\n\n"
+            "不会更新 OCR 模型，也不会删除虚拟环境、模型缓存、书籍、输出和日志。更新完成后需要重启程序。\n\n继续吗？",
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No,
+        )
+        if answer != QMessageBox.Yes:
+            return
+        self._source_update_install_busy = True
+        self._source_check_btn.setEnabled(False)
+        self._source_install_btn.setEnabled(False)
+        self._source_update_status.setText("正在安全更新程序代码…")
+        signals = WorkerSignals()
+        self._source_update_signals = signals
+        signals.log.connect(self._append_source_update_log)
+        signals.finished.connect(self._source_update_install_finished)
+        signals.error.connect(self._source_update_failed)
+
+        def worker():
+            try:
+                from utils.source_update import install_source_update
+                result = install_source_update(info, progress=signals.log.emit)
+                signals.finished.emit(result)
+            except Exception as exc:
+                signals.error.emit(f"{type(exc).__name__}: {exc}")
+
+        thread = threading.Thread(target=worker, daemon=True, name="source-update-install")
+        self._source_update_thread = thread
+        thread.start()
+
+    def _source_update_install_finished(self, result) -> None:
+        self._source_update_install_busy = False
+        self._source_update_thread = None
+        self._source_update_signals = None
+        self._source_update_info = None
+        self._source_check_btn.setEnabled(True)
+        self._source_install_btn.setEnabled(False)
+        new_version = str(getattr(result, "new_version", ""))
+        commit = str(getattr(result, "commit", ""))[:10]
+        requirements_changed = bool(getattr(result, "requirements_changed", False))
+        suffix = "；依赖清单有变化" if requirements_changed else ""
+        self._source_update_status.setText(f"更新完成：v{new_version} · {commit}{suffix}。请重新启动程序。")
+        self._append_source_update_log("更新完成；当前运行中的窗口仍使用旧内存代码，重启后加载新版本。")
+        dependency_note = (
+            "\n\n检测到 requirements 依赖清单变化。为避免更新过程擅自修改 Python/OCR 环境，本功能不会自动 pip install；请按项目安装说明更新主依赖后再启动。"
+            if requirements_changed else ""
+        )
+        QMessageBox.information(self, "更新完成", f"程序源码已安全更新到 v{new_version}。{dependency_note}\n\n请关闭并重新启动 Novel Formatter。")
+
+    def _open_source_repository(self, _checked=False) -> None:
+        QDesktopServices.openUrl(QUrl("https://github.com/Amster-Ilvil/Novel-formatter"))
+
+    def _open_source_root(self, _checked=False) -> None:
+        text = self._source_root.text() if hasattr(self, "_source_root") else str(Path(__file__).resolve().parent)
+        path = Path(text).expanduser().resolve()
+        QDesktopServices.openUrl(QUrl.fromLocalFile(str(path)))
+
+    def _copy_source_diagnostics(self, _checked=False) -> None:
+        try:
+            from utils.source_update import diagnostic_summary
+            text = diagnostic_summary(Path(__file__).resolve().parent)
+        except Exception as exc:
+            text = f"Novel Formatter {VERSION}\n诊断摘要生成失败：{exc}"
+        text += f"\n平台: {platform.system()} {platform.release()} · {platform.machine()}\nPython: {sys.version.split()[0]}"
+        QApplication.clipboard().setText(text)
+        if hasattr(self, "_source_diag_preview"):
+            self._source_diag_preview.setPlainText(text)
+        QMessageBox.information(self, "诊断信息", "诊断信息已复制到剪贴板。")
 
     def _build_about_page(self) -> QWidget:
         scroll, _page, layout = self._scroll_page()
@@ -22481,7 +22984,7 @@ class SystemSettingsTab(QWidget):
         principles, pbox = self._make_card("界面与功能原则")
         for text in (
             "六个主功能区；PDF、替换、OCR 对比和图文对照通过顶部页签融合。",
-            "帮助文档入口不显示；OCR 模型更新仅在系统设置中由用户手动触发。",
+            "帮助文档入口不显示；程序与 OCR 模型更新仅在设置中由用户手动触发。",
             "OCR 开始按钮只位于 OCR 日志标题栏，不进入文字校对区。",
             "界面边框统一为淡蓝色，白色按钮文字统一为黑色。",
             "视觉与设置改造不改变 OCR、Formatter、替换、校对和导出数据链。",
@@ -22567,7 +23070,7 @@ class SystemSettingsTab(QWidget):
         self._settings.sync()
         self.settings_changed.emit(dict(prefs))
         if show_message:
-            QMessageBox.information(self, "设置已保存", "系统设置已保存；OCR 默认行为已同步到当前工作区。")
+            QMessageBox.information(self, "设置已保存", "设置已保存；OCR 默认行为已同步到当前工作区。")
 
     def _reset_defaults(self) -> None:
         self._restore_workspace_cb.setChecked(False)
@@ -22757,6 +23260,7 @@ class MainWindow(QMainWindow):
             lambda: list(getattr(self._tab_pages, "page_images", []) or [])
         )
         self._tab_system = SystemSettingsTab()
+        self._tab_system.set_source_update_busy_provider(self._source_update_has_active_jobs)
 
         self._ocr_section = ReferenceSectionHost([
             ("图片 OCR", self._tab_ocr),
@@ -22887,8 +23391,33 @@ class MainWindow(QMainWindow):
         self._tab_ocr_compare.reset_for_new_book()
         ClearManager.clear_ocr(tab)
 
+    def _source_update_has_active_jobs(self) -> bool:
+        """Conservative write gate used only by the program source updater.
+
+        Existing workspaces are not modified. We merely inspect their explicit
+        busy flags/thread handles so a source-tree mutation cannot overlap an OCR,
+        formatting, comparison or export worker.
+        """
+        for tab in tuple(getattr(self, "_workspace_tabs", ()) or ()):
+            try:
+                for name, value in vars(tab).items():
+                    if isinstance(value, threading.Thread) and value.is_alive():
+                        return True
+                    if name.endswith("_busy") and value is True:
+                        return True
+                    running = getattr(value, "isRunning", None)
+                    if callable(running) and running():
+                        return True
+            except Exception:
+                return True
+        return False
+
     def closeEvent(self, event):
         """Invalidate every workspace task and release retained temporary files."""
+        if hasattr(self, "_tab_system") and self._tab_system.source_update_in_progress():
+            event.ignore()
+            QMessageBox.information(self, "程序更新进行中", "请等待 Git 检查/更新完成后再关闭窗口，以免中断事务更新。")
+            return
         try:
             if hasattr(self, "_workspace_coordinator"):
                 self._workspace_coordinator.shutdown()

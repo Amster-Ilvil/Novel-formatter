@@ -676,11 +676,12 @@ def _accepted_decision_for_export(
     model_ids: Sequence[str],
     texts: Sequence[str],
 ) -> tuple[dict | None, str]:
-    """Validate an already imported verdict before sealing it into a new V3 package.
+    """Validate an already imported verdict against the current OCR evidence.
 
     Returns ``(resolved_verdict, state)`` where state is one of ``prefilled``,
-    ``stale`` or ``none``.  Resolved verdicts are immutable package evidence and
-    therefore do not re-enter the AI work queue.
+    ``stale`` or ``none``.  Callers may either seal a validated verdict as
+    resolved history or expose it as read-only context for an explicit second
+    review pass; the raw OCR evidence itself is never rewritten.
     """
     if not isinstance(decision, dict):
         return None, "none"
@@ -855,6 +856,101 @@ def _read_canonical_verdict(row: dict, model_ids: Sequence[str], schema: str) ->
             "delete_intentionally": delete_intentionally,
         }
     return _derive_legacy_canonical_verdict(row, model_ids)
+
+
+def merge_canonical_decision_overlays(
+    existing: Sequence[dict] | None,
+    incoming: Sequence[dict] | None,
+) -> tuple[list[dict], dict]:
+    """Merge repeated AI adjudication imports without losing earlier good rows.
+
+    Stable physical-column IDs are the authority.  A later *accepted* verdict
+    replaces the earlier verdict for the same row (so a better second-pass AI
+    result can win), while an omitted or unresolved later row never erases an
+    already accepted verdict.  This makes repeated package imports cumulative
+    and idempotent instead of treating every import as a whole-session replace.
+    """
+    by_key: dict[tuple[str, ...], dict] = {}
+    order: list[tuple[str, ...]] = []
+
+    def key_for(item: dict) -> tuple[str, ...]:
+        return tuple(str(value) for value in (item.get("column_ids") or []) if str(value))
+
+    for item in existing or ():
+        if not isinstance(item, dict):
+            continue
+        key = key_for(item)
+        if not key:
+            continue
+        if key not in by_key:
+            order.append(key)
+        by_key[key] = copy.deepcopy(item)
+
+    new_rows = 0
+    replaced_rows = 0
+    preserved_rows = 0
+    unresolved_new_rows = 0
+    changed_accepted: list[dict] = []
+    for item in incoming or ():
+        if not isinstance(item, dict):
+            continue
+        key = key_for(item)
+        if not key:
+            continue
+        current = by_key.get(key)
+        incoming_status = str(item.get("status", "") or "")
+        current_status = str((current or {}).get("status", "") or "")
+        if incoming_status == "accepted":
+            candidate = copy.deepcopy(item)
+            changed = True
+            if current is None:
+                order.append(key)
+                new_rows += 1
+            elif current_status == "accepted":
+                # Later accepted output is authoritative for this stable row,
+                # but an identical re-import is idempotent and must not steal a
+                # later manual selection in the GUI.
+                changed = (
+                    str(current.get("final_text", "") or "") != str(candidate.get("final_text", "") or "")
+                    or bool(current.get("delete_intentionally", False)) != bool(candidate.get("delete_intentionally", False))
+                    or float(current.get("confidence", 0.0) or 0.0) != float(candidate.get("confidence", 0.0) or 0.0)
+                    or str(current.get("reason", "") or "") != str(candidate.get("reason", "") or "")
+                )
+                if changed:
+                    replaced_rows += 1
+                else:
+                    preserved_rows += 1
+            else:
+                replaced_rows += 1
+            by_key[key] = candidate
+            if changed:
+                changed_accepted.append(candidate)
+            continue
+
+        if current is not None and current_status == "accepted":
+            # A blank/unresolved second pass is not evidence that the previous
+            # accepted decision became wrong.  Preserve it until a later pass
+            # supplies a concrete accepted replacement.
+            preserved_rows += 1
+            continue
+
+        candidate = copy.deepcopy(item)
+        if current is None:
+            order.append(key)
+            unresolved_new_rows += 1
+        by_key[key] = candidate
+
+    merged = [by_key[key] for key in order if key in by_key]
+    return merged, {
+        "existing_rows": sum(1 for item in existing or () if isinstance(item, dict) and key_for(item)),
+        "incoming_rows": sum(1 for item in incoming or () if isinstance(item, dict) and key_for(item)),
+        "merged_rows": len(merged),
+        "new_accepted_rows": new_rows,
+        "replaced_accepted_rows": replaced_rows,
+        "preserved_prior_rows": preserved_rows,
+        "new_unresolved_rows": unresolved_new_rows,
+        "changed_accepted_decisions": changed_accepted,
+    }
 
 
 def apply_canonical_decisions_to_fusion_states(
@@ -1098,6 +1194,7 @@ def build_source_correction_payload(
     comparison: MultiOcrComparison,
     *,
     canonical_decisions: Sequence[dict] | None = None,
+    review_prior_decisions: bool = False,
     progress_callback: ProgressCallback | None = None,
 ) -> dict:
     docs = list(documents)
@@ -1118,6 +1215,7 @@ def build_source_correction_payload(
     prefilled_legacy_count = 0
     prefilled_native_count = 0
     stale_prior_count = 0
+    reviewable_prior_count = 0
     pending_conflict_count = 0
     pending_provisional_count = 0
     prior_by_columns = {
@@ -1164,9 +1262,18 @@ def build_source_correction_payload(
             model_ids=model_ids,
             texts=texts,
         )
-        prefilled = resolved_verdict is not None
+        # OCR compare exports can explicitly re-open prior accepted conflict
+        # verdicts for a second AI pass.  Exact/provisional consensus remains
+        # locked.  The previous verdict is supplied as read-only context; if
+        # the new pass returns nothing, cumulative import preserves the old one.
+        prior_reviewable = bool(
+            review_prior_decisions and actual_conflict and resolved_verdict is not None
+        )
+        prefilled = bool(resolved_verdict is not None and not prior_reviewable)
         editable = bool(review_required and not prefilled)
-        if prefilled:
+        if prior_reviewable:
+            reviewable_prior_count += 1
+        elif prefilled:
             prefilled_count += 1
             if str(resolved_verdict.get("source", "") or "").startswith("legacy_"):
                 prefilled_legacy_count += 1
@@ -1189,7 +1296,8 @@ def build_source_correction_payload(
             ),
             "review_required": review_required,
             "decision_state": (
-                "resolved_prefilled" if prefilled
+                "prior_canonical_reopened_for_review" if prior_reviewable
+                else "resolved_prefilled" if prefilled
                 else "pending_ai_review" if editable
                 else "auto_selected_provisional_consensus" if provisional
                 else "locked_exact_consensus"
@@ -1202,7 +1310,17 @@ def build_source_correction_payload(
             "base_row_sha256": _sha256({model_id: texts[index] for index, model_id in enumerate(model_ids)}),
             "segments": segments,
         }
-        if prior_state == "stale":
+        if prior_reviewable and isinstance(resolved_verdict, dict):
+            row_payload["prior_decision_context"] = {
+                "status": "accepted_reopened_for_review",
+                "final_text": str(resolved_verdict.get("final_text", "") or ""),
+                "reason": str(resolved_verdict.get("reason", "") or ""),
+                "confidence": float(resolved_verdict.get("confidence", 0.0) or 0.0),
+                "delete_intentionally": bool(resolved_verdict.get("delete_intentionally", False)),
+                "source": str(resolved_verdict.get("source", "") or ""),
+                "instruction": "这是上一轮已接受结果，仅供参考；若有更好文本可直接改写 ai_verdict.final_text。",
+            }
+        elif prior_state == "stale":
             row_payload["prior_decision_context"] = {
                 "status": "stale_not_prefilled",
                 "source": str((prior_decision or {}).get("source", "") or ""),
@@ -1252,8 +1370,16 @@ def build_source_correction_payload(
                 "base_model_texts、model_texts 与 locked_consensus 永久只读；"
                 "逐模型修正只能写入 model_edits，不得改写原始证据字段。"
             ),
-            "locked_rule": "exact_consensus、provisional_consensus_auto 与 resolved_prior_canonical 均不可修改；共同候选按 v8 规则自动保留，已接受裁决会重新校验后锁定。",
-            "resume_rule": "只处理 editable=true 的 pending_ai_review；resolved_verdict 已完成并锁定，不得重复改写。",
+            "locked_rule": (
+                "exact_consensus 与 provisional_consensus_auto 不可修改；此前已接受的冲突裁决在本包中作为 prior_decision_context 重新开放复审。"
+                if review_prior_decisions else
+                "exact_consensus、provisional_consensus_auto 与 resolved_prior_canonical 均不可修改；共同候选按 v8 规则自动保留，已接受裁决会重新校验后锁定。"
+            ),
+            "resume_rule": (
+                "处理 editable=true 的 pending_ai_review / prior_canonical_reopened_for_review；上一轮结果只是参考，可保留也可改进。"
+                if review_prior_decisions else
+                "只处理 editable=true 的 pending_ai_review；resolved_verdict 已完成并锁定，不得重复改写。"
+            ),
             "whole_row_rule": (
                 "ai_verdict.final_text 是可选的独立最终融合裁决；调序、增删、跨列差异可用它整体裁决。"
                 "仅做逐模型纠错时可保持 final_text 为空。"
@@ -1290,6 +1416,8 @@ def build_source_correction_payload(
         "prefilled_legacy_migration_rows": prefilled_legacy_count,
         "prefilled_native_decision_rows": prefilled_native_count,
         "stale_prior_decision_rows": stale_prior_count,
+        "prior_decision_review_enabled": bool(review_prior_decisions),
+        "prior_decision_review_rows": reviewable_prior_count,
         "locked_consensus_rows": locked_count,
         "rows": rows,
     }
@@ -1650,6 +1778,7 @@ def export_source_correction_bundle(
     fusion_selections: dict[tuple[str, ...], str] | None = None,
     fusion_selection_records: dict[tuple[str, ...], dict] | None = None,
     canonical_decisions: Sequence[dict] | None = None,
+    review_prior_decisions: bool = False,
     current_row_index: int = 0,
 ) -> dict:
     output = Path(output_path).expanduser()
@@ -1659,6 +1788,7 @@ def export_source_correction_bundle(
     payload = build_source_correction_payload(
         documents, labels, comparison,
         canonical_decisions=canonical_decisions,
+        review_prior_decisions=review_prior_decisions,
         progress_callback=progress_callback,
     )
     input_audit_rows, input_audit_summary = _build_detailed_ocr_input_audit(
@@ -1811,8 +1941,8 @@ def export_source_correction_bundle(
             )
         readme = f"""# 多模型 OCR 逐源纠错包
 
-本包同时支持“逐模型纠错”和“最终融合裁决”。此前已安全接受的最终裁决会写入
-`resolved_verdict` 并锁定，只有 `editable=true` 的剩余行需要再次提交给 AI。
+本包同时支持“逐模型纠错”和“最终融合裁决”。{("此前已接受的冲突裁决会作为 prior_decision_context 重新开放复审；AI 可保留，也可提交更好的结果。" if review_prior_decisions else "此前已安全接受的最终裁决会写入 resolved_verdict 并锁定。")}
+只有 `editable=true` 的行需要提交给 AI。
 
 逐模型纠错：只在 `editable_conflict` 段的 `model_edits` 中填写错误模型的修正文字，
 正确模型保持省略。导入后程序仅据此生成“AI逐模型纠错结果”融合候选，不回写任何
@@ -1832,6 +1962,7 @@ OCR 模型、不改变原物理列、不重新对齐；原三模型分歧继续�
 真正分歧总数：{payload['editable_conflict_rows']}  
 两模型共同候选（按 v8 自动保留）：{payload.get('provisional_consensus_rows', 0)}  
 此前已完成并锁定：{payload.get('prefilled_prior_decision_rows', 0)}  
+此前结果重新开放复审：{payload.get('prior_decision_review_rows', 0)}
 本轮真正分歧待审：{payload.get('pending_conflict_rows', 0)}  
 本轮共同候选待审：{payload.get('pending_provisional_rows', 0)}  
 本轮合计待审：{payload.get('pending_review_rows', 0)}  
@@ -1872,6 +2003,8 @@ OCR 模型、不改变原物理列、不重新对齐；原三模型分歧继续�
         "prefilled_legacy_migration_rows": payload.get("prefilled_legacy_migration_rows", 0),
         "prefilled_native_decision_rows": payload.get("prefilled_native_decision_rows", 0),
         "stale_prior_decision_rows": payload.get("stale_prior_decision_rows", 0),
+        "prior_decision_review_enabled": bool(payload.get("prior_decision_review_enabled", False)),
+        "prior_decision_review_rows": payload.get("prior_decision_review_rows", 0),
         "locked_consensus_rows": payload["locked_consensus_rows"],
         "image_count": image_count,
         "evidence_export_profile": payload.get("evidence_export_profile", {}),
@@ -2785,4 +2918,3 @@ def documents_with_comparison_texts(
         docs[model_index] = doc_copy
         _report_progress(progress_callback, "应用当前 OCR 对比文字", position, max(1, len(active)))
     return docs
-

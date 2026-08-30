@@ -10,7 +10,7 @@ PyMuPDF 暴露的字符级数据（坐标 + 字号），比图像 OCR 更准确�
     - 按字号阈值跳过振假名（不像 OCR 路线那样试图保留成 ruby 标注，
       这里字号信息在"扁平化成文字"之后就没有了，唯一可靠的处理方式
       就是在提取阶段直接按字号过滤掉）
-    - 按 X 坐标分列（COL_WIDTH 一列），列内按 Y 排序 —— 处理竖排日文
+    - 按真实 X 基线自适应分列，列内按 Y 排序 —— 处理竖排日文
       的阅读顺序，比图像 OCR 路线的 GapTree 更精确，因为这里是从
       PDF 里拿到的精确字符坐标，不是靠 bounding box 估算
     - 页码识别：纯数字 + 位于页面底部 20% 区域
@@ -27,9 +27,9 @@ from __future__ import annotations
 
 import re
 import sys
-from itertools import groupby
 from pathlib import Path
 from typing import Optional, Callable
+import statistics
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 from models.document import (
@@ -38,6 +38,18 @@ from models.document import (
 
 COL_WIDTH = 20
 FURIGANA_SIZE_THRESHOLD = 8.0
+
+# ``COL_WIDTH`` used to be used directly as ``round(axis / COL_WIDTH)``.  That
+# is unsafe for real Japanese vertical PDFs: this book, for example, has body
+# columns about 15.735 pt apart, so a 20 pt bucket periodically collapses two
+# adjacent physical columns into one and then interleaves their glyphs by Y.
+# Keep the public parameter for compatibility, but use it only as an upper
+# bound for *same-track baseline drift*.  Actual tracks are clustered around
+# their measured origins.
+_MIN_TRACK_TOLERANCE = 0.75
+_MAX_TRACK_TOLERANCE = 5.0
+_FONT_TRACK_TOLERANCE_RATIO = 0.42
+_COL_WIDTH_TOLERANCE_RATIO = 0.22
 
 JP_CHAPTER_NUMBER = r'[一二三四五六七八九十百千〇零\d０-９]+'
 CHAPTER_UNIT = r'[章話節巻回幕篇編]'
@@ -135,6 +147,93 @@ def _detect_block_type(text: str) -> BlockType:
     return BlockType.PARAGRAPH
 
 
+def _track_tolerance(chars: list[dict], col_width: float) -> float:
+    """Return a conservative baseline-drift tolerance for one physical track.
+
+    Vertical Japanese punctuation is not always placed on exactly the same X
+    origin as ordinary glyphs.  In the supplied PDF, for example, ``!`` can be
+    shifted by about 2.95 pt while the neighbouring *column* is 15.735 pt away.
+    A tolerance derived from the actual font size keeps such punctuation in its
+    column without ever treating the full column pitch as a grouping bucket.
+    """
+    sizes = [float(ch.get("size", 0) or 0) for ch in chars if float(ch.get("size", 0) or 0) > 0]
+    median_size = statistics.median(sizes) if sizes else 10.0
+    width_hint = abs(float(col_width or COL_WIDTH))
+    tolerance = min(
+        median_size * _FONT_TRACK_TOLERANCE_RATIO,
+        width_hint * _COL_WIDTH_TOLERANCE_RATIO if width_hint else _MAX_TRACK_TOLERANCE,
+        _MAX_TRACK_TOLERANCE,
+    )
+    return max(_MIN_TRACK_TOLERANCE, tolerance)
+
+
+def _cluster_text_tracks(
+    chars: list[dict],
+    orientation: str,
+    col_width: float = COL_WIDTH,
+) -> list[list[dict]]:
+    """Cluster glyphs into real physical columns/rows without interleaving.
+
+    The old implementation snapped every origin to a fixed 20 pt grid.  Grid
+    phase is arbitrary, so even perfectly regular 15.7 pt columns can collide
+    in the same rounded bucket.  This routine instead clusters neighbouring
+    baselines by *distance*.  It deliberately tolerates only small within-track
+    shifts (vertical ``!?`` / rotated punctuation), never a whole column pitch.
+
+    Reading order remains unchanged:
+      * vertical page: right -> left tracks, top -> bottom glyphs;
+      * horizontal page: top -> bottom tracks, left -> right glyphs.
+    """
+    if not chars:
+        return []
+
+    vertical = orientation != "horizontal"
+    axis = "x" if vertical else "y"
+    inline = "y" if vertical else "x"
+    reverse_tracks = vertical
+    tolerance = _track_tolerance(chars, col_width)
+
+    # First pass: collect nearby origins into baseline clusters.  Median is used
+    # rather than a rounded grid so the result is independent of page offset /
+    # crop box and robust against a few shifted punctuation glyphs.
+    ordered = sorted(
+        chars,
+        key=lambda ch: (
+            -float(ch[axis]) if reverse_tracks else float(ch[axis]),
+            float(ch[inline]),
+            int(ch.get("source_order", 0)),
+        ),
+    )
+    clusters: list[dict] = []
+    for ch in ordered:
+        pos = float(ch[axis])
+        best_index = -1
+        best_distance = tolerance + 1.0
+        # Pages normally have only a few dozen tracks.  Scan all existing
+        # clusters rather than relying on insertion proximity; this keeps the
+        # result correct even for unusual shifted/rotated punctuation.
+        for idx in range(len(clusters)):
+            distance = abs(pos - float(clusters[idx]["center"]))
+            if distance <= tolerance and distance < best_distance:
+                best_index = idx
+                best_distance = distance
+        if best_index < 0:
+            clusters.append({"center": pos, "axis_values": [pos], "chars": [ch]})
+        else:
+            cluster = clusters[best_index]
+            cluster["chars"].append(ch)
+            cluster["axis_values"].append(pos)
+            cluster["center"] = statistics.median(cluster["axis_values"])
+
+    clusters.sort(key=lambda item: float(item["center"]), reverse=reverse_tracks)
+    result: list[list[dict]] = []
+    for cluster in clusters:
+        track = list(cluster["chars"])
+        track.sort(key=lambda ch: (float(ch[inline]), int(ch.get("source_order", 0))))
+        result.append(track)
+    return result
+
+
 def extract_pdf_text_layer(
     pdf_path: str,
     page_overrides: dict[int, str] | None = None,
@@ -155,7 +254,7 @@ def extract_pdf_text_layer(
                         如果需要页面缩略图，请走 Page Manager 的图片流程）
         verbose: 是否打印进度
         furigana_threshold: 字号小于此值的字符视为振假名，提取时跳过
-        col_width: 分列宽度（PDF 坐标单位，通常约等于正文字号）
+        col_width: 兼容参数；仅作为同一文字列基线漂移容差的上限提示，不再用于固定网格分桶
         progress_callback: (current, total, label) -> None
 
     Returns:
@@ -211,9 +310,10 @@ def extract_pdf_text_layer(
         data = page.get_text("rawdict", flags=fitz.TEXT_PRESERVE_WHITESPACE)
 
         chars: list[dict] = []
-        for block in data.get("blocks", []):
-            for line in block.get("lines", []):
-                for span in line.get("spans", []):
+        source_order = 0
+        for block_index, block in enumerate(data.get("blocks", [])):
+            for line_index, line in enumerate(block.get("lines", [])):
+                for span_index, span in enumerate(line.get("spans", [])):
                     font_size = span.get("size", 12)
                     if font_size < furigana_threshold:
                         furigana_chars_skipped += len(span.get("chars", []))
@@ -226,27 +326,25 @@ def extract_pdf_text_layer(
                                 "x": char["origin"][0],
                                 "y": char["origin"][1],
                                 "size": font_size,
+                                # Stable tiebreak only.  Reading order continues
+                                # to come from geometry, not PDF object order.
+                                "source_order": source_order,
+                                "block_index": block_index,
+                                "line_index": line_index,
+                                "span_index": span_index,
                             })
+                            source_order += 1
 
-        # wmode/dir 硬化的方向判定：竖排页走原路径（右→左列、列内上→下），
-        # 横排页（版权页/奥付等）按行序（上→下行、行内左→右）输出，避免乱序。
+        # wmode/dir 硬化的方向判定：竖排页走右→左、列内上→下；横排页走
+        # 上→下、行内左→右。关键变化：不再用固定 20pt 网格分桶，而是按
+        # 实际字符基线自适应聚类，避免相邻物理列被错误交错。
         orientation = _page_orientation(data)
-        if orientation == "horizontal":
-            sort_key = lambda ch: (round(ch["y"] / col_width), ch["x"])
-        else:
-            sort_key = lambda ch: (-round(ch["x"] / col_width), ch["y"])
-        group_key = (
-            (lambda ch: round(ch["y"] / col_width))
-            if orientation == "horizontal"
-            else (lambda ch: -round(ch["x"] / col_width))
-        )
-        chars.sort(key=sort_key)
+        tracks = _cluster_text_tracks(chars, orientation, col_width)
 
         page_blocks: list[Block] = []
         page_w = page.rect.width
 
-        for _, group in groupby(chars, key=group_key):
-            group = list(group)
+        for group in tracks:
 
             if _is_page_number(group, page_height):
                 page_number_cols_skipped += 1

@@ -4461,7 +4461,7 @@ def _choose_adaptive_column_rescue(
     # vertical text strip before inference.  Retrying the full-size masked page
     # therefore produces the same prepared model input, wastes one inference,
     # and can reintroduce the very page-mask hallucination this adapter avoids.
-    if compact_primary and engine not in {"manga_ocr", "manga_48px", "yomitoku"} and (
+    if compact_primary and engine not in {"manga_ocr", "hayai_ocr", "manga_48px", "yomitoku"} and (
         not valid or severe_short or very_low_conf
     ):
         return _ColumnRescueDecision(
@@ -4772,6 +4772,7 @@ class _RecognizerSession:
         self.engine_options = dict(engine_options or {})
         self.load_progress_callback = load_progress_callback
         self._manga = None
+        self._hayai = None
         self._manga48 = None
         self._yomitoku = None
         self._persistent = None
@@ -4783,6 +4784,12 @@ class _RecognizerSession:
             from adapters.manga_ocr_adapter import MangaOcrSession
             self._manga = MangaOcrSession(cancel_check=self.cancel_check, verbose=self.verbose)
             self._manga.__enter__()
+        elif self.engine == "hayai_ocr":
+            from adapters.hayai_ocr_adapter import HayaiOcrSession
+            self._hayai = HayaiOcrSession(
+                engine_options=self.engine_options, cancel_check=self.cancel_check, verbose=self.verbose
+            )
+            self._hayai.__enter__()
         elif self.engine == "manga_48px":
             from adapters.manga_48px_adapter import Manga48pxSession
             self._manga48 = Manga48pxSession(
@@ -4866,6 +4873,8 @@ class _RecognizerSession:
             return {}
         if self._manga is not None:
             return self._manga.recognize(paths, progress_callback=progress_callback)
+        if self._hayai is not None:
+            return self._hayai.recognize(paths, progress_callback=progress_callback)
         if self._manga48 is not None:
             return self._manga48.recognize(paths, progress_callback=progress_callback)
         if self._yomitoku is not None:
@@ -4928,6 +4937,11 @@ class _RecognizerSession:
                 return self._manga.__exit__(exc_type, exc, tb)
             finally:
                 self._manga = None
+        if self._hayai is not None:
+            try:
+                return self._hayai.__exit__(exc_type, exc, tb)
+            finally:
+                self._hayai = None
         if self._manga48 is not None:
             try:
                 return self._manga48.__exit__(exc_type, exc, tb)
@@ -5392,6 +5406,10 @@ def _iter_column_pages(
             # mask containing one 40-60 px column makes the glyphs effectively
             # disappear and the decoder hallucinates fluent unrelated Japanese.
             # It must always receive a compact physical text region.
+            compact_primary_transport = True
+        elif str(recognition_engine or "").strip().lower() == "hayai_ocr":
+            # Hayai v2.1 is also a crop recognizer. NaFlex preserves aspect ratio,
+            # but full-page masks still waste patches and can trigger decoder hallucination.
             compact_primary_transport = True
         elif str(recognition_engine or "").strip().lower() == "manga_48px":
             # The 48px AR network is also a line recognizer, not a page-layout
@@ -7152,6 +7170,8 @@ def run(
         str(column_sentence_context_strategy or "full"),
     )
     if str(recognition_engine or "").strip().lower() == "manga_ocr":
+        runtime_engine_options["column_compact_primary_transport"] = True
+    elif str(recognition_engine or "").strip().lower() == "hayai_ocr":
         runtime_engine_options["column_compact_primary_transport"] = True
     elif str(recognition_engine or "").strip().lower() == "manga_48px":
         runtime_engine_options["column_compact_primary_transport"] = True

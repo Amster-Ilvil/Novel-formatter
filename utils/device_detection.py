@@ -343,6 +343,7 @@ def _runtime_python_candidates() -> list[tuple[str, Path]]:
     candidates = [("主程序", Path(sys.executable))]
     for label, folder in (
         ("Manga OCR", ".venv-manga-ocr"),
+        ("Hayai OCR v2.1", ".venv-hayai-ocr"),
         ("48px AR", ".venv-manga-48px"),
         ("YomiToku", ".venv-yomitoku"),
         ("NDLOCR-Lite", ".venv-ndlocr-lite"),

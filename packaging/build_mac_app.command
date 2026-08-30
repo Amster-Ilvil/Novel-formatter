@@ -5,7 +5,7 @@ set -eu
 
 PROJECT_DIR=${0:A:h:h}
 PACKAGING_DIR="$PROJECT_DIR/packaging"
-VERSION="${1:-1.0}"
+VERSION="${1:-2.0.0}"
 DATE_TAG="$(date +%Y%m%d)"
 DIST_ROOT="$PROJECT_DIR/dist"
 PKG_DIR="$DIST_ROOT/NovelFormatterStudio"
@@ -21,8 +21,6 @@ mkdir -p "$CONTENTS/MacOS" "$CONTENTS/Resources" "$APP_SOURCE"
 echo "==> Copying app source"
 rsync -a \
   --exclude '.git/' \
-  --exclude '.github/' \
-  --exclude '.gitignore' \
   --exclude '.runtime/' \
   --exclude '.model-cache/' \
   --exclude '.ocr-runtimes/' \
@@ -30,7 +28,6 @@ rsync -a \
   --exclude '.manual-model-updates/' \
   --exclude '.windows-runtime-state/' \
   --exclude 'debug/' \
-  --exclude 'tests/' \
   --exclude '.venv*/' \
   --exclude 'venv/' \
   --exclude '.env' \
@@ -38,15 +35,11 @@ rsync -a \
   --exclude '.pytest_cache/' \
   --exclude '__pycache__/' \
   --exclude '*.pyc' \
-  --exclude '*.log' \
-  --exclude '*.db' \
-  --exclude '*.sqlite*' \
   --exclude '.DS_Store' \
   --exclude 'epub_workspace/' \
-  --exclude 'output/' \
-  --exclude 'outputs/' \
   --exclude 'dist/' \
   --exclude 'build/' \
+  --exclude 'tools/apple_vision_helper/.module-cache/' \
   --exclude 'packaging/' \
   --exclude 'legacy/' \
   --exclude '*.command' \
@@ -113,8 +106,7 @@ Novel Formatter Studio（macOS）
 
 隐私
 ----
-- 发布包只从 GitHub 干净源码构建，不包含作者电脑路径、用户名、邮箱、令牌、运行日志、调试输入、OCR 结果或用户文档。
-- OCR 模型权重、虚拟环境和模型缓存不进入发布包。
+- 发布包不包含作者电脑路径、用户名、邮箱、令牌、运行日志或调试输入。
 - 本机运行状态、缓存和日志只保存在本地应用支持目录，不属于 Git 仓库。
 - API 密钥只在运行时填写，不要写入源码或提交 .env 文件。
 
@@ -123,6 +115,7 @@ Novel Formatter Studio（macOS）
 - 可运行“重置Mac运行环境.command”后重新打开。
 - 重置只删除应用运行环境和下载缓存，不删除用户选择的小说文件。
 TXT
+
 
 cat >"$PKG_DIR/重置Mac运行环境.command" <<'RESET'
 #!/bin/zsh
@@ -143,26 +136,22 @@ cd "$DIST_ROOT"
 rm -f "$ZIP_NAME"
 /usr/bin/ditto -c -k --keepParent "NovelFormatterStudio" "$ZIP_NAME"
 
-if [[ "${NF_SKIP_PROJECT_APP:-0}" != "1" ]]; then
-  echo "==> Installing persistent app shell into project folder (fusion mode)"
-  PROJECT_APP="$PROJECT_DIR/Novel Formatter Studio.app"
-  if [ -d "$PROJECT_APP" ]; then
-    echo "    Keeping existing app shell: $PROJECT_APP"
-    mkdir -p "$PROJECT_APP/Contents/MacOS" "$PROJECT_APP/Contents/Resources"
-    cp "$CONTENTS/Info.plist" "$PROJECT_APP/Contents/Info.plist"
-    cp "$CONTENTS/PkgInfo" "$PROJECT_APP/Contents/PkgInfo"
-    cp "$CONTENTS/MacOS/launcher" "$PROJECT_APP/Contents/MacOS/launcher"
-    cp "$CONTENTS/Resources/AppIcon.icns" "$PROJECT_APP/Contents/Resources/AppIcon.icns"
-    chmod +x "$PROJECT_APP/Contents/MacOS/launcher"
-  else
-    cp -R "$APP_DIR" "$PROJECT_APP"
-  fi
+echo "==> Installing persistent app shell into project folder (fusion mode)"
+PROJECT_APP="$PROJECT_DIR/Novel Formatter Studio.app"
+if [ -d "$PROJECT_APP" ]; then
+  echo "    Keeping existing app shell: $PROJECT_APP"
+  mkdir -p "$PROJECT_APP/Contents/MacOS" "$PROJECT_APP/Contents/Resources"
+  cp "$CONTENTS/Info.plist" "$PROJECT_APP/Contents/Info.plist"
+  cp "$CONTENTS/PkgInfo" "$PROJECT_APP/Contents/PkgInfo"
+  cp "$CONTENTS/MacOS/launcher" "$PROJECT_APP/Contents/MacOS/launcher"
+  cp "$CONTENTS/Resources/AppIcon.icns" "$PROJECT_APP/Contents/Resources/AppIcon.icns"
+  chmod +x "$PROJECT_APP/Contents/MacOS/launcher"
 else
-  PROJECT_APP="(skipped for clean release build)"
+  cp -R "$APP_DIR" "$PROJECT_APP"
 fi
 
 echo
 echo "构建完成："
-echo "  项目内 App: $PROJECT_APP"
+echo "  项目内 App（持久外壳，双击运行实时源码）: $PROJECT_APP"
 echo "  独立分发 App: $APP_DIR"
 echo "  Zip:  $DIST_ROOT/$ZIP_NAME"

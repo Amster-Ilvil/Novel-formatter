@@ -2,15 +2,18 @@
 """AI OCR correction pipeline step."""
 
 import os
+import copy
 from pathlib import Path
 
 from models.document import UnifiedDocument
 
 
 def ai_correction_step(doc: UnifiedDocument):
-    """可选 AI 校正步骤。未配置时安全跳过。"""
+    """可选 AI 校正步骤。始终返回独立文档；未配置时安全跳过并记录原因。"""
+    result = copy.deepcopy(doc)
     if os.environ.get("NOVEL_FORMATTER_AI_ENABLED", "0") != "1":
-        return doc
+        result.add_log("ai_correction", "AI 未启用，跳过校正", 0)
+        return result
 
     try:
         from ai.openai_provider import OpenAIProvider
@@ -28,22 +31,26 @@ def ai_correction_step(doc: UnifiedDocument):
         }
         cls = providers.get(provider_name, OpenAIProvider)
         if not key:
-            return doc
+            result.add_log("ai_correction", "AI 已启用但未配置 API Key，跳过校正", 0)
+            return result
 
         provider = cls(key, model=model)
-        suggestions = provider.correct_ocr(doc)
+        suggestions = provider.correct_ocr(result)
 
+        applied = 0
         for item in suggestions:
             idx = item.block_index
-            if idx >= 0 and idx < len(doc.blocks) and item.suggested.strip():
-                doc.blocks[idx].text = item.suggested
-                doc.blocks[idx].modified_by = "ai_correction"
+            if idx >= 0 and idx < len(result.blocks) and item.suggested.strip():
+                result.blocks[idx].text = item.suggested
+                result.blocks[idx].modified_by = "ai_correction"
+                applied += 1
 
-        doc.add_log("ai_correction", f"AI applied {len(suggestions)} suggestions", len(suggestions))
+        result.add_log("ai_correction", f"AI applied {applied} suggestions", applied)
     except Exception as e:
-        doc.add_log("ai_correction", f"AI skipped: {e}", 0)
+        result.add_log("ai_correction", f"AI skipped: {e}", 0)
 
-    return doc
+    return result
+
 
 
 class AIFormatterStep:

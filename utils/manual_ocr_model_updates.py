@@ -70,6 +70,7 @@ _MODEL_ORDER = (
     "apple_vision",
     "ndlocr_lite",
     "manga_48px",
+    "hayai_ocr",
     "manga_ocr",
     "yomitoku",
     "paddle_ocr",
@@ -81,6 +82,7 @@ _LABELS = {
     "apple_vision": "Apple Vision / Live Text",
     "ndlocr_lite": "NDLOCR-Lite",
     "manga_48px": "48px AR OCR",
+    "hayai_ocr": "Hayai OCR v2.1",
     "manga_ocr": "Manga OCR",
     "yomitoku": "YomiToku OCR",
     "paddle_ocr": "PaddleOCR / PP-OCR",
@@ -92,6 +94,7 @@ _SOURCE_URLS = {
     "apple_vision": "x-apple.systempreferences:com.apple.Software-Update-Settings.extension",
     "ndlocr_lite": "https://github.com/ndl-lab/ndlocr-lite/releases",
     "manga_48px": "https://github.com/zyddnys/manga-image-translator/releases",
+    "hayai_ocr": "https://github.com/NopeNopeGuy/hayai-ocr",
     "manga_ocr": "https://huggingface.co/kha-white/manga-ocr-base",
     "yomitoku": "https://pypi.org/project/yomitoku/",
     "paddle_ocr": "https://github.com/PaddlePaddle/PaddleOCR/releases",
@@ -110,6 +113,7 @@ _HF_MODEL_API = {
 }
 
 _PYPI_API = {
+    "hayai_ocr": "https://pypi.org/pypi/hayai-ocr/json",
     "yomitoku": "https://pypi.org/pypi/yomitoku/json",
     "pdf_craft": "https://pypi.org/pypi/pdf-craft/json",
 }
@@ -413,6 +417,23 @@ def local_statuses() -> list[ModelUpdateStatus]:
         )
     )
 
+    hayai_local = _dist_version(ROOT / ".venv-hayai-ocr", "hayai-ocr")
+    hayai_pinned = _read_assignment(ROOT / "adapters" / "hayai_ocr_adapter.py", "HAYAI_OCR_VERSION")
+    statuses.append(
+        ModelUpdateStatus(
+            "hayai_ocr",
+            _LABELS["hayai_ocr"],
+            "与 OCR 代码绑定",
+            hayai_local,
+            "未检查",
+            "compatibility_locked" if hayai_local != "未安装" else "not_installed",
+            f"当前适配器固定兼容 Hayai OCR {hayai_pinned or '2.1.0'}；Torch/LiteRT 与模型接口共同构成运行合同，不盲目升级。",
+            False,
+            "首次使用自动安装" if hayai_local == "未安装" else "不可单独更新",
+            _SOURCE_URLS["hayai_ocr"],
+        )
+    )
+
     manga_local = _manga_ocr_local_revision()
     statuses.append(
         ModelUpdateStatus(
@@ -550,7 +571,7 @@ def check_updates(
                     can_update=True,
                     action_label="重装兼容模型" if state == "current_compatible" else "安装/修复",
                 )
-            elif component_id in {"yomitoku", "paddle_ocr", "pdf_craft"}:
+            elif component_id in {"hayai_ocr", "yomitoku", "paddle_ocr", "pdf_craft"}:
                 pinned_detail = item.detail
                 if local != "未安装" and local == remote:
                     state = "current_compatible"

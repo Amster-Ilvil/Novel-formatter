@@ -186,6 +186,7 @@ def prepare_manga_ocr_segments(
     max_aspect: float = 7.2,
     max_chars: int = 12,
     already_isolated: bool = False,
+    estimate_isolated_chars: bool = False,
 ) -> tuple[list[MangaOcrSegment], int]:
     """Create short, unrotated vertical chunks in Japanese reading order.
 
@@ -210,17 +211,22 @@ def prepare_manga_ocr_segments(
 
         stem = Path(image_path).stem.replace(" ", "_")[:48] or "manga"
         if already_isolated:
-            # Let _split_column_image derive the expected character count from
-            # each segment's actual ink height/width.  The page detector's
-            # estimated_chars value is intentionally unavailable here: after a
-            # compact crop, re-estimating it through another column detector was
-            # the source of 1-3 character estimates for 20-30 character lines.
+            # Historical Manga OCR / 48px callers keep estimated_chars=0 exactly
+            # as before.  Hayai can opt into a conservative ink-envelope estimate
+            # so its larger max_chars target actually participates in splitting,
+            # without changing any pre-Hayai recognizer's segmentation contract.
+            estimated_chars = 0
+            if estimate_isolated_chars:
+                left, top, right, bottom = bbox
+                ink_width = max(1, right - left)
+                ink_height = max(1, bottom - top)
+                estimated_chars = max(1, round(ink_height / max(12.0, ink_width * 0.92)))
             segments = _split_column_image(
                 image,
                 output_dir=output_dir,
                 stem=stem,
                 column_index=0,
-                estimated_chars=0,
+                estimated_chars=estimated_chars,
                 max_aspect=max_aspect,
                 max_chars=max_chars,
             )

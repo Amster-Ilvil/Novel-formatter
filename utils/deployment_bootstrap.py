@@ -441,6 +441,18 @@ def _ndlocr_ready() -> bool:
     return len([p for p in model_dir.glob("*.onnx") if _real_onnx(p)]) >= 4
 
 
+def _hayai_ocr_ready() -> bool:
+    # Keep the legacy deployment helper aligned with the authoritative runtime
+    # catalog.  A model cache alone is not sufficient: the isolated environment
+    # must contain the pinned Hayai package and the Torch-specific cache must be
+    # complete as well.
+    try:
+        from adapters.ocr_runtime_catalog import probe_runtime
+        return bool(probe_runtime("hayai_ocr", refresh=True).ready)
+    except Exception:
+        return False
+
+
 def _manga_ocr_ready() -> bool:
     roots = (
         ROOT / ".model-cache" / "manga-ocr",
@@ -473,6 +485,34 @@ def _install_ndlocr(progress_callback: ProgressCallback | None) -> ComponentResu
     if not _ndlocr_ready():
         raise RuntimeError("NDLOCR-Lite 安装结束后模型仍不完整")
     return ComponentResult("ndlocr_lite", "installed", "首次部署安装完成")
+
+
+def _install_hayai_ocr(progress_callback: ProgressCallback | None) -> ComponentResult:
+    if _hayai_ocr_ready():
+        return ComponentResult("hayai_ocr", "ready", "已安装；未检查更新")
+    _emit(progress_callback, "model", 0, 1, "准备 Hayai OCR v2.1 依赖和模型")
+    from adapters.hayai_ocr_adapter import WORKER_SCRIPT, _resolved_model_cache, setup_venv
+
+    python = setup_venv(verbose=True, backend="torch")
+    cache = _resolved_model_cache()
+    cache.mkdir(parents=True, exist_ok=True)
+    env = dict(os.environ)
+    env["HF_HOME"] = str(cache)
+    env["HUGGINGFACE_HUB_CACHE"] = str(cache / "hub")
+    env["TRANSFORMERS_CACHE"] = str(cache / "transformers")
+    proc = subprocess.run(
+        [str(python), str(WORKER_SCRIPT), "--stream", "--backend", "torch", "--device", "auto"],
+        input=json.dumps({"command": "close"}, ensure_ascii=False) + "\n",
+        text=True,
+        capture_output=True,
+        env=env,
+        timeout=5400,
+    )
+    if proc.returncode != 0 or '"ready": true' not in (proc.stdout or "").lower():
+        raise RuntimeError("Hayai OCR v2.1 模型初始化失败：" + _redact(proc.stderr or proc.stdout))
+    if not _hayai_ocr_ready():
+        raise RuntimeError("Hayai OCR v2.1 下载结束后未检测到完整权重")
+    return ComponentResult("hayai_ocr", "installed", "首次部署安装完成")
 
 
 def _install_manga_ocr(progress_callback: ProgressCallback | None) -> ComponentResult:
@@ -654,6 +694,9 @@ def resolve_profile(hardware: HardwareSummary, requested: str = "auto") -> tuple
         "none": (),
         "lite": ("ndlocr_lite",),
         "standard": ("ndlocr_lite", "manga_ocr", "manga_48px"),
+        # Keep the historical profile byte-for-byte in meaning. Hayai is installed
+        # only after the user explicitly selects it in the GUI; adding a new OCR
+        # engine must never silently enlarge an existing deployment profile.
         "full": ("ndlocr_lite", "manga_ocr", "manga_48px", "paddle_ocr", "yomitoku"),
     }
     return value, plans[value]
@@ -661,6 +704,7 @@ def resolve_profile(hardware: HardwareSummary, requested: str = "auto") -> tuple
 
 _INSTALLERS = {
     "ndlocr_lite": _install_ndlocr,
+    "hayai_ocr": _install_hayai_ocr,
     "manga_ocr": _install_manga_ocr,
     "manga_48px": _install_manga_48px,
     "paddle_ocr": _install_paddle,

@@ -60,6 +60,7 @@ class _ChapterHTMLParser(HTMLParser):
 
         self._tag_stack: list[str] = []
         self._buf: list[str] = []
+        self._source_buf: list[str] = []
         self._leaf_tag: Optional[str] = None
         self._leaf_class = ""
         self._has_ruby = False
@@ -75,9 +76,11 @@ class _ChapterHTMLParser(HTMLParser):
         if self._leaf_tag is None:
             return
         text = "".join(self._buf).strip()
+        source_text = "".join(self._source_buf).strip()
         tag, cls, has_ruby = self._leaf_tag, self._leaf_class, self._has_ruby
         self._leaf_tag = None
         self._buf = []
+        self._source_buf = []
         self._leaf_class = ""
         self._has_ruby = False
         if not text:
@@ -94,7 +97,12 @@ class _ChapterHTMLParser(HTMLParser):
         else:
             btype = BlockType.PARAGRAPH
 
-        self.blocks.append(Block(type=btype, text=text, confidence=1.0))
+        self.blocks.append(Block(
+            type=btype,
+            text=text,
+            ocr_raw=source_text if has_ruby and source_text and source_text != text else "",
+            confidence=1.0,
+        ))
 
     def _emit_image(self, src: str):
         if not src:
@@ -139,6 +147,7 @@ class _ChapterHTMLParser(HTMLParser):
             self._leaf_tag = tag
             self._leaf_class = attrd.get("class", "") or ""
             self._buf = []
+            self._source_buf = []
             self._has_ruby = False
             return
 
@@ -154,6 +163,7 @@ class _ChapterHTMLParser(HTMLParser):
 
         if tag == "br" and self._leaf_tag is not None:
             self._buf.append("\n")
+            self._source_buf.append("\n")
 
     def handle_endtag(self, tag):
         self._end(tag)
@@ -172,6 +182,7 @@ class _ChapterHTMLParser(HTMLParser):
             base = "".join(self._ruby_base)
             reading = "".join(self._ruby_reading)
             self._buf.append(f"{base}|{reading}" if reading else base)
+            self._source_buf.append(f"｜{base}《{reading}》" if reading else base)
             return
 
         if tag == self._leaf_tag:
@@ -184,6 +195,7 @@ class _ChapterHTMLParser(HTMLParser):
             self._ruby_base.append(data)
         elif self._leaf_tag is not None:
             self._buf.append(data)
+            self._source_buf.append(data)
 
 
 class _NavParser(HTMLParser):

@@ -21,6 +21,9 @@ fi
 
 mkdir -p "$OUTPUT_DIR"
 export MACOSX_DEPLOYMENT_TARGET="${MACOSX_DEPLOYMENT_TARGET:-13.0}"
+MODULE_CACHE_DIR="$ROOT/tools/apple_vision_helper/.module-cache"
+mkdir -p "$MODULE_CACHE_DIR"
+export CLANG_MODULE_CACHE_PATH="$MODULE_CACHE_DIR"
 xcrun swiftc "$SOURCE" \
   -O \
   -framework Foundation \

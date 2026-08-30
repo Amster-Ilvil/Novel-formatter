@@ -119,28 +119,47 @@ _ENGINE_PROFILES: tuple[tuple[str, EngineProfile], ...] = (
     # Manga-OCR currently returns a fixed 0.92 in this project, not a measured
     # probability. It may support another engine but is never sufficient alone.
     ("manga_ocr", EngineProfile("manga_ocr", 0.100, False)),
+    # Hayai v2.1 also returns generated sequence text without calibrated token probabilities.
+    # Treat its score as heuristic evidence only; cross-engine/stability gates remain authoritative.
+    ("hayai_ocr", EngineProfile("hayai_ocr", 0.090, False)),
     ("manga_48px", EngineProfile("manga_48px", 0.120, False)),
     ("pdf_craft", EngineProfile("pdf_craft", 0.080, False)),
     ("paddle_vl", EngineProfile("paddle_vl", 0.100, False)),
 )
 
 
+def _engine_match_key(value: str) -> str:
+    """Normalize both stable engine IDs and human-facing labels for matching.
+
+    OCR evidence can arrive from saved metadata using either ``hayai_ocr`` or
+    labels such as ``Hayai OCR v2.1``. Treat separators/version suffixes as
+    presentation details so confidence policy cannot silently fall back to the
+    generic profile merely because the GUI label was persisted.
+    """
+    raw = str(value or "").strip().lower()
+    raw = re.sub(r"[\s\-./]+", "_", raw)
+    raw = re.sub(r"_+", "_", raw).strip("_")
+    return raw
+
+
 def normalize_engine_name(value: str) -> str:
     raw = str(value or "").strip().lower()
-    for needle, profile in _ENGINE_PROFILES:
-        if needle in raw:
-            return profile.key
     if raw.startswith("masked_column_ocr:"):
-        return raw.split(":", 1)[1].strip() or "unknown"
-    return raw or "unknown"
+        raw = raw.split(":", 1)[1].strip()
+    match_key = _engine_match_key(raw)
+    compact_key = match_key.replace("_", "")
+    for needle, profile in _ENGINE_PROFILES:
+        if needle in match_key or needle.replace("_", "") in compact_key:
+            return profile.key
+    return match_key or "unknown"
 
 
 def engine_profile(value: str) -> EngineProfile:
-    raw = str(value or "").strip().lower()
-    for needle, profile in _ENGINE_PROFILES:
-        if needle in raw:
+    key = normalize_engine_name(value)
+    for _needle, profile in _ENGINE_PROFILES:
+        if profile.key == key:
             return profile
-    return EngineProfile(normalize_engine_name(raw), 0.060, False)
+    return EngineProfile(key, 0.060, False)
 
 
 def clean_column_text(text: str) -> str:

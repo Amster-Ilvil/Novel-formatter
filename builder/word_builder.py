@@ -34,9 +34,34 @@ def _add_page_break(doc):
 
 
 def _block_text_for_word(b: Block) -> str:
-    if b.type == BlockType.RUBY:
-        return re.sub(r'([^\s|]+)\|([^\s|]+)', r'\1（\2）', b.text)
-    return b.text
+    if b.type != BlockType.RUBY:
+        return b.text
+
+    source = str(b.ocr_raw or "")
+    if re.search(r"[｜|][^《]+《[^》]+》", source):
+        return re.sub(r"[｜|]([^《]+)《([^》]+)》", r"\1（\2）", source)
+
+    # Legacy ``base|reading`` JSON has no explicit end delimiter.  Restrict the
+    # reading to kana and, when it has greedily captured a following particle
+    # before a kanji/punctuation boundary, put that particle back into prose.
+    value = str(b.text or "")
+    marker = re.compile(r"([^\s|]{1,24})\|([ぁ-ゖァ-ヺー]{1,32})")
+    particles = set("をがにへとはもので")
+    output: list[str] = []
+    last = 0
+    for match in marker.finditer(value):
+        reading = match.group(2)
+        effective_end = match.end()
+        following = value[effective_end:effective_end + 1]
+        if (len(reading) >= 3 and reading[-1] in particles and following
+                and re.match(r"[一-龯々〆ヵヶァ-ヶーA-Za-z0-9０-９、。！？!?]", following)):
+            reading = reading[:-1]
+            effective_end -= 1
+        output.append(value[last:match.start()])
+        output.append(f"{match.group(1)}（{reading}）")
+        last = effective_end
+    output.append(value[last:])
+    return "".join(output)
 
 
 def _source_column_ids(block: Block) -> list[str]:

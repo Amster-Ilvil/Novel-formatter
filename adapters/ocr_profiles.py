@@ -48,7 +48,7 @@ _PROFILES = {
         google_language_hints=("ja",),
         compatible_engines=frozenset({
             "apple_vision", "pdf_craft", "paddle_ocr", "ndlocr_lite",
-            "yomitoku", "manga_48px", "manga_ocr", "google_vision",
+            "yomitoku", "manga_48px", "manga_ocr", "hayai_ocr", "google_vision",
         }),
         allow_column_pipeline=True,
         allow_japanese_handwriting=True,

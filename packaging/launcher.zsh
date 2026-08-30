@@ -61,22 +61,53 @@ else
     exit 2
   fi
   mkdir -p "$APP_SOURCE"
-  /usr/bin/rsync -a --delete \
-    --exclude '.git/' \
-    --exclude '.runtime/' \
-    --exclude '.venv*/' \
-    --exclude '.model-cache/' \
-    --exclude '.ocr-runtimes/' \
-    --exclude '.manual-model-updates/' \
-    --exclude '__pycache__/' \
-    --exclude '.pytest_cache/' \
-    --exclude '*.pyc' \
-    --exclude '*.log' \
-    "$EMBEDDED_SOURCE/" "$APP_SOURCE/" || {
-      show_error "无法准备可写的应用运行目录。"
-      exit 1
-    }
-  print "BOOT_STAGE=source_standalone"
+
+  # A manual in-app Git update writes this ignored state file. Preserve that
+  # verified source across restarts instead of copying the older embedded bundle
+  # over it. If a newly installed app bundle carries a *newer version*, the
+  # embedded release becomes authoritative again and refreshes app-source.
+  should_sync_embedded=1
+  SOURCE_UPDATE_STATE="$APP_SOURCE/.runtime/source_update_state.json"
+  EMBEDDED_VERSION_FILE="$EMBEDDED_SOURCE/VERSION"
+  CURRENT_VERSION_FILE="$APP_SOURCE/VERSION"
+  version_ge() {
+    /usr/bin/awk -v a="$1" -v b="$2" 'BEGIN {
+      gsub(/^v/, "", a); gsub(/^v/, "", b);
+      split(a, A, "."); split(b, B, ".");
+      for (i=1; i<=4; i++) {
+        av=(A[i] == "" ? 0 : A[i]+0); bv=(B[i] == "" ? 0 : B[i]+0);
+        if (av > bv) exit 0; if (av < bv) exit 1;
+      }
+      exit 0;
+    }'
+  }
+  if [[ -f "$SOURCE_UPDATE_STATE" && -f "$CURRENT_VERSION_FILE" && -f "$EMBEDDED_VERSION_FILE" ]]; then
+    current_version="$(/bin/cat "$CURRENT_VERSION_FILE" | /usr/bin/tr -d '[:space:]')"
+    embedded_version="$(/bin/cat "$EMBEDDED_VERSION_FILE" | /usr/bin/tr -d '[:space:]')"
+    if [[ -n "$current_version" && -n "$embedded_version" ]] && version_ge "$current_version" "$embedded_version"; then
+      should_sync_embedded=0
+      print "BOOT_STAGE=source_standalone_git_preserved"
+    fi
+  fi
+
+  if [[ "$should_sync_embedded" == "1" ]]; then
+    /usr/bin/rsync -a --delete \
+      --exclude '.git/' \
+      --exclude '.runtime/' \
+      --exclude '.venv*/' \
+      --exclude '.model-cache/' \
+      --exclude '.ocr-runtimes/' \
+      --exclude '.manual-model-updates/' \
+      --exclude '__pycache__/' \
+      --exclude '.pytest_cache/' \
+      --exclude '*.pyc' \
+      --exclude '*.log' \
+      "$EMBEDDED_SOURCE/" "$APP_SOURCE/" || {
+        show_error "无法准备可写的应用运行目录。"
+        exit 1
+      }
+    print "BOOT_STAGE=source_standalone"
+  fi
 fi
 
 REQ_FILE="$APP_SOURCE/requirements.txt"

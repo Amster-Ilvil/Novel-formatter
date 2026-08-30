@@ -16,6 +16,7 @@ RECOGNITION_ENGINES = {
     "mac_ocr": "macOS OCR（Apple Vision）",
     "macos_ocr": "macOS OCR（Apple Vision）",
     "manga_ocr": "Manga OCR",
+    "hayai_ocr": "Hayai OCR v2.1",
     "manga_48px": "48px AR OCR",
     "yomitoku": "YomiToku OCR",
     "ndlocr_lite": "NDLOCR-Lite",
@@ -152,6 +153,12 @@ def recognizer_iterator(
     if engine == "manga_ocr":
         from adapters.manga_ocr_adapter import recognize_crops
         yield from recognize_crops(image_paths, manifest_path, cancel_check=cancel_check, verbose=verbose)
+        return
+    if engine == "hayai_ocr":
+        from adapters.hayai_ocr_adapter import recognize_crops
+        yield from recognize_crops(
+            image_paths, manifest_path, cancel_check=cancel_check, verbose=verbose, engine_options=options
+        )
         return
     if engine == "manga_48px":
         from adapters.manga_48px_adapter import recognize_crops

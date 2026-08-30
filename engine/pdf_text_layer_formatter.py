@@ -77,8 +77,15 @@ def _append_modified_by(value: str, step: str) -> str:
 
 
 def _compact_guard_text(text: str) -> str:
-    """Characters used by the conservation guard; layout whitespace is ignored."""
-    return re.sub(r"[\s　]+", "", str(text or ""))
+    """Characters used by the conservation guard; layout whitespace is ignored.
+
+    The PDF preparation stage applies NFC normalization (including a number of
+    CJK compatibility ideographs).  The guard must compare the same normalized
+    character stream, otherwise a lossless ``落 -> 落`` normalization is reported
+    as one removed plus one added glyph.
+    """
+    value = unicodedata.normalize("NFC", str(text or ""))
+    return re.sub(r"[\s　]+", "", value)
 
 
 def _counter(texts: Iterable[str]) -> Counter[str]:

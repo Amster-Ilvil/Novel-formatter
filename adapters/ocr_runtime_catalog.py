@@ -29,6 +29,7 @@ from adapters.paddle_ocr_models import (
 
 ROOT = Path(__file__).parent.parent
 STATE_DIR = ROOT / ".ocr-runtime-state"
+HAYAI_OCR_RUNTIME_VERSION = os.environ.get("NOVEL_FORMATTER_HAYAI_OCR_VERSION", "2.1.0").strip() or "2.1.0"
 
 
 @dataclass(frozen=True)
@@ -75,6 +76,16 @@ COMPONENTS: dict[str, RuntimeComponent] = {
         "日文漫画与小说印刷体识别；页面输入会先做物理分列。",
         ".venv-manga-ocr",
     ),
+    "hayai_ocr": RuntimeComponent(
+        "hayai_ocr", "Hayai OCR v2.1 · PyTorch", "本地模型",
+        "约 150M 参数的 CJK crop 识别器；PyTorch 后端支持批量、MPS/CUDA/CPU 与可选 INT4/INT8，页面输入强制先做物理分列。",
+        ".venv-hayai-ocr",
+    ),
+    "hayai_ocr_litert": RuntimeComponent(
+        "hayai_ocr_litert", "Hayai OCR v2.1 · LiteRT", "本地模型",
+        "与 PyTorch 版共享独立 Hayai 环境，但会额外安装 LiteRT 运行库并下载独立 TFLite 权重；仅在选择 LiteRT 后端时需要。",
+        ".venv-hayai-ocr",
+    ),
     "manga_48px": RuntimeComponent(
         "manga_48px", "Manga 48px AR OCR", "本地模型",
         "首次使用下载 Manga Image Translator 官方 48px 自回归权重（约 195 MB）、字符表和独立 PyTorch 环境。",
@@ -98,6 +109,8 @@ _PACKAGE_MARKERS = {
     "paddle_vl": ("paddle", "paddleocr", "paddlex"),
     "ndlocr_lite": ("onnxruntime", "cv2", "yaml"),
     "manga_ocr": ("manga_ocr",),
+    "hayai_ocr": ("hayai_ocr",),
+    "hayai_ocr_litert": ("hayai_ocr", "ai_edge_litert", "tokenizers", "huggingface_hub"),
     "manga_48px": ("torch", "einops", "PIL"),
     "yomitoku": ("yomitoku", "torch", "cv2"),
     "pdf_craft": ("pdf_craft", "torch"),
@@ -108,6 +121,8 @@ _DEEP_IMPORTS = {
     "paddle_vl": "import paddle, paddleocr, paddlex",
     "ndlocr_lite": "import onnxruntime, cv2, yaml",
     "manga_ocr": "from manga_ocr import MangaOcr",
+    "hayai_ocr": "from hayai_ocr import HayaiOcr",
+    "hayai_ocr_litert": "from hayai_ocr import HayaiOcr; import ai_edge_litert, tokenizers, huggingface_hub",
     "manga_48px": "import torch, einops; from PIL import Image",
     "yomitoku": "from yomitoku.text_detector import TextDetector; from yomitoku.text_recognizer import TextRecognizer",
     "pdf_craft": "from pdf_craft import transform_markdown; import torch",
@@ -156,6 +171,29 @@ def _module_marker_exists(component_id: str, module: str) -> bool:
     return False
 
 
+def _distribution_version_from_site(component_id: str, distribution: str) -> str:
+    """Read an installed distribution version without importing its runtime."""
+    prefix = str(distribution or "").strip().lower().replace("-", "_") + "-"
+    for site in _site_package_roots(component_id):
+        try:
+            for item in site.iterdir():
+                normalized = item.name.lower().replace("-", "_")
+                if not (normalized.startswith(prefix) and normalized.endswith(".dist_info")):
+                    continue
+                metadata = item / "METADATA"
+                if metadata.is_file():
+                    for line in metadata.read_text(encoding="utf-8", errors="ignore").splitlines():
+                        if line.lower().startswith("version:"):
+                            return line.split(":", 1)[1].strip()
+                # Fall back to the canonical dist-info directory name.
+                raw = item.name[:-len(".dist-info")] if item.name.endswith(".dist-info") else item.name
+                if "-" in raw:
+                    return raw.rsplit("-", 1)[1].strip()
+        except OSError:
+            continue
+    return ""
+
+
 def _environment_installed(component_id: str, *, deep: bool = False) -> tuple[bool, str]:
     python = _venv_python_path(component_id)
     if python is None:
@@ -163,6 +201,14 @@ def _environment_installed(component_id: str, *, deep: bool = False) -> tuple[bo
     markers = _PACKAGE_MARKERS.get(component_id, ())
     if markers and not all(_module_marker_exists(component_id, marker) for marker in markers):
         return False, "运行环境存在，但所需 OCR 包不完整"
+    if component_id in {"hayai_ocr", "hayai_ocr_litert"}:
+        installed_version = _distribution_version_from_site(component_id, "hayai_ocr")
+        if installed_version != HAYAI_OCR_RUNTIME_VERSION:
+            detail = installed_version or "未知"
+            return False, (
+                f"检测到 Hayai OCR 环境，但版本为 {detail}；"
+                f"当前项目固定要求 {HAYAI_OCR_RUNTIME_VERSION}"
+            )
     if deep:
         try:
             result = subprocess.run(
@@ -194,6 +240,62 @@ def _has_large_file(root: Path, minimum: int = 500_000, name_tokens: tuple[str, 
     return False
 
 
+def _hf_repo_dir(repo_id: str) -> str:
+    return "models--" + "--".join(part for part in str(repo_id or "").strip().split("/") if part)
+
+
+def _hayai_litert_cache_complete(root: Path) -> bool:
+    if not root.exists():
+        return False
+    required = {"encoder.tflite", "prefill.tflite", "decode.tflite", "position_base.npy", "tokenizer.json"}
+    try:
+        for encoder in root.rglob("encoder.tflite"):
+            folder = encoder.parent
+            if all((folder / name).is_file() and (folder / name).stat().st_size > 0 for name in required):
+                return True
+    except OSError:
+        return False
+    return False
+
+
+
+
+def _hayai_processor_cache_complete(root: Path) -> bool:
+    """Return True when SigLIP2 AutoProcessor assets are locally reusable."""
+    repo_dir = root / "hub" / _hf_repo_dir("google/siglip2-base-patch16-naflex")
+    candidates = [repo_dir, root / _hf_repo_dir("google/siglip2-base-patch16-naflex")]
+    try:
+        for candidate in candidates:
+            if not candidate.exists():
+                continue
+            for preprocessor in candidate.rglob("preprocessor_config.json"):
+                folder = preprocessor.parent
+                tokenizer_ready = any((folder / name).is_file() for name in (
+                    "tokenizer.json", "tokenizer.model", "tokenizer_config.json"
+                ))
+                if tokenizer_ready:
+                    return True
+    except OSError:
+        return False
+    return False
+
+def _hayai_torch_cache_complete(root: Path) -> bool:
+    if not root.exists():
+        return False
+    try:
+        for config in root.rglob("config.json"):
+            folder = config.parent
+            tokenizer_ready = any((folder / name).is_file() for name in (
+                "tokenizer.json", "tokenizer_config.json", "special_tokens_map.json"
+            ))
+            weight_ready = _has_large_file(folder, 1_000_000, ("safetensors", "pytorch_model", "model"))
+            if tokenizer_ready and weight_ready:
+                return True
+    except OSError:
+        return False
+    return False
+
+
 def _model_cache_ready(component_id: str) -> tuple[bool, str]:
     home = Path.home()
     if component_id == "manga_48px":
@@ -219,6 +321,43 @@ def _model_cache_ready(component_id: str) -> tuple[bool, str]:
         cache = ROOT / ".model-cache" / "yomitoku" / "huggingface"
         ready = _has_large_file(cache, 1_000_000, ("dbnet", "parseq", "yomitoku"))
         return (True, "检测到 YomiToku Hugging Face 模型缓存") if ready else (False, "环境已安装，但 YomiToku 模型尚未完成首次下载/推理")
+
+    if component_id in {"hayai_ocr", "hayai_ocr_litert"}:
+        # Hayai's two backends share one venv but use different model repos.
+        # Never let a downloaded TFLite repo make the PyTorch backend look ready
+        # (or vice versa), otherwise switching the GUI backend can bypass the
+        # explicit first-download confirmation.
+        cache_override = os.environ.get("NOVEL_FORMATTER_HAYAI_OCR_CACHE_DIR", "").strip()
+        cache_root = Path(cache_override).expanduser() if cache_override else ROOT / ".model-cache" / "hayai-ocr"
+        if component_id == "hayai_ocr_litert":
+            repo_id = os.environ.get(
+                "NOVEL_FORMATTER_HAYAI_OCR_LITERT_REPO", "JustANormalTinkerer/hayai-ocr-v2-tflite"
+            ).strip() or "JustANormalTinkerer/hayai-ocr-v2-tflite"
+            repo_dir = _hf_repo_dir(repo_id)
+            candidates = [cache_root / "hub" / repo_dir, cache_root / repo_dir]
+            local_override = os.environ.get("NOVEL_FORMATTER_HAYAI_OCR_LITERT_MODEL_PATH", "").strip()
+            if local_override:
+                candidates.insert(0, Path(local_override).expanduser())
+            ready = any(_hayai_litert_cache_complete(path) for path in candidates)
+            return (True, "检测到完整 Hayai OCR LiteRT/TFLite 权重") if ready else (False, "环境已安装，但 Hayai OCR LiteRT/TFLite 权重不完整或尚未下载")
+
+        model_name = os.environ.get(
+            "NOVEL_FORMATTER_HAYAI_OCR_MODEL", "JustANormalTinkerer/hayai-ocr-v2"
+        ).strip() or "JustANormalTinkerer/hayai-ocr-v2"
+        local_model = Path(model_name).expanduser()
+        if local_model.exists():
+            candidates = [local_model]
+        else:
+            repo_dir = _hf_repo_dir(model_name)
+            candidates = [cache_root / "hub" / repo_dir, cache_root / repo_dir]
+        model_ready = any(_hayai_torch_cache_complete(path) for path in candidates)
+        processor_ready = _hayai_processor_cache_complete(cache_root)
+        ready = model_ready and processor_ready
+        if ready:
+            return True, "检测到完整 Hayai OCR v2 PyTorch 权重与 SigLIP2 processor 缓存"
+        if model_ready and not processor_ready:
+            return False, "已检测到 Hayai OCR v2 权重，但 SigLIP2 processor 缓存尚未完成"
+        return False, "环境已安装，但 Hayai OCR v2 PyTorch 权重不完整或尚未下载"
 
     if component_id == "manga_ocr":
         candidates = [
@@ -289,6 +428,21 @@ def _state_marker_ready(component_id: str) -> bool:
         # PaddleOCR 运行时”签名，不再把 v6 medium 权重作为唯一 ready 条件。
         if component_id in {"paddle_ocr", "paddle_structure"}:
             return payload.get("runtime_signature") == PADDLE_RUNTIME_SIGNATURE
+        if component_id == "hayai_ocr":
+            version_matches = str(payload.get("version") or "") == HAYAI_OCR_RUNTIME_VERSION
+            backend_matches = str(payload.get("backend") or "torch").lower() != "litert"
+            cache_override = os.environ.get("NOVEL_FORMATTER_HAYAI_OCR_CACHE_DIR", "").strip()
+            cache_root = Path(cache_override).expanduser() if cache_override else ROOT / ".model-cache" / "hayai-ocr"
+            return (
+                version_matches
+                and backend_matches
+                and _model_cache_ready(component_id)[0]
+                and _hayai_processor_cache_complete(cache_root)
+            )
+        if component_id == "hayai_ocr_litert":
+            version_matches = str(payload.get("version") or "") == HAYAI_OCR_RUNTIME_VERSION
+            backend_matches = str(payload.get("backend") or "").lower() == "litert"
+            return version_matches and backend_matches and _model_cache_ready(component_id)[0]
         return True
     except Exception:
         return False
@@ -360,11 +514,21 @@ def clear_probe_cache() -> None:
     _PROBE_CACHE.clear()
 
 
-def required_components(adapter_id: str, *, paddle_pipeline: str = "ocr", layout_engine: str = "", recognition_engine: str = "") -> list[str]:
+def required_components(
+    adapter_id: str,
+    *,
+    paddle_pipeline: str = "ocr",
+    layout_engine: str = "",
+    recognition_engine: str = "",
+    engine_options: dict | None = None,
+) -> list[str]:
     del layout_engine
     engine = recognition_engine or adapter_id
     if engine == "paddle_ocr":
         return [{"ocr":"paddle_ocr","structure":"paddle_structure","vl":"paddle_vl"}.get(paddle_pipeline,"paddle_ocr")]
+    if engine == "hayai_ocr":
+        backend = str((engine_options or {}).get("backend") or "torch").strip().lower()
+        return ["hayai_ocr_litert" if backend in {"litert", "tflite", "lite_rt"} else "hayai_ocr"]
     if engine in {"ndlocr_lite","pdf_craft","manga_ocr","manga_48px","yomitoku"}:
         return [engine]
     return []
@@ -393,5 +557,5 @@ def installed_local_layout_engines() -> list[str]:
 
 
 def installed_local_recognition_engines() -> list[str]:
-    candidates = ["yomitoku", "manga_48px", "manga_ocr", "ndlocr_lite", "paddle_ocr", "pdf_craft"]
+    candidates = ["hayai_ocr", "yomitoku", "manga_48px", "manga_ocr", "ndlocr_lite", "paddle_ocr", "pdf_craft"]
     return [item for item in candidates if runtime_ready(item)]

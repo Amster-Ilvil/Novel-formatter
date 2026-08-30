@@ -382,20 +382,62 @@ def _esc(s: str) -> str:
 
 
 def _ruby_to_xhtml(text: str) -> str:
-    """将 漢字|よみ 格式转换为 <ruby>漢字<rt>よみ</rt></ruby>"""
+    """Convert supported ruby notations to XHTML without swallowing following prose.
+
+    Preferred input is Aozora-style ``｜漢字《よみ》`` because the reading has an
+    explicit closing delimiter.  Legacy ``漢字|よみ`` remains supported for old
+    project JSON; its fallback parser restricts readings to kana and protects a
+    likely following particle instead of greedily consuming the rest of a sentence.
+    """
     import re
-    parts = []
+
+    value = str(text or "")
+    aozora = re.compile(r"[｜|]([^《]+)《([^》]+)》")
+    if aozora.search(value):
+        parts: list[str] = []
+        last = 0
+        for m in aozora.finditer(value):
+            if m.start() > last:
+                parts.append(_esc(value[last:m.start()]))
+            parts.append(f'<ruby>{_esc(m.group(1))}<rt>{_esc(m.group(2))}</rt></ruby>')
+            last = m.end()
+        if last < len(value):
+            parts.append(_esc(value[last:]))
+        return ''.join(parts)
+
+    marker = re.compile(r"([^\s|]{1,24})\|([ぁ-ゖァ-ヺー]{1,32})")
+    particles = set("をがにへとはもので")
+    parts: list[str] = []
     last = 0
-    for m in re.finditer(r'([^\s|]+)\|([^\s|]+)', text):
+    for m in marker.finditer(value):
+        reading = m.group(2)
+        effective_end = m.end()
+        following = value[effective_end:effective_end + 1]
+        if (
+            len(reading) >= 3
+            and reading[-1] in particles
+            and following
+            and re.match(r"[一-龯々〆ヵヶァ-ヶーA-Za-z0-9０-９、。！？!?]", following)
+        ):
+            reading = reading[:-1]
+            effective_end -= 1
+        if not reading:
+            continue
         if m.start() > last:
-            parts.append(_esc(text[last:m.start()]))
-        base = _esc(m.group(1))
-        reading = _esc(m.group(2))
-        parts.append(f'<ruby>{base}<rt>{reading}</rt></ruby>')
-        last = m.end()
-    if last < len(text):
-        parts.append(_esc(text[last:]))
-    return ''.join(parts)
+            parts.append(_esc(value[last:m.start()]))
+        parts.append(f'<ruby>{_esc(m.group(1))}<rt>{_esc(reading)}</rt></ruby>')
+        last = effective_end
+    if last < len(value):
+        parts.append(_esc(value[last:]))
+    return ''.join(parts) if parts else _esc(value)
+
+
+def _ruby_export_source(block: Block) -> str:
+    """Prefer the unambiguous pre-conversion ruby source when available."""
+    source = str(getattr(block, "ocr_raw", "") or "")
+    if re.search(r"[｜|][^《]+《[^》]+》", source):
+        return _sanitize_export_text(source)
+    return _sanitize_export_text(block.text or "")
 
 
 _ORPHAN_CLOSING_QUOTES = {"」", "』"}
@@ -471,7 +513,8 @@ def _block_to_xhtml(b: Block) -> str:
     attrs = _repair_attrs(b)
 
     if b.type == BlockType.RUBY:
-        content = _repair_ruby_to_xhtml(raw) if attrs else _ruby_to_xhtml(raw)
+        ruby_raw = _ruby_export_source(b)
+        content = _repair_ruby_to_xhtml(ruby_raw) if attrs else _ruby_to_xhtml(ruby_raw)
         return f'    <p class="normal"{attrs}>{content}</p>\n'
 
     if b.type == BlockType.CHAPTER:
