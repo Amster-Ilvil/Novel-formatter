@@ -1,5 +1,6 @@
 param(
-    [string]$Version = ""
+    [string]$Version = "",
+    [switch]$RequireInstaller
 )
 $ErrorActionPreference = 'Stop'
 
@@ -12,10 +13,11 @@ if (-not $Version) { throw 'VERSION is empty.' }
 $Dist = Join-Path $Root 'dist'
 $Stage = Join-Path $Dist 'NovelFormatterStudio-Windows'
 $Archive = Join-Path $Dist ("NovelFormatter_{0}_Windows_x64.zip" -f $Version)
+$Installer = Join-Path $Dist ("NovelFormatter_{0}_Windows_x64_Setup.exe" -f $Version)
 $TarPath = Join-Path $Dist '_tracked-source.tar'
 
 Remove-Item -LiteralPath $Stage -Recurse -Force -ErrorAction SilentlyContinue
-Remove-Item -LiteralPath $Archive, $TarPath -Force -ErrorAction SilentlyContinue
+Remove-Item -LiteralPath $Archive, $Installer, $TarPath -Force -ErrorAction SilentlyContinue
 New-Item -ItemType Directory -Force -Path $Dist, $Stage | Out-Null
 
 # Important privacy boundary: package only files tracked in the Git commit.
@@ -44,17 +46,51 @@ foreach ($relative in @('.gitignore')) {
 Novel Formatter Studio $Version - Windows x64
 ================================================
 
-1. Extract this ZIP to a normal writable folder.
-2. Double-click 启动Windows.bat.
-3. The launcher prepares only Python and the main GUI dependencies.
-4. OCR-specific runtimes and model weights are NOT bundled. They are installed
-   only after you start the corresponding OCR function and confirm the prompt.
-5. API credentials are entered at runtime; do not store them in the program folder.
+Recommended: run NovelFormatter_${Version}_Windows_x64_Setup.exe and follow the installer.
+Portable fallback: extract NovelFormatter_${Version}_Windows_x64.zip to a normal writable folder.
 
-Privacy: this package is generated from a clean GitHub checkout and contains no
-local developer cache, .env file, model cache, OCR result, log, EPUB or DOCX data.
+After installation/extraction, launch Novel Formatter Studio from the Start menu, desktop shortcut,
+or double-click 启动Windows.bat.
+
+The first launch automatically prepares a private Python runtime and the main GUI dependencies in
+the current user's profile. Administrator rights are not required. OCR-specific runtimes and model
+weights are NOT bundled; they are installed only after you start the corresponding OCR function and
+confirm the prompt. API credentials are entered at runtime; do not store them in the program folder.
+
+Privacy: this package is generated from a clean GitHub checkout and contains no local developer
+cache, .env file, model cache, OCR result, log, EPUB or DOCX data.
 "@ | Set-Content -LiteralPath (Join-Path $Stage 'RELEASE-README.txt') -Encoding UTF8
 
 Compress-Archive -Path (Join-Path $Stage '*') -DestinationPath $Archive -CompressionLevel Optimal
 if (-not (Test-Path -LiteralPath $Archive)) { throw 'Windows release archive was not created.' }
 Write-Host "Created $Archive"
+
+function Find-Iscc {
+    $command = Get-Command 'ISCC.exe' -ErrorAction SilentlyContinue
+    if ($command) { return $command.Source }
+
+    $candidates = @(
+        (Join-Path ${env:ProgramFiles(x86)} 'Inno Setup 6\ISCC.exe'),
+        (Join-Path $env:ProgramFiles 'Inno Setup 6\ISCC.exe')
+    ) | Where-Object { $_ -and (Test-Path -LiteralPath $_) }
+
+    if ($candidates.Count -gt 0) { return $candidates[0] }
+    return $null
+}
+
+$Iscc = Find-Iscc
+if (-not $Iscc) {
+    if ($RequireInstaller) {
+        throw 'Inno Setup 6 compiler (ISCC.exe) was not found.'
+    }
+    Write-Warning 'Inno Setup 6 was not found; portable ZIP was created, installer was skipped.'
+    exit 0
+}
+
+$Iss = Join-Path $PSScriptRoot 'windows_installer.iss'
+if (-not (Test-Path -LiteralPath $Iss)) { throw "Missing installer script: $Iss" }
+
+& $Iscc "/DMyAppVersion=$Version" "/DSourceDir=$Stage" "/DOutputDir=$Dist" $Iss
+if ($LASTEXITCODE -ne 0) { throw "Inno Setup failed with exit code $LASTEXITCODE." }
+if (-not (Test-Path -LiteralPath $Installer)) { throw 'Windows installer was not created.' }
+Write-Host "Created $Installer"
