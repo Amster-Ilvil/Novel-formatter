@@ -224,7 +224,9 @@ jobs:
           test "$(stat -c '%s' "$DEB")" -gt 100000
           test "$(stat -c '%s' "$TARBALL")" -gt 100000
           dpkg-deb --info "$DEB" >/dev/null
-          tar -tzf "$TARBALL" | grep -q '/bin/novel-formatter$'
+          TAR_LIST="$RUNNER_TEMP/novel-formatter-${LABEL}-tar-list.txt"
+          tar -tzf "$TARBALL" > "$TAR_LIST"
+          grep -q '/bin/novel-formatter$' "$TAR_LIST"
           APPIMAGE_EXTRACT_AND_RUN=1 "$APPIMAGE" --appimage-version >/dev/null 2>&1 || true
       - name: First-run Linux AppImage smoke test
         shell: bash
