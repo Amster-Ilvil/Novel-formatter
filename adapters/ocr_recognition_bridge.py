@@ -28,7 +28,9 @@ RECOGNITION_ENGINES = {
 
 def _apple_config_and_backend(shortcut_name: str, options: dict):
     from adapters.vision_backends import BackendFactory, OCRConfig
-    backend_id = str(options.get("apple_backend") or options.get("backend") or "auto")
+    # Apple OCR is explicit.  ``auto`` is a legacy saved-setting alias handled
+    # by BackendFactory and maps to the explicit Live Text route.
+    backend_id = str(options.get("apple_backend") or options.get("backend") or "live_text")
     backend = BackendFactory.create(backend_id)
     available, reason = backend.is_available()
     if not available:

@@ -2,11 +2,14 @@
 # -*- coding: utf-8 -*-
 """Apple OCR backend registry.
 
-Four modes are kept side by side:
+Three explicit modes are kept side by side:
 * live_text: Swift VisionKit ImageAnalyzer / Live Text transcript
 * native_helper: Swift Vision RecognizeTextRequest (bbox/confidence/candidates)
 * shortcut: original macOS Shortcuts route
-* auto: Live Text first, shortcut only on helper infrastructure/availability failure
+
+``auto`` remains accepted only as a migration alias for old saved settings. It
+must never be presented as a selectable mode because silent backend switching
+makes OCR failures difficult to diagnose and can change reading order/results.
 """
 from __future__ import annotations
 
@@ -16,10 +19,8 @@ from .base import VisionBackend, OCRResult, OCRBlock, OCRConfig, BackendCapabili
 from .shortcut_backend import ShortcutBackend
 from .native_helper_backend import NativeVisionHelperBackend
 from .live_text_backend import LiveTextHelperBackend
-from .auto_backend import AutoVisionBackend
 
 _REGISTRY: dict[str, Callable[[], VisionBackend]] = {
-    "auto": AutoVisionBackend,
     "live_text": LiveTextHelperBackend,
     "native_helper": NativeVisionHelperBackend,
     "shortcut": ShortcutBackend,
@@ -28,9 +29,12 @@ _REGISTRY: dict[str, Callable[[], VisionBackend]] = {
 
 class BackendFactory:
     @staticmethod
-    def create(name: str = "auto", vertical: bool = True) -> VisionBackend:
-        normalized = str(name or "auto").strip().lower()
+    def create(name: str = "live_text", vertical: bool = True) -> VisionBackend:
+        normalized = str(name or "live_text").strip().lower()
         aliases = {
+            # Settings written by older releases are migrated to the stable
+            # explicit route instead of silently choosing a new backend.
+            "auto": "live_text",
             "livetext": "live_text",
             "live-text": "live_text",
             "visionkit": "live_text",
@@ -47,8 +51,10 @@ class BackendFactory:
 
     @staticmethod
     def auto(vertical: bool = True) -> VisionBackend:
-        return _REGISTRY["auto"]()
+        # Compatibility for plugins that still call BackendFactory.auto().
+        # This is deliberately deterministic and is not a UI option.
+        return _REGISTRY["live_text"]()
 
     @staticmethod
     def available_backends() -> list[str]:
-        return ["auto", "live_text", "native_helper", "shortcut"]
+        return ["live_text", "native_helper", "shortcut"]

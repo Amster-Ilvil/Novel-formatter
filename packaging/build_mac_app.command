@@ -48,8 +48,13 @@ rsync -a \
   --exclude '*.docx' \
   "$PROJECT_DIR/" "$APP_SOURCE/"
 
-echo "==> Converting icon"
-sips -s format icns "$PROJECT_DIR/icon.ico" --out "$CONTENTS/Resources/AppIcon.icns" >/dev/null
+echo "==> Installing app icon"
+ICON_SOURCE="$PROJECT_DIR/assets/AppIcon.icns"
+if [[ -f "$ICON_SOURCE" ]]; then
+  cp "$ICON_SOURCE" "$CONTENTS/Resources/AppIcon.icns"
+else
+  sips -s format icns "$PROJECT_DIR/icon.ico" --out "$CONTENTS/Resources/AppIcon.icns" >/dev/null
+fi
 
 echo "==> Writing bundle metadata"
 cat >"$CONTENTS/Info.plist" <<PLIST

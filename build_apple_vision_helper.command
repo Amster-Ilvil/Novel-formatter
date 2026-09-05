@@ -25,6 +25,7 @@ MODULE_CACHE_DIR="$ROOT/tools/apple_vision_helper/.module-cache"
 mkdir -p "$MODULE_CACHE_DIR"
 export CLANG_MODULE_CACHE_PATH="$MODULE_CACHE_DIR"
 xcrun swiftc "$SOURCE" \
+  -parse-as-library \
   -O \
   -framework Foundation \
   -framework Vision \

@@ -87,7 +87,7 @@ def _resolved_model_cache(backend: str = "torch") -> Path:
     if override:
         return Path(override).expanduser()
     try:
-        from adapters.ocr_runtime_catalog import _hayai_cache_roots, _hayai_litert_cache_complete, _hayai_processor_cache_complete, _hayai_torch_cache_complete, _hf_repo_dir
+        from adapters.ocr_runtime_catalog import _hayai_cache_roots, _hayai_litert_cache_complete, _hayai_processor_cache_complete, _hayai_repo_candidates, _hayai_torch_cache_complete, _hf_repo_dir
         roots = _hayai_cache_roots()
         if _normalise_backend(backend) == "litert":
             repo_id = os.environ.get(
@@ -95,7 +95,7 @@ def _resolved_model_cache(backend: str = "torch") -> Path:
             ).strip() or "JustANormalTinkerer/hayai-ocr-v2-tflite"
             repo_dir = _hf_repo_dir(repo_id)
             for root in roots:
-                if any(_hayai_litert_cache_complete(path) for path in (root / "hub" / repo_dir, root / repo_dir)):
+                if any(_hayai_litert_cache_complete(path) for path in _hayai_repo_candidates(root, repo_dir)):
                     return root
         else:
             model_name = os.environ.get(
@@ -109,7 +109,7 @@ def _resolved_model_cache(backend: str = "torch") -> Path:
                 if repo_dir:
                     model_ready = any(
                         _hayai_torch_cache_complete(path)
-                        for path in (root / "hub" / repo_dir, root / repo_dir)
+                        for path in _hayai_repo_candidates(root, repo_dir)
                     )
                 if model_ready and processor_ready:
                     return root

@@ -2806,7 +2806,8 @@ class OCRTab(QWidget):
 
         self._engine_settings_layout.addWidget(make_separator())
 
-        # Apple Vision 识别方式：Swift RecognizeTextRequest Helper 与原快捷指令并存。
+        # Apple OCR uses explicit backends.  Live Text is the default; the
+        # original Shortcuts route remains available as the last option.
         self._vision_backend_widget = QWidget()
         vbw = QVBoxLayout(self._vision_backend_widget)
         vbw.setContentsMargins(10, 0, 10, 0)
@@ -2815,10 +2816,9 @@ class OCRTab(QWidget):
         vb_lbl.setStyleSheet(f"color: {MUTED}; font-size: 11px;")
         vbw.addWidget(vb_lbl)
         self._vision_backend_combo = NoWheelComboBox()
-        self._vision_backend_combo.addItem("Apple Live Text · VisionKit ImageAnalyzer（推荐）", "live_text")
-        self._vision_backend_combo.addItem("macOS 快捷指令 · 精度基准（原方式）", "shortcut")
-        self._vision_backend_combo.addItem("Apple Vision Accurate · 坐标/候选", "native_helper")
-        self._vision_backend_combo.addItem("自动 · Live Text 优先，不可用时回退快捷指令", "auto")
+        self._vision_backend_combo.addItem("Apple Live Text · VisionKit ImageAnalyzer", "live_text")
+        self._vision_backend_combo.addItem("Apple Vision · RecognizeTextRequest 坐标/候选", "native_helper")
+        self._vision_backend_combo.addItem("macOS 快捷指令 · 稳定兼容通道", "shortcut")
         self._vision_backend_combo.setCurrentIndex(0)
         self._vision_backend_combo.currentIndexChanged.connect(self._on_vision_backend_changed)
         vbw.addWidget(self._vision_backend_combo)
@@ -2871,12 +2871,12 @@ class OCRTab(QWidget):
         vlt.addWidget(live_text_note)
         self._engine_settings_layout.addWidget(self._vision_live_text_widget)
 
-        # 原快捷指令名称保留；自动模式仅在 Live Text Helper 基础设施/可用性失败时使用。
+        # 原快捷指令名称保留为显式通道。
         self._shortcut_widget = QWidget()
         sc_col = QVBoxLayout(self._shortcut_widget)
         sc_col.setContentsMargins(10, 4, 10, 0)
         sc_col.setSpacing(2)
-        sc_lbl = QLabel("快捷指令名称（原通道/自动回退）")
+        sc_lbl = QLabel("快捷指令名称")
         sc_lbl.setStyleSheet(f"color: {MUTED}; font-size: 11px;")
         sc_col.addWidget(sc_lbl)
         self._shortcut_edit = QLineEdit("ExtractText")
@@ -4034,9 +4034,11 @@ class OCRTab(QWidget):
             "column_smart_crop": bool(migrated_preprocess["smart_crop"]),
             "column_ruby_strength": str(migrated_preprocess["ruby_strength"]),
         })
+        vision_backend = str(state.get("vision_backend") or "live_text").strip().lower()
+        if vision_backend == "auto" or vision_backend not in {"live_text", "native_helper", "shortcut"}:
+            vision_backend = "live_text"
         self._set_combo_value(
-            getattr(self, "_vision_backend_combo", None),
-            state.get("vision_backend", "live_text"),
+            getattr(self, "_vision_backend_combo", None), vision_backend,
         )
         self._set_combo_value(
             getattr(self, "_hayai_backend_combo", None), state.get("hayai_backend", "torch")
@@ -4256,8 +4258,8 @@ class OCRTab(QWidget):
             live_ok, live_reason = BackendFactory.create("live_text").is_available()
             helper_ok, helper_reason = BackendFactory.create("native_helper").is_available()
             shortcut_ok, shortcut_reason = BackendFactory.create("shortcut").is_available()
-            details.append(f"Apple Live Text Helper：{'可用' if live_ok else '不可用'}（{live_reason or '首次使用自动编译并运行时检测 ImageAnalyzer'}）")
-            details.append(f"Apple Vision Accurate Helper：{'可用' if helper_ok else '不可用'}（{helper_reason or '首次使用自动编译'}）")
+            details.append(f"Apple Live Text Helper：{'可用' if live_ok else '不可用'}（{live_reason or '本地 ImageAnalyzer'}）")
+            details.append(f"Apple Vision RecognizeTextRequest Helper：{'可用' if helper_ok else '不可用'}（{helper_reason or '本地 Swift Helper'}）")
             details.append(f"Apple Vision 快捷指令：{'可用' if shortcut_ok else '不可用'}（{shortcut_reason or '无需模型'}）")
         except Exception as exc:
             details.append(f"Apple Vision：检测失败（{exc}）")
@@ -4265,7 +4267,7 @@ class OCRTab(QWidget):
             probe = probe_runtime(cid, deep=deep, refresh=deep)
             state = "本地可用" if probe.ready else ("环境已安装，模型待确认" if probe.installed else "未安装")
             details.append(f"{cid}：{state}（{probe.detail}）")
-        ready = sum("本地可用" in x or "Apple Live Text Helper：可用" in x or "Apple Vision Accurate Helper：可用" in x or "Apple Vision 快捷指令：可用" in x for x in details)
+        ready = sum("本地可用" in x or "Apple Live Text Helper：可用" in x or "Apple Vision RecognizeTextRequest Helper：可用" in x or "Apple Vision 快捷指令：可用" in x for x in details)
         self._column_detect_status.setText(f"已扫描：{ready} 项可直接使用")
         if show_dialog:
             QMessageBox.information(self,"本地 OCR 检测结果","本次只检查本地文件、环境和系统能力，没有安装或下载任何模型。\n\n"+"\n".join(details))
@@ -4976,7 +4978,7 @@ class OCRTab(QWidget):
             self._hayai_device_combo.setToolTip("")
 
     def _on_vision_backend_changed(self):
-        backend_id = str(self._vision_backend_combo.currentData() or "auto")
+        backend_id = str(self._vision_backend_combo.currentData() or "live_text")
         self._update_shortcut_widget_visibility()
         try:
             from adapters.vision_backends import BackendFactory
@@ -4991,20 +4993,18 @@ class OCRTab(QWidget):
                 message = "使用常驻 Swift Helper 调用 VisionKit ImageAnalyzer（Live Text），直接读取系统 transcript；原图单次识别，不旋转、不紧裁。"
             elif backend_id == "native_helper":
                 message = "使用常驻 Swift Helper 调用 RecognizeTextRequest.accurate；可返回坐标、置信度和多个候选，竖列可选择紧裁旋转。"
-            else:
-                message = "优先使用 VisionKit Live Text；仅在 Helper 无法编译、启动或设备不支持时回退原快捷指令。空识别不会重复调用。"
             self._vision_backend_hint.setText(message)
         except Exception as e:
             self._vision_backend_hint.setText(f"⚠️ {e}")
 
     def _update_shortcut_widget_visibility(self):
         is_apple = self._active_adapter == "apple_vision"
-        backend_id = str(self._vision_backend_combo.currentData() or "auto") if hasattr(self, "_vision_backend_combo") else "auto"
-        self._shortcut_widget.setVisible(is_apple and backend_id in {"auto", "shortcut"})
+        backend_id = str(self._vision_backend_combo.currentData() or "live_text") if hasattr(self, "_vision_backend_combo") else "live_text"
+        self._shortcut_widget.setVisible(is_apple and backend_id == "shortcut")
         if hasattr(self, "_vision_helper_widget"):
             self._vision_helper_widget.setVisible(is_apple and backend_id == "native_helper")
         if hasattr(self, "_vision_live_text_widget"):
-            self._vision_live_text_widget.setVisible(is_apple and backend_id in {"auto", "live_text"})
+            self._vision_live_text_widget.setVisible(is_apple and backend_id == "live_text")
         if hasattr(self, "_vision_vertical_check"):
             from adapters.ocr_profiles import get_ocr_profile
             profile = get_ocr_profile(self._current_ocr_mode())
@@ -5881,7 +5881,7 @@ class OCRTab(QWidget):
         elif engine_id == "apple_vision":
             vertical = bool(profile.vertical and self._vision_vertical_check.isChecked())
             opts.update(
-                apple_backend=str(self._vision_backend_combo.currentData() or "auto"),
+                apple_backend=str(self._vision_backend_combo.currentData() or "live_text"),
                 recognition_level="accurate",
                 recognition_languages=list(profile.apple_languages),
                 use_language_correction=self._vision_language_correction_check.isChecked(),
@@ -6085,7 +6085,7 @@ class OCRTab(QWidget):
         from adapters.apple_vision_adapter import run as ocr_run
         return ocr_run(
             shortcut_name=str(column_opts.get("shortcut_name") or "ExtractText"),
-            backend=str(opts.get("apple_backend") or "auto"),
+            backend=str(opts.get("apple_backend") or "live_text"),
             vertical=bool(opts.get("vertical", profile.vertical)),
             recognition_level=str(opts.get("recognition_level") or "accurate"),
             recognition_languages=list(

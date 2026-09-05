@@ -298,7 +298,7 @@ def _normalise_hf_home(path: Path) -> Path:
     catalog makes readiness checks and the worker consume the same cache.
     """
     value = Path(path).expanduser()
-    if value.name.lower() == "hub":
+    if value.name.lower() in {"hub", "transformers"}:
         return value.parent
     return value
 
@@ -327,8 +327,24 @@ def _hayai_cache_roots() -> list[Path]:
     add(override or (ROOT / ".model-cache" / "hayai-ocr"))
     add(os.environ.get("HF_HOME", "").strip())
     add(os.environ.get("HUGGINGFACE_HUB_CACHE", "").strip())
+    add(os.environ.get("TRANSFORMERS_CACHE", "").strip())
     add(Path.home() / ".cache" / "huggingface")
     return roots
+
+
+def _hayai_repo_candidates(root: Path, repo_dir: str) -> tuple[Path, ...]:
+    """Return the cache layouts used by Hugging Face Hub and Transformers.
+
+    Older Hayai downloads in this project were written below
+    ``<HF_HOME>/transformers`` while newer Hub versions prefer
+    ``<HF_HOME>/hub``.  Both layouts are valid snapshots, and the worker pins
+    ``TRANSFORMERS_CACHE`` to the former for compatibility.
+    """
+    return (
+        root / "hub" / repo_dir,
+        root / "transformers" / repo_dir,
+        root / repo_dir,
+    )
 
 
 def _hayai_litert_cache_complete(root: Path) -> bool:
@@ -359,8 +375,8 @@ def _hayai_processor_cache_complete(root: Path) -> bool:
     processor with ``images=...``; the image processor config is the required
     offline asset here.
     """
-    repo_dir = root / "hub" / _hf_repo_dir("google/siglip2-base-patch16-naflex")
-    candidates = [repo_dir, root / _hf_repo_dir("google/siglip2-base-patch16-naflex")]
+    repo_name = _hf_repo_dir("google/siglip2-base-patch16-naflex")
+    candidates = _hayai_repo_candidates(root, repo_name)
     try:
         for candidate in candidates:
             if not candidate.exists():
@@ -491,7 +507,7 @@ def _model_cache_ready(component_id: str) -> tuple[bool, str]:
             if repo_dir:
                 model_ready = any(
                     _hayai_torch_cache_complete(path)
-                    for path in (cache_root / "hub" / repo_dir, cache_root / repo_dir)
+                    for path in _hayai_repo_candidates(cache_root, repo_dir)
                 )
             any_model_ready = any_model_ready or model_ready
             if model_ready and processor_ready:

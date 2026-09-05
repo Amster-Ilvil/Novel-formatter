@@ -43,8 +43,8 @@ class LiveTextHelperBackend(VisionBackend):
     def is_available(self) -> tuple[bool, str]:
         if platform.system() != "Darwin":
             return False, "仅支持 macOS"
-        if _mac_version_major() < 15:
-            return False, "本项目的双模式 Swift Helper 需要 macOS 15 或更高版本"
+        if _mac_version_major() < 13:
+            return False, "VisionKit ImageAnalyzer 需要 macOS 13 或更高版本"
         if not SOURCE.exists():
             return False, "缺少 AppleVisionOCRHelper.swift"
         if BINARY.exists() or shutil.which("xcrun"):
