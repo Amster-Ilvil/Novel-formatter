@@ -34,8 +34,66 @@ APPIMAGE_OUT="$DIST/NovelFormatter_${VERSION}_Linux_${LABEL}.AppImage"
 
 rm -rf "$WORK"
 rm -f "$TAR_OUT" "$DEB_OUT" "$APPIMAGE_OUT"
-mkdir -p "$APP_SOURCE" "$STAGE/bin" "$STAGE/libexec" \
+mkdir -p "$APP_SOURCE" "$STAGE/bin" "$STAGE/libexec" "$STAGE/lib" \
   "$STAGE/share/applications" "$STAGE/share/icons/hicolor/256x256/apps" "$DIST"
+
+# Qt's Linux wheels intentionally rely on a small set of platform libraries
+# supplied by the OS (EGL/X11/XCB/font stack).  For AppImage and portable tar.gz
+# we bundle these user-space libraries so a clean desktop does not need a manual
+# "install libEGL.so.1" step.  Never bundle glibc/the dynamic loader.
+if [[ "${GITHUB_ACTIONS:-}" == "true" ]]; then
+  sudo apt-get update -qq
+  sudo apt-get install -y --no-install-recommends \
+    libegl1 libgl1 libglx0 libglvnd0 libopengl0 \
+    libx11-6 libx11-xcb1 libxext6 libxrender1 libsm6 libice6 \
+    libxcb1 libxcb-cursor0 libxcb-glx0 libxcb-icccm4 libxcb-image0 \
+    libxcb-keysyms1 libxcb-randr0 libxcb-render0 libxcb-render-util0 \
+    libxcb-shape0 libxcb-shm0 libxcb-sync1 libxcb-util1 libxcb-xfixes0 \
+    libxcb-xkb1 libxcb-xinerama0 libxkbcommon0 libxkbcommon-x11-0 \
+    libfontconfig1 libfreetype6 libdbus-1-3 >/dev/null
+fi
+
+copy_runtime_lib() {
+  local soname="$1" path
+  path="$(/sbin/ldconfig -p 2>/dev/null | awk -v n="$soname" '$1 == n {print $NF; exit}')"
+  if [[ -z "$path" || ! -e "$path" ]]; then
+    echo "Required portable runtime library not found: $soname" >&2
+    return 1
+  fi
+  cp -L "$path" "$STAGE/lib/$soname"
+}
+
+RUNTIME_LIBS=(
+  libEGL.so.1 libGL.so.1 libGLX.so.0 libGLdispatch.so.0 libOpenGL.so.0
+  libX11.so.6 libX11-xcb.so.1 libXext.so.6 libXrender.so.1 libSM.so.6 libICE.so.6
+  libxcb.so.1 libxcb-cursor.so.0 libxcb-glx.so.0 libxcb-icccm.so.4
+  libxcb-image.so.0 libxcb-keysyms.so.1 libxcb-randr.so.0 libxcb-render.so.0
+  libxcb-render-util.so.0 libxcb-shape.so.0 libxcb-shm.so.0 libxcb-sync.so.1
+  libxcb-util.so.1 libxcb-xfixes.so.0 libxcb-xkb.so.1 libxcb-xinerama.so.0
+  libxkbcommon.so.0 libxkbcommon-x11.so.0 libfontconfig.so.1 libfreetype.so.6
+  libdbus-1.so.3
+)
+for soname in "${RUNTIME_LIBS[@]}"; do
+  copy_runtime_lib "$soname"
+done
+
+# Add non-glibc transitive dependencies of the portable libraries.  This makes
+# the bundle robust across minimal distributions while keeping the host's glibc,
+# loader, libm, pthread and low-level compiler runtime authoritative.
+declare -A COPIED_DEPS=()
+for lib in "$STAGE"/lib/*.so*; do
+  while IFS= read -r dep; do
+    [[ -n "$dep" && -e "$dep" ]] || continue
+    base="$(basename "$dep")"
+    case "$base" in
+      libc.so.*|libm.so.*|libpthread.so.*|librt.so.*|libdl.so.*|ld-linux*.so.*|ld-musl-*.so.*|libgcc_s.so.*) continue ;;
+    esac
+    if [[ -z "${COPIED_DEPS[$base]:-}" && ! -e "$STAGE/lib/$base" ]]; then
+      cp -L "$dep" "$STAGE/lib/$base"
+      COPIED_DEPS[$base]=1
+    fi
+  done < <(ldd "$lib" 2>/dev/null | awk '/=> \/|^\// {for (i=1;i<=NF;i++) if ($i ~ /^\//) {print $i; break}}')
+done
 
 # Privacy boundary: stage only files tracked by the current Git commit.
 TMP_TAR="$WORK/source.tar"
@@ -110,6 +168,10 @@ Recommended: run the AppImage. The portable tar.gz is also user-local and does
 not require administrator privileges. The DEB package installs a system launcher
 and therefore normally uses your distribution package manager.
 
+The AppImage and portable archive include the Qt/X11/EGL user-space runtime
+libraries needed by the GUI. They intentionally do not bundle glibc or graphics
+driver binaries, which remain part of the Linux system.
+
 First launch prepares a managed Python 3.12 runtime and the main GUI dependencies
 inside your user data directory. OCR-specific runtimes and model weights are NOT
 bundled and remain on-demand after you start the corresponding OCR function and
@@ -144,7 +206,7 @@ Section: text
 Priority: optional
 Architecture: $DEB_ARCH
 Maintainer: Novel Formatter contributors
-Depends: bash, ca-certificates, libgl1, libegl1, libxkbcommon0, libdbus-1-3, fontconfig
+Depends: bash, ca-certificates, fontconfig
 Recommends: poppler-utils
 Description: Novel Formatter Studio
  Japanese vertical novel OCR, multi-model review and EPUB production tool.
