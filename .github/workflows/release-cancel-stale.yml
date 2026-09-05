@@ -1,0 +1,21 @@
+name: Cancel stale release runs
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - ".github/workflows/release-cancel-stale.yml"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: novel-formatter-release-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  cancel-stale:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Release queue reset
+        run: echo "Stale Novel Formatter release runs canceled; final main validation may start cleanly."
