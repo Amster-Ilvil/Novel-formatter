@@ -9,6 +9,14 @@ PACKAGE_ROOT="$(cd "$(dirname "$SELF")/.." && pwd)"
 EMBEDDED_SOURCE="$PACKAGE_ROOT/share/novel-formatter/app"
 UV_BIN="$PACKAGE_ROOT/libexec/uv"
 
+# Some AppImage runtimes forward metadata probes to AppRun instead of consuming
+# them themselves (observed on ARM64).  Never turn such a probe into a real app
+# boot, otherwise a structure check could start Python provisioning or the GUI.
+if [[ "${1:-}" == "--appimage-version" ]]; then
+  echo "Novel Formatter Studio AppImage"
+  exit 0
+fi
+
 XDG_DATA_HOME="${XDG_DATA_HOME:-$HOME/.local/share}"
 XDG_CACHE_HOME="${XDG_CACHE_HOME:-$HOME/.cache}"
 XDG_STATE_HOME="${XDG_STATE_HOME:-$HOME/.local/state}"
