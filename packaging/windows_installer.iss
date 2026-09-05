@@ -38,11 +38,10 @@ UsePreviousTasks=yes
 Uninstallable=yes
 
 [Languages]
-Name: "chinesesimp"; MessagesFile: "compiler:Languages\ChineseSimplified.isl"
 Name: "english"; MessagesFile: "compiler:Default.isl"
 
 [Tasks]
-Name: "desktopicon"; Description: "创建桌面快捷方式"; GroupDescription: "附加选项："; Flags: unchecked
+Name: "desktopicon"; Description: "Create a desktop shortcut"; GroupDescription: "Additional options:"; Flags: unchecked
 
 [Files]
 Source: "{#SourceDir}\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs
@@ -52,4 +51,4 @@ Name: "{autoprograms}\Novel Formatter Studio"; Filename: "{app}\启动Windows.ba
 Name: "{autodesktop}\Novel Formatter Studio"; Filename: "{app}\启动Windows.bat"; WorkingDir: "{app}"; IconFilename: "{app}\icon.ico"; Tasks: desktopicon
 
 [Run]
-Filename: "{app}\启动Windows.bat"; Description: "启动 Novel Formatter Studio"; WorkingDir: "{app}"; Flags: postinstall nowait skipifsilent shellexec
+Filename: "{app}\启动Windows.bat"; Description: "Launch Novel Formatter Studio"; WorkingDir: "{app}"; Flags: postinstall nowait skipifsilent shellexec

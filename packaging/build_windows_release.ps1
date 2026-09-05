@@ -69,12 +69,12 @@ function Find-Iscc {
     $command = Get-Command 'ISCC.exe' -ErrorAction SilentlyContinue
     if ($command) { return $command.Source }
 
-    $candidates = @(
+    $candidate = @(
         (Join-Path ${env:ProgramFiles(x86)} 'Inno Setup 6\ISCC.exe'),
         (Join-Path $env:ProgramFiles 'Inno Setup 6\ISCC.exe')
-    ) | Where-Object { $_ -and (Test-Path -LiteralPath $_) }
+    ) | Where-Object { $_ -and (Test-Path -LiteralPath $_) } | Select-Object -First 1
 
-    if ($candidates.Count -gt 0) { return $candidates[0] }
+    if ($candidate) { return $candidate }
     return $null
 }
 

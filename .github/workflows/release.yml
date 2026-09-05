@@ -79,12 +79,12 @@ jobs:
       - name: Ensure Inno Setup 6
         shell: pwsh
         run: |
-          $candidates = @(
+          $candidate = @(
             (Join-Path ${env:ProgramFiles(x86)} 'Inno Setup 6\ISCC.exe'),
             (Join-Path $env:ProgramFiles 'Inno Setup 6\ISCC.exe')
-          ) | Where-Object { $_ -and (Test-Path -LiteralPath $_) }
-          if ($candidates.Count -gt 0) {
-            Write-Host "Using $($candidates[0])"
+          ) | Where-Object { $_ -and (Test-Path -LiteralPath $_) } | Select-Object -First 1
+          if ($candidate) {
+            Write-Host "Using $candidate"
             exit 0
           }
           choco install innosetup --no-progress -y
