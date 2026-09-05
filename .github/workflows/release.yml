@@ -339,23 +339,23 @@ jobs:
           cat > "$NOTES" <<EOF
           ## Novel Formatter Studio ${VERSION}
 
-          本 Release 直接由当前 main 提交 `${GITHUB_SHA}` 在 GitHub Actions 干净环境中构建。
+          本 Release 直接由当前 main 提交 **${GITHUB_SHA}** 在 GitHub Actions 干净环境中构建。
 
           ### 推荐下载
-          - **Windows x64（推荐）**：`NovelFormatter_${VERSION}_Windows_x64_Setup.exe` —— 双击安装，无需管理员权限；安装后从开始菜单启动。
-          - **Windows x64 便携版**：`NovelFormatter_${VERSION}_Windows_x64.zip` —— 解压后双击 `启动Windows.bat`。
-          - **Mac Apple Silicon / M 系列（推荐）**：`NovelFormatter_${VERSION}_macOS_AppleSilicon.dmg`。
-          - **Mac Intel（推荐）**：`NovelFormatter_${VERSION}_macOS_Intel.dmg`。
-          - **Linux x86_64（推荐）**：`NovelFormatter_${VERSION}_Linux_x86_64.AppImage` —— 赋予执行权限后直接运行，无需管理员权限。
-          - **Linux ARM64（推荐）**：`NovelFormatter_${VERSION}_Linux_ARM64.AppImage` —— 原生 ARM64 构建。
-          - Linux 同时提供 `.deb`（Debian/Ubuntu 系）和 `.tar.gz`（通用便携版）。
-          - macOS `.app.zip` 保留为不使用 DMG 时的备用包。
+          - **Windows x64（推荐）**：**NovelFormatter_${VERSION}_Windows_x64_Setup.exe** —— 双击安装，无需管理员权限；安装后从开始菜单启动。
+          - **Windows x64 便携版**：**NovelFormatter_${VERSION}_Windows_x64.zip** —— 解压后双击“启动Windows.bat”。
+          - **Mac Apple Silicon / M 系列（推荐）**：**NovelFormatter_${VERSION}_macOS_AppleSilicon.dmg**。
+          - **Mac Intel（推荐）**：**NovelFormatter_${VERSION}_macOS_Intel.dmg**。
+          - **Linux x86_64（推荐）**：**NovelFormatter_${VERSION}_Linux_x86_64.AppImage** —— 赋予执行权限后直接运行，无需管理员权限。
+          - **Linux ARM64（推荐）**：**NovelFormatter_${VERSION}_Linux_ARM64.AppImage** —— 原生 ARM64 构建。
+          - Linux 同时提供 .deb（Debian/Ubuntu 系）和 .tar.gz（通用便携版）。
+          - macOS .app.zip 保留为不使用 DMG 时的备用包。
 
-          Windows、macOS 与 Linux 首次启动都会自动准备主程序运行环境；Linux AppImage/便携版使用包内 `uv` 在用户目录准备 Python 3.12 与主 GUI 依赖。OCR 模型与 OCR 专用运行环境仍按需安装，只在用户实际启动对应 OCR 并确认后下载。
+          Windows、macOS 与 Linux 首次启动都会自动准备主程序运行环境；Linux AppImage/便携版使用包内 uv 在用户目录准备 Python 3.12 与主 GUI 依赖。OCR 模型与 OCR 专用运行环境仍按需安装，只在用户实际启动对应 OCR 并确认后下载。
 
           Apple Live Text / Apple Vision 与 MLX 属于 macOS 专属能力；Linux 使用可跨平台的 OCR 后端。Linux x86_64 与 ARM64 均在对应原生 GitHub runner 上完成首次启动依赖准备和 GUI 导入烟雾测试。
 
-          发布包只来自 Git 跟踪文件，不包含开发机缓存、`.env`、API Key、模型缓存、日志、用户小说、OCR 结果、EPUB 或 DOCX。请使用 `SHA256SUMS.txt` 校验下载文件。
+          发布包只来自 Git 跟踪文件，不包含开发机缓存、.env、API Key、模型缓存、日志、用户小说、OCR 结果、EPUB 或 DOCX。请使用 SHA256SUMS.txt 校验下载文件。
           EOF
 
           if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
@@ -388,6 +388,11 @@ jobs:
           do
             grep -qx "$name" <<< "$ASSETS"
           done
+          BODY="$(gh release view "$RELEASE_TAG" --json body --jq .body)"
+          grep -Fq "$GITHUB_SHA" <<< "$BODY"
+          grep -Fq "NovelFormatter_${VERSION}_Windows_x64_Setup.exe" <<< "$BODY"
+          grep -Fq "NovelFormatter_${VERSION}_Linux_x86_64.AppImage" <<< "$BODY"
+          grep -Fq "NovelFormatter_${VERSION}_Linux_ARM64.AppImage" <<< "$BODY"
           gh release view "$RELEASE_TAG" --json url,name,tagName,isDraft,isPrerelease,assets \
             --jq '{url,name,tagName,isDraft,isPrerelease,assets:[.assets[].name]}'
 
