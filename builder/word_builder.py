@@ -33,12 +33,26 @@ def _add_page_break(doc):
     run._r.append(br)
 
 
-def _block_text_for_word(b: Block) -> str:
+def _ruby_source_matches_current_text(marked: str, current_text: str) -> bool:
+    if not re.search(r"[｜|][^《]+《[^》]+》", marked or ""):
+        return False
+    plain = re.sub(r"[｜|]([^《\n]+)《([^》\n]+)》", r"\1", str(marked or ""))
+    return plain == str(current_text or "")
+
+
+def _block_text_for_word(b: Block, *, allow_ruby: bool = True) -> str:
+    metadata = b.metadata if isinstance(getattr(b, "metadata", None), dict) else {}
+    current = str(b.text or "")
+    if not allow_ruby:
+        return current
+    source = str(metadata.get("ruby_aozora") or "")
+    if _ruby_source_matches_current_text(source, current):
+        return re.sub(r"[｜|]([^《]+)《([^》]+)》", r"\1（\2）", source)
     if b.type != BlockType.RUBY:
-        return b.text
+        return current
 
     source = str(b.ocr_raw or "")
-    if re.search(r"[｜|][^《]+《[^》]+》", source):
+    if _ruby_source_matches_current_text(source, current):
         return re.sub(r"[｜|]([^《]+)《([^》]+)》", r"\1（\2）", source)
 
     # Legacy ``base|reading`` JSON has no explicit end delimiter.  Restrict the
@@ -131,6 +145,9 @@ def build_word(
         BlockType.PARAGRAPH, BlockType.DIALOGUE, BlockType.CHAPTER,
         BlockType.SECTION, BlockType.RUBY,
     }
+    ruby_export_enabled = bool(
+        getattr(getattr(doc, "metadata", None), "ruby_preservation_enabled", False)
+    )
     expected_ids, page_by_id = _expected_column_manifest(doc)
     represented_ids: list[str] = []
     written_texts: list[str] = []
@@ -141,7 +158,12 @@ def build_word(
             continue
         if block.type not in text_types:
             continue
-        text = _block_text_for_word(block)
+        text = _block_text_for_word(
+            block,
+            # Preserve legacy/imported BlockType.RUBY independently of the OCR
+            # findtext side-channel switch.
+            allow_ruby=(ruby_export_enabled or block.type == BlockType.RUBY),
+        )
         if not text.strip():
             continue
         if page_breaks and prev_page is not None and block.page != prev_page and written_texts:

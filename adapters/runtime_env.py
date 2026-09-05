@@ -17,6 +17,26 @@ from pathlib import Path
 from typing import Iterable
 
 
+
+def persistent_runtime_root() -> Path:
+    """Per-user OCR runtime root shared by application/source upgrades."""
+    override = os.environ.get("NOVEL_FORMATTER_OCR_RUNTIME_HOME", "").strip()
+    if override:
+        return Path(override).expanduser()
+    home = Path.home()
+    if sys.platform == "darwin":
+        return home / "Library" / "Caches" / "NovelFormatter" / "ocr-runtimes"
+    if os.name == "nt":
+        base = os.environ.get("LOCALAPPDATA", "").strip()
+        return (Path(base) if base else home / "AppData" / "Local") / "NovelFormatter" / "ocr-runtimes"
+    xdg = os.environ.get("XDG_CACHE_HOME", "").strip()
+    return (Path(xdg).expanduser() if xdg else home / ".cache") / "novel-formatter" / "ocr-runtimes"
+
+
+def persistent_venv_dir(name: str) -> Path:
+    safe = "".join(ch if ch.isalnum() or ch in "-_." else "-" for ch in str(name or "ocr"))
+    return persistent_runtime_root() / safe / "venv"
+
 def _candidate_paths() -> Iterable[str]:
     seen: set[str] = set()
 

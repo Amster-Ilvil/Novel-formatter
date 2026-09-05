@@ -37,7 +37,7 @@ _TRAILING_CLOSERS = set("」』】）》〉〕］）】")
 _TITLE_TYPES = {BlockType.CHAPTER, BlockType.SECTION, BlockType.TOC_ENTRY}
 _TEXT_TYPES = {
     BlockType.PARAGRAPH, BlockType.DIALOGUE, BlockType.CHAPTER,
-    BlockType.SECTION, BlockType.TOC_ENTRY,
+    BlockType.SECTION, BlockType.RUBY, BlockType.TOC_ENTRY,
 }
 _MAX_GROUP_SPAN = 3
 
@@ -1706,6 +1706,7 @@ def build_fused_document(
     result_lines: Sequence[str] | None = None,
     *,
     delete_flags: Sequence[bool] | None = None,
+    ruby_overlay_source: UnifiedDocument | dict | None = None,
 ) -> UnifiedDocument:
     lines = list(result_lines if result_lines is not None else selected_lines(comparison))
     if len(lines) != len(comparison.rows):
@@ -2277,8 +2278,14 @@ def build_fused_document(
                     [str(item) for item in (*row.warnings, *row.character_fusion_warnings) if str(item)]
                 )),
             })
+        source_block_ids = [
+            str(result.blocks[source_index].id)
+            for source_index in source_indices
+            if 0 <= source_index < len(result.blocks) and str(result.blocks[source_index].id)
+        ]
         target.metadata = {
             **(target.metadata or {}),
+            "multi_ocr_source_block_ids": source_block_ids,
             "ocr_review_regions": regions,
             "ocr_review_preferred_image_path": preferred,
             "ocr_review_sentence_image_path": preferred,
@@ -2559,6 +2566,20 @@ def build_fused_document(
         "multi_ocr_decisions": decisions,
     })
     result.add_log("multi_ocr_fusion", comparison.summary, changed)
+    # Ruby is a locked structural side-channel, never an OCR voting candidate.
+    # Re-attach it only after the authoritative fused/AI-edited prose is final.
+    try:
+        from adapters.findtext_centernet_ruby import apply_ruby_overlay, strip_ruby_overlay
+        if ruby_overlay_source is not None:
+            apply_ruby_overlay(result, ruby_overlay_source)
+        else:
+            # Rebuilding a fusion without an explicit overlay source is a hard
+            # Ruby-OFF boundary.  Never revive stale metadata inherited from the
+            # primary OCR document or an older snapshot.
+            strip_ruby_overlay(result, strip_candidate_geometry=False, strip_logs=False)
+    except Exception:
+        # Ruby preservation is optional and must never break the main OCR path.
+        pass
     return result
 
 

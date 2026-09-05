@@ -43,6 +43,17 @@ from models.paragraph import Paragraph
 from engine.alignment_v2 import align
 from engine.japanese_normalizer import compare_key
 from engine.vertical_ocr_canonicalizer import VerticalOCRCanonicalizer, normalize_for_alignment
+
+
+def _carry_locked_ruby(source: UnifiedDocument, target: UnifiedDocument) -> None:
+    """Preserve locked Ruby metadata without making it replacement text."""
+    try:
+        from adapters.findtext_centernet_ruby import carry_ruby_overlay, has_ruby_overlay
+        if has_ruby_overlay(source):
+            carry_ruby_overlay(source, target)
+    except Exception:
+        # Replacement must remain usable even when optional Ruby support is off.
+        pass
 from engine.strict_reflow import (
     ReflowSegment, analyze_layout_texts, layout_neutral_text, reflow_source_paragraphs,
 )
@@ -732,6 +743,7 @@ def _replace_vertical_logical_text(
         post_deduped=post_deduped,
         execution_seconds=time.time() - t0,
     )
+    _carry_locked_ruby(ocr_doc, new_doc)
     return new_doc, report
 
 
@@ -1204,6 +1216,7 @@ def strict_replace_text(
         literal_extra_chars=literal_extra,
         literal_similarity=literal_ratio,
     )
+    _carry_locked_ruby(ocr_doc, out)
     return out, report
 
 
@@ -1475,6 +1488,7 @@ def replace_text(
         post_deduped=post_deduped,
         execution_seconds=time.time() - t0,
     )
+    _carry_locked_ruby(ocr_doc, new_doc)
     return new_doc, report
 
 

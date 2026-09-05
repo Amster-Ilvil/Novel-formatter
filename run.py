@@ -76,6 +76,14 @@ def main(argv=None) -> int:
     parser.add_argument("--text-layer", action="store_true",
                         help="input 是带文字层的 PDF 时，直接读取文字层（更准确、"
                              "自动按字号跳过振假名/页码），不走图像 OCR")
+    parser.add_argument("--preserve-ruby", action="store_true",
+                        help="额外使用 findtextCenterNet 保留日文原文 Ruby；默认关闭。"
+                             "只提取振假名结构，不覆盖主 OCR 正文")
+    parser.add_argument(
+        "--ruby-scan-mode", choices=["smart_roi", "full_page", "auto"], default="smart_roi",
+        help="Ruby 扫描范围：smart_roi=仅处理普通 OCR 记录的疑似 Ruby 上下文框（默认）；"
+             "full_page=整页精确扫描（慢）；auto=有候选时 ROI、无候选时回退整页",
+    )
 
     # 元数据
     parser.add_argument("--title",     help="书名（写入 EPUB metadata）")
@@ -213,6 +221,25 @@ def main(argv=None) -> int:
                 )
             finally:
                 crop_manager.cleanup(crop_path)
+
+        if args.preserve_ruby and not args.text_layer:
+            if verbose:
+                print("\n── Ruby 旁路：findtextCenterNet ────────────────────────────")
+            from adapters.findtext_centernet_ruby import preserve_ruby_in_documents
+            report = preserve_ruby_in_documents(
+                [doc],
+                log_callback=(print if verbose else None),
+                progress_callback=(
+                    (lambda current, total, name: print(f"  [Ruby {current}/{total}] {name}"))
+                    if verbose else None
+                ),
+                scan_mode=args.ruby_scan_mode,
+            )
+            if verbose:
+                if report.error:
+                    print(f"⚠️ Ruby 保留失败，正文保持原样：{report.error}")
+                else:
+                    print(f"✅ Ruby：检测 {report.ruby_pairs}，安全写回 {report.matched_pairs}")
 
         # 补充命令行传入的 metadata
         if args.title:     doc.metadata.title     = args.title

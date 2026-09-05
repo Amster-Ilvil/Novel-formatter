@@ -1,60 +1,47 @@
-# Local environments and model data
+# Local Python environments and downloaded OCR assets
 .venv*/
 venv/
 env/
-.runtime/
 .model-cache/
 .ocr-runtimes/
 .ocr-runtime-state/
 .manual-model-updates/
+.runtime/
 .windows-runtime-state/
-.venv-app-windows/
-model_cache/
-models/cache/
-models/checkpoints/
-models/weights/
 
-# Local application state and generated files
+# Secrets and local configuration
 .env
 .env.*
 !.env.example
-!.env.sample
-!.env.template
-.cache/
-.pytest_cache/
-__pycache__/
-debug/
-*.py[cod]
-*.db
-*.sqlite
-*.sqlite3
-*.sqlite-*
-*.log
-output/
-outputs/
-exports/
-backups/
-workspaces/
-dist/
-build/
-package/
-logs/
-cache/
-tmp/
-temp/
-*.app/
-*.dmg
-*.epub
-*.docx
-epub_workspace/
-.DS_Store
-Thumbs.db
-
-# Local credentials / signing material
-credentials*.json
-secrets*.json
-service-account*.json
 *.pem
 *.p12
 *.pfx
-*.key
+
+# Runtime logs, debug inputs and caches
+debug/
+logs/
+*.log
+__pycache__/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+*.py[cod]
+.DS_Store
+Thumbs.db
+
+# User workspaces and generated books
+epub_workspace/
+output/
+outputs/
+build/
+dist/
+*.epub
+*.docx
+*.pdf
+*.sqlite
+*.sqlite3
+*.db
+
+# IDE metadata
+.idea/
+.vscode/

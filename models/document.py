@@ -232,6 +232,18 @@ class Metadata:
     column_sentence_reflow_max_columns: int = 0
     column_ocr_audit: dict = field(default_factory=dict)  # per-page expected/recognized/model/DOCX column IDs
     column_ocr_integrity_passed: bool = False
+    # Geometry-only Ruby candidates captured while normal OCR is already splitting columns.
+    # They contain no recognized Ruby text and never participate in OCR voting/fusion.
+    ruby_candidate_pages: dict = field(default_factory=dict)
+    # Ruby preservation is a locked side-channel on authoritative output only.
+    # Keep these fields explicit so generic JSON/repository round-trips cannot
+    # silently discard them (older code stored them dynamically in __dict__).
+    ruby_preservation_enabled: bool = False
+    ruby_overlay_scope: str = ""
+    ruby_input_contract: str = ""
+    ruby_preservation_engine: str = ""
+    ruby_preservation_report: dict = field(default_factory=dict)
+    ruby_overlay_transfer_report: dict = field(default_factory=dict)
     ocr_review_report: dict = field(default_factory=dict)  # OCR + 手动输入疑点筛查汇总
     page_asset_sync_signature: str = ""  # Page Manager overlay signature; avoids redundant full-document sync
 

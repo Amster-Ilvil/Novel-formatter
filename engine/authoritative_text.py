@@ -445,6 +445,12 @@ def reconcile_authoritative_result(source: UnifiedDocument, result: UnifiedDocum
         f"逐来源块重建：恢复 {recovered}，协议占位恢复 {protocol_recovered}，重叠操作拒绝 {overlap_recovered}，相邻污染恢复 {adjacency_recovered}，排版邻接回退 {layout_adjacency_recovered}",
         recovered + overlap_recovered + layout_adjacency_recovered,
     )
+    try:
+        from adapters.findtext_centernet_ruby import carry_ruby_overlay, has_ruby_overlay
+        if has_ruby_overlay(source):
+            carry_ruby_overlay(source, output)
+    except Exception:
+        pass
     return output
 
 

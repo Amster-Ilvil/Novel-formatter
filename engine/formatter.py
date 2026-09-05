@@ -26,6 +26,7 @@ import re
 import copy
 import difflib
 import unicodedata
+import uuid
 from pathlib import Path
 from typing import Optional, Callable
 import sys
@@ -1759,7 +1760,7 @@ def restore_dialogue_breaks(doc: UnifiedDocument) -> UnifiedDocument:
         # 独立对白列。嵌套的『术语』仍保留在同一条对白内部。
         whole_dialogue = re.fullmatch(r"\s*「[^」]*」\s*", text, re.DOTALL)
         if whole_dialogue:
-            dialogue = copy.copy(block)
+            dialogue = copy.deepcopy(block)
             dialogue.text = text.strip()
             dialogue.type = BlockType.DIALOGUE
             dialogue.modified_by = _append_modified_by(
@@ -1799,15 +1800,17 @@ def restore_dialogue_breaks(doc: UnifiedDocument) -> UnifiedDocument:
 
             before = text[cursor:match.start()].strip()
             if before:
-                paragraph = copy.copy(block)
-                paragraph.id = ""
+                paragraph = copy.deepcopy(block)
+                paragraph.id = uuid.uuid4().hex
+                paragraph.metadata = {**(paragraph.metadata or {}), "formatter_source_block_ids": [str(block.id)]}
                 paragraph.text = before
                 paragraph.type = BlockType.PARAGRAPH
                 paragraph.modified_by = "restore_dialogue_breaks"
                 pieces.append(paragraph)
 
-            dialogue = copy.copy(block)
-            dialogue.id = ""
+            dialogue = copy.deepcopy(block)
+            dialogue.id = uuid.uuid4().hex
+            dialogue.metadata = {**(dialogue.metadata or {}), "formatter_source_block_ids": [str(block.id)]}
             dialogue.text = match.group(0).strip()
             dialogue.type = BlockType.DIALOGUE
             dialogue.modified_by = "restore_dialogue_breaks"
@@ -1817,8 +1820,9 @@ def restore_dialogue_breaks(doc: UnifiedDocument) -> UnifiedDocument:
 
         tail = text[cursor:].strip()
         if tail:
-            paragraph = copy.copy(block)
-            paragraph.id = ""
+            paragraph = copy.deepcopy(block)
+            paragraph.id = uuid.uuid4().hex
+            paragraph.metadata = {**(paragraph.metadata or {}), "formatter_source_block_ids": [str(block.id)]}
             paragraph.text = tail
             paragraph.type = BlockType.PARAGRAPH
             paragraph.modified_by = "restore_dialogue_breaks"
@@ -2521,6 +2525,16 @@ def run_pipeline(
             progress_callback(step_id, step_idx, total)
 
         result = fn(current)
+        # Ruby is immutable side-channel evidence. Structural formatter steps
+        # may split/merge/rebuild blocks, so carry it from the pre-step document
+        # before committing the new version. Ambiguous mappings fail closed.
+        try:
+            from adapters.findtext_centernet_ruby import carry_ruby_overlay, has_ruby_overlay
+            if has_ruby_overlay(current):
+                carry_ruby_overlay(current, result)
+        except Exception:
+            # Optional Ruby preservation must never break the formatter path.
+            pass
         _sync_toc_after_formatter_step(current, result)
         # 步骤函数内部 deepcopy 出的新对象不会带着上一版的 repo/commit_id，
         # 这里接续上，保证 commit 链条完整。

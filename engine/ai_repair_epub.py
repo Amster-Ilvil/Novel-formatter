@@ -321,6 +321,24 @@ def build_repair_document(
     for index, block in enumerate(result.blocks):
         block.reading_order = index
     result.metadata.source_engine = f"{result.metadata.source_engine or 'multi_ocr'}+ai_repair_epub"
+    try:
+        from adapters.findtext_centernet_ruby import (
+            apply_ruby_overlay, refresh_preserved_ruby, strip_ruby_overlay,
+        )
+        ruby_overlay = package.get("ruby_overlay") if isinstance(package, dict) else None
+        overlay_enabled = bool(
+            isinstance(ruby_overlay, dict)
+            and (ruby_overlay.get("document_metadata") or {}).get("ruby_preservation_enabled")
+            and ruby_overlay.get("blocks")
+        )
+        if overlay_enabled:
+            apply_ruby_overlay(result, ruby_overlay)
+        elif bool(getattr(getattr(result, "metadata", None), "ruby_preservation_enabled", False)):
+            refresh_preserved_ruby(result)
+        else:
+            strip_ruby_overlay(result, strip_candidate_geometry=False, strip_logs=False)
+    except Exception:
+        pass
     return result
 
 
@@ -602,6 +620,27 @@ def _map_item(
         "risk_level": _risk_level_from_reasons(risk_reasons, confidence),
         "risk_reasons": risk_reasons,
     }
+    # Ruby is an immutable side-channel only when the authoritative document
+    # explicitly says the feature is enabled.  Stray/stale block metadata from
+    # a previous run must never leak into an AI package created while Ruby is OFF.
+    from adapters.findtext_centernet_ruby import has_ruby_overlay
+    if (
+        source is not None
+        and has_ruby_overlay(primary_doc)
+        and isinstance(getattr(source, "metadata", None), dict)
+    ):
+        ruby_annotations = copy.deepcopy(source.metadata.get("ruby_annotations") or [])
+        if not ruby_annotations:
+            ruby_source = str(source.metadata.get("ruby_aozora", "") or "")
+            ruby_annotations = [
+                {"base": m.group(1), "reading": m.group(2)}
+                for m in re.finditer(r"[｜|]([^《\n]+)《([^》\n]+)》", ruby_source)
+            ]
+        if ruby_annotations:
+            # Immutable evidence: AI edits only plain base text; readings are
+            # re-attached by the app after import and are never model-generated.
+            result["ruby_locked_annotations"] = ruby_annotations
+            result["ruby_preservation_policy"] = "locked_reading_reapply_after_text_edit"
     if result["content_format"] == "inline_tokens_v1":
         result["baseline_tokens"] = _inline_tokens(baseline)
     if mode in {"standard", "expert", "one_pass"}:
@@ -1002,10 +1041,11 @@ def _guide_text(mode: str) -> str:
 
 ## 允许操作
 
-- 只修复日文 OCR 错字、漏字、重复、断句和错序；Ruby 振假名全部删除，只保留底字。
+- 只修复日文 OCR 错字、漏字、重复、断句和错序；AI 可编辑内容始终是普通正文底字。
+- Ruby/振假名由程序作为锁定结构层独立保存；`ruby_locked_annotations` 只读，禁止修改、删除、猜测或新增读音。
 - 保留稳定 `item_id`，不得翻译、润色、续写或概括。
 - 普通多行文本使用 `\\n`；程序会安全回写为 `<br/>`。
-- 不得生成 `ruby` token；输出只允许普通正文底字。
+- 不得生成 `ruby` token 或把振假名混入 `edited_text`；导入后程序会按最新正文安全重新挂接原 Ruby。
 
 ## 稀疏 JSON 示例
 

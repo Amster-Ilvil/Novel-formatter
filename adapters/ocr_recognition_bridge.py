@@ -194,6 +194,7 @@ def recognizer_iterator(
             pipeline=pipeline,
             cancel_check=cancel_check,
             model_source=str(options.get("model_source") or "auto"),
+            vl_backend=str(options.get("vl_backend") or "auto"),
         )
         return
     if engine == "pdf_craft":

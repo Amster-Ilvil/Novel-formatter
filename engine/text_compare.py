@@ -799,6 +799,7 @@ def apply_compare_records(source: UnifiedDocument, records: Sequence[CompareLine
                 block.modified_by = (block.modified_by + ",manual_aligned_compare_edit").strip(",")
                 block.metadata.setdefault("manual_compare_audit", []).append({"before": before, "after": text})
                 changed += 1
+            block.metadata = {**(block.metadata or {}), "manual_compare_source_block_ids": list(ids)}
             block.type = _coerce_record_type(record.block_type, text, original.type)
             if normalise_for_alignment(text) in toc_titles or looks_like_chapter_title(text):
                 block.type = BlockType.CHAPTER
@@ -889,5 +890,11 @@ def apply_compare_records(source: UnifiedDocument, records: Sequence[CompareLine
         f"文本对比工作区重建正文 {len(result.blocks)} 块；修改 {changed} 处；跳过重复引用 {duplicate_ref_rows} 行",
         changed,
     )
+    try:
+        from adapters.findtext_centernet_ruby import carry_ruby_overlay, has_ruby_overlay
+        if has_ruby_overlay(source):
+            carry_ruby_overlay(source, result)
+    except Exception:
+        pass
     return result, changed
 

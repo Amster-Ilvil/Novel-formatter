@@ -180,3 +180,101 @@ def classify_vertical_ruby(
         ruby_component_count=len(ruby_items),
         confidence=round(float(confidence), 4),
     )
+
+
+def detect_vertical_ruby_candidates(
+    components: Sequence[dict],
+    *,
+    body_x0: int,
+    body_x1: int,
+    image_width: int,
+    target_width: float,
+    target_height: float,
+) -> RubyFilterResult:
+    """High-recall geometry telemetry for scheduling specialist Ruby OCR.
+
+    Unlike :func:`classify_vertical_ruby`, this helper is *not* allowed to
+    remove pixels from the normal OCR input.  It may therefore be deliberately
+    more permissive: repeated half-size glyphs just outside the body band are
+    recorded as candidate ROIs and later verified by findtextCenterNet.
+    False positives cost a small ROI inference; false negatives would lose Ruby.
+    """
+    items = [dict(component) for component in components]
+    if not items or body_x1 <= body_x0:
+        return RubyFilterResult(
+            max(0, int(body_x0)), min(int(image_width), int(body_x1)),
+            tuple(items), tuple(), tuple(), len(items), 0, 0.0,
+        )
+
+    body_width = max(1.0, float(body_x1 - body_x0))
+    glyph_w = max(body_width, float(target_width or body_width))
+    glyph_h = max(4.0, float(target_height or glyph_w))
+    side_reach = max(6.0, glyph_w * 0.95)
+    max_w = max(4.0, glyph_w * 0.72)
+    max_h = max(5.0, glyph_h * 0.78)
+    max_area = max(10.0, glyph_w * glyph_h * 0.46)
+
+    side_candidates: dict[str, list[dict]] = {"left": [], "right": []}
+    for item in items:
+        cx = float(item.get("cx", 0.0))
+        w = _width(item); h = _height(item); area = max(1, _area(item))
+        if w > max_w or h > max_h or area > max_area:
+            continue
+        # Require the component centre to be outside the body core.  A small
+        # overlap is tolerated because anti-aliasing and connected radicals can
+        # cross the estimated body edge by a few pixels.
+        if float(body_x1) - 1.0 < cx <= float(body_x1) + side_reach:
+            side_candidates["right"].append(item)
+        elif float(body_x0) - side_reach <= cx < float(body_x0) + 1.0:
+            side_candidates["left"].append(item)
+
+    ruby_items: list[dict] = []
+    scores: list[float] = []
+    seen_boxes: set[tuple[int, int, int, int]] = set()
+    for candidates in side_candidates.values():
+        if not candidates:
+            continue
+        # Split candidates into rough x lanes first; punctuation at unrelated x
+        # positions should not combine into a fake vertical reading.
+        ordered_x = sorted(candidates, key=lambda item: float(item.get("cx", 0.0)))
+        lanes: list[list[dict]] = []
+        lane_gap = max(4.0, glyph_w * 0.42)
+        for item in ordered_x:
+            cx = float(item.get("cx", 0.0))
+            if not lanes:
+                lanes.append([item]); continue
+            lane_cx = median([float(value.get("cx", 0.0)) for value in lanes[-1]])
+            if abs(cx - lane_cx) <= lane_gap:
+                lanes[-1].append(item)
+            else:
+                lanes.append([item])
+        for lane in lanes:
+            for cluster in _vertical_clusters(lane, glyph_h):
+                if len(cluster) < 2:
+                    continue
+                centres = [float(item.get("cy", 0.0)) for item in cluster]
+                span = max(1.0, max(centres) - min(centres))
+                density = min(1.0, len(cluster) * glyph_h * 0.46 / span)
+                widths = [_width(item) for item in cluster]
+                consistency = 1.0 - min(1.0, (max(widths)-min(widths))/max(1.0,max_w))
+                score = 0.62 * density + 0.38 * consistency
+                if score < 0.34:
+                    continue
+                for item in cluster:
+                    box=(int(item.get("x0",0)),int(item.get("y0",0)),int(item.get("x1",0)),int(item.get("y1",0)))
+                    if box in seen_boxes:
+                        continue
+                    seen_boxes.add(box); ruby_items.append(item)
+                scores.append(score)
+
+    boxes = tuple(
+        (int(item.get("x0",0)), int(item.get("y0",0)), int(item.get("x1",0)), int(item.get("y1",0)))
+        for item in ruby_items
+    )
+    confidence = sum(scores)/len(scores) if scores else 0.0
+    return RubyFilterResult(
+        body_x0=int(body_x0), body_x1=int(body_x1),
+        kept_components=tuple(items), ruby_components=tuple(ruby_items),
+        ruby_boxes=boxes, body_component_count=len(items),
+        ruby_component_count=len(ruby_items), confidence=round(float(confidence),4),
+    )

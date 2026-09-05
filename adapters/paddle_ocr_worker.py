@@ -104,7 +104,14 @@ def _medium_ocr_kwargs(lang: str) -> dict:
     )
 
 
-def build_engine(pipeline: str, lang: str):
+def build_engine(
+    pipeline: str,
+    lang: str,
+    *,
+    vl_backend: str = "paddle",
+    vl_server_url: str = "",
+    vl_api_model_name: str = "PaddlePaddle/PaddleOCR-VL-1.6",
+):
     if pipeline == "structure":
         from paddleocr import PPStructureV3
         # PP-Structure 保留版面分析，但文字检测与识别统一锁定到与普通 OCR
@@ -131,8 +138,27 @@ def build_engine(pipeline: str, lang: str):
         return engine, "structure"
     elif pipeline == "vl":
         from paddleocr import PaddleOCRVL
-        # 显式锁定 v1.6，不依赖库的默认值。
-        return PaddleOCRVL(pipeline_version="v1.6"), "vl"
+        # 显式锁定 v1.6，不依赖库的默认值。Apple Silicon 的 MLX 路径
+        # 严格使用 PaddleOCR 官方提供的 mlx-vlm-server 接口；布局/预处理
+        # 仍由 PaddleOCR 客户端负责，不改变后续 parsing_res_list 协议。
+        backend = str(vl_backend or "paddle").strip().lower()
+        if backend == "mlx":
+            if not str(vl_server_url or "").strip():
+                raise RuntimeError("已选择 MLX-VLM，但未提供本地服务地址")
+            engine = PaddleOCRVL(
+                pipeline_version="v1.6",
+                vl_rec_backend="mlx-vlm-server",
+                vl_rec_server_url=str(vl_server_url),
+                vl_rec_api_model_name=(
+                    str(vl_api_model_name or "PaddlePaddle/PaddleOCR-VL-1.6")
+                ),
+                device="cpu",
+            )
+            setattr(engine, "_novel_formatter_vl_backend", "mlx")
+            return engine, "vl"
+        engine = PaddleOCRVL(pipeline_version="v1.6")
+        setattr(engine, "_novel_formatter_vl_backend", "paddle")
+        return engine, "vl"
     else:
         from paddleocr import PaddleOCR
         try:
@@ -170,9 +196,34 @@ def main():
     parser.add_argument("images", nargs="*", help="图片路径列表")
     parser.add_argument("--lang", default="japan")
     parser.add_argument("--pipeline", default="ocr", choices=["ocr", "structure", "vl"])
+    parser.add_argument("--vl-backend", default="paddle", choices=["paddle", "mlx"])
+    parser.add_argument("--vl-server-url", default="")
+    parser.add_argument(
+        "--vl-api-model-name", default="PaddlePaddle/PaddleOCR-VL-1.6"
+    )
     args = parser.parse_args()
 
-    engine, pipeline = build_engine(args.pipeline, args.lang)
+    try:
+        engine, pipeline = build_engine(
+            args.pipeline,
+            args.lang,
+            vl_backend=args.vl_backend,
+            vl_server_url=args.vl_server_url,
+            vl_api_model_name=args.vl_api_model_name,
+        )
+    except Exception as mlx_start_exc:
+        if args.pipeline != "vl" or args.vl_backend != "mlx":
+            raise
+        # Compatibility safety net for a mismatched/older PaddleOCR install:
+        # preserve OCR functionality rather than crashing the complete job.
+        print(
+            "PaddleOCR-VL MLX warning: 后端初始化失败，自动回退 Paddle："
+            + str(mlx_start_exc),
+            file=sys.stderr,
+            flush=True,
+        )
+        engine, pipeline = build_engine("vl", args.lang, vl_backend="paddle")
+        setattr(engine, "_novel_formatter_vl_backend", "paddle-fallback")
 
     if args.probe:
         print(json.dumps({
@@ -181,12 +232,37 @@ def main():
             "pipeline": pipeline,
             "model_source": os.environ.get("PADDLE_PDX_MODEL_SOURCE", "huggingface"),
             "model_profile": getattr(engine, "_novel_formatter_model_profile", pipeline),
+            "vl_backend": getattr(engine, "_novel_formatter_vl_backend", ""),
         }, ensure_ascii=False), flush=True)
         return
 
+    fallback_engine = None
+
     def process_path(path: str, request_id=None) -> dict:
+        nonlocal engine, fallback_engine
+        active_backend = getattr(engine, "_novel_formatter_vl_backend", "")
         try:
-            results = engine.predict(path)
+            try:
+                results = engine.predict(path)
+            except Exception as mlx_exc:
+                # Runtime safety net: if the official MLX service fails after
+                # startup (server/model/network edge case), retry the same page
+                # with native Paddle and keep using it for the rest of this worker.
+                if pipeline != "vl" or active_backend != "mlx":
+                    raise
+                print(
+                    "PaddleOCR-VL MLX warning: 推理失败，当前页及后续页面自动回退 Paddle："
+                    + str(mlx_exc),
+                    file=sys.stderr,
+                    flush=True,
+                )
+                if fallback_engine is None:
+                    fallback_engine, _ = build_engine(
+                        "vl", args.lang, vl_backend="paddle"
+                    )
+                engine = fallback_engine
+                active_backend = "paddle-fallback"
+                results = engine.predict(path)
             blocks = []
             for res in results:
                 if pipeline == "vl":
@@ -201,7 +277,12 @@ def main():
                         blocks.extend(_blocks_from_ocr_result(res))
                 else:
                     blocks.extend(_blocks_from_ocr_result(res))
-            payload = {"ok": True, "path": path, "blocks": blocks}
+            payload = {
+                "ok": True,
+                "path": path,
+                "blocks": blocks,
+                "backend": active_backend,
+            }
         except Exception as exc:
             payload = {"ok": False, "path": path, "error": str(exc)}
         if request_id is not None:

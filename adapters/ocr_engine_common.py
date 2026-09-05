@@ -507,6 +507,52 @@ def run_ocr_engine(
     doc.metadata = Metadata(source_engine=source_engine, language=profile.language)
     apply_profile_metadata(doc, ocr_mode)
 
+    # Persist page-level Ruby *geometry* while column detection results are still
+    # available.  This is intentionally independent of recognized text: it lets
+    # the optional findtextCenterNet pass crop only likely Ruby areas from the
+    # untouched original page, without re-running a full-page detector.
+    ruby_candidate_pages: dict[str, dict] = {}
+    for page_no, items in enumerate(raw_items_per_page, start=1):
+        columns = []
+        for item in sorted(
+            (it for it in items if it.get("layout_group") == "fixed_region_column"),
+            key=lambda it: int(it.get("column_index", 0) or 0),
+        ):
+            boxes = [
+                [int(v) for v in box[:4]]
+                for box in (item.get("ruby_candidate_boxes") or [])
+                if isinstance(box, (list, tuple)) and len(box) >= 4
+            ]
+            columns.append({
+                "left": int(item.get("column_left", 0) or 0),
+                "top": int(item.get("column_top", 0) or 0),
+                "right": int(item.get("column_right", 0) or 0),
+                "bottom": int(item.get("column_bottom", 0) or 0),
+                "hard_left": int(item.get("column_hard_left", item.get("column_left", 0)) or 0),
+                "hard_right": int(item.get("column_hard_right", item.get("column_right", 0)) or 0),
+                "ruby_candidate_boxes": boxes,
+                "ruby_candidate_confidence": float(item.get("ruby_candidate_confidence", 0.0) or 0.0),
+            })
+        # Do not persist empty telemetry.  When Ruby is OFF the normal column
+        # adapter does not capture candidates at all, so the resulting document
+        # is byte-for-byte free of Ruby candidate side-channel state.
+        if columns and any(column["ruby_candidate_boxes"] for column in columns):
+            ruby_candidate_pages[str(page_no)] = {
+                "schema": "novel-formatter-ruby-candidates-v1-geometry-only",
+                "page_no": page_no,
+                "page_path": str(image_paths[page_no - 1]),
+                "columns": columns,
+                "ruby_candidate_summary": {
+                    "columns": sum(1 for column in columns if column["ruby_candidate_boxes"]),
+                    "boxes": sum(len(column["ruby_candidate_boxes"]) for column in columns),
+                    "max_confidence": max(
+                        (float(column["ruby_candidate_confidence"]) for column in columns),
+                        default=0.0,
+                    ),
+                },
+            }
+    doc.metadata.ruby_candidate_pages = ruby_candidate_pages
+
     order_counter = 0
     skipped_image_count = 0
     text_page_count = 0
@@ -592,6 +638,9 @@ def run_ocr_engine(
                     "layout_group", "layout_order", "layout_text", "recognizer", "label",
                     "horizontal_fragment_count", "horizontal_source_indices",
                     "column_id", "column_index", "column_expected_count",
+                    "column_left", "column_top", "column_right", "column_bottom",
+                    "column_hard_left", "column_hard_right",
+                    "ruby_candidate_boxes", "ruby_candidate_confidence",
                     "column_ocr_empty", "column_requires_handwriting",
                     "preserve_empty_ocr_column", "preserve_ocr_item",
                     "column_manual_placeholder", "column_ocr_attempts",

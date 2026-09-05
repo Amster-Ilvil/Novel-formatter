@@ -16,7 +16,7 @@ import threading
 from pathlib import Path
 from typing import Iterator
 
-from adapters.runtime_env import ensure_venv
+from adapters.runtime_env import ensure_venv, persistent_venv_dir
 from adapters.manga_ocr_adapter import (
     _compact_text,
     _japanese_ratio,
@@ -25,7 +25,7 @@ from adapters.manga_ocr_adapter import (
 )
 
 ROOT = Path(__file__).parent.parent
-VENV_DIR = ROOT / ".venv-hayai-ocr"
+VENV_DIR = persistent_venv_dir("hayai-ocr-v2.1")
 WORKER_SCRIPT = Path(__file__).parent / "hayai_ocr_worker.py"
 MODEL_CACHE = ROOT / ".model-cache" / "hayai-ocr"
 HAYAI_OCR_VERSION = "2.1.0"
@@ -75,9 +75,47 @@ def _normalise_litert_quant(value: str | None) -> str:
     return raw if raw in {"none", "wi4", "wi8_afp32", "dynamic_wi4", "dynamic_wi8"} else "wi4"
 
 
-def _resolved_model_cache() -> Path:
+def _resolved_model_cache(backend: str = "torch") -> Path:
+    """Use the same already-populated cache root that runtime detection found.
+
+    Prefer the project-local cache for new downloads, but transparently reuse a
+    complete HF_HOME / ~/.cache/huggingface installation.  This keeps the model
+    detector and the actual Hayai worker from disagreeing about where the model
+    lives.
+    """
     override = os.environ.get("NOVEL_FORMATTER_HAYAI_OCR_CACHE_DIR", "").strip()
-    return Path(override).expanduser() if override else MODEL_CACHE
+    if override:
+        return Path(override).expanduser()
+    try:
+        from adapters.ocr_runtime_catalog import _hayai_cache_roots, _hayai_litert_cache_complete, _hayai_processor_cache_complete, _hayai_torch_cache_complete, _hf_repo_dir
+        roots = _hayai_cache_roots()
+        if _normalise_backend(backend) == "litert":
+            repo_id = os.environ.get(
+                "NOVEL_FORMATTER_HAYAI_OCR_LITERT_REPO", "JustANormalTinkerer/hayai-ocr-v2-tflite"
+            ).strip() or "JustANormalTinkerer/hayai-ocr-v2-tflite"
+            repo_dir = _hf_repo_dir(repo_id)
+            for root in roots:
+                if any(_hayai_litert_cache_complete(path) for path in (root / "hub" / repo_dir, root / repo_dir)):
+                    return root
+        else:
+            model_name = os.environ.get(
+                "NOVEL_FORMATTER_HAYAI_OCR_MODEL", "JustANormalTinkerer/hayai-ocr-v2"
+            ).strip() or "JustANormalTinkerer/hayai-ocr-v2"
+            local_model = Path(model_name).expanduser()
+            repo_dir = _hf_repo_dir(model_name) if not local_model.exists() else ""
+            for root in roots:
+                processor_ready = _hayai_processor_cache_complete(root)
+                model_ready = local_model.exists() and _hayai_torch_cache_complete(local_model)
+                if repo_dir:
+                    model_ready = any(
+                        _hayai_torch_cache_complete(path)
+                        for path in (root / "hub" / repo_dir, root / repo_dir)
+                    )
+                if model_ready and processor_ready:
+                    return root
+    except Exception:
+        pass
+    return MODEL_CACHE
 
 
 def setup_venv(*, verbose: bool = True, backend: str = "torch") -> Path:
@@ -110,19 +148,24 @@ def setup_venv(*, verbose: bool = True, backend: str = "torch") -> Path:
 def _offline_cache_ready(backend: str) -> bool:
     component_id = "hayai_ocr_litert" if _normalise_backend(backend) == "litert" else "hayai_ocr"
     try:
-        from adapters.ocr_runtime_catalog import _state_marker_ready
-        return bool(_state_marker_ready(component_id))
+        from adapters.ocr_runtime_catalog import _model_cache_ready, _state_marker_ready
+        # The successful-run marker suppresses the GUI install prompt, but only
+        # force HF offline mode when a fresh static scan can still see reusable
+        # assets.  If the user manually deleted/moved the cache, allow upstream
+        # to repair/download instead of trapping the worker in offline mode.
+        return bool(_state_marker_ready(component_id) and _model_cache_ready(component_id)[0])
     except Exception:
         return False
 
 
 def _worker_env(backend: str = "torch") -> dict[str, str]:
     env = os.environ.copy()
-    cache = _resolved_model_cache()
+    cache = _resolved_model_cache(backend)
     cache.mkdir(parents=True, exist_ok=True)
-    # Always isolate Hayai from the process-wide Hugging Face cache. This avoids
-    # one OCR backend changing another backend's cache state and makes runtime
-    # detection deterministic. A dedicated Hayai override remains available.
+    # Pin the worker to the exact cache root selected by runtime detection.
+    # New downloads still prefer the project-local cache, while an already
+    # complete HF_HOME / ~/.cache/huggingface snapshot is reused without a
+    # second download or a repeated install-confirmation dialog.
     env["HF_HOME"] = str(cache)
     env["HUGGINGFACE_HUB_CACHE"] = str(cache / "hub")
     env["TRANSFORMERS_CACHE"] = str(cache / "transformers")
@@ -231,6 +274,27 @@ class HayaiOcrSession:
         self.startup_warning = str(ready.get("warning") or "").strip()
         if self.startup_warning and self.verbose:
             print(f"[Hayai OCR] {self.startup_warning}")
+
+        # The model is already loaded at this point.  Record that fact now, not
+        # only when the context manager exits: a later user cancel, downstream
+        # crop error, or GUI close must not make the next run ask to "install"
+        # a Hayai model that has just proven it can load successfully.
+        try:
+            from adapters.ocr_runtime_catalog import mark_runtime_ready
+            component_id = "hayai_ocr_litert" if self.backend == "litert" else "hayai_ocr"
+            mark_runtime_ready(
+                component_id,
+                backend=self.backend,
+                device=self.device,
+                version=HAYAI_OCR_VERSION,
+                cache_root=str(_resolved_model_cache(self.backend)),
+                requested_quantize=self.requested_quantize,
+                effective_quantize=self.effective_quantize,
+                warning=self.startup_warning,
+                verified_stage="worker_model_loaded",
+            )
+        except Exception:
+            pass
         return self
 
     def _drain_stderr(self, stderr_pipe) -> None:
@@ -485,9 +549,11 @@ class HayaiOcrSession:
                 backend=self.backend,
                 device=self.device,
                 version=HAYAI_OCR_VERSION,
+                cache_root=str(_resolved_model_cache(self.backend)),
                 requested_quantize=self.requested_quantize,
                 effective_quantize=self.effective_quantize,
                 warning=self.startup_warning,
+                verified_stage="session_completed",
             )
         return False
 

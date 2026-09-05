@@ -9,11 +9,12 @@ requirements.
 """
 
 from .center_detector import CenterIntervalResult, detect_center_intervals
-from .ruby_filter import RubyFilterResult, classify_vertical_ruby
+from .ruby_filter import RubyFilterResult, classify_vertical_ruby, detect_vertical_ruby_candidates
 
 __all__ = [
     "CenterIntervalResult",
     "RubyFilterResult",
     "classify_vertical_ruby",
+    "detect_vertical_ruby_candidates",
     "detect_center_intervals",
 ]

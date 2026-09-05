@@ -41,17 +41,33 @@ class PersistentRecognitionSession:
                 "--source-root", str(source), "--server",
             ]
         if self.engine == "paddle_ocr":
-            from adapters.paddle_ocr_adapter import setup_venv, VENV_PYTHON, WORKER_SCRIPT
+            from adapters.paddle_ocr_adapter import (
+                setup_venv, VENV_PYTHON, WORKER_SCRIPT, _prepare_vl_runtime
+            )
             pipeline = str(self.options.get("pipeline") or "ocr")
             if pipeline not in {"ocr", "structure", "vl"}:
                 pipeline = "ocr"
             setup_venv(verbose=False, pipeline=pipeline)
-            return [
+            vl_runtime = _prepare_vl_runtime(
+                pipeline,
+                str(self.options.get("vl_backend") or "auto"),
+                verbose=False,
+            )
+            command = [
                 str(VENV_PYTHON), str(WORKER_SCRIPT),
                 "--lang", str(self.options.get("lang") or "japan"),
                 "--pipeline", pipeline,
-                "--server",
             ]
+            if pipeline == "vl":
+                command.extend([
+                    "--vl-backend", "mlx" if vl_runtime.get("backend") == "mlx" else "paddle",
+                    "--vl-server-url", str(vl_runtime.get("server_url") or ""),
+                    "--vl-api-model-name", str(
+                        vl_runtime.get("model") or "PaddlePaddle/PaddleOCR-VL-1.6"
+                    ),
+                ])
+            command.append("--server")
+            return command
         raise RuntimeError(f"不支持持久会话的 OCR：{self.engine}")
 
     def _process_environment(self) -> dict[str, str] | None:
@@ -111,9 +127,21 @@ class PersistentRecognitionSession:
                         payload = {"request_id": request_id, "images": [str(Path(p)) for p in image_paths]}
                         self._proc.stdin.write(json.dumps(payload, ensure_ascii=False) + "\n")
                         self._proc.stdin.flush()
-                        request_timeout = env_seconds(
-                            "NOVEL_FORMATTER_OCR_REQUEST_TIMEOUT", 300.0, minimum=30.0
-                        )
+                        if (
+                            self.engine == "paddle_ocr"
+                            and str(self.options.get("pipeline") or "ocr") == "vl"
+                            and request_id == 1
+                        ):
+                            # The first MLX-VLM request may also download/load
+                            # PaddleOCR-VL-1.6. Reuse the normal model-startup
+                            # deadline instead of the shorter steady-state page deadline.
+                            request_timeout = env_seconds(
+                                "NOVEL_FORMATTER_OCR_STARTUP_TIMEOUT", 900.0, minimum=60.0
+                            )
+                        else:
+                            request_timeout = env_seconds(
+                                "NOVEL_FORMATTER_OCR_REQUEST_TIMEOUT", 300.0, minimum=30.0
+                            )
                         while True:
                             line = self._stdout_pump.readline(
                                 proc=self._proc,

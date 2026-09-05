@@ -314,6 +314,15 @@ def build_ai_document(source: UnifiedDocument, payload: dict) -> tuple[UnifiedDo
     errs = validate_ai_document(source, out, require_complete=bool(payload.get("complete_document")))
     if errs:
         raise ValueError("AI result validation failed: " + "; ".join(errs))
+    # AI may merge/split source blocks and can inherit stale Ruby metadata from
+    # the first template block. Rebuild the locked side-channel from source
+    # lineage after the authoritative text validation has succeeded.
+    try:
+        from adapters.findtext_centernet_ruby import carry_ruby_overlay, has_ruby_overlay
+        if has_ruby_overlay(source):
+            carry_ruby_overlay(source, out)
+    except Exception:
+        pass
     return out, changes
 
 
@@ -412,6 +421,14 @@ def cleanup_ai_covered_fragments(source: UnifiedDocument, result: UnifiedDocumen
 
     if changed:
         result.add_log("ai_covered_fragment_cleanup", f"AI排版后清理 {changed} 个被前块覆盖的续接残片", changed)
+        # A consumed tail may contain Ruby whose base text was absorbed by the
+        # previous AI block. Reattach from the immutable source after cleanup.
+        try:
+            from adapters.findtext_centernet_ruby import carry_ruby_overlay, has_ruby_overlay
+            if has_ruby_overlay(source):
+                carry_ruby_overlay(source, result)
+        except Exception:
+            pass
     return changed
 
 

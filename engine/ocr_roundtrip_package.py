@@ -559,6 +559,7 @@ def export_multi_package(
     *,
     result_lines: Sequence[str] | None = None,
     delete_flags: Sequence[bool] | None = None,
+    ruby_overlay_source: UnifiedDocument | dict | None = None,
 ) -> dict:
     docs = list(documents or [])
     if len(docs) < 2:
@@ -642,6 +643,12 @@ def export_multi_package(
                 1 for value in snapshot.values() if str(value or "").strip()
             ),
         })
+    if ruby_overlay_source is not None:
+        from adapters.findtext_centernet_ruby import extract_ruby_overlay
+        ruby_overlay = extract_ruby_overlay(ruby_overlay_source)
+        if ruby_overlay.get("blocks"):
+            package["ruby_overlay"] = ruby_overlay
+            package["instructions"]["do_not_change"].append("ruby_overlay")
     package.update({
         "model_labels": safe_labels,
         # Every model's complete aligned text is already present in each row's
@@ -880,6 +887,14 @@ def import_single_package(package: dict, *, current_document: UnifiedDocument | 
     _validate_immutable_manifest(package)
     _validate_required_epub_assets(result)
     _sync_toc(result)
+    try:
+        from adapters.findtext_centernet_ruby import refresh_preserved_ruby, strip_ruby_overlay
+        if bool(getattr(getattr(result, "metadata", None), "ruby_preservation_enabled", False)):
+            refresh_preserved_ruby(result)
+        else:
+            strip_ruby_overlay(result, strip_candidate_geometry=False, strip_logs=False)
+    except Exception:
+        pass
     result.metadata.source_engine = f"{result.metadata.source_engine or 'ocr'}+external_ai_roundtrip"
     result.add_log("external_ai_roundtrip", f"严格导入单 OCR 校对包，共 {len(expected_ids)} 个正文块", len(expected_ids))
     return result
@@ -1033,6 +1048,7 @@ def import_multi_package(
         comparison,
         result_lines,
         delete_flags=delete_flags,
+        ruby_overlay_source=package.get("ruby_overlay"),
     )
     result.metadata.source_engine = f"{primary.metadata.source_engine or 'ocr'}+external_ai_multi_fusion"
     result.add_log("external_ai_multi_fusion", f"严格导入多模型融合包，共 {len(items)} 句", len(items))

@@ -43,6 +43,7 @@ from adapters.ocr_recognition_bridge import (
 )
 from adapters.image_preprocess import build_fallback_variant, build_fallback_variants, close_variants
 from adapters.column_image_cleanup import cleanup_column_image, normalise_ruby_strength
+from adapters.segmentation import detect_vertical_ruby_candidates
 from engine.column_sentence_reflow import (
     has_sentence_terminal,
     is_provisional_quote_terminal,
@@ -60,7 +61,7 @@ SUPPORTED_RECOGNIZERS = {
     key: value for key, value in RECOGNITION_ENGINES.items() if key != "native"
 }
 
-COLUMN_DETECTOR_VERSION = "component-geometry-v11-short-column-full-coverage-lossless-body-pixels-v12-no-projection"
+COLUMN_DETECTOR_VERSION = "component-geometry-v14-ruby-roi-tile-packing"
 LEGACY_PROJECTION_DETECTOR_VERSION = "review-only-projection-v5-periodic-grid"
 
 _SHARED_PREPARE_LOCK_GUARD = threading.Lock()
@@ -146,6 +147,7 @@ def _column_input_contract_descriptor(
     smart_crop: bool,
     ruby_strength: str,
     preserve_body_pixels: bool,
+    capture_ruby_candidates: bool,
     input_profile: str,
 ) -> tuple[dict[str, object], str]:
     payload: dict[str, object] = {
@@ -167,6 +169,11 @@ def _column_input_contract_descriptor(
         "smart_crop": bool(smart_crop),
         "ruby_strength": normalise_ruby_strength(ruby_strength),
         "preserve_body_pixels": bool(preserve_body_pixels),
+        # Ruby candidate telemetry does not alter OCR crop pixels, but it does
+        # alter the cached column metadata.  Namespace ON/OFF separately so an
+        # OFF run can never leak candidate sidecars into a later ON run (or vice
+        # versa).
+        "capture_ruby_candidates": bool(capture_ruby_candidates),
         "input_profile": _normalise_column_input_profile(input_profile),
     }
     encoded = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
@@ -188,6 +195,7 @@ def _shared_prepare_profile_dir(
     smart_crop: bool,
     ruby_strength: str,
     preserve_body_pixels: bool,
+    capture_ruby_candidates: bool,
     input_profile: str,
 ) -> tuple[Path, str]:
     """Return an immutable cache namespace for one effective OCR input contract.
@@ -212,6 +220,7 @@ def _shared_prepare_profile_dir(
         smart_crop=smart_crop,
         ruby_strength=ruby_strength,
         preserve_body_pixels=preserve_body_pixels,
+        capture_ruby_candidates=capture_ruby_candidates,
         input_profile=input_profile,
     )
     target = base_dir / f"input_{fingerprint}"
@@ -261,6 +270,10 @@ class DetectedColumn:
     full_height_slot: bool = False
     supplemental_boxes: tuple[tuple[int, int, int, int], ...] = ()
     excluded_boxes: tuple[tuple[int, int, int, int], ...] = ()
+    # Geometry-only Ruby candidate telemetry. These boxes never enter normal
+    # OCR text/voting; findtextCenterNet consumes them later for smart ROI.
+    ruby_candidate_boxes: tuple[tuple[int, int, int, int], ...] = ()
+    ruby_candidate_confidence: float = 0.0
 
     @property
     def width(self) -> int:
@@ -2814,6 +2827,7 @@ def _detect_vertical_columns_components(
     max_columns: int = 80,
     fixed_region_rect: Sequence[float] | None = None,
     fixed_region_already_masked: bool = False,
+    capture_ruby_candidates: bool = True,
 ) -> list[DetectedColumn]:
     """Detect physical columns from connected printed-glyph components.
 
@@ -2909,6 +2923,70 @@ def _detect_vertical_columns_components(
                     typical_height=typical_height,
                     typical_area=typical_area,
                 )
+
+                # Record possible Ruby while connected components are already in
+                # Candidate telemetry is strictly opt-in with Ruby preservation.
+                # When Ruby is OFF we skip this branch entirely, restoring the
+                # pre-Ruby column-detection cost and leaving no candidate sidecar.
+                ruby_candidate_mask_boxes: list[tuple[int, int, int, int]] = []
+                ruby_candidate_confidence = 0.0
+                if capture_ruby_candidates:
+                    # Connected components are already in memory for ordinary OCR
+                    # column splitting; this branch performs geometry only, never OCR.
+                    candidate_core_half = max(typical_width * 0.62, typical_height * 0.52)
+                    candidate_body_x0 = max(hard_left, int(round(center - candidate_core_half)))
+                    candidate_body_x1 = min(hard_right, int(round(center + candidate_core_half)))
+                    # Ruby often sits just outside the midpoint-based hard slot of
+                    # its base column (especially vertical text, where furigana is
+                    # printed in the gutter to the right). Observe a narrow halo
+                    # for telemetry only; it never widens pixels fed to normal OCR.
+                    candidate_scan_margin = max(2.0, typical_width * 0.72)
+                    local_component_dicts = [
+                        {
+                            "x0": component.left, "y0": component.top,
+                            "x1": component.right, "y1": component.bottom,
+                            "cx": component.center_x, "cy": component.center_y,
+                            "area": component.area,
+                        }
+                        for component in components
+                        if (hard_left - candidate_scan_margin) <= component.center_x
+                        < (hard_right + candidate_scan_margin)
+                    ]
+                    ruby_candidate_geometry = detect_vertical_ruby_candidates(
+                        local_component_dicts,
+                        body_x0=candidate_body_x0,
+                        body_x1=candidate_body_x1,
+                        image_width=mask.width,
+                        target_width=typical_width,
+                        target_height=typical_height,
+                    )
+                    ruby_candidate_mask_boxes = list(dict.fromkeys(
+                        ruby_candidate_geometry.ruby_boxes
+                    ))
+                    if not ruby_candidate_mask_boxes and excluded:
+                        plausible_excluded = []
+                        for box in excluded:
+                            bw = max(1, int(box[2]) - int(box[0]))
+                            bh = max(1, int(box[3]) - int(box[1]))
+                            aspect = max(bw / max(1, bh), bh / max(1, bw))
+                            if (
+                                bw <= max(3.0, typical_width * 0.72)
+                                and bh <= max(4.0, typical_height * 0.82)
+                                and aspect <= 3.0
+                            ):
+                                plausible_excluded.append(box)
+                        if len(plausible_excluded) >= 2:
+                            ruby_candidate_mask_boxes.extend(plausible_excluded)
+                    ruby_candidate_mask_boxes = list(dict.fromkeys(
+                        tuple(int(value) for value in box[:4])
+                        for box in ruby_candidate_mask_boxes
+                        if len(box) >= 4 and box[2] > box[0] and box[3] > box[1]
+                    ))
+                    ruby_candidate_confidence = (
+                        max(0.65, float(ruby_candidate_geometry.confidence or 0.0))
+                        if ruby_candidate_mask_boxes else 0.0
+                    )
+
                 supplemental_components = [
                     component for component in components
                     if any(
@@ -2988,6 +3066,17 @@ def _detect_vertical_columns_components(
                         for box in excluded
                         if box[2] > box[0] and box[3] > box[1]
                     ),
+                    ruby_candidate_boxes=tuple(
+                        (
+                            max(body_left_px, math.floor(box[0] * inv_scale)),
+                            max(body_top_px, math.floor(box[1] * inv_scale)),
+                            min(body_right_px, math.ceil(box[2] * inv_scale)),
+                            min(body_bottom_px, math.ceil(box[3] * inv_scale)),
+                        )
+                        for box in ruby_candidate_mask_boxes
+                        if box[2] > box[0] and box[3] > box[1]
+                    ),
+                    ruby_candidate_confidence=round(ruby_candidate_confidence, 4),
                 ))
             if body_bounds_px is None:
                 columns = _remove_running_margin_artifacts(
@@ -3025,6 +3114,7 @@ def detect_vertical_columns(
     fixed_region_rect: Sequence[float] | None = None,
     fixed_region_already_masked: bool = False,
     detector_mode: str = "components",
+    capture_ruby_candidates: bool = True,
 ) -> list[DetectedColumn]:
     """Detect vertical columns using the ordinary no-projection component path.
 
@@ -3049,6 +3139,7 @@ def detect_vertical_columns(
         max_columns=max_columns,
         fixed_region_rect=fixed_region_rect,
         fixed_region_already_masked=fixed_region_already_masked,
+        capture_ruby_candidates=bool(capture_ruby_candidates),
     )
 
 _OCR_PLACEHOLDER_CHARS = frozenset("□■◻◼�")
@@ -5038,6 +5129,7 @@ def _prepare_page_crops(
     ruby_strength: str = "standard",
     detector_mode: str = "components",
     preserve_body_pixels: bool = True,
+    capture_ruby_candidates: bool = True,
 ) -> tuple[str, list[DetectedColumn], list[tuple[str, int]], str | None]:
     try:
         image = _open_page_image(page_path, fixed_region_rect)
@@ -5050,6 +5142,7 @@ def _prepare_page_crops(
                 fixed_region_rect=fixed_region_rect,
                 fixed_region_already_masked=bool(fixed_region_rect),
                 detector_mode=detector_mode,
+                capture_ruby_candidates=bool(capture_ruby_candidates),
             )
             if not columns:
                 raise RuntimeError("固定正文区域内没有检测到可识别的竖列")
@@ -5101,6 +5194,8 @@ def _column_to_json(column: DetectedColumn) -> dict:
         "full_height_slot": bool(column.full_height_slot),
         "supplemental_boxes": [list(box) for box in column.supplemental_boxes],
         "excluded_boxes": [list(box) for box in column.excluded_boxes],
+        "ruby_candidate_boxes": [list(box) for box in column.ruby_candidate_boxes],
+        "ruby_candidate_confidence": float(column.ruby_candidate_confidence),
     }
 
 
@@ -5126,6 +5221,12 @@ def _column_from_json(data: dict) -> DetectedColumn:
             for box in data.get("excluded_boxes", [])
             if isinstance(box, (list, tuple)) and len(box) >= 4
         ),
+        ruby_candidate_boxes=tuple(
+            (int(box[0]), int(box[1]), int(box[2]), int(box[3]))
+            for box in data.get("ruby_candidate_boxes", [])
+            if isinstance(box, (list, tuple)) and len(box) >= 4
+        ),
+        ruby_candidate_confidence=float(data.get("ruby_candidate_confidence", 0.0) or 0.0),
     )
 
 
@@ -5145,6 +5246,7 @@ def _prepare_page_crops_cached_unlocked(
     ruby_strength: str = "standard",
     detector_mode: str = "components",
     preserve_body_pixels: bool = True,
+    capture_ruby_candidates: bool = True,
 ) -> tuple[str, list[DetectedColumn], list[tuple[str, int]], str | None]:
     """Prepare deterministic column masks once and reuse them across OCR models.
 
@@ -5170,6 +5272,7 @@ def _prepare_page_crops_cached_unlocked(
                 "smart_crop": bool(smart_crop),
                 "ruby_strength": normalise_ruby_strength(ruby_strength),
                 "preserve_body_pixels": bool(preserve_body_pixels),
+                "capture_ruby_candidates": bool(capture_ruby_candidates),
             }
             if all(payload.get(key) == value for key, value in expected.items()):
                 columns = [_column_from_json(item) for item in payload.get("columns", [])]
@@ -5202,6 +5305,7 @@ def _prepare_page_crops_cached_unlocked(
         ruby_strength=ruby_strength,
         detector_mode=detector_mode,
         preserve_body_pixels=preserve_body_pixels,
+        capture_ruby_candidates=capture_ruby_candidates,
     )
     returned_path, columns, generated, error = result
     if error or not columns:
@@ -5220,7 +5324,19 @@ def _prepare_page_crops_cached_unlocked(
         "smart_crop": bool(smart_crop),
         "ruby_strength": normalise_ruby_strength(ruby_strength),
         "preserve_body_pixels": bool(preserve_body_pixels),
+        "capture_ruby_candidates": bool(capture_ruby_candidates),
         "columns": [_column_to_json(column) for column in columns],
+        # Run-local Ruby geometry telemetry is produced as a free by-product of
+        # ordinary column detection. It is never OCR text and never enters
+        # comparison/fusion; only the independent Ruby ROI planner consumes it.
+        "ruby_candidate_summary": {
+            "columns": sum(1 for column in columns if column.ruby_candidate_boxes),
+            "boxes": sum(len(column.ruby_candidate_boxes) for column in columns),
+            "max_confidence": max(
+                (float(column.ruby_candidate_confidence) for column in columns),
+                default=0.0,
+            ),
+        },
         "crop_files": [Path(path).name for path, _ in generated],
         "crop_sha256": [_file_sha256(path) for path, _ in generated],
     }
@@ -5246,6 +5362,7 @@ def _prepare_page_crops_cached(
     ruby_strength: str = "standard",
     detector_mode: str = "components",
     preserve_body_pixels: bool = True,
+    capture_ruby_candidates: bool = True,
 ) -> tuple[str, list[DetectedColumn], list[tuple[str, int]], str | None]:
     """Thread-safe wrapper for two OCR engines sharing one crop cache."""
     lock = _shared_prepare_lock(cache_dir, page_index)
@@ -5265,6 +5382,7 @@ def _prepare_page_crops_cached(
             ruby_strength=ruby_strength,
             detector_mode=detector_mode,
             preserve_body_pixels=preserve_body_pixels,
+            capture_ruby_candidates=capture_ruby_candidates,
         )
 
 
@@ -5365,11 +5483,18 @@ def _iter_column_pages(
         # projection remains isolated in the review module.
         if detector_mode != "components":
             detector_mode = "components"
-        # Production OCR defaults to the v2-style lossless body-pixel contract.
-        # Component geometry may determine column routing, but no component or
-        # density rule is allowed to paint over pixels inside the physical slot.
+        # The caller selects between two exact-pixel transports.  The standard
+        # Japanese-novel path uses ``False``: copy only detector-approved body
+        # source boxes (plus punctuation supplements) so side Ruby never reaches
+        # ordinary OCR.  No body glyph is resized or sharpened.
         preserve_body_pixels = bool(
-            runtime_options.pop("column_preserve_body_pixels", True)
+            runtime_options.pop("column_preserve_body_pixels", False)
+        )
+        # Ruby candidate telemetry is an optional side-channel.  Normal OCR
+        # defaults to the pre-Ruby behavior: no candidate scan and no candidate
+        # metadata unless the caller explicitly enabled Ruby preservation.
+        capture_ruby_candidates = bool(
+            runtime_options.pop("column_capture_ruby_candidates", False)
         )
         auto_filter_ruby = bool(
             runtime_options.pop("column_auto_filter_ruby", True)
@@ -5393,7 +5518,10 @@ def _iter_column_pages(
             filter_fragments = False
             requested_smart_crop = True
             ruby_strength = "standard"
-            preserve_body_pixels = True
+            # v8_exact now means the intended Ruby-free main-OCR contract:
+            # detector-approved body boxes only.  findtextCenterNet has its own
+            # independent untouched-page input and is the sole Ruby recognizer.
+            preserve_body_pixels = False
             smart_crop = True
         elif input_profile == "v8_legacy":
             smart_crop = requested_smart_crop or engine_key in {
@@ -5435,6 +5563,7 @@ def _iter_column_pages(
                 smart_crop=smart_crop,
                 ruby_strength=ruby_strength,
                 preserve_body_pixels=preserve_body_pixels,
+                capture_ruby_candidates=capture_ruby_candidates,
                 input_profile=input_profile,
             )
         )
@@ -5453,6 +5582,7 @@ def _iter_column_pages(
                 smart_crop=smart_crop,
                 ruby_strength=ruby_strength,
                 preserve_body_pixels=preserve_body_pixels,
+                capture_ruby_candidates=capture_ruby_candidates,
                 input_profile=input_profile,
             )
             if namespaced_fingerprint != input_profile_fingerprint:
@@ -5524,6 +5654,7 @@ def _iter_column_pages(
                     ruby_strength=ruby_strength,
                     detector_mode=detector_mode,
                     preserve_body_pixels=preserve_body_pixels,
+                    capture_ruby_candidates=capture_ruby_candidates,
                 )
                 if shared_prepare is not None
                 else _prepare_page_crops(
@@ -5539,6 +5670,7 @@ def _iter_column_pages(
                     ruby_strength=ruby_strength,
                     detector_mode=detector_mode,
                     preserve_body_pixels=preserve_body_pixels,
+                    capture_ruby_candidates=capture_ruby_candidates,
                 )
             )
 
@@ -6979,7 +7111,7 @@ def _iter_column_pages(
                     "column_ruby_strength": ruby_strength,
                     "column_preserve_body_pixels": bool(preserve_body_pixels),
                     "column_ocr_input_contract": (
-                        "lossless_hard_slot_v1" if preserve_body_pixels else "legacy_filtered_body_v1"
+                        "lossless_hard_slot_v1" if preserve_body_pixels else "ruby_excluded_body_boxes_v2"
                     ),
                     "column_ocr_input_profile": input_profile,
                     "column_ocr_input_profile_sha256": input_profile_fingerprint,
@@ -7030,6 +7162,17 @@ def _iter_column_pages(
                     "column_id": column_id,
                     "column_index": column_index + 1,
                     "column_expected_count": expected,
+                    # Geometry-only Ruby telemetry captured for the later specialist
+                    # side-pass.  Normal recognizers never see these pixels/text as
+                    # candidates; the values only schedule original-page ROIs.
+                    "column_left": int(column.left),
+                    "column_top": int(column.top),
+                    "column_right": int(column.right),
+                    "column_bottom": int(column.bottom),
+                    "column_hard_left": int(column.hard_left),
+                    "column_hard_right": int(column.hard_right),
+                    "ruby_candidate_boxes": [list(box) for box in column.ruby_candidate_boxes],
+                    "ruby_candidate_confidence": float(column.ruby_candidate_confidence),
                     "black_ink_estimated_chars": int(column.estimated_chars or 0),
                     "black_ink_content_spans": [list(span) for span in column.content_spans],
                     "preserve_ocr_item": True,
@@ -7050,7 +7193,7 @@ def _iter_column_pages(
                     "column_ruby_strength": ruby_strength,
                     "column_preserve_body_pixels": bool(preserve_body_pixels),
                     "column_ocr_input_contract": (
-                        "lossless_hard_slot_v1" if preserve_body_pixels else "legacy_filtered_body_v1"
+                        "lossless_hard_slot_v1" if preserve_body_pixels else "ruby_excluded_body_boxes_v2"
                     ),
                     "column_ocr_input_profile": input_profile,
                     "column_ocr_input_profile_sha256": input_profile_fingerprint,

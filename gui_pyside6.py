@@ -3062,8 +3062,26 @@ class OCRTab(QWidget):
         self._paddle_model_combo = NoWheelComboBox()
         self._paddle_model_combo.addItem("PaddleOCR（日文印刷体；优先 v6 medium）", "ocr")
         self._paddle_model_combo.addItem("PP-StructureV3（复杂版面与区域分析）", "structure")
-        self._paddle_model_combo.addItem("PaddleOCR-VL-1.6（实验性；日文竖排顺序可能不稳定）", "vl")
+        self._paddle_model_combo.addItem("PaddleOCR-VL-1.6（Apple Silicon 可用官方 MLX 加速）", "vl")
         pmv.addWidget(self._paddle_model_combo)
+        vl_backend_row = QHBoxLayout()
+        vl_backend_lbl = QLabel("VL 后端")
+        vl_backend_lbl.setStyleSheet(f"color: {MUTED}; font-size: 11px;")
+        vl_backend_row.addWidget(vl_backend_lbl)
+        self._paddle_vl_backend_combo = NoWheelComboBox()
+        self._paddle_vl_backend_combo.addItem(
+            "自动（Apple Silicon 优先官方 MLX；失败回退 Paddle）", "auto"
+        )
+        self._paddle_vl_backend_combo.addItem("MLX-VLM（Apple Silicon 官方后端）", "mlx")
+        self._paddle_vl_backend_combo.addItem("Paddle（兼容后端）", "paddle")
+        self._paddle_vl_backend_combo.setEnabled(False)
+        self._paddle_vl_backend_combo.setToolTip(
+            "仅对 PaddleOCR-VL-1.6 生效。自动模式在 Apple Silicon 上通过 PaddleOCR "
+            "官方 mlx-vlm-server 接口使用 Apple GPU；MLX 安装/启动或实际推理失败时自动回退原生 Paddle。"
+        )
+        vl_backend_row.addWidget(self._paddle_vl_backend_combo, 1)
+        pmv.addLayout(vl_backend_row)
+        self._paddle_model_combo.currentIndexChanged.connect(self._update_paddle_vl_backend_state)
         source_row = QHBoxLayout()
         source_lbl = QLabel("模型下载源")
         source_lbl.setStyleSheet(f"color: {MUTED}; font-size: 11px;")
@@ -3077,6 +3095,7 @@ class OCRTab(QWidget):
         self._paddle_source_combo.setToolTip(
             "PaddleOCR 3.x 默认从 Hugging Face 下载。若当前网络无法访问，"
             "可改用 ModelScope 或百度 BOS；自动模式只在模型初始化阶段切换来源，不会重复 OCR 页面。"
+            "PaddleOCR-VL 的 MLX-VLM 模型由官方 MLX 路径使用 Hugging Face 模型 ID 加载，此选项主要控制 Paddle 客户端/版面模型来源。"
         )
         source_row.addWidget(self._paddle_source_combo, 1)
         pmv.addLayout(source_row)
@@ -3095,7 +3114,7 @@ class OCRTab(QWidget):
         self._paddle_runtime_status.setWordWrap(True)
         self._paddle_runtime_status.setStyleSheet(f"color: {MUTED}; font-size: 10px;")
         pmv.addWidget(self._paddle_runtime_status)
-        pm_hint = QLabel("Paddle 会优先使用 PP-OCRv6_medium_det / PP-OCRv6_medium_rec；若 v6 模型源不可达，会自动回退到 PaddleOCR 默认日文模型。下载源可独立切换，Paddle-VL 仍只用于复杂文档理解。")
+        pm_hint = QLabel("PP-OCRv6 / PP-Structure 保持原有 Paddle 路径。PaddleOCR-VL-1.6 在 Apple Silicon 上默认通过官方 MLX-VLM 后端加速，并使用独立环境避免依赖冲突；MLX 不可用或页级推理失败会自动回退 Paddle。")
         pm_hint.setStyleSheet(f"color: #98A2B3; font-size: 10px;")
         pm_hint.setWordWrap(True)
         pmv.addWidget(pm_hint)
@@ -3174,6 +3193,32 @@ class OCRTab(QWidget):
         # v8-compatible OCR input is the hidden default.  The normal UI does
         # not expose internal profile names; only explicit advanced changes
         # create a custom preprocessing contract.
+        self._preserve_ruby_check = QCheckBox("保留原文 Ruby（findtextCenterNet）")
+        self._preserve_ruby_check.setChecked(False)
+        self._preserve_ruby_check.setToolTip(
+            "默认关闭，因此不会下载模型、不会增加 OCR 时间。开启后普通 OCR 仍只识别分列正文，"
+            "并强制从其临时列图中排除 Ruby；只有 findtextCenterNet 单独读取原始页面提取 "
+            "rubybase ↔ 振假名关系。两条证据通道完全独立，findtextCenterNet 不参与正文多数票或字符融合。"
+        )
+        self._preserve_ruby_check.toggled.connect(self._on_preserve_ruby_toggled)
+        cov.addWidget(self._preserve_ruby_check)
+
+        ruby_scan_row = QHBoxLayout()
+        ruby_scan_lbl = QLabel("Ruby 扫描范围")
+        ruby_scan_lbl.setStyleSheet(f"color: {MUTED}; font-size: 11px;")
+        ruby_scan_row.addWidget(ruby_scan_lbl)
+        self._ruby_scan_mode_combo = NoWheelComboBox()
+        self._ruby_scan_mode_combo.addItem("智能 ROI（推荐）", "smart_roi")
+        self._ruby_scan_mode_combo.addItem("全页精确扫描（慢）", "full_page")
+        self._ruby_scan_mode_combo.setCurrentIndex(0)
+        self._ruby_scan_mode_combo.setEnabled(False)
+        self._ruby_scan_mode_combo.setToolTip(
+            "智能 ROI 会复用普通 OCR 分列时顺手记录的疑似 Ruby 几何，只从未清理原图裁取相邻几列上下文交给 "
+            "findtextCenterNet；没有候选的页面不会再次 OCR。全页模式仅用于漏检诊断。"
+        )
+        ruby_scan_row.addWidget(self._ruby_scan_mode_combo, 1)
+        cov.addLayout(ruby_scan_row)
+
         self._column_preprocess_toggle = QToolButton()
         self._column_preprocess_toggle.setText("> 高级 OCR 预处理")
         self._column_preprocess_toggle.setCheckable(True)
@@ -3841,6 +3886,22 @@ class OCRTab(QWidget):
         combo.setCurrentIndex(index)
         combo.blockSignals(blocked)
 
+    def _on_preserve_ruby_toggled(self, checked: bool) -> None:
+        """Toggle only the independent Ruby side-channel.
+
+        This control must never rewrite, lock or otherwise mutate the ordinary
+        OCR preprocessing controls.  Normal OCR therefore receives the exact
+        same pixel contract whether Ruby preservation is ON or OFF; the only
+        additional ON work is geometry telemetry plus the independent
+        findtextCenterNet pass after normal OCR/fusion has finished.
+        """
+        scan_mode = getattr(self, "_ruby_scan_mode_combo", None)
+        if scan_mode is not None:
+            scan_mode.setEnabled(bool(checked))
+        # Deliberately do not call _on_column_cleanup_control_changed() here.
+        # Ruby preservation is orthogonal to the user's normal-OCR cleanup
+        # profile and must not turn the ordinary Ruby filter on/off.
+
     def _capture_ocr_mode_state(self) -> dict:
         def checked(name: str, default: bool = False) -> bool:
             widget = getattr(self, name, None)
@@ -3859,6 +3920,8 @@ class OCRTab(QWidget):
             "multi_parallel_first": checked("_multi_parallel_first_check", True),
             "multi_sentence_speed": combo_data("_multi_sentence_speed_combo", "primary_only"),
             "column_split": checked("_column_split_check"),
+            "preserve_ruby": checked("_preserve_ruby_check", False),
+            "ruby_scan_mode": combo_data("_ruby_scan_mode_combo", "smart_roi"),
             # Internal compatibility field remains in saved state and audit
             # data, but is intentionally not exposed as a normal UI option.
             "column_input_profile": (
@@ -3882,6 +3945,7 @@ class OCRTab(QWidget):
             "hayai_quantize": combo_data("_hayai_quant_combo", "none"),
             "hayai_litert_quant": combo_data("_hayai_litert_quant_combo", "wi4"),
             "paddle_pipeline": combo_data("_paddle_model_combo", "ocr"),
+            "paddle_vl_backend": combo_data("_paddle_vl_backend_combo", "auto"),
             "paddle_source": combo_data("_paddle_source_combo", "auto"),
             "google_language_hints": (
                 self._google_vision_lang_edit.text().strip()
@@ -3904,6 +3968,8 @@ class OCRTab(QWidget):
                 "multi_parallel_first": True,
                 "multi_sentence_speed": "primary_only",
                 "column_split": False,
+                "preserve_ruby": False,
+                "ruby_scan_mode": "smart_roi",
                 "column_input_profile": "v8_exact",
                 "column_preprocess_customized": False,
                 "column_preprocess_expanded": False,
@@ -3923,6 +3989,7 @@ class OCRTab(QWidget):
                 "hayai_quantize": "none",
                 "hayai_litert_quant": "wi4",
                 "paddle_pipeline": "ocr",
+                "paddle_vl_backend": "auto",
                 "paddle_source": "auto",
                 "google_language_hints": "zh-CN, zh",
                 "merge_horizontal_fragments": True,
@@ -3989,9 +4056,14 @@ class OCRTab(QWidget):
             state.get("paddle_pipeline", "ocr"),
         )
         self._set_combo_value(
+            getattr(self, "_paddle_vl_backend_combo", None),
+            state.get("paddle_vl_backend", "auto"),
+        )
+        self._set_combo_value(
             getattr(self, "_paddle_source_combo", None),
             state.get("paddle_source", "auto"),
         )
+        self._update_paddle_vl_backend_state()
         self._set_combo_value(
             getattr(self, "_multi_model2_combo", None), state.get("multi_model2", "")
         )
@@ -4006,11 +4078,16 @@ class OCRTab(QWidget):
             getattr(self, "_column_ruby_strength_combo", None),
             (state.get("column_ruby_strength", "standard") if preprocess_customized else "standard"),
         )
+        self._set_combo_value(
+            getattr(self, "_ruby_scan_mode_combo", None),
+            state.get("ruby_scan_mode", "smart_roi"),
+        )
         for name, key, default in (
             ("_multi_ocr_check", "multi_ocr", False),
             ("_multi_early_consensus_check", "multi_early_consensus", True),
             ("_multi_parallel_first_check", "multi_parallel_first", True),
             ("_column_split_check", "column_split", False),
+            ("_preserve_ruby_check", "preserve_ruby", False),
             ("_column_ruby_filter_check", "column_auto_filter_ruby", True),
             ("_column_fragment_filter_check", "column_filter_fragments", False),
             ("_column_smart_crop_check", "column_smart_crop", True),
@@ -4026,6 +4103,8 @@ class OCRTab(QWidget):
             widget = getattr(self, name, None)
             if widget is not None:
                 widget.setChecked(bool(state.get(key, default)))
+        if hasattr(self, "_preserve_ruby_check"):
+            self._on_preserve_ruby_toggled(self._preserve_ruby_check.isChecked())
         self._column_preprocess_customized = preprocess_customized
         toggle = getattr(self, "_column_preprocess_toggle", None)
         expanded = bool(state.get("column_preprocess_expanded", False))
@@ -4114,11 +4193,15 @@ class OCRTab(QWidget):
             if not japanese_mode:
                 self._column_split_check.setChecked(False)
                 self._column_sentence_reflow_check.setChecked(False)
+                if hasattr(self, "_preserve_ruby_check"):
+                    self._preserve_ruby_check.setChecked(False)
                 if hasattr(self, "_handwriting_trace_check"):
                     self._handwriting_trace_check.setChecked(False)
                 self._vision_vertical_check.setChecked(False)
                 self._vision_vertical_compat_check.setChecked(False)
             self._column_split_check.setEnabled(japanese_mode)
+            if hasattr(self, "_preserve_ruby_check"):
+                self._preserve_ruby_check.setEnabled(japanese_mode)
             self._column_ocr_widget.setVisible(japanese_mode)
             self._ocr_reflow_widget.setVisible(japanese_mode)
             self._handwriting_card_widget.setVisible(profile.allow_japanese_handwriting)
@@ -4146,8 +4229,8 @@ class OCRTab(QWidget):
 
             self._ocr_mode_summary.setText(
                 (
-                    "现有日文轻小说路径：竖排右→左、分列掩膜、Ruby 清理、"
-                    "逐列成句与日语手写复核均保持原样。"
+                    "现有日文轻小说路径：竖排右→左、分列掩膜与逐列成句保持原样；"
+                    "Ruby 保留为独立开关，默认关闭，开启后才加载 findtextCenterNet。"
                 )
                 if japanese_mode else (
                     "独立简体中文路径：整页横排左→右、上→下；Apple Vision 使用 "
@@ -4178,7 +4261,7 @@ class OCRTab(QWidget):
             details.append(f"Apple Vision 快捷指令：{'可用' if shortcut_ok else '不可用'}（{shortcut_reason or '无需模型'}）")
         except Exception as exc:
             details.append(f"Apple Vision：检测失败（{exc}）")
-        for cid in ("hayai_ocr", "hayai_ocr_litert", "yomitoku", "ndlocr_lite", "paddle_ocr", "paddle_structure", "paddle_vl", "manga_48px", "manga_ocr", "pdf_craft"):
+        for cid in ("hayai_ocr", "hayai_ocr_litert", "yomitoku", "ndlocr_lite", "paddle_ocr", "paddle_structure", "paddle_vl", "manga_48px", "manga_ocr", "findtext_centernet_ruby", "pdf_craft"):
             probe = probe_runtime(cid, deep=deep, refresh=deep)
             state = "本地可用" if probe.ready else ("环境已安装，模型待确认" if probe.installed else "未安装")
             details.append(f"{cid}：{state}（{probe.detail}）")
@@ -4186,6 +4269,18 @@ class OCRTab(QWidget):
         self._column_detect_status.setText(f"已扫描：{ready} 项可直接使用")
         if show_dialog:
             QMessageBox.information(self,"本地 OCR 检测结果","本次只检查本地文件、环境和系统能力，没有安装或下载任何模型。\n\n"+"\n".join(details))
+
+    def _update_paddle_vl_backend_state(self, *_args):
+        combo = getattr(self, "_paddle_vl_backend_combo", None)
+        model_combo = getattr(self, "_paddle_model_combo", None)
+        if combo is None or model_combo is None:
+            return
+        enabled = str(model_combo.currentData() or "ocr") == "vl"
+        combo.setEnabled(enabled)
+        combo.setToolTip(
+            "PaddleOCR-VL-1.6：Apple Silicon 自动优先官方 MLX-VLM，失败回退 Paddle。"
+            if enabled else "仅 PaddleOCR-VL-1.6 使用 MLX；PP-OCRv6 / PP-Structure 不受影响。"
+        )
 
     def _paddle_component_id(self) -> str:
         pipeline = str(self._paddle_model_combo.currentData() or "ocr")
@@ -4206,6 +4301,15 @@ class OCRTab(QWidget):
         else:
             text = f"○ 尚未安装：{probe.detail}"
             style = "color: #6E6E73; font-size: 10px;"
+        if component_id == "paddle_vl":
+            try:
+                from adapters.paddle_vl_mlx import probe_mlx_runtime, normalize_vl_backend
+                requested = normalize_vl_backend(self._paddle_vl_backend_combo.currentData())
+                if requested in {"auto", "mlx"}:
+                    mlx_ok, mlx_detail = probe_mlx_runtime(deep=True)
+                    text += f" · MLX：{'可用' if mlx_ok else '待安装/回退'}（{mlx_detail}）"
+            except Exception as exc:
+                text += f" · MLX 检测失败（{exc}）"
         self._paddle_runtime_status.setText(text)
         self._paddle_runtime_status.setStyleSheet(style)
         self._log_view.appendPlainText(f"\n[PaddleOCR 检查] {text}")
@@ -4219,6 +4323,7 @@ class OCRTab(QWidget):
         token = self._paddle_prepare_generation.begin()
         pipeline = str(self._paddle_model_combo.currentData() or "ocr")
         source = str(self._paddle_source_combo.currentData() or "auto")
+        vl_backend = str(self._paddle_vl_backend_combo.currentData() or "auto")
         self._paddle_prepare_active = True
         self._run_btn.setEnabled(False)
         self._paddle_prepare_btn.setEnabled(False)
@@ -4260,8 +4365,10 @@ class OCRTab(QWidget):
             restore_buttons()
             selected_source = str((payload or {}).get("model_source") or source)
             profile = str((payload or {}).get("model_profile") or pipeline)
+            effective_vl = str((payload or {}).get("vl_backend") or "")
+            backend_suffix = (f" · VL {effective_vl.upper()}" if effective_vl else "")
             self._paddle_runtime_status.setText(
-                f"✓ PaddleOCR 已就绪 · 来源 {selected_source} · {profile}"
+                f"✓ PaddleOCR 已就绪 · 来源 {selected_source} · {profile}{backend_suffix}"
             )
             self._paddle_runtime_status.setStyleSheet("color: #248A3D; font-size: 10px;")
             self._refresh_ocr_runtime_status(show_dialog=False, deep=False)
@@ -4295,6 +4402,7 @@ class OCRTab(QWidget):
                     pipeline=pipeline,
                     lang=profile.paddle_lang,
                     model_source=source,
+                    vl_backend=vl_backend,
                     verbose=True,
                     progress_callback=signals.log.emit,
                 )
@@ -4437,7 +4545,11 @@ class OCRTab(QWidget):
             ruby_filter_checked=bool(ruby is not None and ruby.isChecked()),
             fragment_filter_checked=bool(fragments is not None and fragments.isChecked()),
         )
-        for checkbox in (ruby, fragments, smart_crop):
+        if ruby is not None:
+            # Independent contract: the Ruby-preservation switch never changes
+            # the ordinary OCR cleanup profile.
+            ruby.setEnabled(state.cleanup_controls_enabled)
+        for checkbox in (fragments, smart_crop):
             if checkbox is not None:
                 checkbox.setEnabled(state.cleanup_controls_enabled)
         if combo is not None:
@@ -5576,6 +5688,7 @@ class OCRTab(QWidget):
                         padding_percent=self._column_padding_spin.value(),
                         fixed_region_rect=crop_rect,
                         fixed_region_already_masked=True,
+                        capture_ruby_candidates=False,
                     )
                 if not columns:
                     QMessageBox.warning(
@@ -5735,6 +5848,7 @@ class OCRTab(QWidget):
                 pipeline=self._paddle_model_combo.currentData(),
                 lang=profile.paddle_lang,
                 model_source=self._paddle_source_combo.currentData(),
+                vl_backend=self._paddle_vl_backend_combo.currentData(),
             )
         elif engine_id == "hayai_ocr":
             opts.update(
@@ -5793,7 +5907,11 @@ class OCRTab(QWidget):
             fragments = False
             smart_crop = True
             strength = "standard"
-            preserve_body_pixels = True
+            # Main OCR must never receive side Ruby in the standard Japanese-novel
+            # path.  ``False`` does not resample body glyphs: it copies only the
+            # component detector's authoritative body/source boxes and blanks the
+            # side-Ruby boxes from the temporary OCR transport image.
+            preserve_body_pixels = False
         else:
             ruby = bool(
                 hasattr(self, "_column_ruby_filter_check")
@@ -5815,6 +5933,12 @@ class OCRTab(QWidget):
             if strength not in {"weak", "standard", "strong"}:
                 strength = "standard"
             preserve_body_pixels = not (ruby or fragments)
+        # Ruby preservation is a side-channel only.  Snapshot its scheduling
+        # flag independently; never modify the ordinary OCR pixel/cleanup
+        # contract merely because findtextCenterNet is enabled.
+        ruby_preservation_enabled = bool(
+            getattr(getattr(self, "_preserve_ruby_check", None), "isChecked", lambda: False)()
+        )
         return {
             "column_detector_mode": "components",
             "column_sensitivity": float(self._column_sensitivity_spin.value()),
@@ -5827,6 +5951,10 @@ class OCRTab(QWidget):
             "column_smart_crop": smart_crop,
             "column_ruby_strength": strength,
             "column_preserve_body_pixels": preserve_body_pixels,
+            # Geometry telemetry is strictly tied to the explicit Ruby feature.
+            # OFF runs skip it entirely and therefore follow the original OCR
+            # path with no Ruby sidecar/candidate overhead.
+            "column_capture_ruby_candidates": ruby_preservation_enabled,
         }
 
     @staticmethod
@@ -5872,6 +6000,7 @@ class OCRTab(QWidget):
             "column_smart_crop",
             "column_ruby_strength",
             "column_preserve_body_pixels",
+            "column_capture_ruby_candidates",
         ):
             if key in column_opts:
                 opts[key] = column_opts[key]
@@ -5882,6 +6011,12 @@ class OCRTab(QWidget):
             opts.setdefault("request_timeout", 45.0)
         if extra_engine_options:
             opts.update(dict(extra_engine_options))
+        # The run-level Ruby toggle is authoritative.  Engine-specific options,
+        # plugins and persisted kwargs cannot secretly enable candidate telemetry
+        # during a Ruby-OFF run or disable it during a Ruby-ON run.
+        opts["column_capture_ruby_candidates"] = bool(
+            column_opts.get("column_capture_ruby_candidates", False)
+        )
         # Projection is review-only.  Ordinary OCR cannot be switched back to the
         # legacy projection detector by saved settings, plugins or direct kwargs.
         opts["column_detector_mode"] = "components"
@@ -5922,6 +6057,7 @@ class OCRTab(QWidget):
                 pipeline=opts.get("pipeline"),
                 lang=str(opts.get("lang") or profile.paddle_lang),
                 model_source=str(opts.get("model_source") or "auto"),
+                vl_backend=str(opts.get("vl_backend") or "auto"),
                 **common_kwargs,
             )
         if engine_id == "ndlocr_lite":
@@ -5964,7 +6100,9 @@ class OCRTab(QWidget):
             **common_kwargs,
         )
 
-    def _confirm_runtime_installation(self, engine_ids: list[str] | None = None) -> bool:
+    def _confirm_runtime_installation(
+        self, engine_ids: list[str] | None = None, *, include_ruby: bool = False
+    ) -> bool:
         # OCR + 手动纠错始终先运行当前选定的普通 OCR。Apple/OpenVINO
         # 只用于可选测试或实验候选，不应绕过 OCR 运行环境检查。
         from adapters.ocr_runtime_catalog import required_components, missing_components, confirmation_text
@@ -5976,6 +6114,8 @@ class OCRTab(QWidget):
                 recognition_engine=engine_id if self._column_split_check.isChecked() else "",
                 engine_options=self._engine_options(engine_id),
             ))
+        if include_ruby:
+            ids.append("findtext_centernet_ruby")
         ids = list(dict.fromkeys(ids))
         missing = missing_components(ids)
         if not missing:
@@ -6026,6 +6166,17 @@ class OCRTab(QWidget):
         from adapters.ocr_profiles import get_ocr_profile, is_engine_compatible
         ocr_mode_snapshot = self._current_ocr_mode()
         ocr_profile = get_ocr_profile(ocr_mode_snapshot)
+        ruby_preserve_enabled = bool(
+            ocr_profile.allow_column_pipeline
+            and hasattr(self, "_preserve_ruby_check")
+            and self._preserve_ruby_check.isChecked()
+        )
+        ruby_scan_mode_snapshot = str(
+            getattr(getattr(self, "_ruby_scan_mode_combo", None), "currentData", lambda: "smart_roi")()
+            or "smart_roi"
+        )
+        if ruby_scan_mode_snapshot not in {"smart_roi", "full_page"}:
+            ruby_scan_mode_snapshot = "smart_roi"
         # Defence in depth.  The mode-switch UI already disables these controls,
         # but a restored legacy QSettings value must never route Simplified
         # Chinese pages into Japanese right-to-left column/handwriting code.
@@ -6085,7 +6236,9 @@ class OCRTab(QWidget):
         if self._multi_ocr_check.isChecked() and len(engine_ids) < 2:
             QMessageBox.warning(self, "请选择模型", "多模型 OCR 对比至少需要模型1和模型2。")
             return
-        if not self._confirm_runtime_installation(engine_ids):
+        if not self._confirm_runtime_installation(
+            engine_ids, include_ruby=ruby_preserve_enabled
+        ):
             return
 
         # Freeze every model option on the GUI thread.  Users may inspect or
@@ -6139,6 +6292,16 @@ class OCRTab(QWidget):
             f"🧭 OCR 模式：{ocr_profile.label} · {ocr_profile.language} · "
             f"{ocr_profile.writing_direction}"
         )
+        if ruby_preserve_enabled:
+            self._log_view.appendPlainText(
+                "💎 Ruby 保留：已开启。普通 OCR 继续只识别 Ruby-free 分列正文；"
+                + (
+                    "findtextCenterNet 将复用分列阶段记录的疑似 Ruby 位置，只扫描原图局部 ROI。"
+                    if ruby_scan_mode_snapshot == "smart_roi"
+                    else "findtextCenterNet 使用全页精确扫描（慢）。"
+                )
+                + " Ruby 证据不参与正文投票/融合。"
+            )
         if page_overrides_snapshot:
             from engine.page_ocr_policy import should_skip_page_ocr
             skipped_by_type: dict[str, int] = {}
@@ -6207,6 +6370,7 @@ class OCRTab(QWidget):
                 "engine_ids": list(engine_ids),
                 "multi_model": len(engine_ids) > 1,
                 "ocr_mode": ocr_mode_snapshot,
+                "ruby_preservation": ruby_preserve_enabled,
             },
         )
         self._active_ocr_performance_trace = performance_trace
@@ -6542,6 +6706,84 @@ class OCRTab(QWidget):
                 # Previously each model independently enumerated or rendered the
                 # same 400-page input before OCR could begin.
                 resolved_inputs = list(inputs)
+
+                ruby_detection_cache = {"prepared": False, "report": None}
+
+                def maybe_preserve_ruby(documents):
+                    docs = [item for item in documents if item is not None]
+                    if not docs:
+                        return
+                    if not ruby_preserve_enabled:
+                        # Hard OFF-state boundary.  A fresh Ruby-disabled run must
+                        # behave like the pre-Ruby pipeline: no locked readings, no
+                        # Ruby report/state and no persisted candidate sidecar.  This
+                        # does not alter OCR prose, confidence, layout or provenance.
+                        from adapters.findtext_centernet_ruby import strip_ruby_overlay
+                        for doc in docs:
+                            strip_ruby_overlay(
+                                doc, strip_candidate_geometry=True, strip_logs=True
+                            )
+                        return
+                    raise_if_cancelled()
+                    signals.log.emit(
+                        "\n💎 Ruby 结构识别："
+                        + (
+                            "复用普通 OCR 分列阶段的几何候选，将相邻列合并为原图上下文 ROI；"
+                            "无候选页不再二次 OCR…"
+                            if ruby_scan_mode_snapshot == "smart_roi"
+                            else "findtextCenterNet 单独读取未清理原始正文页执行全页扫描…"
+                        )
+                    )
+                    from adapters.findtext_centernet_ruby import preserve_ruby_in_documents
+
+                    def ruby_progress(current, total, filename):
+                        if cancel_event.is_set():
+                            return
+                        emit_phase_progress("Ruby 结构识别", current, max(1, total))
+                        if current <= 1 or current >= total or current % max(1, total // 10) == 0:
+                            signals.log.emit(
+                                f"  [Ruby {current:3d}/{max(1, total)}] {filename}"
+                            )
+
+                    report = preserve_ruby_in_documents(
+                        docs,
+                        cancel_check=cancel_event.is_set,
+                        log_callback=signals.log.emit,
+                        progress_callback=ruby_progress,
+                        scan_mode=ruby_scan_mode_snapshot,
+                        candidate_root=shared_column_prepare_dir,
+                    )
+                    # Candidate geometry is a transient scheduling aid only. Once
+                    # the optional pass finishes, discard it from every OCR model
+                    # document so raw voters stay fully Ruby-free on save/roundtrip.
+                    # The last document is the authoritative overlay target.
+                    from adapters.findtext_centernet_ruby import strip_ruby_overlay
+                    for source_doc in docs[:-1]:
+                        strip_ruby_overlay(
+                            source_doc, strip_candidate_geometry=True, strip_logs=False
+                        )
+                    target_meta = getattr(docs[-1], "metadata", None)
+                    if target_meta is not None and hasattr(target_meta, "ruby_candidate_pages"):
+                        target_meta.ruby_candidate_pages = {}
+                    ruby_detection_cache["prepared"] = True
+                    ruby_detection_cache["report"] = report
+                    if report.error:
+                        signals.log.emit(
+                            "⚠️ Ruby 保留未完成；已保留主 OCR 正文，不做任何猜测性回写。"
+                        )
+                    else:
+                        if report.scan_mode == "smart_roi":
+                            saved_pct = max(0.0, (1.0 - report.estimated_tile_ratio) * 100.0)
+                            signals.log.emit(
+                                f"✅ Ruby ROI 完成：{report.candidate_boxes} 个候选 → {report.roi_count} 个 ROI，"
+                                f"实际触发 {report.pages_scanned} 页；预计 findtext 检测窗减少约 {saved_pct:.1f}%。"
+                            )
+                        signals.log.emit(
+                            f"✅ Ruby 保留完成：检测 {report.ruby_pairs} 处，"
+                            f"安全写回 {report.matched_pairs} 处 / {report.updated_blocks} 块；"
+                            f"未唯一匹配 {report.unmatched_pairs} 处保持原样。"
+                        )
+
                 try:
                     from adapters.pdf_input import expand_inputs, natural_sort_key
                     work_dir = str(Path(inputs[0]).expanduser().parent)
@@ -7147,6 +7389,7 @@ class OCRTab(QWidget):
                                 emit_overall_progress(
                                     progress_estimator.complete(label="OCR 完成（多模型降级）")
                                 )
+                                maybe_preserve_ruby([only_doc])
                                 signals.finished.emit(only_doc)
                                 return
 
@@ -7361,6 +7604,7 @@ class OCRTab(QWidget):
                             emit_overall_progress(
                                 progress_estimator.complete(label="OCR 完成（多模型降级）")
                             )
+                            maybe_preserve_ruby([only_doc])
                             signals.finished.emit(only_doc)
                             return
 
@@ -7399,6 +7643,10 @@ class OCRTab(QWidget):
                         ), performance_trace.stage("multi_model_alignment_and_fusion"):
                             comparison = compare_ocr_documents(documents, labels)
                             fused = build_fused_document(documents[0], comparison)
+                        # Feed every ordinary OCR document as geometry evidence;
+                        # preserve_ruby_in_documents() merges geometry-only hints
+                        # and still writes Ruby metadata exclusively to ``fused``.
+                        maybe_preserve_ruby([*documents, fused])
                         if adaptive_ensemble_audit:
                             fused.metadata.__dict__["adaptive_ocr_ensemble"] = dict(adaptive_ensemble_audit)
                         if handwriting_enabled:
@@ -7425,6 +7673,7 @@ class OCRTab(QWidget):
                             "comparison": comparison,
                             "source_texts": source_texts,
                             "fused": fused,
+                            "ruby_enabled": bool(ruby_preserve_enabled),
                             "handwriting_review_context": dict(handwriting_review_context_snapshot),
                             "performance_trace_path": trace_path,
                         })
@@ -7509,6 +7758,7 @@ class OCRTab(QWidget):
                             doc.add_log("handwriting_trace_review", "等待 OCR 疑点人工纠错；复核完成后再执行逐列成句", 0)
                         else:
                             doc.add_log("column_sentence_reflow", "OCR 界面已关闭逐列成句，原始 OCR 块直接进入 Formatter", 0)
+                        maybe_preserve_ruby([doc])
                         emit_overall_progress(progress_estimator.complete(label="OCR 完成"))
                         doc.metadata.__dict__["ocr_performance_trace_path"] = trace_path
                         signals.finished.emit(doc)
@@ -15580,6 +15830,10 @@ class OCRCompareTab(QWidget):
         self._suspended_multi_state: dict | None = None
         self._comparison = None
         self._primary_doc: UnifiedDocument | None = None
+        # Ruby is a locked structural overlay produced on the worker's initial
+        # fused document.  Keep that immutable overlay available because the
+        # review page rebuilds a fresh fused document when the user clicks Apply.
+        self._ruby_overlay_doc: UnifiedDocument | None = None
         self._initial_payload: dict | None = None
         self._source_editors: list[QPlainTextEdit] = []
         self._source_labels: list[QLabel] = []
@@ -16057,7 +16311,7 @@ class OCRCompareTab(QWidget):
         result_header = QHBoxLayout()
         result_header.setContentsMargins(0, 0, 0, 0)
         result_header.setSpacing(5)
-        self._result_title = QLabel("融合结果（真正一致自动保留；共同候选需确认）")
+        self._result_title = QLabel("融合结果（真正一致与两模型共同候选均自动保留；真正分歧需裁决）")
         self._result_title.setStyleSheet("font-size:11px; font-weight:700;")
         result_header.addWidget(self._result_title)
         self._review_only_check = QCheckBox("只显示需判断")
@@ -16518,6 +16772,7 @@ class OCRCompareTab(QWidget):
             "comparison": self._comparison,
             "primary_doc": self._primary_doc,
             "initial_payload": self._initial_payload,
+            "ruby_overlay_doc": self._ruby_overlay_doc,
             "fusion_states": self._fusion_states,
             "image_review_overrides": copy.deepcopy(self._image_review_overrides),
             "canonical_source_decisions": copy.deepcopy(self._canonical_source_decisions),
@@ -16542,6 +16797,7 @@ class OCRCompareTab(QWidget):
         self._comparison = state.get("comparison")
         self._primary_doc = state.get("primary_doc")
         self._initial_payload = state.get("initial_payload")
+        self._ruby_overlay_doc = state.get("ruby_overlay_doc")
         self._fusion_states = list(state.get("fusion_states") or [])
         self._image_review_overrides = copy.deepcopy(state.get("image_review_overrides") or {})
         self._canonical_source_decisions = copy.deepcopy(state.get("canonical_source_decisions") or {})
@@ -16595,7 +16851,7 @@ class OCRCompareTab(QWidget):
         self._choose_label.setVisible(True)
         self._row_state.setVisible(True)
         self._result_panel.setVisible(True)
-        self._result_title.setText("融合结果（真正一致自动保留；共同候选需确认）")
+        self._result_title.setText("融合结果（真正一致与两模型共同候选均自动保留；真正分歧需裁决）")
         self._auto_btn.setEnabled(True)
         self._realign_btn.setEnabled(True)
         self._restore_btn.setEnabled(self._initial_payload is not None)
@@ -16777,6 +17033,15 @@ class OCRCompareTab(QWidget):
         self._suspended_multi_state = None
         documents = list(payload.get("documents") or [])[:3]
         comparison = payload.get("comparison")
+        fused_doc = payload.get("fused")
+        ruby_enabled = bool(
+            payload.get(
+                "ruby_enabled",
+                getattr(getattr(fused_doc, "metadata", None), "ruby_preservation_enabled", False),
+            )
+        )
+        ruby_overlay_doc = fused_doc if ruby_enabled else None
+        self._ruby_overlay_doc = ruby_overlay_doc
         # Keep immutable worker results by reference instead of deep-copying
         # three 300-page books and the whole comparison on the GUI thread.
         # User decisions live in separate lightweight states; destructive
@@ -16789,6 +17054,8 @@ class OCRCompareTab(QWidget):
             # only copies the comparison on explicit destructive operations.
             "comparison": comparison,
             "source_texts": tuple(payload.get("source_texts") or ()),
+            "fused": ruby_overlay_doc,
+            "ruby_enabled": ruby_enabled,
         }
         self._load_results(payload)
 
@@ -16799,6 +17066,14 @@ class OCRCompareTab(QWidget):
         self._documents = list(payload.get("documents") or [])[:3]
         self._labels = list(payload.get("labels") or [])[:3]
         self._comparison = payload.get("comparison")
+        fused_doc = payload.get("fused")
+        ruby_enabled = bool(
+            payload.get(
+                "ruby_enabled",
+                getattr(getattr(fused_doc, "metadata", None), "ruby_preservation_enabled", False),
+            )
+        )
+        self._ruby_overlay_doc = fused_doc if ruby_enabled else None
         self._primary_doc = self._documents[0] if self._documents else None
         if self._comparison is None or len(self._documents) < 2:
             self.clear()
@@ -16851,7 +17126,7 @@ class OCRCompareTab(QWidget):
         self._choose_label.setVisible(True)
         self._row_state.setVisible(True)
         self._result_panel.setVisible(True)
-        self._result_title.setText("融合结果（真正一致自动保留；共同候选需确认）")
+        self._result_title.setText("融合结果（真正一致与两模型共同候选均自动保留；真正分歧需裁决）")
         self._apply_btn.setText("✓ 应用融合稿")
         self._single_export_btn.setEnabled(False)
         self._export_ai_package_btn.setEnabled(True)
@@ -16867,7 +17142,7 @@ class OCRCompareTab(QWidget):
         self._refresh_source_highlights()
         self._summary.setText(
             f"模型：{' · '.join(self._labels)}。{self._comparison.summary} "
-            "共同字符已标绿、差异字符已标红；真正分歧与第3模型未独立运行的共同候选等待逐句打钩。"
+            "共同字符已标绿、差异字符已标红；真正分歧等待逐句裁决，第3模型未独立运行的两模型共同候选按 v8 规则自动保留。"
         )
         self._auto_btn.setEnabled(True)
         self._realign_btn.setEnabled(True)
@@ -17184,6 +17459,18 @@ class OCRCompareTab(QWidget):
         self._ai_import_signal_refs.clear()
         self._pending_ai_import_apply = None
         self._ai_import_busy = False
+        # Source-correction export/import/restore workers may still be finishing
+        # in background.  A clear, book switch, or mode replacement makes every
+        # prior callback stale so old-book decisions can never land in the new
+        # OCR workspace.  The worker may finish naturally; GenerationGuard drops it.
+        self._source_correction_generation.invalidate()
+        self._source_correction_signal_refs.clear()
+        self._source_correction_busy = False
+        self._source_correction_lock_workspace = False
+        if hasattr(self, "_source_correction_progress"):
+            self._source_correction_progress.setVisible(False)
+        if hasattr(self, "_restore_source_session_btn"):
+            self._restore_source_session_btn.setEnabled(True)
         self._full_source_texts = []
         self._full_source_lines = []
         self._single_card_preview_row = -1
@@ -17200,6 +17487,10 @@ class OCRCompareTab(QWidget):
         self._comparison = None
         self._primary_doc = None
         self._initial_payload = None
+        # A true clear/new-book boundary must never retain Ruby annotations
+        # from the previous multi-model session. Temporary multi -> single
+        # switching saves/restores this overlay explicitly in _capture_multi_state.
+        self._ruby_overlay_doc = None
         self._fusion_states = []
         self._image_review_overrides = {}
         self._canonical_source_decisions = {}
@@ -17279,6 +17570,10 @@ class OCRCompareTab(QWidget):
         self._result_load_generation += 1
         self._ai_import_generation.invalidate()
         self._ai_import_signal_refs.clear()
+        self._source_correction_generation.invalidate()
+        self._source_correction_signal_refs.clear()
+        self._source_correction_busy = False
+        self._source_correction_lock_workspace = False
 
     def _current_row(self) -> int:
         return max(0, self._current_row_index)
@@ -17585,7 +17880,7 @@ class OCRCompareTab(QWidget):
         self._refresh_source_highlights()
         self._summary.setText(
             f"已接受增删换行并重新自动对齐。{comparison.summary} "
-            "红绿字符差异与融合候选已重建；真正分歧和共同候选需重新打钩。"
+            "红绿字符差异与融合候选已重建；真正分歧需重新裁决，两模型共同候选按 v8 规则自动保留。"
         )
         self._select_row(min(self._current_row(), max(0, len(comparison.rows) - 1)))
 
@@ -17855,6 +18150,7 @@ class OCRCompareTab(QWidget):
             "labels": list(self._initial_payload.get("labels") or []),
             "comparison": self._initial_payload.get("comparison"),
             "source_texts": list(self._initial_payload.get("source_texts") or []),
+            "fused": self._initial_payload.get("fused"),
         }
         self._load_results(payload)
         self._summary.setText(
@@ -18205,6 +18501,7 @@ class OCRCompareTab(QWidget):
                 comparison,
                 result_lines=result_lines,
                 delete_flags=delete_flags,
+                ruby_overlay_source=self._ruby_overlay_doc,
             )
             written = save_package(package, path)
         except Exception as exc:
@@ -18315,6 +18612,7 @@ class OCRCompareTab(QWidget):
         }
         recovery_decisions = [dict(item) for item in self._canonical_source_decisions.values()]
         recovery_row_index = int(self._current_row_index)
+        recovery_ruby_overlay = self._ruby_overlay_doc
         output_path = str(path)
         self._set_source_correction_busy(
             True, "正在后台同步物理列并导出 AI OCR 裁决包；上一轮已接受结果将作为可复审参考保留…", lock_workspace=False,
@@ -18337,6 +18635,7 @@ class OCRCompareTab(QWidget):
                     canonical_decisions=recovery_decisions,
                     review_prior_decisions=True,
                     current_row_index=recovery_row_index,
+                    ruby_overlay_source=recovery_ruby_overlay,
                 )
                 signals.finished.emit(report)
             except Exception as exc:
@@ -18467,11 +18766,14 @@ class OCRCompareTab(QWidget):
             labels = list(result.get("labels") or [])
             comparison = result.get("comparison")
             report = dict(result.get("report") or {})
+            restored_ruby_overlay = report.get("ruby_overlay")
             self.clear(preserve_available_single=True)
             self._initial_payload = {
                 "documents": tuple(documents), "labels": tuple(labels),
                 "comparison": comparison, "source_texts": tuple(result.get("prepared") or ()),
+                "ruby_overlay": restored_ruby_overlay,
             }
+            self._ruby_overlay_doc = restored_ruby_overlay
             self._labels = labels
             decisions = [item for item in (result.get("canonical_decisions") or report.get("canonical_decisions") or []) if isinstance(item, dict)]
             self._canonical_source_decisions = {
@@ -18532,9 +18834,13 @@ class OCRCompareTab(QWidget):
             from engine.multi_ocr_compare import build_fused_document
             result_lines = [state.output_text() for state in self._fusion_states]
             delete_flags = [state.output_delete_intentionally() for state in self._fusion_states]
-            fused = build_fused_document(self._primary_doc, comparison, result_lines, delete_flags=delete_flags)
+            fused = build_fused_document(
+                self._primary_doc, comparison, result_lines, delete_flags=delete_flags,
+                ruby_overlay_source=self._ruby_overlay_doc,
+            )
         except Exception:
             fused = self._primary_doc
+        self._ruby_overlay_doc = fused
         self.multi_session_restored.emit({
             "documents": documents, "labels": labels, "comparison": comparison,
             "fused": fused, "report": report,
@@ -18922,6 +19228,9 @@ class OCRCompareTab(QWidget):
             self,
             "融合结果与骨架 EPUB 已导出",
             f"正文条目：{report.get('row_count', 0)}\n"
+            f"锁定 Ruby：{report.get('ruby_pair_count', 0)} 组"
+            f"（{'开启' if report.get('ruby_enabled') else '关闭'}）\n"
+            "已包含锁定 Ruby sidecar、AI 正文模板、最终 EPUB 构建器和 Ruby 验证器。\n"
             f"融合 JSON 和稳定 ID 骨架 EPUB 已打包：\n{report.get('path', path)}",
         )
 
@@ -19015,6 +19324,7 @@ class OCRCompareTab(QWidget):
             comparison,
             result_lines=result_lines,
             delete_flags=delete_flags,
+            ruby_overlay_source=self._ruby_overlay_doc,
         )
         # AI 修复包只使用当前多模型 OCR、页面结构和原始出版图片。
         # 出版参考 EPUB 属于文字对比页的独立功能，不得被静默附加到
@@ -19440,6 +19750,7 @@ class OCRCompareTab(QWidget):
         documents = list(self._documents)
         labels = list(self._labels)
         current_primary = self._primary_doc
+        ruby_overlay_doc = self._ruby_overlay_doc
         title = safe_result_filename(
             str(getattr(getattr(self._primary_doc, "metadata", None), "title", "") or ""),
             default="multi_ocr",
@@ -19462,6 +19773,7 @@ class OCRCompareTab(QWidget):
                     comparison,
                     result_lines=result_lines,
                     delete_flags=delete_flags,
+                    ruby_overlay_source=ruby_overlay_doc,
                 )
                 options = AdjudicationOptions(
                     batch_pages=int(config["batch_pages"]),
@@ -19989,6 +20301,15 @@ class OCRCompareTab(QWidget):
                 return
         self._summary.setText("当前没有需要跳转的未决分歧或已保留历史分歧。")
 
+    @staticmethod
+    def _reattach_ruby_overlay(overlay, target) -> int:
+        """Compatibility wrapper around the central Ruby side-channel API."""
+        if overlay is None or target is None:
+            return 0
+        from adapters.findtext_centernet_ruby import apply_ruby_overlay
+        report = apply_ruby_overlay(target, overlay)
+        return int(report.get("target_blocks", 0) or 0)
+
     def _update_unresolved_summary(self):
         unresolved = sum(1 for state in self._fusion_states if state.unresolved)
         if self._comparison is not None:
@@ -20058,10 +20379,20 @@ class OCRCompareTab(QWidget):
                 comparison_for_apply,
                 lines,
                 delete_flags=delete_flags,
+                ruby_overlay_source=self._ruby_overlay_doc,
+            )
+            ruby_blocks = int(
+                (getattr(fused.metadata, "ruby_overlay_transfer_report", {}) or {}).get("target_blocks", 0)
             )
         except Exception as exc:
             show_error_dialog(self, "应用 OCR 融合稿失败", str(exc))
             return
+        if ruby_blocks:
+            fused.add_log(
+                "ruby_preservation",
+                f"应用融合稿时保留 Ruby 结构覆盖：{ruby_blocks} 个文字块",
+                ruby_blocks,
+            )
         self.doc_applied.emit(fused)
         self._summary.setText("已将当前逐句裁决稿应用到工作流；源 OCR 和候选卡仍保留在本页。")
         QMessageBox.information(

@@ -863,6 +863,15 @@ def apply_lossless_layout(doc: UnifiedDocument) -> tuple[UnifiedDocument, int]:
         ),
         total,
     )
+    # The literal layout stage is allowed to split/merge blocks. Deep-copying
+    # alone can duplicate a whole Ruby annotation set onto every child, so
+    # reconstruct it from source evidence after the character-preserving gate.
+    try:
+        from adapters.findtext_centernet_ruby import carry_ruby_overlay, has_ruby_overlay
+        if has_ruby_overlay(source):
+            carry_ruby_overlay(source, result)
+    except Exception:
+        pass
     return result, total
 
 

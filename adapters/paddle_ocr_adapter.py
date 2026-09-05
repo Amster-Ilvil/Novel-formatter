@@ -101,12 +101,45 @@ def _page_size(image_path: str) -> tuple[int, int]:
         return img.size  # (w, h)
 
 
-def _worker_command(image_paths: list[str], *, lang: str, pipeline: str, probe: bool = False) -> list[str]:
+def _worker_command(
+    image_paths: list[str],
+    *,
+    lang: str,
+    pipeline: str,
+    probe: bool = False,
+    vl_runtime: dict | None = None,
+) -> list[str]:
     cmd = [str(VENV_PYTHON), str(WORKER_SCRIPT), "--lang", lang, "--pipeline", pipeline]
+    if pipeline == "vl":
+        runtime = dict(vl_runtime or {})
+        cmd.extend([
+            "--vl-backend", "mlx" if runtime.get("backend") == "mlx" else "paddle",
+            "--vl-server-url", str(runtime.get("server_url") or ""),
+            "--vl-api-model-name", str(
+                runtime.get("model") or "PaddlePaddle/PaddleOCR-VL-1.6"
+            ),
+        ])
     if probe:
         cmd.append("--probe")
     cmd.extend(image_paths)
     return cmd
+
+
+def _prepare_vl_runtime(
+    pipeline: str,
+    vl_backend: str,
+    *,
+    verbose: bool = False,
+    progress_callback=None,
+) -> dict:
+    if pipeline != "vl":
+        return {}
+    from adapters.paddle_vl_mlx import prepare_vl_backend
+    return prepare_vl_backend(
+        vl_backend,
+        verbose=verbose,
+        progress_callback=progress_callback,
+    )
 
 
 def _run_worker(
@@ -116,6 +149,7 @@ def _run_worker(
     cancel_check=None,
     model_source: str = "auto",
     status_callback=None,
+    vl_backend: str = "auto",
 ):
     """Run PaddleOCR in a child process without pipe deadlocks or infinite waits."""
     from adapters.subprocess_watchdog import (
@@ -126,12 +160,20 @@ def _run_worker(
     failures: list[str] = []
     startup_timeout = env_seconds("NOVEL_FORMATTER_OCR_STARTUP_TIMEOUT", 900.0, minimum=60.0)
     request_timeout = env_seconds("NOVEL_FORMATTER_OCR_REQUEST_TIMEOUT", 300.0, minimum=30.0)
+    vl_runtime = _prepare_vl_runtime(
+        pipeline,
+        vl_backend,
+        verbose=False,
+        progress_callback=status_callback,
+    )
     for attempt_index, source in enumerate(paddle_model_source_attempts(model_source), start=1):
         label = PADDLE_MODEL_SOURCE_LABELS.get(source, source)
         if status_callback is not None:
             status_callback(f"PaddleOCR 模型源：{label}（第 {attempt_index} 次尝试）")
         proc = subprocess.Popen(
-            _worker_command(image_paths, lang=lang, pipeline=pipeline),
+            _worker_command(
+                image_paths, lang=lang, pipeline=pipeline, vl_runtime=vl_runtime
+            ),
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
@@ -227,6 +269,7 @@ def prepare_runtime(
     pipeline: str = "ocr",
     lang: str = "japan",
     model_source: str = "auto",
+    vl_backend: str = "auto",
     verbose: bool = True,
     progress_callback=None,
 ) -> dict:
@@ -238,6 +281,12 @@ def prepare_runtime(
     if pipeline not in {"ocr", "structure", "vl"}:
         pipeline = "ocr"
     setup_venv(verbose=verbose, pipeline=pipeline)
+    vl_runtime = _prepare_vl_runtime(
+        pipeline,
+        vl_backend,
+        verbose=verbose,
+        progress_callback=progress_callback,
+    )
     failures: list[str] = []
     startup_timeout = env_seconds("NOVEL_FORMATTER_OCR_STARTUP_TIMEOUT", 900.0, minimum=60.0)
     for attempt_index, source in enumerate(paddle_model_source_attempts(model_source), start=1):
@@ -245,7 +294,9 @@ def prepare_runtime(
         if progress_callback is not None:
             progress_callback(f"正在通过 {label} 准备 PaddleOCR（尝试 {attempt_index}）…")
         proc = subprocess.Popen(
-            _worker_command([], lang=lang, pipeline=pipeline, probe=True),
+            _worker_command(
+                [], lang=lang, pipeline=pipeline, probe=True, vl_runtime=vl_runtime
+            ),
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
             text=True,
@@ -309,10 +360,17 @@ def prepare_runtime(
                 recognition_model=PADDLE_RECOGNITION_MODEL,
                 model_source=source,
                 model_profile=str(payload.get("model_profile") or ""),
+                vl_backend=str(payload.get("vl_backend") or vl_runtime.get("backend") or ""),
+                vl_requested_backend=str(vl_runtime.get("requested") or ""),
             )
             if progress_callback is not None:
                 progress_callback(f"PaddleOCR 已就绪：{label}")
-            return {**payload, "model_source": source}
+            return {
+                **payload,
+                "model_source": source,
+                "vl_backend": str(payload.get("vl_backend") or vl_runtime.get("backend") or ""),
+                "vl_backend_detail": str(vl_runtime.get("detail") or ""),
+            }
         failures.append(f"{label}: " + "\n".join(output_lines[-40:])[-6000:])
 
     raise RuntimeError(
@@ -336,6 +394,7 @@ def run(
     reuse_existing_crops: bool = False,
     filter_running_headers: bool = True,
     model_source: str = "auto",
+    vl_backend: str = "auto",
     ocr_mode: str = "ja_vertical",
     merge_horizontal_fragments: bool = True,
 ) -> UnifiedDocument:
@@ -371,6 +430,8 @@ def run(
             pipeline=pipeline,
             cancel_check=cancel_check,
             model_source=model_source,
+            status_callback=progress_callback,
+            vl_backend=vl_backend,
         )
 
     doc = run_ocr_engine(
@@ -402,6 +463,12 @@ def run(
             "detection_model": PADDLE_DETECTION_MODEL,
             "recognition_model": PADDLE_RECOGNITION_MODEL,
             "model_source": normalize_paddle_model_source(model_source),
+        }
+    elif component_id == "paddle_vl":
+        from adapters.paddle_vl_mlx import normalize_vl_backend
+        details = {
+            "pipeline_version": "v1.6",
+            "vl_requested_backend": normalize_vl_backend(vl_backend),
         }
     mark_runtime_ready(component_id, **details)
     return doc

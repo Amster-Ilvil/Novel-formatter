@@ -105,7 +105,7 @@ CSS_TEMPLATES: dict[str, str] = {
         /* Ruby 振假名 */
         ruby rt {
             -epub-ruby-position: right;
-            ruby-position: under;
+            ruby-position: over;
         }
         /* 插图页 */
         .illus-page {
@@ -432,12 +432,40 @@ def _ruby_to_xhtml(text: str) -> str:
     return ''.join(parts) if parts else _esc(value)
 
 
-def _ruby_export_source(block: Block) -> str:
-    """Prefer the unambiguous pre-conversion ruby source when available."""
+def _ruby_source_matches_current_text(marked: str, current_text: str) -> bool:
+    """Reject stale Ruby markup that would resurrect superseded prose at export.
+
+    ``ruby_aozora`` is a side-channel rendering of ``Block.text``. If any rebuild
+    path ever forgets to refresh it, publication must prefer current authoritative
+    prose without Ruby rather than silently exporting an older text snapshot.
+    """
+    if not re.search(r"[｜|][^《]+《[^》]+》", marked or ""):
+        return False
+    plain = re.sub(r"[｜|]([^《\n]+)《([^》\n]+)》", r"\1", str(marked or ""))
+    return _sanitize_export_text(plain) == _sanitize_export_text(current_text or "")
+
+
+def _ruby_export_source(block: Block, *, allow_ruby: bool = True) -> str:
+    """Prefer Ruby markup only when explicitly allowed and prose is current."""
+    metadata = block.metadata if isinstance(getattr(block, "metadata", None), dict) else {}
+    if not allow_ruby:
+        return _sanitize_export_text(str(block.text or ""))
+    current = str(block.text or "")
+    # Historical/imported BlockType.RUBY stores the authoritative structured
+    # source in ``ocr_raw`` while ``text`` may use the legacy ``base|reading``
+    # representation.  This is not the optional findtext side-channel and must
+    # keep the pre-feature EPUB round-trip semantics.
+    if block.type == BlockType.RUBY:
+        structural = str(getattr(block, "ocr_raw", "") or "")
+        if re.search(r"[｜|][^《]+《[^》]+》", structural):
+            return _sanitize_export_text(structural)
+    preserved = str(metadata.get("ruby_aozora") or "")
+    if _ruby_source_matches_current_text(preserved, current):
+        return _sanitize_export_text(preserved)
     source = str(getattr(block, "ocr_raw", "") or "")
-    if re.search(r"[｜|][^《]+《[^》]+》", source):
+    if _ruby_source_matches_current_text(source, current):
         return _sanitize_export_text(source)
-    return _sanitize_export_text(block.text or "")
+    return _sanitize_export_text(current)
 
 
 _ORPHAN_CLOSING_QUOTES = {"」", "』"}
@@ -503,51 +531,45 @@ def _repair_attrs(b: Block) -> str:
     return " " + " ".join(attrs)
 
 
-def _block_to_xhtml(b: Block) -> str:
-    """
-    把单个 Block 转成 XHTML 片段。
-    
-    检测段落开头是否有全角空格（\u3000），并将其转换为 CSS 缩进类。
-    """
+def _block_to_xhtml(b: Block, *, allow_ruby: bool = True) -> str:
+    """把单个 Block 转成 XHTML；Ruby OFF 时绝不读取 Ruby side-channel。"""
     raw = _sanitize_export_text(b.text or "")
     attrs = _repair_attrs(b)
+    ruby_raw = _ruby_export_source(b, allow_ruby=allow_ruby)
+    has_ruby = bool(re.search(r"[｜|][^《]+《[^》]+》", ruby_raw))
+
+    def render(value: str) -> str:
+        if has_ruby:
+            return _repair_ruby_to_xhtml(value) if attrs else _ruby_to_xhtml(value)
+        return _repair_plain_to_xhtml(value) if attrs else _esc(value)
 
     if b.type == BlockType.RUBY:
-        ruby_raw = _ruby_export_source(b)
-        content = _repair_ruby_to_xhtml(ruby_raw) if attrs else _ruby_to_xhtml(ruby_raw)
+        content = render(ruby_raw)
         return f'    <p class="normal"{attrs}>{content}</p>\n'
 
     if b.type == BlockType.CHAPTER:
         # XHTML 已经使用 h1，不再保留 Markdown 标题前缀。
-        raw = re.sub(r"^\s*#+\s*", "", raw).strip()
-        content = _repair_plain_to_xhtml(raw) if attrs else _esc(raw)
-        return f"    <h1{attrs}>{content}</h1>\n"
+        value = ruby_raw if has_ruby else raw
+        value = re.sub(r"^\s*#+\s*", "", value).strip()
+        return f"    <h1{attrs}>{render(value)}</h1>\n"
 
     if b.type == BlockType.SECTION:
-        raw = re.sub(r"^\s*#+\s*", "", raw).strip()
-        content = _repair_plain_to_xhtml(raw) if attrs else _esc(raw)
-        return f"    <h2{attrs}>{content}</h2>\n"
+        value = ruby_raw if has_ruby else raw
+        value = re.sub(r"^\s*#+\s*", "", value).strip()
+        return f"    <h2{attrs}>{render(value)}</h2>\n"
 
     if b.type == BlockType.DIALOGUE:
-        # 对白去掉前导全角空格，但保留其他内容
-        raw = raw.lstrip("　")
-        content = _repair_plain_to_xhtml(raw) if attrs else _esc(raw)
-        return f'    <p class="dialogue"{attrs}>{content}</p>\n'
+        value = (ruby_raw if has_ruby else raw).lstrip("　")
+        return f'    <p class="dialogue"{attrs}>{render(value)}</p>\n'
 
-    # 普通段落：统计开头的全角空格数量
+    # 普通段落：统计开头的全角空格数量。
+    value = ruby_raw if has_ruby else raw
     indent_count = 0
-    while raw.startswith("　"):
-        raw = raw[1:]
+    while value.startswith("　"):
+        value = value[1:]
         indent_count += 1
-
-    # 根据缩进数量决定 CSS 类
-    if indent_count >= 1:
-        cls = "normal indent"
-    else:
-        cls = "normal"
-
-    content = _repair_plain_to_xhtml(raw) if attrs else _esc(raw)
-    return f'    <p class="{cls}"{attrs}>{content}</p>\n'
+    cls = "normal indent" if indent_count >= 1 else "normal"
+    return f'    <p class="{cls}"{attrs}>{render(value)}</p>\n'
 
 
 # ── 核心构建函数 ──────────────────────────────────────────────────────────────
@@ -587,6 +609,7 @@ def build_epub(
     (tmp / "META-INF").mkdir(parents=True)
 
     meta = doc.metadata
+    ruby_export_enabled = bool(getattr(meta, "ruby_preservation_enabled", False))
     book_id = str(uuid.uuid4())
     title  = meta.title  or "Untitled"
     author = meta.author or "Unknown"
@@ -805,7 +828,14 @@ html, body, p {
                     continue
                 export_block = copy.copy(b)
                 export_block.text = clean_text
-                xhtml_piece = _block_to_xhtml(export_block)
+                xhtml_piece = _block_to_xhtml(
+                    export_block,
+                    # Existing/imported structural Ruby is part of the document
+                    # and keeps the historical round-trip behavior.  The OCR
+                    # Ruby switch gates only findtext side-channel metadata on
+                    # ordinary prose blocks.
+                    allow_ruby=(ruby_export_enabled or export_block.type == BlockType.RUBY),
+                )
                 lines.append(xhtml_piece)
                 chapter_has_content = True
 

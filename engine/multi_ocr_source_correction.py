@@ -1591,6 +1591,7 @@ def _write_recovery_snapshot(
     fusion_selection_records: dict[tuple[str, ...], dict] | None = None,
     canonical_decisions: Sequence[dict] | None = None,
     current_row_index: int = 0,
+    ruby_overlay_source: UnifiedDocument | dict | None = None,
     progress_callback: ProgressCallback | None = None,
 ) -> dict:
     recovery = folder / "RECOVERY"
@@ -1643,6 +1644,21 @@ def _write_recovery_snapshot(
                 "image_path": path,
                 "file_name": Path(path).name if path else "",
             })
+    ruby_overlay_file = None
+    if ruby_overlay_source is not None:
+        from adapters.findtext_centernet_ruby import extract_ruby_overlay
+        ruby_overlay = extract_ruby_overlay(ruby_overlay_source)
+        if ruby_overlay.get("blocks"):
+            raw_overlay = _json_bytes(ruby_overlay)
+            compressed_overlay = gzip.compress(raw_overlay, compresslevel=6, mtime=0)
+            relative_overlay = "RECOVERY/ruby_overlay.json.gz"
+            (folder / relative_overlay).write_bytes(compressed_overlay)
+            ruby_overlay_file = {
+                "path": relative_overlay,
+                "compressed_sha256": _sha256(compressed_overlay),
+                "document_sha256": _sha256(raw_overlay),
+                "block_count": len(ruby_overlay.get("blocks") or []),
+            }
     manifest = {
         "schema": RECOVERY_SCHEMA,
         "package_id": str(package_id or ""),
@@ -1654,6 +1670,7 @@ def _write_recovery_snapshot(
         "canonical_decisions": [copy.deepcopy(item) for item in (canonical_decisions or []) if isinstance(item, dict)],
         "current_row_index": max(0, int(current_row_index or 0)),
         "source_pages": source_pages,
+        "ruby_overlay": ruby_overlay_file,
         "instructions": (
             "重新打开程序后可直接选择本纠错 ZIP 恢复三份 OCR 文档；若 PDF/图片临时路径改变，"
             "先在页面管理重新载入同一批页面，程序只重绑图片路径，不重新 OCR。"
@@ -1728,6 +1745,24 @@ def load_source_correction_recovery(
             )
             documents.append(document)
             labels.append(str(item.get("label", "") or f"OCR 模型 {position}"))
+        ruby_overlay = None
+        ruby_item = manifest.get("ruby_overlay")
+        if isinstance(ruby_item, dict) and ruby_item.get("path"):
+            relative = str(ruby_item.get("path") or "")
+            if relative not in names:
+                raise SourceCorrectionError(f"恢复 Ruby 侧通道缺失：{relative}")
+            compressed = archive.read(relative)
+            if _sha256(compressed) != str(ruby_item.get("compressed_sha256", "") or ""):
+                raise SourceCorrectionError("恢复 Ruby 侧通道压缩哈希不一致。")
+            try:
+                raw_overlay = gzip.decompress(compressed)
+                if _sha256(raw_overlay) != str(ruby_item.get("document_sha256", "") or ""):
+                    raise SourceCorrectionError("恢复 Ruby 侧通道内容哈希不一致。")
+                ruby_overlay = json.loads(raw_overlay.decode("utf-8"))
+            except SourceCorrectionError:
+                raise
+            except Exception as exc:
+                raise SourceCorrectionError(f"无法恢复 Ruby 侧通道：{exc}") from exc
     rebind_report = _rebind_recovery_page_images(documents, replacement_page_images)
     _report_progress(progress_callback, "重新对齐恢复的 OCR 文档", 1, 2)
     comparison = compare_ocr_documents(documents, labels)
@@ -1761,6 +1796,7 @@ def load_source_correction_recovery(
         "fusion_selections": selections,
         "fusion_selection_records": selection_records,
         "canonical_decisions": [copy.deepcopy(item) for item in (manifest.get("canonical_decisions") or []) if isinstance(item, dict)],
+        "ruby_overlay": copy.deepcopy(ruby_overlay) if isinstance(ruby_overlay, dict) else None,
         "image_rebind": rebind_report,
     }
     return documents, labels, comparison, report
@@ -1780,6 +1816,7 @@ def export_source_correction_bundle(
     canonical_decisions: Sequence[dict] | None = None,
     review_prior_decisions: bool = False,
     current_row_index: int = 0,
+    ruby_overlay_source: UnifiedDocument | dict | None = None,
 ) -> dict:
     output = Path(output_path).expanduser()
     if output.suffix.lower() != ".zip":
@@ -1937,7 +1974,9 @@ def export_source_correction_bundle(
                 fusion_selections=fusion_selections,
                 fusion_selection_records=fusion_selection_records,
                 canonical_decisions=canonical_decisions,
-                current_row_index=current_row_index, progress_callback=progress_callback,
+                current_row_index=current_row_index,
+                ruby_overlay_source=ruby_overlay_source,
+                progress_callback=progress_callback,
             )
         readme = f"""# 多模型 OCR 逐源纠错包
 
@@ -2815,6 +2854,7 @@ def export_fusion_and_skeleton_bundle(
         folder.mkdir(parents=True, exist_ok=True)
         fusion_path = folder / "01_multi_ocr_fusion_result.json"
         fusion_path.write_bytes(_json_bytes(fusion_package, pretty=True))
+        fusion_sha256 = _sha256(fusion_path.read_bytes())
         audit = copy.deepcopy(correction_audit or {})
         (folder / "02_model_correction_audit.json").write_bytes(_json_bytes(audit, pretty=True))
         comparison = fusion_package.get("comparison") or {}
@@ -2847,14 +2887,51 @@ def export_fusion_and_skeleton_bundle(
             _strip_framework_work_payloads(skeleton)
         except Exception:
             pass
+
+        # External AI edits plain text only.  Ruby is frozen separately and the
+        # provided builder re-attaches only uniquely resolvable readings.
+        from engine.ruby_exchange_bundle import (
+            build_edit_template, build_locked_ruby_payload, model_command_text,
+            write_exchange_tools,
+        )
+        ruby_lock = build_locked_ruby_payload(primary_doc, fusion_package)
+        ruby_lock_path = folder / "04_ruby_overlay.locked.json"
+        ruby_lock_path.write_bytes(_json_bytes(ruby_lock, pretty=True))
+        ruby_lock_sha256 = _sha256(ruby_lock_path.read_bytes())
+        ai_output = folder / "AI_OUTPUT"
+        ai_output.mkdir(parents=True, exist_ok=True)
+        edit_template = build_edit_template(
+            fusion_package, fusion_sha256=fusion_sha256,
+            ruby_lock_sha256=ruby_lock_sha256,
+        )
+        (ai_output / "edited_text.json").write_bytes(_json_bytes(edit_template, pretty=True))
+        (folder / "00_AGENTS.md").write_text(model_command_text(), encoding="utf-8")
+        tool_paths = write_exchange_tools(folder)
+        tool_sha256 = {
+            relative: _sha256((folder / relative).read_bytes())
+            for relative in tool_paths
+        }
+
+        skeleton_sha256 = _sha256(skeleton.read_bytes())
         manifest = {
-            "schema": "novel_formatter.fusion_skeleton_bundle.v1",
+            "schema": "novel_formatter.fusion_skeleton_bundle.v2",
             "created_at": datetime.now(timezone.utc).isoformat(),
             "fusion_json": fusion_path.name,
             "skeleton_epub": skeleton.relative_to(folder).as_posix(),
-            "fusion_json_sha256": _sha256(fusion_path.read_bytes()),
-            "skeleton_epub_sha256": _sha256(skeleton.read_bytes()),
+            "ruby_lock": ruby_lock_path.name,
+            "edit_template": "AI_OUTPUT/edited_text.json",
+            "builder": "tools/build_final_epub.py",
+            "ruby_validator": "tools/validate_ruby.py",
+            "fusion_json_sha256": fusion_sha256,
+            "skeleton_epub_sha256": skeleton_sha256,
+            "ruby_lock_sha256": ruby_lock_sha256,
+            "ruby_enabled": bool(ruby_lock.get("ruby_preservation_enabled")),
+            "ruby_pair_count": int(ruby_lock.get("ruby_pair_count", 0) or 0),
+            "ruby_anchor_policy": str(ruby_lock.get("anchor_policy", "") or ""),
+            "ruby_anchor_policy_version": int(ruby_lock.get("anchor_policy_version", 1) or 1),
             "row_count": alignment_report["row_count"],
+            "tool_paths": tool_paths,
+            "tool_sha256": tool_sha256,
             "epub_report": epub_report,
         }
         (folder / "00_manifest.json").write_bytes(_json_bytes(manifest, pretty=True))
@@ -2872,6 +2949,9 @@ def export_fusion_and_skeleton_bundle(
         "path": str(output),
         "fusion_json_sha256": manifest["fusion_json_sha256"],
         "skeleton_epub_sha256": manifest["skeleton_epub_sha256"],
+        "ruby_lock_sha256": manifest.get("ruby_lock_sha256", ""),
+        "ruby_enabled": bool(manifest.get("ruby_enabled")),
+        "ruby_pair_count": int(manifest.get("ruby_pair_count", 0) or 0),
         "row_count": manifest["row_count"],
     }
 
