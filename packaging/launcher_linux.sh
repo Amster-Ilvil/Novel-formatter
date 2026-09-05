@@ -24,7 +24,11 @@ LOG_FILE="$LOG_DIR/launcher.log"
 PY="$VENV_DIR/bin/python"
 
 mkdir -p "$DATA_ROOT" "$CACHE_ROOT" "$STATE_ROOT" "$LOG_DIR"
-exec >>"$LOG_FILE" 2>&1
+if [[ "${CI:-}" == "true" || "${NF_LAUNCHER_CONSOLE_LOG:-0}" == "1" ]]; then
+  exec > >(tee -a "$LOG_FILE") 2>&1
+else
+  exec >>"$LOG_FILE" 2>&1
+fi
 printf '\n==== %s Novel Formatter Linux launch ====\n' "$(date '+%Y-%m-%d %H:%M:%S')"
 printf 'BOOT_STAGE=launcher_start package_root=%s\n' "$PACKAGE_ROOT"
 
