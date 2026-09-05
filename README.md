@@ -4,7 +4,7 @@
 
 <h1 align="center">Novel Formatter</h1>
 
-<p align="center">面向日文竖排书籍的 OCR、校对、排版与 EPUB 制作工具，重点优化 macOS，同时支持 Windows。</p>
+<p align="center"></p>
 
 <p align="center">
   <img alt="macOS" src="https://img.shields.io/badge/macOS-Apple%20Silicon%20%2F%20Intel-black?logo=apple">
