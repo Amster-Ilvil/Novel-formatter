@@ -18,7 +18,7 @@
 
 ## 下载
 
-优先从仓库 **Releases** 下载对应平台的最新安装包。
+优先从仓库 [**Releases 1.0**](https://github.com/Amster-Ilvil/Novel-formatter/releases/tag/1.0) 下载对应平台的安装包。
 
 源码运行同样支持 macOS 与 Windows；部分 Apple 原生能力仅在 macOS 可用。
 
@@ -26,9 +26,9 @@
 
 - **图片 / PDF 导入**：支持图片、文件夹和 PDF 页面处理。
 - **日文竖排 OCR**：针对日文书籍纵排、分列和跨列内容处理。
-- **多模型 OCR 对比与融合**：可组合 Apple Vision、NDLOCR、Manga OCR、PaddleOCR、YomiToku 等结果进行复核。
+- **多模型 OCR 对比与融合**：可组合 Apple Vision、NDLOCR、Manga OCR、PaddleOCR、YomiToku、Hayai OCR 等结果进行复核。
 - **图文对照校对**：结合原始页面与 OCR 结果检查错字、漏字、低置信度文本和版面问题。
-- **Ruby / 页眉页码处理**：支持假名注音、页眉、页码、跨列和跨页文本整理。
+- **Ruby / 页眉页码处理**：使用 FindText CenterNet 辅助定位并清理假名注音、页眉、页码、跨列和跨页残片。
 - **Formatter 文本整理**：对 OCR 文本进行段落、标点、标题和跨页接续等后处理。
 - **EPUB 制作**：从整理后的正文、结构和资源直接导出 EPUB。
 - **AI 修复包**：导出 OCR 证据、正文、结构和资源，交给 GPT、Claude 等大模型继续复核并生成接近出版成品的 EPUB。
@@ -42,7 +42,10 @@
 - NDLOCR
 - Manga OCR
 - PaddleOCR
+- Paddle VL MLX（macOS Apple Silicon）
 - YomiToku
+- Hayai OCR
+- FindText CenterNet（Ruby 区域辅助）
 
 Apple Vision、Swift OCR Helper、Apple Pencil 手写识别仅在 macOS 可用。
 
