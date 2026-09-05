@@ -16,11 +16,7 @@
 
 > 日文竖排 OCR · 多模型对比与融合 · 图文对照 · Formatter · EPUB · AI 修复包 · Apple Vision
 
-## 下载
 
-优先从仓库 [**Releases 1.0**](https://github.com/Amster-Ilvil/Novel-formatter/releases/tag/1.0) 下载对应平台的安装包。
-
-源码运行同样支持 macOS 与 Windows；部分 Apple 原生能力仅在 macOS 可用。
 
 ## 主要特性
 
