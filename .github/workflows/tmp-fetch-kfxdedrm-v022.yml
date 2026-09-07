@@ -17,7 +17,19 @@ jobs:
           curl -L --fail --retry 3 -o /tmp/kfx.zip https://github.com/jadehawk/kfx-dedrm/releases/download/0.2.2/kfx-dedrm-v0.2.2-no-kterm.zip
           echo '59c89f8cc38aaf106f5def71cf22487140e68e90f6b92911a48c7b8dd872c43f  /tmp/kfx.zip' | sha256sum -c -
           rm -rf /tmp/kfx && mkdir -p /tmp/kfx
-          unzip -q /tmp/kfx.zip -d /tmp/kfx
+          python3 - <<'PY'
+          import os, zipfile
+          src='/tmp/kfx.zip'; dst='/tmp/kfx'
+          with zipfile.ZipFile(src) as z:
+              for info in z.infolist():
+                  name=info.filename.replace('\\','/')
+                  if not name or name.endswith('/'):
+                      continue
+                  out=os.path.join(dst,name)
+                  os.makedirs(os.path.dirname(out), exist_ok=True)
+                  with z.open(info) as r, open(out,'wb') as w:
+                      w.write(r.read())
+          PY
           SRC='/tmp/kfx/COPY TO KINDLE ROOT/extensions/kfxdedrm-scriptlet/bin'
           test -d "$SRC"
           mkdir -p out
