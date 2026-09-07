@@ -1,0 +1,39 @@
+name: tmp-fetch-kfxdedrm-v022
+on:
+  push:
+    branches:
+      - tmp/native-koreader-kfx-20260907
+permissions:
+  contents: read
+jobs:
+  fetch:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Download verified kfx-dedrm 0.2.2
+        shell: bash
+        run: |
+          set -euo pipefail
+          curl -L --fail --retry 3 -o /tmp/kfx.zip https://github.com/jadehawk/kfx-dedrm/releases/download/0.2.2/kfx-dedrm-v0.2.2-no-kterm.zip
+          echo '59c89f8cc38aaf106f5def71cf22487140e68e90f6b92911a48c7b8dd872c43f  /tmp/kfx.zip' | sha256sum -c -
+          rm -rf /tmp/kfx && mkdir -p /tmp/kfx
+          unzip -q /tmp/kfx.zip -d /tmp/kfx
+          SRC='/tmp/kfx/COPY TO KINDLE ROOT/extensions/kfxdedrm-scriptlet/bin'
+          test -d "$SRC"
+          mkdir -p out
+          for f in kfxdedrmhf_c11 kfxdedrmhf_old kfxdedrm_c11 kfxdedrm_old; do
+            test -f "$SRC/$f"
+            cp "$SRC/$f" "out/$f"
+            chmod +x "out/$f"
+            file "out/$f"
+            sha256sum "out/$f"
+          done
+          cp /tmp/kfx/THIRD_PARTY_NOTICES.md out/THIRD_PARTY_NOTICES-kfx-dedrm-v0.2.2.md
+          cp /tmp/kfx/LICENSE out/LICENSE-kfx-dedrm-v0.2.2.txt
+          printf '%s\n' 'Source: jadehawk/kfx-dedrm release 0.2.2 no-kterm' 'Release SHA-256: 59c89f8cc38aaf106f5def71cf22487140e68e90f6b92911a48c7b8dd872c43f' > out/SOURCE.txt
+      - uses: actions/upload-artifact@v4
+        with:
+          name: kfxdedrm-native-extractors-v0.2.2
+          path: out/
+          if-no-files-found: error
+          compression-level: 0
