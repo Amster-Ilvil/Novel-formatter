@@ -69,12 +69,17 @@ jobs:
           verify_tree() {
               d="$1"
               [ -f "$d/reader.lua" ] && \
-              [ -x "$d/koreader.sh" ] && \
+              [ -f "$d/koreader.sh" ] && \
               [ -f "$d/frontend/pluginloader.lua" ] && \
               [ -f "$d/plugins/kindle.koplugin/main.lua" ] && \
               [ -f "$d/plugins/kindle.koplugin/_meta.lua" ] && \
-              [ -x "$d/plugins/kindle.koplugin/kindle-helper" ] && \
+              [ -f "$d/plugins/kindle.koplugin/kindle-helper" ] && \
               [ -f "$d/NATIVE_KOREADER_KFX_BUILD.txt" ]
+          }
+          make_executable() {
+              d="$1"
+              chmod +x "$d/koreader.sh" "$d/plugins/kindle.koplugin/kindle-helper" 2>/dev/null || true
+              [ -f "$d/plugins/kindle.koplugin/dist/bin/python3" ] && chmod +x "$d/plugins/kindle.koplugin/dist/bin/python3" 2>/dev/null || true
           }
           if [ -d "$STAGE" ]; then
               log "clean activation start"
@@ -82,11 +87,13 @@ jobs:
                   log "stage verification failed"
                   exit 72
               fi
+              make_executable "$STAGE"
               rm -rf "$BACKUP"
               if [ -d "$LIVE" ]; then
                   mv "$LIVE" "$BACKUP" || exit 73
               fi
               if mv "$STAGE" "$LIVE" && verify_tree "$LIVE"; then
+                  make_executable "$LIVE"
                   rm -rf "$BACKUP"
                   sync
                   log "clean activation complete"
@@ -102,8 +109,7 @@ jobs:
               log "live tree verification failed"
               exit 75
           fi
-          chmod +x "$LIVE/koreader.sh" "$LIVE/plugins/kindle.koplugin/kindle-helper" 2>/dev/null || true
-          [ -f "$LIVE/plugins/kindle.koplugin/dist/bin/python3" ] && chmod +x "$LIVE/plugins/kindle.koplugin/dist/bin/python3" 2>/dev/null || true
+          make_executable "$LIVE"
           log "launch native KOReader"
           exec "$LIVE/koreader.sh" --kual
           EOF
@@ -119,10 +125,12 @@ jobs:
           import hashlib, pathlib, sys
           orig=pathlib.Path('/tmp/orig/koreader')
           new=pathlib.Path('/tmp/root/koreader-native-stage')
-          allowed={'plugins/kindle.koplugin','NATIVE_KOREADER_KFX_BUILD.txt'}
           bad=[]
+          count=0
           for p in orig.rglob('*'):
-              if not p.is_file(): continue
+              if not p.is_file():
+                  continue
+              count += 1
               rel=p.relative_to(orig).as_posix()
               q=new/rel
               if not q.is_file():
@@ -131,7 +139,7 @@ jobs:
                   bad.append(('changed',rel))
           if bad:
               print(bad[:20]); sys.exit(1)
-          print('OFFICIAL_KOREADER_RUNTIME_BYTE_IDENTICAL', sum(1 for p in orig.rglob('*') if p.is_file()))
+          print('OFFICIAL_KOREADER_RUNTIME_BYTE_IDENTICAL', count)
           PY
       - name: Validate plugin and syntax
         shell: bash
