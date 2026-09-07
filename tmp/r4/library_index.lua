@@ -42,6 +42,14 @@ local function looksJapanese(text)
                 return true
             end
         end
+        if a and b and a >= 0xE4 and a <= 0xE9 then
+            if (a > 0xE4 and a < 0xE9)
+                or (a == 0xE4 and b >= 0xB8)
+                or (a == 0xE9 and b <= 0xBF)
+            then
+                return true
+            end
+        end
     end
     return false
 end
