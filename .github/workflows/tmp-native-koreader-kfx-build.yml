@@ -1,0 +1,195 @@
+name: tmp-native-koreader-kfx-build
+on:
+  push:
+    branches:
+      - tmp/native-koreader-kfx-20260907
+permissions:
+  contents: read
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Download verified upstream releases
+        shell: bash
+        run: |
+          set -euo pipefail
+          curl -L --fail --retry 3 -o /tmp/koreader.zip https://github.com/koreader/koreader/releases/download/v2026.07.1/koreader-kindlepw2-v2026.07.1.zip
+          echo 'ea1f575c54492a2c679d128b7f3210fd7d6a87e5f5a1ff1f7a7fe2080ff68f86  /tmp/koreader.zip' | sha256sum -c -
+          curl -L --fail --retry 3 -o /tmp/kindle.zip https://github.com/kaikozlov/kindle.koplugin/releases/download/v0.0.5/kindle-koplugin-armv7.zip
+          echo '35fda255c726b62a601225c4744a4fa1e29e25b3c8f8e1dbb2b4afe0e6dd561f  /tmp/kindle.zip' | sha256sum -c -
+      - name: Assemble clean native package
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -rf /tmp/root /tmp/plugin
+          mkdir -p /tmp/root /tmp/plugin
+          unzip -q /tmp/koreader.zip -d /tmp/root
+          test -x /tmp/root/koreader/koreader.sh
+          test -f /tmp/root/koreader/reader.lua
+          test -f /tmp/root/koreader/frontend/pluginloader.lua
+          unzip -q /tmp/kindle.zip -d /tmp/plugin
+          test -f /tmp/plugin/kindle.koplugin/main.lua
+          test -x /tmp/plugin/kindle.koplugin/kindle-helper
+          rm -rf /tmp/root/koreader/plugins/kindle.koplugin
+          cp -a /tmp/plugin/kindle.koplugin /tmp/root/koreader/plugins/
+          cat > /tmp/root/koreader/NATIVE_KOREADER_KFX_BUILD.txt <<'EOF'
+          Native KOReader + Kindle Virtual Library
+          KOReader: v2026.07.1 kindlepw2 official release
+          Kindle Virtual Library: kindle.koplugin v0.0.5 ARMv7 official release
+          Target: Kindle Voyage / models >= Paperwhite 2
+          No Fusion/Duokan runtime patches are applied.
+          EOF
+          mv /tmp/root/koreader /tmp/root/koreader-native-stage
+          mkdir -p /tmp/root/extensions/koreader/bin
+          cat > /tmp/root/extensions/koreader/menu.json <<'EOF'
+          {
+            "items": [
+              {
+                "name": "KOReader",
+                "priority": 0,
+                "action": "./bin/native-start.sh",
+                "params": "",
+                "exitmenu": false,
+                "status": false,
+                "internal": "status Start KOReader"
+              }
+            ]
+          }
+          EOF
+          cat > /tmp/root/extensions/koreader/bin/native-start.sh <<'EOF'
+          #!/bin/sh
+          ROOT=/mnt/us
+          LIVE="$ROOT/koreader"
+          STAGE="$ROOT/koreader-native-stage"
+          BACKUP="$ROOT/koreader-fusion-old"
+          log() {
+              echo "[native-koreader-kfx] $*" >> "$ROOT/koreader-native-install.log"
+          }
+          verify_tree() {
+              d="$1"
+              [ -f "$d/reader.lua" ] && \
+              [ -x "$d/koreader.sh" ] && \
+              [ -f "$d/frontend/pluginloader.lua" ] && \
+              [ -f "$d/plugins/kindle.koplugin/main.lua" ] && \
+              [ -f "$d/plugins/kindle.koplugin/_meta.lua" ] && \
+              [ -x "$d/plugins/kindle.koplugin/kindle-helper" ] && \
+              [ -f "$d/NATIVE_KOREADER_KFX_BUILD.txt" ]
+          }
+          if [ -d "$STAGE" ]; then
+              log "clean activation start"
+              if ! verify_tree "$STAGE"; then
+                  log "stage verification failed"
+                  exit 72
+              fi
+              rm -rf "$BACKUP"
+              if [ -d "$LIVE" ]; then
+                  mv "$LIVE" "$BACKUP" || exit 73
+              fi
+              if mv "$STAGE" "$LIVE" && verify_tree "$LIVE"; then
+                  rm -rf "$BACKUP"
+                  sync
+                  log "clean activation complete"
+              else
+                  log "activation failed; restoring previous tree"
+                  rm -rf "$LIVE"
+                  [ -d "$BACKUP" ] && mv "$BACKUP" "$LIVE"
+                  sync
+                  exit 74
+              fi
+          fi
+          if ! verify_tree "$LIVE"; then
+              log "live tree verification failed"
+              exit 75
+          fi
+          chmod +x "$LIVE/koreader.sh" "$LIVE/plugins/kindle.koplugin/kindle-helper" 2>/dev/null || true
+          [ -f "$LIVE/plugins/kindle.koplugin/dist/bin/python3" ] && chmod +x "$LIVE/plugins/kindle.koplugin/dist/bin/python3" 2>/dev/null || true
+          log "launch native KOReader"
+          exec "$LIVE/koreader.sh" --kual
+          EOF
+          chmod +x /tmp/root/extensions/koreader/bin/native-start.sh
+      - name: Validate native runtime is unpatched
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -rf /tmp/orig
+          mkdir /tmp/orig
+          unzip -q /tmp/koreader.zip -d /tmp/orig
+          python3 - <<'PY'
+          import hashlib, pathlib, sys
+          orig=pathlib.Path('/tmp/orig/koreader')
+          new=pathlib.Path('/tmp/root/koreader-native-stage')
+          allowed={'plugins/kindle.koplugin','NATIVE_KOREADER_KFX_BUILD.txt'}
+          bad=[]
+          for p in orig.rglob('*'):
+              if not p.is_file(): continue
+              rel=p.relative_to(orig).as_posix()
+              q=new/rel
+              if not q.is_file():
+                  bad.append(('missing',rel)); continue
+              if hashlib.sha256(p.read_bytes()).digest()!=hashlib.sha256(q.read_bytes()).digest():
+                  bad.append(('changed',rel))
+          if bad:
+              print(bad[:20]); sys.exit(1)
+          print('OFFICIAL_KOREADER_RUNTIME_BYTE_IDENTICAL', sum(1 for p in orig.rglob('*') if p.is_file()))
+          PY
+      - name: Validate plugin and syntax
+        shell: bash
+        run: |
+          set -euo pipefail
+          diff -qr /tmp/plugin/kindle.koplugin /tmp/root/koreader-native-stage/plugins/kindle.koplugin
+          python3 - <<'PY'
+          import ast, pathlib
+          root=pathlib.Path('/tmp/root/koreader-native-stage/plugins/kindle.koplugin')
+          py=list(root.rglob('*.py'))
+          for p in py:
+              ast.parse(p.read_text('utf-8'), filename=str(p))
+          print('PLUGIN_PY_AST_OK', len(py))
+          PY
+          python3 -m json.tool /tmp/root/extensions/koreader/menu.json >/dev/null
+          sh -n /tmp/root/extensions/koreader/bin/native-start.sh
+          grep -q 'version = "v0.0.5"' /tmp/root/koreader-native-stage/plugins/kindle.koplugin/_meta.lua
+      - name: ARMv7 helper smoke
+        uses: docker/setup-qemu-action@v3
+        with:
+          platforms: arm
+      - name: Execute ARMv7 helper under QEMU
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd /tmp/root/koreader-native-stage/plugins/kindle.koplugin
+          set +e
+          ./kindle-helper >/tmp/helper.out 2>/tmp/helper.err
+          rc=$?
+          set -e
+          test "$rc" -eq 2
+          grep -q 'usage: kindle-helper' /tmp/helper.err
+          grep -q 'convert' /tmp/helper.err
+          : >/tmp/not-a-kfx.kfx
+          ./kindle-helper convert --input /tmp/not-a-kfx.kfx --output /tmp/out.epub --cache-dir /tmp/kcache >/tmp/convert.json
+          python3 - <<'PY'
+          import json
+          x=json.load(open('/tmp/convert.json'))
+          assert x['version']==1 and x['ok'] is False and x.get('code') in ('error','drm')
+          print('ARM_HELPER_STRUCTURED_FAILURE_OK')
+          PY
+      - name: Package
+        shell: bash
+        run: |
+          set -euo pipefail
+          OUT='KOReader-Voyage-v2026.07.1-Native-Kindle-KFX-v0.0.5-ARMv7-OneEntry.zip'
+          cd /tmp/root
+          zip -qry9 "$GITHUB_WORKSPACE/$OUT" .
+          cd "$GITHUB_WORKSPACE"
+          unzip -t "$OUT" >/dev/null
+          sha256sum "$OUT" > "$OUT.sha256.txt"
+          du -h "$OUT"
+          unzip -l "$OUT" | tail -1
+      - uses: actions/upload-artifact@v4
+        with:
+          name: native-koreader-kfx-package
+          path: |
+            KOReader-Voyage-v2026.07.1-Native-Kindle-KFX-v0.0.5-ARMv7-OneEntry.zip
+            KOReader-Voyage-v2026.07.1-Native-Kindle-KFX-v0.0.5-ARMv7-OneEntry.zip.sha256.txt
+          if-no-files-found: error
+          compression-level: 0
