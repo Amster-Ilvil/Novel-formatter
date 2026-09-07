@@ -1,0 +1,24 @@
+name: tmp-fetch-bookshelf-v470
+on:
+  push:
+    branches:
+      - tmp/native-koreader-kfx-20260907
+permissions:
+  contents: read
+jobs:
+  fetch:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Download verified Bookshelf v4.7.0
+        shell: bash
+        run: |
+          set -euo pipefail
+          curl -L --fail --retry 3 -o bookshelf.koplugin.zip https://github.com/AndyHazz/bookshelf.koplugin/releases/download/v4.7.0/bookshelf.koplugin.zip
+          echo '19cf4c43990c98e0e11bb037967b7bad7d494804aa13b14daa7d7a0224e7c98d  bookshelf.koplugin.zip' | sha256sum -c -
+      - uses: actions/upload-artifact@v4
+        with:
+          name: bookshelf-koplugin-v4.7.0
+          path: bookshelf.koplugin.zip
+          if-no-files-found: error
+          compression-level: 0
