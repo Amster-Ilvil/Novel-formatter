@@ -1,0 +1,53 @@
+name: tmp-r4-kindle-syntax
+on:
+  push:
+    branches:
+      - tmp/native-koreader-kfx-20260907
+permissions:
+  contents: read
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Lua 5.1
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y lua5.1 lua-filesystem
+      - name: Parse R4 Lua
+        run: |
+          set -euo pipefail
+          luac5.1 -p tmp/r4/library_index.lua
+          luac5.1 -p tmp/r4/virtual_library.lua
+          luac5.1 -p tmp/r4/kindle_library.lua
+          echo LUA_R4_PARSE_OK
+      - name: Exercise physical Kindle scan
+        run: |
+          set -euo pipefail
+          sudo mkdir -p /mnt/us/documents/Downloads/Items01
+          sudo chown -R "$USER":"$USER" /mnt/us
+          printf 'CONTxxxx' > '/mnt/us/documents/Downloads/Items01/とある魔術の禁書目録_B012345678.kfx'
+          printf 'BOOKMOBI' > '/mnt/us/documents/Downloads/Items01/日本語KF8_B087654321.azw3'
+          printf '\352DRMION\356' > '/mnt/us/documents/Downloads/Items01/DRMION_Test_B001122334.azw'
+          lua5.1 - <<'LUA'
+          package.preload['libs/libkoreader-lfs'] = function() return require('lfs') end
+          package.preload['logger'] = function()
+              return { info=function() end, warn=function() end, dbg=function() end }
+          end
+          local LibraryIndex = dofile('tmp/r4/library_index.lua')
+          local fake = { isAvailable=function() return false end }
+          local idx = LibraryIndex:new(fake)
+          local books = assert(idx:scan())
+          assert(#books == 3, 'expected three physical entries, got '..#books)
+          local byfmt, jp, downloads = {}, 0, 0
+          for _, b in ipairs(books) do
+              byfmt[b.format_label] = (byfmt[b.format_label] or 0) + 1
+              if b.library_group == 'amazon_jp' then jp = jp + 1 end
+              if b.filesystem_download then downloads = downloads + 1 end
+          end
+          assert(byfmt.KFX == 2, 'expected two KFX entries')
+          assert(byfmt.AZW3 == 1, 'expected one AZW3 entry')
+          assert(downloads == 3, 'expected all three as physical downloads')
+          assert(jp >= 2, 'expected Japanese filename detection')
+          print('R4_PHYSICAL_SCAN_PASS', #books, byfmt.KFX, byfmt.AZW3, jp)
+          LUA
