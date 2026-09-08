@@ -1,0 +1,37 @@
+name: tmp-r9-lua-syntax
+on:
+  push:
+    branches:
+      - tmp/native-koreader-kfx-20260907
+permissions:
+  contents: read
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Lua syntax validators
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq lua5.1 luajit
+      - name: Validate R9 modified Lua
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -rf /tmp/r9lua && mkdir -p /tmp/r9lua
+          gzip -t .tmp/r9-lua-test.tar.gz
+          tar -xzf .tmp/r9-lua-test.tar.gz -C /tmp/r9lua
+          mapfile -t files < <(find /tmp/r9lua -type f -name '*.lua' | sort)
+          printf 'Lua files: %s\n' "${#files[@]}"
+          test "${#files[@]}" -ge 10
+          for f in "${files[@]}"; do
+            echo "lua5.1: $f"
+            luac5.1 -p "$f"
+            echo "luajit: $f"
+            luajit -b "$f" /tmp/out.luac
+            rm -f /tmp/out.luac
+          done
+          grep -R 'kindle_jp' /tmp/r9lua/plugins/bookshelf.koplugin/lib/bookshelf_tab_model.lua
+          grep -R 'source = { kind = "local" }' /tmp/r9lua/plugins/bookshelf.koplugin/lib/bookshelf_tab_model.lua
+          grep -R 'saveSetting("start_with", "bookshelf")' /tmp/r9lua/patches/0-amazonjp-bookshelf-home.lua
+          echo 'R9 Lua syntax PASS'
