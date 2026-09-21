@@ -23,3 +23,35 @@ jobs:
           python-version: "3.12"
       - name: Scan tracked files for private data
         run: python scripts/privacy_audit.py
+
+  ai-image-cloud-validation:
+    name: AI image GLM transport (Python ${{ matrix.python-version }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.12", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v6
+        with:
+          python-version: ${{ matrix.python-version }}
+      - name: Restore exact validation overlay
+        shell: bash
+        run: |
+          base64 -d .cloud/ai-validation-overlay.tar.gz.b64 > /tmp/ai-validation-overlay.tar.gz
+          echo "90cb4325ad46cd0cb2b12b347e873bdc85f80ec3580e3deb72b0994fb29e6ded  /tmp/ai-validation-overlay.tar.gz" | sha256sum -c -
+          tar -xzf /tmp/ai-validation-overlay.tar.gz
+      - name: Install cloud-test dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install "openai>=1.50,<3" httpx pillow pytest
+      - name: Compile AI transport modules
+        run: |
+          python -m py_compile ai/config.py ai/secure_store.py ai/redaction.py ai/glm_compat.py ai/multimodal_client.py ai/openai_provider.py ai/provider_factory.py
+      - name: Run GLM and multimodal transport tests
+        env:
+          PYTHONUTF8: "1"
+        run: |
+          python -m pytest -q tests/test_glm_provider_multimodal.py tests/test_multimodal_client_resilience.py tests/test_multimodal_openai_transport_e2e.py tests/test_openai_provider_glm_compat.py
