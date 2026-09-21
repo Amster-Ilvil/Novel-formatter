@@ -4,9 +4,12 @@ on:
   push:
     branches:
       - ai-image-v16-cloud-validation-20260921
+      - ai-image-v16-cloud-validation-base-20260921
+      - ai-image-v16-cloud-validation-run-20260921
   pull_request:
     branches:
       - main
+      - ai-image-v16-cloud-validation-base-20260921
   workflow_dispatch:
 
 permissions:
