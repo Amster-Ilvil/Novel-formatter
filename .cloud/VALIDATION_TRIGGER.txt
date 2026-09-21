@@ -1,0 +1,4 @@
+AI image cloud validation trigger
+Date: 2026-09-21
+Overlay SHA-256: 90cb4325ad46cd0cb2b12b347e873bdc85f80ec3580e3deb72b0994fb29e6ded
+Purpose: trigger pull_request synchronize after the validation workflow exists on the branch.
