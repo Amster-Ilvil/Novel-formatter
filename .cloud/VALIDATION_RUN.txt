@@ -1,0 +1,4 @@
+Cloud validation child PR trigger
+Date: 2026-09-21
+Parent validation base: 78c536077c58d39cb6344b99f73ca0ed497f4a37
+Overlay SHA-256: 90cb4325ad46cd0cb2b12b347e873bdc85f80ec3580e3deb72b0994fb29e6ded
