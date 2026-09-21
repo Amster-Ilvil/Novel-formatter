@@ -4,6 +4,9 @@ on:
   push:
     branches:
       - ai-image-v16-cloud-validation-20260921
+  pull_request:
+    branches:
+      - main
   workflow_dispatch:
 
 permissions:
@@ -40,10 +43,10 @@ jobs:
 
       - name: Compile AI transport modules
         run: |
-          python -m py_compile             ai/config.py             ai/secure_store.py             ai/redaction.py             ai/glm_compat.py             ai/multimodal_client.py             ai/openai_provider.py             ai/provider_factory.py
+          python -m py_compile ai/config.py ai/secure_store.py ai/redaction.py ai/glm_compat.py ai/multimodal_client.py ai/openai_provider.py ai/provider_factory.py
 
       - name: Run GLM and multimodal transport tests
         env:
           PYTHONUTF8: "1"
         run: |
-          python -m pytest -q             tests/test_glm_provider_multimodal.py             tests/test_multimodal_client_resilience.py             tests/test_multimodal_openai_transport_e2e.py             tests/test_openai_provider_glm_compat.py
+          python -m pytest -q tests/test_glm_provider_multimodal.py tests/test_multimodal_client_resilience.py tests/test_multimodal_openai_transport_e2e.py tests/test_openai_provider_glm_compat.py
