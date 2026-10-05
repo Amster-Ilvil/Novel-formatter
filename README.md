@@ -22,28 +22,39 @@
 
 - **图片 / PDF 导入**：支持图片、文件夹和 PDF 页面处理。
 - **日文竖排 OCR**：针对日文书籍纵排、分列和跨列内容处理。
-- **多模型 OCR 对比与融合**：可组合 Apple Vision、NDLOCR、Manga OCR、PaddleOCR、YomiToku、Hayai OCR 等结果进行复核。
+- **多模型 OCR 对比与融合**：可组合 Apple Vision、Windows Snipping OCR、NDLOCR-Lite、Hayai OCR、48px OCR、PaddleOCR 等结果进行复核。
 - **图文对照校对**：结合原始页面与 OCR 结果检查错字、漏字、低置信度文本和版面问题。
 - **Ruby / 页眉页码处理**：使用 FindText CenterNet 辅助定位并清理假名注音、页眉、页码、跨列和跨页残片。
 - **Formatter 文本整理**：对 OCR 文本进行段落、标点、标题和跨页接续等后处理。
 - **EPUB 制作**：从整理后的正文、结构和资源直接导出 EPUB。
-- **AI 修复包**：导出 OCR 证据、正文、结构和资源，交给 GPT、Claude 等大模型继续复核并生成接近出版成品的 EPUB。
+- **AI 修复包**：导出 OCR 证据、正文、结构和资源，交给 GPT、Gemini、GLM、DeepSeek 等兼容服务继续复核并生成接近出版成品的 EPUB。
 - **本地数据优先**：模型、缓存、日志、数据库和用户输出不作为项目源码提交。
+
+## v2.0 主要更新
+
+相比 v1.3，v2.0 对 OCR、校对、PDF 与 EPUB 工作流进行了较大升级：
+
+- **全新的项目工作区**：统一保存页面、OCR、裁决、格式处理与 EPUB 制作状态，支持项目恢复与最近项目管理。
+- **多模型 OCR 与裁决升级**：完善逐列 / 全页等模型角色、分歧复核、图文对照和人工裁决流程，并优化 Hayai OCR、NDLOCR-Lite、48px OCR 等本地引擎的运行链路。
+- **原生系统 OCR 扩展**：新增 Windows 11 Snipping OCR；Apple OCR 重构为更稳定的原生 Vision 路径，并改善 Intel 与 Apple Silicon Mac 的兼容性。
+- **PDF 文字层流程重构**：直接使用“页面管理”中的原始 PDF 与物理页映射，改善竖排阅读顺序、跨页接续、段落结构和出版级文本整理。
+- **AI 裁决增强**：支持 GPT、Gemini、GLM、DeepSeek 等兼容服务，并加强裁决包、模型证据与人工修改的安全往返。
+- **EPUB / TEI 与界面升级**：增强封面、插图、分页、元数据和 EPUB 结构处理，同时重构主要界面、预览与进度反馈，并提升长篇任务稳定性和跨平台运行能力。
 
 ## OCR 引擎
 
 支持或可选：
 
 - Apple Vision（macOS）
-- NDLOCR
-- Manga OCR
+- Windows Snipping OCR（Windows 11）
+- NDLOCR-Lite
+- Hayai OCR
+- 48px OCR
 - PaddleOCR
 - Paddle VL MLX（macOS Apple Silicon）
-- YomiToku
-- Hayai OCR
 - FindText CenterNet（Ruby 区域辅助）
 
-Apple Vision、Swift OCR Helper、Apple Pencil 手写识别仅在 macOS 可用。
+Apple Vision、Swift OCR Helper、Apple Pencil 手写识别仅在 macOS 可用；Windows Snipping OCR 仅在支持相应系统 OCR 组件的 Windows 11 环境可用。
 
 ## 推荐流程
 
@@ -113,6 +124,7 @@ python gui_pyside6.py
 | Formatter / EPUB | ✓ | ✓ |
 | AI 修复包 | ✓ | ✓ |
 | Apple Vision | ✓ | — |
+| Windows Snipping OCR | — | Windows 11 |
 | Swift OCR Helper | ✓ | — |
 | Apple Pencil 手写识别 | ✓ | — |
 
