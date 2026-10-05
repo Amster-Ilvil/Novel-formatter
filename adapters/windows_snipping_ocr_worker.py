@@ -210,7 +210,11 @@ class OneOcrEngine:
                     f"OneOCR 输入尺寸必须在 {MIN_IMAGE_SIDE}–{MAX_IMAGE_SIDE}pt；"
                     f"当前为 {width}×{height}"
                 )
-            raw = rgba.tobytes("raw", "RGBA")
+            # OneOCR type=3 expects BGRA byte order (the native Windows image
+            # convention used by Snipping Tool), not Pillow's default RGBA order.
+            b, g, red, a = rgba.split()
+            bgra = Image.merge("RGBA", (b, g, red, a))
+            raw = bgra.tobytes()
             stride = width * 4
 
         buffer = (c_ubyte * len(raw)).from_buffer_copy(raw)
