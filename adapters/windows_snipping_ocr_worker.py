@@ -212,8 +212,8 @@ class OneOcrEngine:
                 )
             # OneOCR type=3 expects BGRA byte order (the native Windows image
             # convention used by Snipping Tool), not Pillow's default RGBA order.
-            b, g, red, a = rgba.split()
-            bgra = Image.merge("RGBA", (b, g, red, a))
+            red, green, blue, alpha = rgba.split()
+            bgra = Image.merge("RGBA", (blue, green, red, alpha))
             raw = bgra.tobytes()
             stride = width * 4
 
