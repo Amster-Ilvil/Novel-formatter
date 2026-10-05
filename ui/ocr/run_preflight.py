@@ -162,6 +162,12 @@ def build_run_preflight(tab) -> OcrRunPreflight:
             )
         physical_column_required = False
 
+    if issue is None and "windows_snipping_ocr" in engine_ids:
+        from adapters.windows_snipping_ocr_adapter import availability
+        ready, detail = availability()
+        if not ready:
+            issue = OcrPreflightIssue("Windows Snipping OCR 不可用", detail)
+
     if multi_role_plan is not None:
         columnish_engines = {
             engine for role, engine in multi_role_plan.selected_roles

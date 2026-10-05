@@ -795,6 +795,12 @@ def runtime_ready(component_id: str) -> bool:
 
 
 def runtime_status_text(component_id: str, *, deep: bool = False, refresh: bool = False) -> str:
+    if component_id == "windows_snipping_ocr":
+        try:
+            from adapters.windows_snipping_ocr_adapter import runtime_status
+            return runtime_status()
+        except Exception as exc:
+            return f"Windows Snipping OCR 检测失败：{exc}"
     if component_id == "apple_vision":
         try:
             from adapters.vision_backends import BackendFactory
@@ -910,4 +916,11 @@ def installed_local_layout_engines() -> list[str]:
 
 def installed_local_recognition_engines() -> list[str]:
     candidates = ["hayai_ocr", "manga_48px", "ndlocr_lite", "paddle_ocr"]
-    return [item for item in candidates if runtime_ready(item)]
+    installed = [item for item in candidates if runtime_ready(item)]
+    try:
+        from adapters.windows_snipping_ocr_adapter import availability
+        if availability()[0]:
+            installed.append("windows_snipping_ocr")
+    except Exception:
+        pass
+    return installed

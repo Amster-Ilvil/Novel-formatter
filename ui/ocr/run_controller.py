@@ -371,6 +371,7 @@ def _run_ocr_impl(
         if project_manager is not None and project_manager.active_project is not None:
             adapter_file_map = {
                 "apple_vision": "apple_vision_adapter.py",
+                "windows_snipping_ocr": "windows_snipping_ocr_adapter.py",
                 "ndlocr_lite": "ndlocr_lite_adapter.py",
                 "hayai_ocr": "hayai_ocr_adapter.py",
                 "manga_48px": "manga_48px_adapter.py",

@@ -2812,6 +2812,9 @@ class OCRTab(QWidget):
         if engine_id == "ndlocr_lite":
             from adapters.ndlocr_lite_adapter import run as ocr_run
             return ocr_run(**common_kwargs)
+        if engine_id == "windows_snipping_ocr":
+            from adapters.windows_snipping_ocr_adapter import run as ocr_run
+            return ocr_run(**common_kwargs)
         if engine_id == "hayai_ocr":
             from adapters.hayai_ocr_adapter import run as ocr_run
             return ocr_run(engine_options=opts, **common_kwargs)

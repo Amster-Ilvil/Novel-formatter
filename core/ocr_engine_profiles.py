@@ -41,6 +41,11 @@ _PROFILES: dict[str, OcrEngineProfile] = {
         0.85, 0.50, 18, 14,
         notes="Native pixels with generous paper context; avoids narrow manual-crop regression.",
     ),
+    "windows_snipping_ocr": OcrEngineProfile(
+        "windows_snipping_ocr", "windows-oneocr-context-v1", "column", "context", "cpu_model",
+        0.70, 0.40, 16, 12,
+        notes="Windows Snipping Tool OneOCR using the installed system model and native RGBA pixels.",
+    ),
     "macocr": OcrEngineProfile(
         "macocr", "apple-vision-context-v1", "column", "context", "native_vision",
         0.85, 0.50, 18, 14,

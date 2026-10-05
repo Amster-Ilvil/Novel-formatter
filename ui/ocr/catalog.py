@@ -1,9 +1,13 @@
 # -*- coding: utf-8 -*-
 """Selectable OCR engine catalog shared by OCR and settings UI."""
 
+import sys
+
 OCR_ADAPTERS = [
     ("apple_vision", "Apple OCR", "macOS", "#4A3FA3",
      "Apple Live Text / Vision 框架，竖排识别优先", True),
+    ("windows_snipping_ocr", "Windows Snipping OCR", "Windows 10/11", "#2563EB",
+     "复用系统截图工具 Snipping Tool 自带 OneOCR；本地离线，不下载或打包 Microsoft DLL/模型", sys.platform == "win32"),
     ("paddle_ocr",   "PaddleOCR",        "跨平台", "#C0542F",
      "百度 PaddleOCR，坐标为像素值数组（首次使用会自动创建独立环境并下载模型）", True),
     ("paddle_aistudio", "PaddleOCR · AI Studio API", "云端", "#2B6CB0",

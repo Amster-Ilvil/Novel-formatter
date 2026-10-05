@@ -82,7 +82,7 @@ _COMPACT_VIEWPORT_ENGINES = frozenset({
     if get_ocr_engine_profile(key).viewport_mode in {"compact", "line", "short_block"}
 })
 _CONTEXT_VIEWPORT_ENGINES = frozenset({
-    key for key in ("apple_vision", "macocr", "mac_ocr", "macos_ocr", "ndlocr_lite",
+    key for key in ("apple_vision", "macocr", "mac_ocr", "macos_ocr", "windows_snipping_ocr", "ndlocr_lite",
                     "paddle_ocr", "google_vision")
     if get_ocr_engine_profile(key).viewport_mode == "context"
 })
