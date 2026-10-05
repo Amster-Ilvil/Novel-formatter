@@ -47,7 +47,7 @@ _PROFILES = {
         paddle_lang="japan",
         google_language_hints=("ja",),
         compatible_engines=frozenset({
-            "apple_vision", "paddle_ocr", "ndlocr_lite",
+            "apple_vision", "windows_snipping_ocr", "paddle_ocr", "ndlocr_lite",
             "manga_48px", "hayai_ocr", "paddle_aistudio",
         }),
         allow_column_pipeline=True,
@@ -66,7 +66,7 @@ _PROFILES = {
         apple_languages=("zh-Hans", "zh-CN", "en-US"),
         paddle_lang="ch",
         google_language_hints=("zh-CN", "zh"),
-        compatible_engines=frozenset({"apple_vision", "paddle_ocr", "paddle_aistudio"}),
+        compatible_engines=frozenset({"apple_vision", "windows_snipping_ocr", "paddle_ocr", "paddle_aistudio"}),
         allow_column_pipeline=False,
         allow_japanese_handwriting=False,
         preserve_layout_by_default=True,

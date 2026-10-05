@@ -179,6 +179,24 @@ class OCRCompareViewMixin:
         return tuple(index for index, state in enumerate(self._fusion_states) if state.unresolved)
 
 
+    def disagreement_queue_row_order(self) -> tuple[int, ...]:
+        """Return the active pending-row order for the synchronized image queue."""
+        if bool(getattr(self, "_show_resolved_history", False)):
+            return ()
+        return tuple(self._decision_navigation_rows())
+
+
+    def _publish_disagreement_queue_order(self, rows=None) -> None:
+        if bool(getattr(self, "_show_resolved_history", False)):
+            return
+        values = self.disagreement_queue_row_order() if rows is None else tuple(
+            int(value) for value in rows
+        )
+        signal = getattr(self, "disagreement_queue_order_changed", None)
+        if signal is not None:
+            signal.emit(tuple(values))
+
+
     def _toggle_active_review_queue(self, checked: bool) -> None:
         self._decision_queue_signature = ()
         self._refresh_decision_queue(force=True)
@@ -489,6 +507,8 @@ class OCRCompareViewMixin:
                 self._syncing_decision_queue = False
             self._decision_queue_signature = mode_key
         self._select_current_queue_item()
+        if not history_mode:
+            self._publish_disagreement_queue_order(rows)
 
 
     def _remove_decision_queue_rows(self, row_indices) -> int:
@@ -497,6 +517,7 @@ class OCRCompareViewMixin:
         removed = self._decision_queue_model.remove_row_indices(row_indices)
         if removed:
             self._decision_queue_count.setText(str(self._decision_queue_model.rowCount()))
+            self._publish_disagreement_queue_order(self._decision_queue_model.rows)
         return removed
 
 
@@ -720,6 +741,9 @@ class OCRCompareViewMixin:
             if hasattr(self, "_history_service"):
                 widget.about_to_resolve.connect(self._history_service.prepare_resolution)
                 widget.about_to_reopen.connect(self._history_service.prepare_reopen)
+            # Publish selected-candidate edits without rebuilding the editor
+            # under the user's cursor or advancing to another sentence.
+            widget.manual_text_changed.connect(self._publish_fusion_decision)
             widget.resolved.connect(self._fusion_row_resolved)
             widget.reopened.connect(self._fusion_row_reopened)
             if hasattr(self, "_history_service"):

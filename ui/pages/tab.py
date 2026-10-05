@@ -1539,7 +1539,7 @@ class PageManagerTab(QWidget):
         cell.setContextMenuPolicy(Qt.CustomContextMenu)
         cell.customContextMenuRequested.connect(partial(self._on_thumb_context, page_no))
         self._grid_layout.addWidget(
-            cell, index // columns, index % columns, Qt.AlignTop | Qt.AlignHCenter,
+            cell, index // columns, index % columns, Qt.AlignTop | Qt.AlignLeft,
         )
 
     def _desired_grid_columns(self) -> int:

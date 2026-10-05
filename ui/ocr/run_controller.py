@@ -309,7 +309,7 @@ def _run_ocr_impl(
         }
         if configured_engine == "apple_vision":
             runtime_backend_config[configured_engine].setdefault(
-                "apple_backend", options.get("apple_backend") or "live_text"
+                "apple_backend", options.get("apple_backend") or "native_helper"
             )
         elif configured_engine == "ndlocr_lite":
             runtime_backend_config[configured_engine].setdefault("backend", "NDLOCR-Lite / ONNX Runtime")
@@ -371,6 +371,7 @@ def _run_ocr_impl(
         if project_manager is not None and project_manager.active_project is not None:
             adapter_file_map = {
                 "apple_vision": "apple_vision_adapter.py",
+                "windows_snipping_ocr": "windows_snipping_ocr_adapter.py",
                 "ndlocr_lite": "ndlocr_lite_adapter.py",
                 "hayai_ocr": "hayai_ocr_adapter.py",
                 "manga_48px": "manga_48px_adapter.py",

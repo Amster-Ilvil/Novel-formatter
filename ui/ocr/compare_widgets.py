@@ -271,6 +271,7 @@ class _FusionCandidateCard(QFrame):
     def _sync_candidate_text(self):
         if self._candidate_state is not None:
             self._candidate_state.text = self.editor.toPlainText()
+            self._candidate_state.delete_intentionally = not bool(self._candidate_state.text.strip())
             self._candidate_state_signature = self._snapshot_candidate_state(self._candidate_state)
         self.text_edited.emit(self.candidate_index)
 
@@ -384,6 +385,7 @@ class _FusionDecisionRow(QFrame):
     resolved = Signal(int)
     about_to_reopen = Signal(int)
     reopened = Signal(int)
+    manual_text_changed = Signal(int)
 
     def __init__(
         self,
@@ -696,6 +698,8 @@ class _FusionDecisionRow(QFrame):
             self._decision_state.selection_origin = "human_manual_edit"
         self._refresh_candidate_diffs()
         self._refresh_reference_preview()
+        if self._decision_state.selected_index == int(candidate_index):
+            self.manual_text_changed.emit(self.row_index)
 
     @staticmethod
     def _merge_marks(marks):

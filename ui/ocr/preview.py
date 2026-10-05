@@ -51,16 +51,16 @@ class OCRCropPreview(QLabel):
         # Real-time masked-column preview.  Boxes are stored in normalized image
         # coordinates so they remain aligned after the QLabel is resized.
         self._column_rects_norm: list[tuple[float, float, float, float]] = []
-        self._column_overlays: list[QLabel] = []
-        # Final native-pixel OCR reveal boxes.  These are deliberately separate
-        # from the detector boxes: red shows what the detector found, while
-        # green shows the larger source area that is actually preserved before
-        # Ruby is blanked and white context is added for the recognizer.
+        self._column_overlays: list[QFrame] = []
+        self._column_labels: list[QLabel] = []
+        # Final native-pixel OCR reveal boxes are deliberately separate from
+        # detector boxes: red marks detected columns, blue marks source pixels
+        # preserved for OCR before Ruby is blanked and white context is added.
         self._input_rects_norm: list[tuple[float, float, float, float]] = []
         self._input_overlays: list[QFrame] = []
         self._show_detector_boxes = True
         self._show_input_boxes = True
-        # Review-only one-character frames.  They are independent from the green
+        # Review-only one-character frames. They are independent from the
         # physical-column boxes and are only populated while the user has
         # explicitly enabled the per-character review controls.
         self._character_rects_norm: list[tuple[float, float, float, float]] = []
@@ -68,10 +68,11 @@ class OCRCropPreview(QLabel):
 
     def _clear_column_overlays(self):
         self._column_rects_norm = []
-        for overlay in self._column_overlays:
+        for overlay in (*self._column_overlays, *self._column_labels):
             overlay.hide()
             overlay.deleteLater()
         self._column_overlays = []
+        self._column_labels = []
 
     def _clear_input_overlays(self):
         self._input_rects_norm = []
@@ -125,15 +126,23 @@ class OCRCropPreview(QLabel):
             if right - left <= 0.0001 or bottom - top <= 0.0001:
                 continue
             self._column_rects_norm.append((left, top, right, bottom))
-            overlay = QLabel(str(index), self)
-            overlay.setAlignment(Qt.AlignTop | Qt.AlignLeft)
-            overlay.setContentsMargins(3, 1, 0, 0)
-            overlay.setStyleSheet(
-                "background: rgba(220,38,38,5); border: 2px solid rgb(220,38,38); "
-                "color: rgb(220,38,38); font-size: 11px; font-weight: 700;"
+            frame = QFrame(self)
+            frame.setStyleSheet(
+                "background: transparent; border: 2px solid rgb(220,38,38);"
             )
-            overlay.setAttribute(Qt.WA_TransparentForMouseEvents)
-            self._column_overlays.append(overlay)
+            frame.setAttribute(Qt.WA_TransparentForMouseEvents)
+            self._column_overlays.append(frame)
+
+            label = QLabel(str(index), self)
+            label.setAlignment(Qt.AlignCenter)
+            label.setStyleSheet(
+                "background: rgba(255,255,255,230); border: 1px solid rgb(220,38,38); "
+                "color: rgb(220,38,38); font-size: 11px; font-weight: 700; padding: 0 3px;"
+            )
+            label.adjustSize()
+            label.setFixedSize(max(18, label.sizeHint().width()), 18)
+            label.setAttribute(Qt.WA_TransparentForMouseEvents)
+            self._column_labels.append(label)
         self._update_column_overlay_geometry()
 
     def _set_input_rects(self, rects):
@@ -154,8 +163,8 @@ class OCRCropPreview(QLabel):
             self._input_rects_norm.append((left, top, right, bottom))
             overlay = QFrame(self)
             overlay.setStyleSheet(
-                "background: rgba(22,163,74,3); "
-                "border: 2px solid rgb(22,163,74); border-radius: 2px;"
+                "background: rgba(22,119,255,3); "
+                "border: 2px solid rgb(22,119,255); border-radius: 2px;"
             )
             overlay.setAttribute(Qt.WA_TransparentForMouseEvents)
             self._input_overlays.append(overlay)
@@ -381,14 +390,23 @@ class OCRCropPreview(QLabel):
     def _update_column_overlay_geometry(self):
         geo = self._display_geometry()
         if not self._show_detector_boxes or not geo or not self._column_rects_norm:
-            for overlay in self._column_overlays:
+            for overlay in (*self._column_overlays, *self._column_labels):
                 overlay.hide()
             return
         dx, dy, dw, dh = geo
         preview_outset = 2  # diagnostic outline stays outside the OCR crop
         display_right = dx + dw
         display_bottom = dy + dh
-        for overlay, (x0, y0, x1, y1) in zip(self._column_overlays, self._column_rects_norm):
+        common_frame_top = min(
+            max(dy, int(dy + y0 * dh) - preview_outset)
+            for _x0, y0, _x1, _y1 in self._column_rects_norm
+        )
+        common_label_y = max(
+            0, int(common_frame_top) - max(label.height() for label in self._column_labels)
+        )
+        for overlay, label, (x0, y0, x1, y1) in zip(
+            self._column_overlays, self._column_labels, self._column_rects_norm
+        ):
             crop_left = int(dx + x0 * dw)
             crop_top = int(dy + y0 * dh)
             crop_right = int(math.ceil(dx + x1 * dw))
@@ -404,6 +422,16 @@ class OCRCropPreview(QLabel):
             ))
             overlay.show()
             overlay.raise_()
+            label_x = max(
+                dx,
+                min(
+                    display_right - label.width(),
+                    int((frame_left + frame_right - label.width()) / 2),
+                ),
+            )
+            label.setGeometry(label_x, common_label_y, label.width(), label.height())
+            label.show()
+            label.raise_()
 
     def _update_character_overlay_geometry(self):
         geo = self._display_geometry()
@@ -421,4 +449,3 @@ class OCRCropPreview(QLabel):
             ))
             overlay.show()
             overlay.raise_()
-

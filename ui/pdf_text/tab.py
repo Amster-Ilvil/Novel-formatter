@@ -51,7 +51,9 @@ class PdfTextLayerTab(QWidget):
         left.setFixedWidth(PDF_LEFT_WIDTH)
         left.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Expanding)
         left_outer = QVBoxLayout(left)
-        left_outer.setContentsMargins(0, 0, 0, 0)
+        # The OCR/PDF switcher overlays the first 42px of the left column.
+        # Keep the source card entirely below it, including its top border.
+        left_outer.setContentsMargins(0, 52, 0, 0)
         left_outer.setSpacing(16)
 
         # 卡片一：输入
@@ -548,4 +550,3 @@ class PdfTextLayerTab(QWidget):
         if not self._finish_extract(token):
             return
         show_error_dialog(self, "提取失败", msg)
-

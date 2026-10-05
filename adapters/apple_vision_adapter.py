@@ -407,7 +407,7 @@ def run(
     crop_top: float = 0.0,
     crop_bottom: float = 0.0,
     crop_rect: tuple[float, float, float, float] | None = None,
-    backend: str = "live_text",
+    backend: str = "native_helper",
     vertical: bool = True,
     recognition_level: str = "accurate",
     recognition_languages: list[str] | None = None,
@@ -444,7 +444,7 @@ def run(
         crop_bottom:    同上，裁掉底部（页脚区域）。
         crop_rect:      手动框选的识别区域 (x0,y0,x1,y1)，归一化坐标，优先于
                         crop_top/crop_bottom（GUI 拖框选工具产生的参数）。
-        backend:        "live_text" 使用 VisionKit ImageAnalyzer；"native_helper" 使用现代 RecognizeTextRequest；"shortcut" 使用原快捷指令。旧配置中的 "auto" 仅迁移为 live_text。
+        backend:        "live_text" 使用 VisionKit ImageAnalyzer；"native_helper" 使用现代 RecognizeTextRequest；"shortcut" 使用原快捷指令。旧配置中的 "auto" 迁移为稳定的 native_helper。
         vertical:       竖排阅读顺序提示；Helper 会按右到左、上到下排序观察结果。
         vertical_preprocess: "crop_rotate_left" 时仅对单个狭长竖列保留宽纸白上下文并左旋 90°后识别一次，不缩放正文。
         filter_running_headers: 是否在组装文档前自动删除跨页重复页眉/页脚。
@@ -776,7 +776,7 @@ def main():
     parser.add_argument(
         "--backend", "-b",
         choices=["live_text", "native_helper", "shortcut"],
-        default="live_text",
+        default="native_helper",
         help="OCR backend：live_text / native_helper / shortcut",
     )
     parser.add_argument("--quiet", "-q", action="store_true")

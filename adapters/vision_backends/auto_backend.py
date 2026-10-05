@@ -1,22 +1,30 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""Prefer Swift VisionKit Live Text; retain original Shortcuts fallback."""
+"""Compatibility auto backend: native Vision -> Live Text -> Shortcuts.
+
+The normal GUI keeps every Apple OCR route explicit for reproducibility.  This
+backend exists for older plugins/callers that explicitly request ``auto``.  It
+prefers the cross-architecture native Vision helper, then tries VisionKit Live
+Text, and finally preserves the original Shortcuts route.
+"""
 from __future__ import annotations
 
 from .base import VisionBackend, OCRResult, OCRConfig, BackendCapabilities
+from .native_helper_backend import (
+    NativeVisionHelperBackend,
+    HelperInfrastructureError,
+    VisionRecognitionError,
+)
 from .live_text_backend import LiveTextHelperBackend
-from .native_helper_backend import HelperInfrastructureError
 from .shortcut_backend import ShortcutBackend
 
 
 class AutoVisionBackend(VisionBackend):
     def __init__(self):
+        self._native = NativeVisionHelperBackend()
         self._live_text = LiveTextHelperBackend()
-        # Compatibility alias for older tests/extensions that inspected _native.
-        self._native = self._live_text
         self._shortcut = ShortcutBackend()
-        self._live_text_disabled = False
-        self._native_disabled = False
+        self._disabled: set[str] = set()
 
     @property
     def name(self) -> str:
@@ -24,30 +32,50 @@ class AutoVisionBackend(VisionBackend):
 
     @property
     def capabilities(self) -> BackendCapabilities:
-        return self._live_text.capabilities
+        return self._native.capabilities
 
     def is_available(self) -> tuple[bool, str]:
-        live_ok, live_reason = self._live_text.is_available()
-        shortcut_ok, shortcut_reason = self._shortcut.is_available()
-        if live_ok or shortcut_ok:
-            return True, ""
-        return False, f"Live Text Helper: {live_reason}；快捷指令: {shortcut_reason}"
+        reasons: list[str] = []
+        for label, backend in (
+            ("Native Vision", self._native),
+            ("Live Text", self._live_text),
+            ("快捷指令", self._shortcut),
+        ):
+            ok, reason = backend.is_available()
+            if ok:
+                return True, ""
+            reasons.append(f"{label}: {reason}")
+        return False, "；".join(reasons)
 
     def recognize(self, image_path: str, config: OCRConfig) -> OCRResult:
-        if not self._live_text_disabled and not self._native_disabled:
-            available, _ = self._live_text.is_available()
-            if available:
+        failures: list[str] = []
+        for key, backend in (
+            ("native_helper", self._native),
+            ("live_text", self._live_text),
+            ("shortcut", self._shortcut),
+        ):
+            if key in self._disabled:
+                continue
+            available, reason = backend.is_available()
+            if not available:
+                failures.append(f"{key}: {reason}")
+                continue
+            try:
+                return backend.recognize(image_path, config)
+            except (HelperInfrastructureError, VisionRecognitionError, RuntimeError) as exc:
+                self._disabled.add(key)
                 try:
-                    # Empty but successful Live Text output is final: do not run
-                    # a second OCR merely because no text was found.
-                    return self._live_text.recognize(image_path, config)
-                except HelperInfrastructureError as exc:
-                    self._live_text_disabled = True
-                    self._native_disabled = True
-                    self._live_text.close()
-                    print(f"  ⚠️ Swift Live Text 基础设施/可用性失败，本次任务回退快捷指令：{exc}")
-        return self._shortcut.recognize(image_path, config)
+                    backend.close()
+                except Exception:
+                    pass
+                failures.append(f"{key}: {exc}")
+        raise HelperInfrastructureError(
+            "Apple OCR 自动兼容链全部不可用：" + "；".join(failures[-3:])
+        )
 
     def close(self) -> None:
-        self._live_text.close()
-        self._shortcut.close()
+        for backend in (self._native, self._live_text, self._shortcut):
+            try:
+                backend.close()
+            except Exception:
+                pass

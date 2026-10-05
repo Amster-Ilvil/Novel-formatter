@@ -214,8 +214,7 @@ class OCRCompareProjectStateService:
                 state.selected_index = None
                 state.selection_origin = ""
                 state.review_indices = state._build_review_indices()
-                if str(data.get("origin", "")) == "image_review":
-                    tab._image_review_overrides.pop(tab._image_review_row_identity(tab._comparison.rows[row_index]), None)
+                tab._image_review_overrides.pop(tab._image_review_row_identity(tab._comparison.rows[row_index]), None)
                 affected.add(row_index)
                 continue
 
@@ -266,6 +265,8 @@ class OCRCompareProjectStateService:
                     "segment_key": str(data.get("segment_key", "") or ""),
                     "delete_intentionally": delete_intentionally,
                 }
+            else:
+                tab._image_review_overrides.pop(tab._image_review_row_identity(tab._comparison.rows[row_index]), None)
             affected.add(row_index)
 
         if not affected:

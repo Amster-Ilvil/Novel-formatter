@@ -25,7 +25,7 @@ from ui.common.toast import notify
 from ui.common.styling import BORDER, CARD, MUTED, LIGHT_PREVIEW_STYLE, EDITOR_SCROLLBAR_STYLE, accent_button, wrap_in_card
 from ui.design.metrics import (
     REVIEW_PAGE_MARGIN_X, REVIEW_PAGE_MARGIN_TOP, REVIEW_PAGE_MARGIN_BOTTOM,
-    REVIEW_LEFT_WIDTH, REVIEW_COLUMN_GAP, REVIEW_TEXT_HEIGHT, REVIEW_EDITOR_HEIGHT,
+    REVIEW_LEFT_WIDTH, REVIEW_COLUMN_GAP,
 )
 from ui.dialogs import show_error_dialog
 from ui.localized_dialogs import LocalizedMessageBox
@@ -47,7 +47,7 @@ class _ImageReviewFusionCandidateCard(QFrame):
         self.candidate_index = int(candidate_index)
         self.candidate_text = str(text or "")
         self.setObjectName("imageReviewFusionCard")
-        self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Minimum)
+        self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
         root = QVBoxLayout(self)
         root.setContentsMargins(10, 8, 10, 9)
         root.setSpacing(6)
@@ -141,8 +141,10 @@ class _ImageReviewFusionCandidateCard(QFrame):
             document = self._body.document()
             document.setTextWidth(float(max(1, self._body.viewport().width())))
             height = max(64, int(math.ceil(document.size().height())) + 24)
-            if self._body.height() != height or self._body.minimumHeight() != height:
-                self._body.setFixedHeight(height)
+            # Keep enough height for every wrapped line, while allowing the
+            # candidate card's row to use the remaining comparison area.
+            if self._body.minimumHeight() != height:
+                self._body.setMinimumHeight(height)
         except RuntimeError:
             pass
 
@@ -228,6 +230,8 @@ class OCRImageTextReviewTab(QWidget):
         self._pending_judgement_indices: set[int] = set()
         self._has_judgement_entries = False
         self._ocr_disagreement_indices: list[int] = []
+        self._ocr_disagreement_source_indices: list[int] = []
+        self._ocr_disagreement_source_row_order: tuple[int, ...] = ()
         self._pending_ocr_sync_rows: set[int] = set()
         self._pending_ocr_compare_decisions: dict[str, dict] = {}
         self._suppress_row_review_emit = False
@@ -418,7 +422,7 @@ class OCRImageTextReviewTab(QWidget):
         self._fusion_candidate_frame.setStyleSheet(
             "QFrame#fusionCandidateFrame { background: #F7F8FA; border: 1px solid #E2E5E9; border-radius: 12px; }"
         )
-        self._fusion_candidate_frame.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Minimum)
+        self._fusion_candidate_frame.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
         candidate_box = QVBoxLayout(self._fusion_candidate_frame)
         candidate_box.setContentsMargins(8, 6, 8, 7)
         candidate_box.setSpacing(5)
@@ -440,12 +444,15 @@ class OCRImageTextReviewTab(QWidget):
         self._fusion_candidate_scroll.setFrameShape(QFrame.NoFrame)
         self._fusion_candidate_scroll.setStyleSheet("QScrollArea{background:transparent;border:none;}")
         self._fusion_candidate_scroll.setWidget(self._fusion_candidate_frame)
-        text_layout.addWidget(self._fusion_candidate_scroll, 3)
+        text_layout.addWidget(self._fusion_candidate_scroll, 1)
         self._set_fusion_candidates_visible(False)
 
         self._editor = MouseWheelPlainTextEdit()
         self._editor.setPlaceholderText("完成 OCR 后在此横排逐句校对")
-        self._editor.setMinimumHeight(REVIEW_EDITOR_HEIGHT + 24)
+        self._editor.setLineWrapMode(MouseWheelPlainTextEdit.WidgetWidth)
+        self._editor.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self._editor.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self._editor.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
         editor_font = QFont(self._editor.font())
         editor_font.setPointSize(max(13, editor_font.pointSize() + 2))
         self._editor.setFont(editor_font)
@@ -453,7 +460,11 @@ class OCRImageTextReviewTab(QWidget):
             "QPlainTextEdit {" + LIGHT_PREVIEW_STYLE + "}" + EDITOR_SCROLLBAR_STYLE
         )
         self._editor.textChanged.connect(self._on_text_changed)
-        text_layout.addWidget(self._editor, 1)
+        self._editor_fit_timer = QTimer(self)
+        self._editor_fit_timer.setSingleShot(True)
+        self._editor_fit_timer.timeout.connect(self._fit_review_editor_height)
+        text_layout.addWidget(self._editor, 0)
+        self._schedule_review_editor_fit()
 
         # Phase 20 layout follows the supplied review mock-up: immutable OCR
         # columns stay in a narrow card on the left; the source image gets the
@@ -464,8 +475,9 @@ class OCRImageTextReviewTab(QWidget):
         nav = QHBoxLayout()
         nav.setContentsMargins(0, 0, 0, 0)
         nav.setSpacing(7)
-        self._prev_btn = QPushButton("← 上一句")
-        self._prev_btn.clicked.connect(self._previous)
+        self._prev_btn = QPushButton("← 上一分歧")
+        self._prev_btn.setToolTip("保存当前修改并跳到上一条 OCR 分歧句")
+        self._prev_btn.clicked.connect(self._jump_previous_ocr_disagreement)
         self._next_btn = QPushButton("下一句 →")
         self._next_btn.clicked.connect(self._next)
         self._next_btn.setVisible(False)  # Alt+Right and the jump menu browse all sentences.
@@ -499,6 +511,8 @@ class OCRImageTextReviewTab(QWidget):
         self._jump_next_diff_action.triggered.connect(self._jump_next_ocr_disagreement)
         self._jump_menu_btn.setMenu(jump_menu)
         jump_menu.addSeparator()
+        self._jump_previous_plain_action = jump_menu.addAction("上一句（不确认）  Alt+←")
+        self._jump_previous_plain_action.triggered.connect(self._previous)
         self._jump_next_plain_action = jump_menu.addAction("下一句（不确认）  Alt+→")
         self._jump_next_plain_action.triggered.connect(self._next)
         self._jump_menu_btn.setVisible(True)   # 跳转命令需要可见入口，不能只靠右键/快捷键
@@ -730,11 +744,40 @@ class OCRImageTextReviewTab(QWidget):
         return str(entry.text or "")
 
     def _refresh_review_disagreement_queue(self) -> None:
-        values = tuple(int(value) for value in self._ocr_disagreement_indices)
+        source_indices = tuple(int(value) for value in self._ocr_disagreement_source_indices)
+        ordered: list[int] = []
+        seen: set[int] = set()
+        for source_row in self._ocr_disagreement_source_row_order:
+            entry_index = self._entry_index_by_source_row.get(int(source_row))
+            if entry_index is not None and entry_index in source_indices and entry_index not in seen:
+                ordered.append(entry_index)
+                seen.add(entry_index)
+        ordered.extend(index for index in source_indices if index not in seen)
+        self._ocr_disagreement_indices = ordered
+        values = tuple(ordered)
         self._disagreement_queue_indices = values
         self._review_disagreement_queue_model.set_rows(values)
         self._left_queue_btn.setText(f"分歧 {len(values)}")
         self._select_review_disagreement_queue_item()
+
+    def set_disagreement_source_row_order(self, source_rows) -> None:
+        """Apply OCR 对比's queue ordering to matching 图文对照 entries."""
+        values: list[int] = []
+        seen: set[int] = set()
+        for value in source_rows or ():
+            try:
+                row = int(value)
+            except (TypeError, ValueError, OverflowError):
+                continue
+            if row >= 0 and row not in seen:
+                values.append(row)
+                seen.add(row)
+        order = tuple(values)
+        if order == self._ocr_disagreement_source_row_order:
+            return
+        self._ocr_disagreement_source_row_order = order
+        if self._entries:
+            self._refresh_review_disagreement_queue()
 
     def _select_review_disagreement_queue_item(self) -> None:
         row = self._review_disagreement_queue_model.model_index_for_row(self._index)
@@ -763,7 +806,7 @@ class OCRImageTextReviewTab(QWidget):
         self._editor.setEnabled(enabled)
         locked = self._entry_consensus_locked(self._current_entry())
         self._editor.setReadOnly(locked)
-        self._prev_btn.setEnabled(enabled and self._index > 0)
+        self._prev_btn.setEnabled(enabled and len(self._ocr_disagreement_indices) > 1)
         self._next_btn.setEnabled(enabled and self._index + 1 < len(self._entries))
         self._save_btn.setEnabled(enabled and not locked)
         self._save_next_btn.setEnabled(enabled and bool(self._ocr_disagreement_indices))
@@ -905,6 +948,7 @@ class OCRImageTextReviewTab(QWidget):
 
     def reset_for_new_book(self) -> None:
         """Detach every image/text review object from the previous OCR document."""
+        self._external_decision_dirty_rows = set()
         # Release the displayed pixmap before deleting its cache directory.  This
         # matters on platforms that keep open image files locked.
         self._image.clear_image("完成 OCR 后，右侧显示当前句对应的单列或多列原图。")
@@ -938,6 +982,8 @@ class OCRImageTextReviewTab(QWidget):
         self._pending_judgement_indices.clear()
         self._has_judgement_entries = False
         self._ocr_disagreement_indices.clear()
+        self._ocr_disagreement_source_indices.clear()
+        self._ocr_disagreement_source_row_order = ()
         self._index = -1
         self._dirty = False
         self._reviewed_count = 0
@@ -1135,7 +1181,7 @@ class OCRImageTextReviewTab(QWidget):
             if bool(entry.requires_judgement and not entry.reviewed)
         }
         self._has_judgement_entries = any(bool(entry.requires_judgement) for entry in self._entries)
-        self._ocr_disagreement_indices = [
+        self._ocr_disagreement_source_indices = [
             index for index, entry in enumerate(self._entries)
             if self._entry_has_ocr_disagreement(entry)
         ]
@@ -1185,12 +1231,15 @@ class OCRImageTextReviewTab(QWidget):
             if not self._save_current(silent=True):
                 return False
         if target == self._index:
+            if target in getattr(self, "_external_decision_dirty_rows", set()):
+                self._show_current()
             return True
         self._index = target
         self._show_current()
         return True
 
     def _on_text_changed(self) -> None:
+        self._schedule_review_editor_fit()
         entry = self._current_entry()
         if entry is None:
             return
@@ -1210,7 +1259,32 @@ class OCRImageTextReviewTab(QWidget):
         else:
             self._source_label.setText(self._source_name)
 
+    def _schedule_review_editor_fit(self) -> None:
+        timer = getattr(self, "_editor_fit_timer", None)
+        if timer is not None:
+            timer.start(0)
+
+    def _fit_review_editor_height(self) -> None:
+        """Size the manual editor to its wrapped text, leaving spare room above."""
+        try:
+            document = self._editor.document()
+            document.setTextWidth(float(max(1, self._editor.viewport().width() - 4)))
+            content_height = int(math.ceil(document.documentLayout().documentSize().height()))
+            margins = self._editor.contentsMargins()
+            chrome = (
+                self._editor.frameWidth() * 2
+                + margins.top() + margins.bottom()
+                + 18
+            )
+            target = max(58, content_height + chrome)
+            if self._editor.height() != target:
+                self._editor.setFixedHeight(target)
+        except RuntimeError:
+            # The editor may be closing while a coalesced resize is pending.
+            return
+
     def _show_current(self) -> None:
+        getattr(self, "_external_decision_dirty_rows", set()).discard(self._index)
         entry = self._current_entry()
         if entry is None:
             return
@@ -1221,6 +1295,7 @@ class OCRImageTextReviewTab(QWidget):
         self._editor.blockSignals(True)
         self._editor.setPlainText(entry.text)
         self._editor.blockSignals(False)
+        self._schedule_review_editor_fit()
         self._text_state.setText("已人工确认" if entry.reviewed else "")
         physical_count = max(
             1,
@@ -1519,6 +1594,7 @@ class OCRImageTextReviewTab(QWidget):
 
     def resizeEvent(self, event):
         super().resizeEvent(event)
+        self._schedule_review_editor_fit()
         entry = self._current_entry()
         if entry is None or not getattr(self, "_fusion_candidate_frame", None):
             return
@@ -1614,6 +1690,7 @@ class OCRImageTextReviewTab(QWidget):
             row = (candidate_number - 1) // columns
             column = (candidate_number - 1) % columns
             self._fusion_candidate_grid.addWidget(card, row, column)
+            self._fusion_candidate_grid.setRowStretch(row, 1)
             card._choose.setEnabled(not self._entry_consensus_locked(entry))
             card.show()
         for column in range(4):
@@ -1657,8 +1734,11 @@ class OCRImageTextReviewTab(QWidget):
         if not indices:
             self._text_state.setText("当前文档没有多模型 OCR 分歧句")
             return
-        position = bisect_left(indices, self._index) - 1
-        self._index = indices[position] if position >= 0 else indices[-1]
+        try:
+            position = indices.index(self._index)
+        except ValueError:
+            position = 0
+        self._index = indices[(position - 1) % len(indices)]
         self._show_current()
         self._text_state.setText("已跳到上一条 OCR 对比不一致句图")
 
@@ -1671,8 +1751,11 @@ class OCRImageTextReviewTab(QWidget):
         if not indices:
             self._text_state.setText("当前文档没有多模型 OCR 分歧句")
             return
-        position = bisect_right(indices, self._index)
-        self._index = indices[position] if position < len(indices) else indices[0]
+        try:
+            position = indices.index(self._index)
+        except ValueError:
+            position = -1
+        self._index = indices[(position + 1) % len(indices)]
         self._show_current()
         self._text_state.setText("已跳到下一条 OCR 对比不一致句图")
 
@@ -1846,23 +1929,27 @@ class OCRImageTextReviewTab(QWidget):
         if int(getattr(entry, "source_row_index", -1)) >= 0 and not self._suppress_row_review_emit:
             source_row = int(entry.source_row_index)
             self._pending_ocr_sync_rows.add(source_row)
+            self._text_state.setText("已保存，正在同步到 OCR 对比…")
             self.row_review_saved.emit({
                 "row_index": source_row,
                 "sentence_group_id": str(getattr(entry, "sentence_group_id", "") or ""),
                 "column_ids": list(entry.column_ids),
                 "text": str(entry.text or ""),
+                "delete_intentionally": not bool(str(entry.text or "").strip()),
                 "selected_candidate_index": int(entry.selected_candidate_index),
                 "segment_key": str(entry.segment_key),
                 "changed": bool(entry.changed),
                 "reviewed": True,
             })
-            self._text_state.setText("已保存，正在同步到 OCR 对比…")
         return True
 
     def save_pending_edit(self) -> bool:
         """Commit only a real unsaved editor change before leaving the workspace."""
         entry = self._current_entry()
         if entry is None:
+            return True
+        if self._index in getattr(self, "_external_decision_dirty_rows", set()):
+            self._show_current()
             return True
         value = self._editor.toPlainText().replace("\r\n", "\n").replace("\r", "\n").strip("\n")
         if value == str(entry.text or ""):
@@ -1997,6 +2084,10 @@ class OCRImageTextReviewTab(QWidget):
                 self._pending_ocr_compare_decisions[key] = dict(payload)
             return False
         entry = self._entries[target]
+        if not refresh:
+            if not hasattr(self, "_external_decision_dirty_rows"):
+                self._external_decision_dirty_rows = set()
+            self._external_decision_dirty_rows.add(target)
         resolved = bool(payload.get("resolved", False))
         if not resolved:
             was_reviewed = bool(entry.reviewed)
@@ -2143,6 +2234,8 @@ class OCRImageTextReviewTab(QWidget):
             self._apple_handwriting_timeout.stop()
             return
         self.ensure_document_loaded()
+        if self._index in getattr(self, "_external_decision_dirty_rows", set()):
+            self._show_current()
         if self._queued_image_request is not None and not self._image_render_busy:
             self._drain_queued_review_image_render()
         elif self._current_entry() is not None and not self._current_review_image_path:

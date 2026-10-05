@@ -617,6 +617,7 @@ class OCRPreviewController:
                 # blanked and recognizer-specific white context is added.
                 line_width = 1
                 preview_outset = max(2, round(min(annotated.size) / 900))
+                column_frames = []
                 for index, column in enumerate(columns, start=1):
                     in_left, in_top, in_right, in_bottom = _column_source_union(column)
                     input_left = max(0, int(in_left) - preview_outset)
@@ -633,16 +634,36 @@ class OCRPreviewController:
                     frame_top = max(0, int(det_top) - preview_outset)
                     frame_right = min(annotated.width - 1, int(det_right) - 1 + preview_outset)
                     frame_bottom = min(annotated.height - 1, int(det_bottom) - 1 + preview_outset)
+                    column_frames.append((index, frame_left, frame_top, frame_right, frame_bottom))
+
+                # Put every column number on one shared row above the highest
+                # detector frame, so uneven column tops do not stagger labels.
+                common_label_y = max(
+                    0,
+                    min(frame_top for _index, _left, frame_top, _right, _bottom in column_frames)
+                    - 16,
+                )
+                for index, frame_left, frame_top, frame_right, frame_bottom in column_frames:
                     draw.rectangle(
                         (frame_left, frame_top, frame_right, frame_bottom),
                         outline=(34, 197, 94),
                         width=line_width,
                     )
-                    draw.text(
-                        (min(annotated.width - 1, frame_left + 2), min(annotated.height - 1, frame_top + 2)),
-                        str(index),
-                        fill=(17, 130, 68),
+                    label_text = str(index)
+                    label_box = draw.textbbox((0, 0), label_text)
+                    label_width = label_box[2] - label_box[0]
+                    label_height = label_box[3] - label_box[1]
+                    label_x = max(0, min(
+                        annotated.width - label_width,
+                        frame_left + (frame_right - frame_left - label_width) // 2,
+                    ))
+                    label_y = common_label_y
+                    draw.rectangle(
+                        (label_x - 2, label_y - 1,
+                         label_x + label_width + 2, label_y + label_height + 1),
+                        fill=(255, 255, 255),
                     )
+                    draw.text((label_x, label_y), label_text, fill=(17, 130, 68))
                 runtime_options = self._column_runtime_options_snapshot()
                 preserve_body_pixels = bool(
                     runtime_options.get("column_preserve_body_pixels", False)
@@ -712,4 +733,3 @@ class OCRPreviewController:
             dialog.exec()
         except Exception as exc:
             show_error_dialog(self, "分列预览失败", str(exc))
-

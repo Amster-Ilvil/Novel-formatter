@@ -15,6 +15,7 @@ RECOGNITION_ENGINES = {
     "macocr": "Apple OCR",
     "mac_ocr": "Apple OCR",
     "macos_ocr": "Apple OCR",
+    "windows_snipping_ocr": "Windows Snipping OCR",
     "hayai_ocr": "Hayai OCR",
     "manga_48px": "48px AR OCR",
     "ndlocr_lite": "NDLOCR-Lite",
@@ -48,7 +49,7 @@ def _apple_config_and_backend(shortcut_name: str, options: dict):
     from adapters.vision_backends import BackendFactory, OCRConfig
     # Apple OCR is explicit.  ``auto`` is a legacy saved-setting alias handled
     # by BackendFactory and maps to the explicit Live Text route.
-    backend_id = str(options.get("apple_backend") or options.get("backend") or "live_text")
+    backend_id = str(options.get("apple_backend") or options.get("backend") or "native_helper")
     backend = BackendFactory.create(backend_id)
     available, reason = backend.is_available()
     if not available:
@@ -333,6 +334,10 @@ def recognizer_iterator(
             shortcut_name=shortcut_name, engine_options=options, cancel_check=cancel_check
         ) as session:
             yield from session.iter_recognize(image_paths)
+        return
+    if engine == "windows_snipping_ocr":
+        from adapters.windows_snipping_ocr_adapter import _run_worker
+        yield from _run_worker(image_paths, cancel_check=cancel_check, verbose=verbose)
         return
     if engine == "hayai_ocr":
         from adapters.hayai_ocr_adapter import recognize_crops

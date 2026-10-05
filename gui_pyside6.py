@@ -589,7 +589,7 @@ class OCRTab(QWidget):
             "handwriting_backend": combo_data("_handwriting_backend_combo", "auto"),
             "handwriting_char_mask": checked("_handwriting_char_mask_check", True),
             "handwriting_symbol_insert": checked("_handwriting_symbol_insert_check", True),
-            "vision_backend": combo_data("_vision_backend_combo", "live_text"),
+            "vision_backend": combo_data("_vision_backend_combo", "native_helper"),
             "vision_vertical": checked("_vision_vertical_check", True),
             "vision_vertical_compat": checked("_vision_vertical_compat_check", True),
             "vision_language_correction": checked("_vision_language_correction_check", True),
@@ -720,7 +720,7 @@ class OCRTab(QWidget):
                 "handwriting_backend": "auto",
                 "handwriting_char_mask": True,
                 "handwriting_symbol_insert": True,
-                "vision_backend": "live_text",
+                "vision_backend": "native_helper",
                 "vision_vertical": False,
                 "vision_vertical_compat": False,
                 "vision_language_correction": True,
@@ -802,9 +802,9 @@ class OCRTab(QWidget):
             "column_smart_crop": bool(migrated_preprocess["smart_crop"]),
             "column_ruby_strength": str(migrated_preprocess["ruby_strength"]),
         })
-        vision_backend = str(state.get("vision_backend") or "live_text").strip().lower()
+        vision_backend = str(state.get("vision_backend") or "native_helper").strip().lower()
         if vision_backend == "auto" or vision_backend not in {"live_text", "native_helper", "shortcut"}:
-            vision_backend = "live_text"
+            vision_backend = "native_helper"
         self._set_combo_value(
             getattr(self, "_vision_backend_combo", None), vision_backend,
         )
@@ -2219,7 +2219,7 @@ class OCRTab(QWidget):
             self._hayai_device_combo.setToolTip("")
 
     def _on_vision_backend_changed(self):
-        backend_id = str(self._vision_backend_combo.currentData() or "live_text")
+        backend_id = str(self._vision_backend_combo.currentData() or "native_helper")
         self._update_shortcut_widget_visibility()
         try:
             from adapters.vision_backends import BackendFactory
@@ -2240,7 +2240,7 @@ class OCRTab(QWidget):
 
     def _update_shortcut_widget_visibility(self):
         is_apple = self._active_adapter == "apple_vision"
-        backend_id = str(self._vision_backend_combo.currentData() or "live_text") if hasattr(self, "_vision_backend_combo") else "live_text"
+        backend_id = str(self._vision_backend_combo.currentData() or "native_helper") if hasattr(self, "_vision_backend_combo") else "native_helper"
         self._shortcut_widget.setVisible(is_apple and backend_id == "shortcut")
         if hasattr(self, "_vision_helper_widget"):
             self._vision_helper_widget.setVisible(is_apple and backend_id == "native_helper")
@@ -2620,7 +2620,7 @@ class OCRTab(QWidget):
         elif engine_id == "apple_vision":
             vertical = bool(profile.vertical and self._vision_vertical_check.isChecked())
             opts.update(
-                apple_backend=str(self._vision_backend_combo.currentData() or "live_text"),
+                apple_backend=str(self._vision_backend_combo.currentData() or "native_helper"),
                 recognition_level="accurate",
                 recognition_languages=list(profile.apple_languages),
                 use_language_correction=self._vision_language_correction_check.isChecked(),
@@ -2812,6 +2812,9 @@ class OCRTab(QWidget):
         if engine_id == "ndlocr_lite":
             from adapters.ndlocr_lite_adapter import run as ocr_run
             return ocr_run(**common_kwargs)
+        if engine_id == "windows_snipping_ocr":
+            from adapters.windows_snipping_ocr_adapter import run as ocr_run
+            return ocr_run(**common_kwargs)
         if engine_id == "hayai_ocr":
             from adapters.hayai_ocr_adapter import run as ocr_run
             return ocr_run(engine_options=opts, **common_kwargs)
@@ -2836,7 +2839,7 @@ class OCRTab(QWidget):
         from adapters.apple_vision_adapter import run as ocr_run
         return ocr_run(
             shortcut_name=str(column_opts.get("shortcut_name") or "ExtractText"),
-            backend=str(opts.get("apple_backend") or "live_text"),
+            backend=str(opts.get("apple_backend") or "native_helper"),
             vertical=bool(opts.get("vertical", profile.vertical)),
             recognition_level=str(opts.get("recognition_level") or "accurate"),
             recognition_languages=list(
@@ -3111,6 +3114,8 @@ class OCRCompareTab(OCRCompareViewMixin, QWidget):
     # The payload is keyed by stable physical columns; raw OCR sources are never
     # rewritten.  Consumers must treat ``origin`` as a loop-prevention token.
     fusion_decision_changed = Signal(object)
+    # Keep the disagreement queue in 图文对照 in the same order as OCR 对比.
+    disagreement_queue_order_changed = Signal(object)
     # Request the existing independent image/text workspace at the same stable row.
     image_review_requested = Signal(int)
     # Successful/failed external package exports are persisted in project Run History.
@@ -3862,19 +3867,22 @@ class OCRCompareTab(OCRCompareViewMixin, QWidget):
         self._sync_canonical_authority_from_states([row_index])
         payload = self._fusion_decision_payload(row_index, origin=origin)
         if payload is not None:
+            if origin != "image_review":
+                row = self._comparison.rows[row_index]
+                self._image_review_overrides.pop(self._image_review_row_identity(row), None)
             self.fusion_decision_changed.emit(payload)
 
     def _manual_decision_seed_text(self, state, row_index: int) -> str:
         """Return the human-edit baseline without mutating any OCR source.
 
-        Prefer a strict raw-model majority (for example the 2-of-3 result).
+        Prefer the latest explicit human decision, then a strict raw-model majority.
         If no strict majority exists, keep the currently selected fusion output
         or the comparison row's deterministic fallback.  A previous explicit
         human edit remains visible so revisiting a row never discards user work.
         """
         origin = str(getattr(state, "selection_origin", "") or "")
         current = str(state.output_text() or "").strip()
-        if origin == "human_manual_edit" and current:
+        if origin.startswith("human_") and state.selected_index is not None:
             return current
         try:
             row = self._comparison.rows[int(row_index)]
@@ -4034,6 +4042,9 @@ class OCRCompareTab(OCRCompareViewMixin, QWidget):
         # ``origin=image_review`` prevents MainWindow from echoing the event back
         # into the source widget while still allowing other consumers to observe it.
         self._publish_fusion_decision(row_index, origin="image_review")
+        # Rebuild visible cards on the next activation, even for the same row.
+        self._fusion_window_indices = ()
+        self._current_row_index = row_index
         # Hidden-surface sync must stay model-only.  Remove just this resolved
         # row from the virtual queue and update counters; do not rebuild 1k-4k
         # rows and do not repaint the OCR comparison window when 图文 is active.
@@ -4085,6 +4096,7 @@ class OCRCompareTab(OCRCompareViewMixin, QWidget):
                     "sentence_group_id": str(group.get("sentence_group_id", "") or ""),
                     "column_ids": list(group.get("column_ids") or []),
                     "text": str(group.get("text", "") or ""),
+                    "delete_intentionally": not bool(str(group.get("text", "") or "").strip()),
                     "segment_key": segment_key,
                     "reviewed": True,
                 }, refresh=False):
@@ -5317,6 +5329,9 @@ class MainWindow(MainWindowControllerMixin, QMainWindow):
             lambda row: self._workspace_coordinator.publish_stable_row(row, "ocr_compare")
         )
         tab.fusion_decision_changed.connect(self._on_ocr_compare_decision_changed)
+        tab.disagreement_queue_order_changed.connect(
+            self._tab_ocr_image_review.set_disagreement_source_row_order
+        )
         tab.image_review_requested.connect(self._open_image_review_from_ocr_compare)
         tab.package_exported.connect(self._on_package_exported)
         tab.run_log_event.connect(self._on_compare_run_log_event)

@@ -2,10 +2,12 @@ from __future__ import annotations
 
 from functools import partial
 
+from ui.ocr.catalog import adapter_available_on_current_platform
+
 from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QGridLayout, QFormLayout, QLabel,
     QCheckBox, QLineEdit, QPushButton, QRadioButton, QScrollArea, QFrame,
-    QSizePolicy, QSpinBox, QTabWidget, QToolButton,
+    QSizePolicy, QSpinBox, QTabWidget, QToolButton, QComboBox, QLayout,
 )
 from PySide6.QtCore import Qt
 from PySide6.QtGui import QCursor, QAction
@@ -159,15 +161,14 @@ def build_ocr_model_settings(tab, top_row, ocr_adapters):
     # Legacy source-contract marker: ll.addWidget(engine_picker)
     # Legacy source-contract marker: ll.addWidget(self._ocr_settings_tabs)
     self = tab
-    PAGE_STYLE = (f"QWidget#ocrSettingPage{{background:{CARD};border:1px solid {BORDER};"
-                  "border-radius:14px;}")
+    PAGE_STYLE = f"QWidget#ocrSettingPage{{background:{CARD};border:1px solid {BORDER};border-radius:12px;}}"
     left_container = QWidget()
-    left_container.setMinimumWidth(OCR_LEFT_MIN)
-    left_container.setMaximumWidth(OCR_LEFT_MAX)
+    left_container.setObjectName("ocrSettingsColumn")
     left_container.setFixedWidth(OCR_LEFT_WIDTH)
-    # 控制区保持稳定宽度，把更多横向空间留给页面与逐列预览。
-    left_container.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Expanding)
-    left_container.setStyleSheet(f"background: {CARD}; border-right: 1px solid {BORDER};")
+    left_container.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Expanding)
+    left_container.setStyleSheet(
+        f"QWidget#ocrSettingsColumn{{background:{CARD};border-right:1px solid {BORDER};}}"
+    )
     left_outer = QVBoxLayout(left_container)
     left_outer.setContentsMargins(0, 0, 0, 0)
     left_outer.setSpacing(0)
@@ -175,10 +176,12 @@ def build_ocr_model_settings(tab, top_row, ocr_adapters):
     left = QWidget()
     left.setStyleSheet(f"background: {BG};")
     ll = QVBoxLayout(left)
-    ll.setContentsMargins(15, 54, 13, 14)
+    # Reserve the overlaid OCR/PDF switcher plus a visible card gap.
+    ll.setContentsMargins(8, 54, 8, 10)
     ll.setSpacing(13)
-    left.setMinimumWidth(OCR_LEFT_MIN - 18)
-    left.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.MinimumExpanding)
+    left.setMinimumWidth(0)
+    left.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.MinimumExpanding)
+    ll.setSizeConstraint(QLayout.SetNoConstraint)
 
     # OCR profile selector: Japanese vertical remains the untouched default;
     # Simplified Chinese horizontal owns an independent control snapshot and
@@ -226,7 +229,7 @@ def build_ocr_model_settings(tab, top_row, ocr_adapters):
     engine_picker_layout.addWidget(engine_label)
     self._adapter_combo = NoWheelComboBox()
     for aid, name, badge_text, _color, _desc, enabled in ocr_adapters:
-        if enabled:
+        if enabled and adapter_available_on_current_platform(aid):
             # Keep the engine picker deliberately clean. Runtime/platform
             # notes still live in the descriptive text below, but the
             # selectable model name itself no longer carries Chinese badges
@@ -264,7 +267,7 @@ def build_ocr_model_settings(tab, top_row, ocr_adapters):
     self._ocr_settings_tabs.setMinimumHeight(620)
     self._ocr_settings_tabs.setMaximumHeight(16777215)
     engine_settings_page = QWidget()
-    engine_settings_page.setMinimumWidth(350)
+    engine_settings_page.setMinimumWidth(0)
     engine_settings_page.setObjectName("ocrSettingPage")
     engine_settings_page.setStyleSheet(PAGE_STYLE)
     engine_settings_page.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.MinimumExpanding)
@@ -272,7 +275,7 @@ def build_ocr_model_settings(tab, top_row, ocr_adapters):
     self._engine_settings_layout.setContentsMargins(12, 12, 12, 12)
     self._engine_settings_layout.setSpacing(5)
     layout_settings_page = QWidget()
-    layout_settings_page.setMinimumWidth(350)
+    layout_settings_page.setMinimumWidth(0)
     layout_settings_page.setObjectName("ocrSettingPage")
     layout_settings_page.setStyleSheet(PAGE_STYLE)
     layout_settings_page.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.MinimumExpanding)
@@ -280,7 +283,7 @@ def build_ocr_model_settings(tab, top_row, ocr_adapters):
     self._layout_settings_layout.setContentsMargins(12, 12, 12, 12)
     self._layout_settings_layout.setSpacing(5)
     review_settings_page = QWidget()
-    review_settings_page.setMinimumWidth(350)
+    review_settings_page.setMinimumWidth(0)
     review_settings_page.setObjectName("ocrSettingPage")
     review_settings_page.setStyleSheet(PAGE_STYLE)
     review_settings_page.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.MinimumExpanding)
@@ -290,10 +293,26 @@ def build_ocr_model_settings(tab, top_row, ocr_adapters):
     self._ocr_settings_tabs.addTab(engine_settings_page, "引擎")
     self._ocr_settings_tabs.addTab(layout_settings_page, "分列与组句")
     self._ocr_settings_tabs.addTab(review_settings_page, "逐字审校")
-    ll.addWidget(self._ocr_settings_tabs)
+    # Keep the upper rule outside the tab bar's selected/hover painting.
+    # Native tab backgrounds can otherwise cover just the active tab's span.
+    settings_tabs_host = QWidget()
+    settings_tabs_layout = QVBoxLayout(settings_tabs_host)
+    settings_tabs_layout.setContentsMargins(0, 0, 0, 0)
+    settings_tabs_layout.setSpacing(0)
+    self._ocr_settings_top_rule = QFrame()
+    self._ocr_settings_top_rule.setObjectName("ocrSettingsTopRule")
+    self._ocr_settings_top_rule.setFixedHeight(1)
+    self._ocr_settings_top_rule.setStyleSheet(
+        f"QFrame#ocrSettingsTopRule{{background:{BORDER};border:none;}}"
+    )
+    settings_tabs_layout.addWidget(self._ocr_settings_top_rule)
+    settings_tabs_layout.addWidget(self._ocr_settings_tabs)
+    ll.addWidget(settings_tabs_host)
 
     self._adapter_cards: dict[str, QWidget] = {}
     for aid, name, badge_text, color, desc, enabled in ocr_adapters:
+        if not adapter_available_on_current_platform(aid):
+            continue
         card = QWidget()
         card.setCursor(QCursor(Qt.PointingHandCursor))
         card.setStyleSheet(
@@ -389,7 +408,7 @@ def build_ocr_model_settings(tab, top_row, ocr_adapters):
         combo = NoWheelComboBox()
         combo.addItem("未选择", "")
         for engine_id, engine_name, _badge, _color, _desc, enabled in ocr_adapters:
-            if enabled:
+            if enabled and adapter_available_on_current_platform(engine_id):
                 combo.addItem(engine_name, engine_id)
         # Manga OCR is deliberately review-only: it must never become a normal
         # single/page/full-column primary model. Its 224x224 recognizer is fed
@@ -449,8 +468,8 @@ def build_ocr_model_settings(tab, top_row, ocr_adapters):
 
     self._engine_settings_layout.addWidget(make_separator())
 
-    # Apple OCR uses explicit backends.  Live Text is the default; the
-    # original Shortcuts route remains available as the last option.
+    # Apple OCR uses explicit backends. Native Vision is the Intel/Apple
+    # Silicon default; Live Text and Shortcuts remain explicit alternatives.
     self._vision_backend_widget = QWidget()
     vbw = QVBoxLayout(self._vision_backend_widget)
     vbw.setContentsMargins(10, 0, 10, 0)
@@ -459,8 +478,8 @@ def build_ocr_model_settings(tab, top_row, ocr_adapters):
     vb_lbl.setStyleSheet(f"color: {MUTED}; font-size: 11px;")
     vbw.addWidget(vb_lbl)
     self._vision_backend_combo = NoWheelComboBox()
+    self._vision_backend_combo.addItem("Apple Vision · 原生 OCR（Intel / Apple Silicon 推荐）", "native_helper")
     self._vision_backend_combo.addItem("Apple Live Text · VisionKit ImageAnalyzer", "live_text")
-    self._vision_backend_combo.addItem("Apple Vision · RecognizeTextRequest 坐标/候选", "native_helper")
     self._vision_backend_combo.addItem("macOS 快捷指令 · 稳定兼容通道", "shortcut")
     self._vision_backend_combo.setCurrentIndex(0)
     self._vision_backend_combo.currentIndexChanged.connect(self._on_vision_backend_changed)
@@ -1311,12 +1330,28 @@ def build_ocr_model_settings(tab, top_row, ocr_adapters):
     left_scroll.setWidgetResizable(True)
     left_scroll.setFrameShape(QFrame.NoFrame)
     left_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
-    left_scroll.setMinimumWidth(OCR_LEFT_WIDTH)
+    left_scroll.setMinimumWidth(0)
+    # Explanatory prose belongs in tooltips; it must not set the width of
+    # the scroll content or consume the settings viewport.
+    for note in (
+        self._multi_ocr_speed_note, multi_hint, live_text_note, pa_hint,
+        hy_hint, pm_hint, chs_note, preprocess_reset_hint, hint, hw_desc,
+        apple_test_hint, handwriting_hint, reflow_hint,
+    ):
+        note.hide()
+    for combo in left.findChildren(QComboBox):
+        combo.setSizeAdjustPolicy(QComboBox.AdjustToMinimumContentsLengthWithIcon)
+        combo.setMinimumContentsLength(8)
+        combo.setMinimumWidth(0)
+        combo.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Fixed)
+    for checkbox in left.findChildren(QCheckBox):
+        checkbox.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Fixed)
+    for page in (engine_settings_page, layout_settings_page, review_settings_page):
+        page.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.MinimumExpanding)
+        page.layout().setSizeConstraint(QLayout.SetNoConstraint)
     left_scroll.setWidget(left)
     left_outer.addWidget(left_scroll, 1)
 
     # OCR 执行控制已移到下方日志标题栏右侧，左侧只保留参数与输入区。
 
-    top_row.addWidget(left_container, 1)
-
-
+    top_row.addWidget(left_container, 0)

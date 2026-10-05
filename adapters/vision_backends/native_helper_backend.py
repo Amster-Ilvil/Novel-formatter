@@ -31,10 +31,26 @@ from adapters.geometry_transform import AffineMatrix
 ROOT = Path(__file__).resolve().parents[2]
 SOURCE = ROOT / "tools" / "apple_vision_helper" / "AppleVisionOCRHelper.swift"
 BUILD_SCRIPT = ROOT / "build_apple_vision_helper.command"
+def _normalized_architecture(value: str | None = None) -> str:
+    raw = str(value or platform.machine() or "unknown").strip().lower()
+    aliases = {"aarch64": "arm64", "amd64": "x86_64"}
+    normalized = aliases.get(raw, raw)
+    if normalized in {"arm64", "x86_64"}:
+        return normalized
+    return "".join(ch if ch.isalnum() or ch in {"_", "-"} else "_" for ch in normalized) or "unknown"
+
+
+def _default_helper_root() -> Path:
+    return (
+        Path.home() / "Library" / "Caches" / "NovelFormatter"
+        / "apple_vision_helper" / _normalized_architecture()
+    )
+
+
 _RUNTIME_HELPER_ROOT = Path(
     os.environ.get(
         "NOVEL_FORMATTER_APPLE_VISION_HELPER_DIR",
-        str(Path.home() / "Library" / "Caches" / "NovelFormatter" / "apple_vision_helper"),
+        str(_default_helper_root()),
     )
 ).expanduser()
 BINARY = _RUNTIME_HELPER_ROOT / "apple_vision_helper"
@@ -203,9 +219,9 @@ def _probe_helper_binary(binary: Path) -> None:
     """Require a candidate helper to start and execute the supported OCR APIs.
 
     The probe uses a generated blank PNG, so it does not depend on project
-    fixtures or user files.  macOS 13/14 validate the VisionKit path; macOS 15+
-    additionally validate native Vision.  Empty OCR text is acceptable, but an
-    API/process error is not.
+    fixtures or user files. Native Vision is the mandatory cross-architecture
+    contract on every supported macOS version; VisionKit Live Text is optional.
+    Empty OCR text is acceptable, but an API/process error is not.
     """
     binary = _ensure_helper_executable(Path(binary))
     with tempfile.TemporaryDirectory(prefix="novel_formatter_apple_helper_probe_") as tmp:
@@ -213,9 +229,10 @@ def _probe_helper_binary(binary: Path) -> None:
         _write_probe_png(image)
         client = _SubprocessJSONClient(binary)
         try:
-            apis = ["live_text"]
-            if _mac_version_major() >= 15:
-                apis.append("recognize_text")
+            # Native Vision is the installation contract on every supported Mac.
+            # VisionKit/Live Text is optional and must never prevent promotion of
+            # an otherwise healthy helper (it has stricter runtime constraints).
+            apis = ["recognize_text"]
             for api in apis:
                 response = client.request({
                     "id": f"selftest-{api}",
@@ -275,9 +292,16 @@ def _promote_candidate_helper(candidate_root: Path, *, sdk_version: str, archite
     return _ensure_helper_executable(BINARY)
 
 
+def _swift_toolchain_available() -> bool:
+    return bool(shutil.which("xcrun") or shutil.which("swiftc"))
+
+
 def _build_candidate_helper(*, sdk_version: str, architecture: str, source_hash: str) -> Path:
-    if not shutil.which("xcrun"):
-        raise HelperInfrastructureError("Swift Helper 需要构建，但未找到 xcrun；请安装 Xcode 或 Xcode Command Line Tools")
+    if not _swift_toolchain_available():
+        raise HelperInfrastructureError(
+            "Swift Helper 需要首次构建，但未找到 Swift 编译器；"
+            "请安装 Xcode Command Line Tools（xcode-select --install）或 Xcode"
+        )
     BINARY.parent.mkdir(parents=True, exist_ok=True)
     with tempfile.TemporaryDirectory(prefix="novel_formatter_apple_helper_candidate_", dir=str(BINARY.parent)) as tmp:
         candidate_root = Path(tmp)
@@ -306,7 +330,7 @@ def ensure_helper_binary() -> Path:
         raise HelperInfrastructureError(f"缺少 Swift Helper 源码：{SOURCE}")
 
     sdk_version = _current_sdk_version()
-    architecture = platform.machine().strip().lower()
+    architecture = _normalized_architecture()
     source_hash = _helper_source_sha256()
     force = _force_helper_rebuild_requested()
 
@@ -705,13 +729,17 @@ class NativeVisionHelperBackend(VisionBackend):
     def is_available(self) -> tuple[bool, str]:
         if platform.system() != "Darwin":
             return False, "仅支持 macOS"
-        if _mac_version_major() < 15:
-            return False, "RecognizeTextRequest 需要 macOS 15 或更高版本"
+        if _mac_version_major() < 13:
+            return False, "Apple Vision OCR 需要 macOS 13 或更高版本"
         if not SOURCE.exists():
             return False, "缺少 AppleVisionOCRHelper.swift"
-        if BINARY.exists() or shutil.which("xcrun"):
+        if BINARY.exists() or _swift_toolchain_available():
             return True, ""
-        return False, "未找到 xcrun，请安装 Xcode 或 Xcode Command Line Tools"
+        return False, (
+            "首次使用需要 Swift 编译器；请安装 Xcode Command Line Tools "
+            "（xcode-select --install）或 Xcode。已生成的 Helper 会按 Intel/x86_64 "
+            "与 Apple Silicon/arm64 分架构缓存，后续无需重复编译。"
+        )
 
     def recognize(self, image_path: str, config: OCRConfig) -> OCRResult:
         binary = ensure_helper_binary()

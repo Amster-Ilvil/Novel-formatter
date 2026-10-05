@@ -1026,12 +1026,19 @@ class MainWindowControllerMixin:
         # render emits row 0, and must not overwrite the row the user came from.
         row = self._tab_ocr_compare.current_row_index()
         self._pending_image_review_source_row = max(0, int(row))
+        self._tab_ocr_image_review.set_disagreement_source_row_order(
+            self._tab_ocr_compare.disagreement_queue_row_order()
+        )
         self._tab_ocr_image_review.ensure_document_loaded()
         self._tab_ocr_image_review.jump_to_source_row(row)
 
     def _on_proof_subtab_changed(self, index: int) -> None:
         previous = int(getattr(self, "_last_proof_subtab_index", self._proof_section.current_index()))
         index = max(0, min(1, int(index)))
+        if previous == 0 and index == 1:
+            compare = self._lazy_workspace_if_loaded("ocr_compare")
+            if compare is not None:
+                compare._commit_manual_decision_editor()
         if self._stack.currentIndex() == SECTION_PROOF:
             self._ensure_proof_subworkspace(index)
             proof_keys = ("ocr_compare", "image_review")

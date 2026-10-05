@@ -1,9 +1,13 @@
 # -*- coding: utf-8 -*-
 """Selectable OCR engine catalog shared by OCR and settings UI."""
 
+import sys
+
 OCR_ADAPTERS = [
     ("apple_vision", "Apple OCR", "macOS", "#4A3FA3",
-     "Apple Live Text / Vision 框架，竖排识别优先", True),
+     "Apple Vision 原生 OCR；Intel / Apple Silicon 本机按架构构建 Helper", True),
+    ("windows_snipping_ocr", "Windows Snipping OCR", "Windows 10/11", "#2563EB",
+     "复用系统截图工具 Snipping Tool 自带 OneOCR；本地离线，不下载或打包 Microsoft DLL/模型", True),
     ("paddle_ocr",   "PaddleOCR",        "跨平台", "#C0542F",
      "百度 PaddleOCR，坐标为像素值数组（首次使用会自动创建独立环境并下载模型）", True),
     ("paddle_aistudio", "PaddleOCR · AI Studio API", "云端", "#2B6CB0",
@@ -16,4 +20,13 @@ OCR_ADAPTERS = [
      "Hayai OCR（约 150M）；NaFlex 多行/竖排识别，支持批处理、MPS/CUDA/CPU 与 INT4/INT8；页面强制先物理分列", True),
 ]
 
-__all__ = ["OCR_ADAPTERS"]
+def adapter_available_on_current_platform(adapter_id: str) -> bool:
+    key = str(adapter_id or "").strip().lower()
+    if key == "windows_snipping_ocr":
+        return sys.platform == "win32"
+    if key == "apple_vision":
+        return sys.platform == "darwin"
+    return True
+
+
+__all__ = ["OCR_ADAPTERS", "adapter_available_on_current_platform"]

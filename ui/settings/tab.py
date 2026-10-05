@@ -32,7 +32,7 @@ from ui.localized_dialogs import LocalizedMessageBox, ui_message
 from ui.navigation.sidebar import (
     REFERENCE_SECTION_ITEMS, SECTION_WORKSPACE, SECTION_PAGE, SECTION_SYSTEM,
 )
-from ui.ocr.catalog import OCR_ADAPTERS
+from ui.ocr.catalog import OCR_ADAPTERS, adapter_available_on_current_platform
 from ui.settings.ai_dialog import AISettingsDialog
 
 QMessageBox = LocalizedMessageBox
@@ -679,7 +679,10 @@ class SystemSettingsTab(QWidget):
             card.mousePressEvent = lambda event, idx=tab_index: self._show_settings_details(idx)
             return card
 
-        enabled_by_id = {aid: name for aid, name, _badge, _color, _desc, enabled in OCR_ADAPTERS if enabled}
+        enabled_by_id = {
+            aid: name for aid, name, _badge, _color, _desc, enabled in OCR_ADAPTERS
+            if enabled and adapter_available_on_current_platform(aid)
+        }
         ocr_rows = [
             (enabled_by_id.get("hayai_ocr", "Hayai OCR"), "可用"),
             (enabled_by_id.get("ndlocr_lite", "NDLOCR-Lite"), "可用"),
@@ -832,7 +835,7 @@ class SystemSettingsTab(QWidget):
         engine_row.addWidget(QLabel("默认识别引擎"))
         self._ocr_engine_combo = NoWheelComboBox()
         for aid, name, badge_text, _color, _desc, enabled in OCR_ADAPTERS:
-            if enabled:
+            if enabled and adapter_available_on_current_platform(aid):
                 self._ocr_engine_combo.addItem(f"{name} · {badge_text}", aid)
         engine_row.addWidget(self._ocr_engine_combo, 1)
         defaults_box.addLayout(engine_row)

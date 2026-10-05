@@ -181,6 +181,8 @@ def iter_server_worker_jsonl(
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         text=True,
+        encoding="utf-8",
+        errors="replace",
         bufsize=1,
         **isolated_process_kwargs(),
     )

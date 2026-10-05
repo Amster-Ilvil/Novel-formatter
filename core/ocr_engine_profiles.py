@@ -41,6 +41,20 @@ _PROFILES: dict[str, OcrEngineProfile] = {
         0.85, 0.50, 18, 14,
         notes="Native pixels with generous paper context; avoids narrow manual-crop regression.",
     ),
+    "windows_snipping_ocr": OcrEngineProfile(
+        "windows_snipping_ocr", "windows-oneocr-context-v2", "column", "context", "cpu_model",
+        # OneOCR is unusually sensitive to punctuation close to the vertical
+        # edge of a compact input.  A 12 px top/bottom margin caused a real
+        # opening Japanese quote to disappear even though the glyph was present
+        # in the crop.  Native-pixel tests on the same column recover it with a
+        # 56 px vertical paper margin.  Scale that margin with the body-column
+        # width for higher-resolution scans; horizontal padding remains modest.
+        0.70, 1.40, 16, 56,
+        notes=(
+            "Windows Snipping Tool OneOCR using the installed system model and "
+            "native pixels; generous vertical paper context protects edge punctuation."
+        ),
+    ),
     "macocr": OcrEngineProfile(
         "macocr", "apple-vision-context-v1", "column", "context", "native_vision",
         0.85, 0.50, 18, 14,

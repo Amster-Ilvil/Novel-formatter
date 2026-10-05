@@ -15,7 +15,9 @@ def build_ocr_preview_panel(tab, top_row):
     center = QWidget()
     center.setStyleSheet(f"background: {BG};")
     cv = QVBoxLayout(center)
-    cv.setContentsMargins(21, 15, 19, 15)
+    # Avoid a wide blank gutter between the settings column and the preview;
+    # this is especially costly in character-review mode on a narrow window.
+    cv.setContentsMargins(10, 15, 12, 15)
     cv.setSpacing(10)
 
     # Phase 21: match the supplied reference navigation row.  The controls
@@ -131,5 +133,4 @@ def build_ocr_preview_panel(tab, top_row):
     self._update_preview_navigation()
 
     top_row.addWidget(center, 2)
-
 

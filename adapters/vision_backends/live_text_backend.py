@@ -11,14 +11,13 @@ expose through this helper.
 from __future__ import annotations
 
 import platform
-import shutil
 import uuid
 from pathlib import Path
 
 from .base import VisionBackend, OCRResult, OCRBlock, OCRConfig, BackendCapabilities
 from .native_helper_backend import (
     SOURCE, BINARY, ensure_helper_binary, _mac_version_major,
-    _request_with_resilient_client,
+    _request_with_resilient_client, _swift_toolchain_available,
     HelperInfrastructureError, VisionRecognitionError,
 )
 
@@ -49,9 +48,9 @@ class LiveTextHelperBackend(VisionBackend):
             return False, "VisionKit ImageAnalyzer 需要 macOS 13 或更高版本"
         if not SOURCE.exists():
             return False, "缺少 AppleVisionOCRHelper.swift"
-        if BINARY.exists() or shutil.which("xcrun"):
+        if BINARY.exists() or _swift_toolchain_available():
             return True, ""
-        return False, "未找到 xcrun，请安装 Xcode 或 Xcode Command Line Tools"
+        return False, "首次使用需要 Swift 编译器；请安装 Xcode Command Line Tools 或 Xcode"
 
     def recognize(self, image_path: str, config: OCRConfig) -> OCRResult:
         binary = ensure_helper_binary()

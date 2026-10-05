@@ -3516,6 +3516,8 @@ _EXACT_EN.update({
     "跳到待判断或 OCR 分歧句；仅浏览不会自动裁决当前句": "Jump to a pending or OCR-conflict sentence; browsing alone never adjudicates the current sentence",
     "上一 OCR 分歧": "Previous OCR Conflict",
     "下一 OCR 分歧": "Next OCR Conflict",
+    "保存当前修改并跳到上一条 OCR 分歧句": "Save current changes and jump to the previous OCR disagreement",
+    "上一句（不确认）  Alt+←": "Previous sentence (without confirming)  Alt+←",
 })
 _EXACT_JA.update({
     "确认并下一句": "確認して次へ",
@@ -3524,6 +3526,8 @@ _EXACT_JA.update({
     "跳到待判断或 OCR 分歧句；仅浏览不会自动裁决当前句": "未判定またはOCR差分の文へ移動します。閲覧だけでは現在文を裁決しません",
     "上一 OCR 分歧": "前のOCR差分",
     "下一 OCR 分歧": "次のOCR差分",
+    "保存当前修改并跳到上一条 OCR 分歧句": "現在の変更を保存して前のOCR差分文へ移動",
+    "上一句（不确认）  Alt+←": "前の文（確定せず）  Alt+←",
 })
 
 # Multi-model OCR 2–6 and column-input terminology (v19, 2026-09-26).
@@ -4365,6 +4369,15 @@ _PATTERNS[LANG_JA].extend([
     (re.compile(r"^已重做：(.*)（仅更新 (\d+) 个受影响句）。$"), lambda m: f"やり直し：{m.group(1)}（影響した {m.group(2)} 文のみ更新）。"),
 ])
 
+
+# Cross-platform Apple OCR backend labels.  Keep these explicit so the
+# Intel/Apple-Silicon wording remains deterministic in all interface languages.
+_EXACT_EN.update({
+    "Apple Vision · 原生 OCR（Intel / Apple Silicon 推荐）": "Apple Vision · Native OCR (Intel / Apple Silicon recommended)",
+})
+_EXACT_JA.update({
+    "Apple Vision · 原生 OCR（Intel / Apple Silicon 推荐）": "Apple Vision · ネイティブOCR（Intel / Apple Silicon 推奨）",
+})
 
 # Phase 20 redesigned chrome: keep the new visible strings covered by the
 # offline localization contract.  These are presentation-only labels.

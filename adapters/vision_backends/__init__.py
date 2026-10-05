@@ -3,13 +3,13 @@
 """Apple OCR backend registry.
 
 Three explicit modes are kept side by side:
+* native_helper: Swift Vision OCR (stable default, bbox/confidence/candidates)
 * live_text: Swift VisionKit ImageAnalyzer / Live Text transcript
-* native_helper: Swift Vision RecognizeTextRequest (bbox/confidence/candidates)
 * shortcut: original macOS Shortcuts route
 
-``auto`` remains accepted only as a migration alias for old saved settings. It
-must never be presented as a selectable mode because silent backend switching
-makes OCR failures difficult to diagnose and can change reading order/results.
+``auto`` remains accepted as a migration alias and resolves deterministically to
+the native Vision backend. The GUI keeps every route explicit so OCR evidence
+does not silently change between machines.
 """
 from __future__ import annotations
 
@@ -29,12 +29,12 @@ _REGISTRY: dict[str, Callable[[], VisionBackend]] = {
 
 class BackendFactory:
     @staticmethod
-    def create(name: str = "live_text", vertical: bool = True) -> VisionBackend:
-        normalized = str(name or "live_text").strip().lower()
+    def create(name: str = "native_helper", vertical: bool = True) -> VisionBackend:
+        normalized = str(name or "native_helper").strip().lower()
         aliases = {
             # Settings written by older releases are migrated to the stable
             # explicit route instead of silently choosing a new backend.
-            "auto": "live_text",
+            "auto": "native_helper",
             "livetext": "live_text",
             "live-text": "live_text",
             "visionkit": "live_text",
@@ -51,10 +51,11 @@ class BackendFactory:
 
     @staticmethod
     def auto(vertical: bool = True) -> VisionBackend:
-        # Compatibility for plugins that still call BackendFactory.auto().
-        # This is deliberately deterministic and is not a UI option.
-        return _REGISTRY["live_text"]()
+        # Compatibility for plugins that explicitly ask for a resilient auto
+        # chain. The GUI itself keeps the concrete backend explicit.
+        from .auto_backend import AutoVisionBackend
+        return AutoVisionBackend()
 
     @staticmethod
     def available_backends() -> list[str]:
-        return ["live_text", "native_helper", "shortcut"]
+        return ["native_helper", "live_text", "shortcut"]
