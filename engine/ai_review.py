@@ -15,7 +15,7 @@ from difflib import SequenceMatcher
 import re
 from typing import Sequence
 
-from engine.text_compare import CompareLine, align_lines, parse_image_marker
+from engine.document_alignment import CompareLine, align_lines, parse_image_marker
 
 
 @dataclass(slots=True)

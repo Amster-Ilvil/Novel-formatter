@@ -2,10 +2,10 @@
 # -*- coding: utf-8 -*-
 """NDLOCR-Lite adapter with automatic source/model/dependency installation.
 
-The official release title is prefixed with ``v`` (for example ``v1.2.3``),
-but the Git tag itself is ``1.2.3``.  Do not hard-code the release title as a
-Git branch: resolve the latest release tag through GitHub's API and gracefully
-fall back to compatible tag spellings or the default branch.
+The official release title may be prefixed with ``v`` while the Git tag itself
+may omit it. Do not hard-code the visible release title as a Git branch: resolve
+the latest release tag through GitHub's API and gracefully fall back to compatible
+tag spellings or the default branch.
 """
 from __future__ import annotations
 
@@ -24,9 +24,10 @@ import urllib.request
 import zipfile
 from pathlib import Path
 from utils.safe_archive import safe_extract_zip
+from utils.apple_silicon_runtime import is_m6, profile, recommended_cpu_threads
 
 from adapters.ocr_engine_common import iter_worker_jsonl, run_ocr_engine
-from adapters.runtime_env import ensure_venv
+from adapters.runtime_env import ensure_venv, persistent_runtime_root
 
 ROOT = Path(__file__).parent.parent
 RUNTIME_ROOT = ROOT / ".ocr-runtimes"
@@ -36,10 +37,46 @@ WORKER_SCRIPT = Path(__file__).parent / "ndlocr_lite_worker.py"
 REPO_URL = "https://github.com/ndl-lab/ndlocr-lite.git"
 LATEST_RELEASE_API = "https://api.github.com/repos/ndl-lab/ndlocr-lite/releases/latest"
 # Offline fallback only. Online first installation resolves releases/latest.
-FALLBACK_REF = "1.2.3"
+FALLBACK_REF = "1.3.1"
 REF_MARKER = ".novel-formatter-ndlocr-ref"
 MODEL_MIN_BYTES = 1_000_000
 USER_AGENT = "Novel-Formatter-NDLOCR-Installer/1.1"
+
+
+def _ndlocr_worker_env(engine_options: dict | None = None) -> dict[str, str]:
+    env = os.environ.copy()
+    options = dict(engine_options or {})
+    threads = str(recommended_cpu_threads())
+    if threads:
+        env.setdefault("OMP_NUM_THREADS", threads)
+        env.setdefault("OPENBLAS_NUM_THREADS", threads)
+        env.setdefault("MKL_NUM_THREADS", threads)
+        env.setdefault("VECLIB_MAXIMUM_THREADS", threads)
+        env.setdefault("BLIS_NUM_THREADS", threads)
+        env.setdefault("NUMEXPR_NUM_THREADS", threads)
+        env.setdefault("OMP_WAIT_POLICY", "PASSIVE")
+        env.setdefault("PYTHONUNBUFFERED", "1")
+    enable_tcy = options.get("enable_tcy")
+    if enable_tcy is not None:
+        env["NOVEL_FORMATTER_NDLOCR_TCY"] = "1" if bool(enable_tcy) else "0"
+    else:
+        env["NOVEL_FORMATTER_NDLOCR_TCY"] = "0"
+
+    # NDLOCR is ONNX Runtime, not a PyTorch/MPS model.  On Apple Silicon use a
+    # conservative hybrid by default: page detector may use CoreML/ANE while
+    # PARSeq recognizers stay on CPU so character logits retain the stable path.
+    requested_provider = str(
+        options.get("execution_provider")
+        or options.get("provider")
+        or env.get("NOVEL_FORMATTER_NDLOCR_PROVIDER")
+        or ("auto" if profile().available else "cpu")
+    ).strip().lower()
+    env["NOVEL_FORMATTER_NDLOCR_PROVIDER"] = requested_provider
+    cache_dir = persistent_runtime_root() / "ndlocr-lite" / "coreml-cache"
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    env.setdefault("NOVEL_FORMATTER_NDLOCR_COREML_CACHE", str(cache_dir))
+    env.setdefault("NOVEL_FORMATTER_NDLOCR_COREML_UNITS", "CPUAndNeuralEngine")
+    return env
 
 
 def _is_real_model(path: Path) -> bool:
@@ -52,7 +89,8 @@ def _is_real_model(path: Path) -> bool:
         return False
 
 
-def _models_ready(source_dir: Path = SOURCE_DIR) -> bool:
+def _models_ready(source_dir: Path | None = None) -> bool:
+    source_dir = source_dir or SOURCE_DIR
     model_dir = source_dir / "src" / "model"
     models = list(model_dir.glob("*.onnx"))
     return len(models) >= 4 and all(_is_real_model(path) for path in models)
@@ -61,9 +99,9 @@ def _models_ready(source_dir: Path = SOURCE_DIR) -> bool:
 def _ref_candidates(ref: str) -> list[str]:
     """Return tag/branch spellings in safe retry order.
 
-    GitHub currently labels the release ``v1.2.3`` while its actual Git tag is
-    ``1.2.3``.  Supporting both forms also keeps environment overrides from
-    breaking when users copy the visible release title.
+    GitHub release titles and Git tags have not always used the same ``v`` prefix.
+    Supporting both forms keeps environment overrides robust when users copy the
+    visible release title.
     """
     value = (ref or "").strip()
     value = re.sub(r"^refs/tags/", "", value)
@@ -208,33 +246,52 @@ def _write_ref_marker(source_dir: Path, ref: str) -> None:
         pass
 
 
+def _activate_source(staged_dir: Path) -> None:
+    """Replace the active runtime only after its source and weights validate."""
+    backup = RUNTIME_ROOT / f".ndlocr-lite-previous-{uuid.uuid4().hex}"
+    moved_old = False
+    if SOURCE_DIR.exists() or SOURCE_DIR.is_symlink():
+        os.replace(SOURCE_DIR, backup)
+        moved_old = True
+    try:
+        os.replace(staged_dir, SOURCE_DIR)
+    except Exception:
+        if moved_old and not SOURCE_DIR.exists():
+            os.replace(backup, SOURCE_DIR)
+        raise
+    if moved_old:
+        shutil.rmtree(backup, ignore_errors=True)
+
+
 def _clone_source(ref: str, verbose: bool) -> tuple[bool, str]:
     git = shutil.which("git")
     if not git:
         return False, "系统未找到 git"
-    shutil.rmtree(SOURCE_DIR, ignore_errors=True)
+    RUNTIME_ROOT.mkdir(parents=True, exist_ok=True)
     if verbose:
         print(f"⬇️  git 下载 NDLOCR-Lite {ref} ...")
-    try:
-        proc = subprocess.run(
-            [git, "clone", "--depth", "1", "--branch", ref, REPO_URL, str(SOURCE_DIR)],
-            capture_output=True,
-            text=True,
-            timeout=900,
-        )
-    except subprocess.TimeoutExpired:
-        shutil.rmtree(SOURCE_DIR, ignore_errors=True)
-        return False, "git clone 超过 15 分钟，已终止"
-    if proc.returncode != 0:
-        shutil.rmtree(SOURCE_DIR, ignore_errors=True)
-        return False, (proc.stderr or proc.stdout)[-2000:]
-    ready, model_failures = _ensure_models(SOURCE_DIR, ref, verbose)
-    if ready:
-        _write_ref_marker(SOURCE_DIR, ref)
+    with tempfile.TemporaryDirectory(prefix="ndlocr-clone-", dir=RUNTIME_ROOT) as tmp_name:
+        staged = Path(tmp_name) / "source"
+        try:
+            proc = subprocess.run(
+                [git, "clone", "--depth", "1", "--branch", ref, REPO_URL, str(staged)],
+                capture_output=True,
+                text=True,
+                timeout=900,
+            )
+        except subprocess.TimeoutExpired:
+            return False, "git clone 超过 15 分钟，已终止"
+        if proc.returncode != 0:
+            return False, (proc.stderr or proc.stdout)[-2000:]
+        ready, model_failures = _ensure_models(staged, ref, verbose)
+        if not ready:
+            return False, "\n".join(model_failures[-6:]) or "ONNX 模型不完整"
+        _write_ref_marker(staged, ref)
+        try:
+            _activate_source(staged)
+        except OSError as exc:
+            return False, f"无法切换到已验证的 NDLOCR-Lite 安装：{exc}"
         return True, ""
-    detail = "\n".join(model_failures[-6:]) or "ONNX 模型不完整"
-    shutil.rmtree(SOURCE_DIR, ignore_errors=True)
-    return False, detail
 
 
 def _archive_url(ref: str) -> str:
@@ -246,7 +303,6 @@ def _archive_url(ref: str) -> str:
 
 def _download_archive_source(ref: str, verbose: bool) -> tuple[bool, str]:
     RUNTIME_ROOT.mkdir(parents=True, exist_ok=True)
-    shutil.rmtree(SOURCE_DIR, ignore_errors=True)
     try:
         with tempfile.TemporaryDirectory(prefix="ndlocr-download-", dir=RUNTIME_ROOT) as tmp_name:
             tmp = Path(tmp_name)
@@ -260,16 +316,15 @@ def _download_archive_source(ref: str, verbose: bool) -> tuple[bool, str]:
             roots = [p for p in extract_dir.iterdir() if p.is_dir()]
             if len(roots) != 1:
                 return False, "GitHub压缩包目录结构异常"
-            shutil.move(str(roots[0]), str(SOURCE_DIR))
-        ready, model_failures = _ensure_models(SOURCE_DIR, ref, verbose)
-        if ready:
-            _write_ref_marker(SOURCE_DIR, ref)
+            staged = tmp / "source"
+            shutil.move(str(roots[0]), str(staged))
+            ready, model_failures = _ensure_models(staged, ref, verbose)
+            if not ready:
+                return False, "\n".join(model_failures[-6:]) or "ONNX 模型不完整"
+            _write_ref_marker(staged, ref)
+            _activate_source(staged)
             return True, ""
-        detail = "\n".join(model_failures[-6:]) or "ONNX 模型不完整"
-        shutil.rmtree(SOURCE_DIR, ignore_errors=True)
-        return False, detail
     except Exception as exc:
-        shutil.rmtree(SOURCE_DIR, ignore_errors=True)
         return False, str(exc)
 
 
@@ -341,15 +396,17 @@ class NDLOcrLiteSession:
 
     STARTUP_TIMEOUT_SECONDS = 300.0
 
-    def __init__(self, *, cancel_check=None, verbose: bool = True):
+    def __init__(self, *, cancel_check=None, verbose: bool = True, engine_options: dict | None = None):
         self.cancel_check = cancel_check
         self.verbose = verbose
+        self.engine_options = dict(engine_options or {})
         self.process = None
         self._stderr_file = None
         self._queue: queue.Queue[str | None] = queue.Queue()
         self._reader = None
         self._lock = threading.RLock()
         self._ready = False
+        self.provider_info: dict = {}
 
     def _stderr_text(self) -> str:
         handle = self._stderr_file
@@ -380,6 +437,7 @@ class NDLOcrLiteSession:
             text=True,
             encoding="utf-8",
             bufsize=1,
+            env=_ndlocr_worker_env(self.engine_options),
             **isolated_process_kwargs(),
         )
         process = self.process
@@ -448,6 +506,10 @@ class NDLOcrLiteSession:
                 continue
             if payload.get("type") == "ready" and payload.get("ok", True):
                 self._ready = True
+                self.provider_info = dict(payload.get("provider") or {})
+                if self.verbose and self.provider_info:
+                    effective = str(self.provider_info.get("effective") or "cpu")
+                    print(f"🚀  NDLOCR-Lite ONNX provider：{effective}")
                 return
             # Startup errors are emitted as an ordinary error packet with an
             # empty path before the worker exits.
@@ -468,7 +530,7 @@ class NDLOcrLiteSession:
         self._ensure_started()
         return self
 
-    def iter_recognize(self, image_paths: list[str]):
+    def iter_recognize(self, image_paths: list[str], *, on_wait=None):
         paths = [str(path) for path in image_paths]
         if not paths:
             return
@@ -508,6 +570,7 @@ class NDLOcrLiteSession:
                 "NOVEL_FORMATTER_OCR_REQUEST_TIMEOUT", 300.0, minimum=30.0
             )
             deadline = time.monotonic() + request_timeout
+            next_heartbeat = time.monotonic() + 20.0
             returned: set[str] = set()
             while True:
                 if self.cancel_check is not None and self.cancel_check():
@@ -537,6 +600,14 @@ class NDLOcrLiteSession:
                 try:
                     line = self._queue.get(timeout=0.20)
                 except queue.Empty:
+                    now = time.monotonic()
+                    if now >= next_heartbeat:
+                        if callable(on_wait):
+                            try:
+                                on_wait(len(returned), len(paths))
+                            except Exception:
+                                pass
+                        next_heartbeat = now + 20.0
                     continue
                 if line is None:
                     detail = self._stderr_text()
@@ -556,6 +627,7 @@ class NDLOcrLiteSession:
                 if str(payload.get("request_id") or "") != request_id:
                     continue
                 deadline = time.monotonic() + request_timeout
+                next_heartbeat = time.monotonic() + 20.0
                 if payload.get("type") in {"request_done", "batch_done"}:
                     break
                 path = str(payload.get("path") or "")

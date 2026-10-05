@@ -3,7 +3,7 @@ from PySide6.QtWidgets import QFrame, QWidget, QVBoxLayout, QHBoxLayout, QLabel,
 
 PAGE_TYPE_COLORS = {
     "cover": "#F26B4A", "color_illustration": "#EC6F9E", "color_illus": "#EC6F9E",
-    "blank": "#D2D2D7", "toc": "#4F8FEF", "toc_page": "#4F8FEF",
+    "blank": "#D8DDE3", "toc": "#5B93FF", "toc_page": "#5B93FF",
     "illustration": "#32A47C", "text": "#6C63D8", "paragraph": "#6C63D8",
     "afterword": "#C68A2D", "copyright": "#7D7D83", "colophon": "#7D7D83", "unknown": "#B8B8BD",
 }

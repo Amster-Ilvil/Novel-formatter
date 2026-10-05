@@ -39,6 +39,7 @@ import json
 import subprocess
 import argparse
 import threading
+import time
 from collections import Counter
 from pathlib import Path
 
@@ -221,6 +222,37 @@ def crop_for_ocr(image_path: str, crop_top: float = 0.0, crop_bottom: float = 0.
 # 识别方式只需要在那边加一个 backend，这里完全不用改。
 from adapters.vision_backends import BackendFactory, OCRConfig
 
+def _vision_runtime_log_line(metadata: dict[str, object]) -> str:
+    """Compact, truthful runtime line for the native Apple OCR route."""
+    if not metadata:
+        return ""
+    system = str(metadata.get("system") or "macOS")
+    api = str(metadata.get("api") or "Apple Vision")
+    revision = str(metadata.get("revision") or "system-default")
+    supported_revisions = [str(v) for v in (metadata.get("supportedRevisions") or []) if str(v)]
+    requested = [str(v) for v in (metadata.get("requestedLanguages") or []) if str(v)]
+    supported_languages = [str(v) for v in (metadata.get("supportedRecognitionLanguages") or []) if str(v)]
+    directions = [str(v) for v in (metadata.get("directionEvidence") or []) if str(v)]
+    direction = ",".join(dict.fromkeys(directions)) if directions else "未返回（bbox 几何回退）"
+    revision_part = revision
+    if supported_revisions:
+        revision_part += f"；支持 {','.join(supported_revisions)}"
+    language_part = ",".join(requested) or "系统默认"
+    if supported_languages:
+        # Avoid turning a startup log into hundreds of characters on future OSes.
+        shown = supported_languages[:12]
+        language_part += f"；系统支持 {','.join(shown)}"
+        if len(supported_languages) > len(shown):
+            language_part += f" 等 {len(supported_languages)} 种"
+    level = str(metadata.get("recognitionLevel") or "system")
+    direction_used = bool(metadata.get("directionEvidenceUsed"))
+    direction_note = "Vision 原生方向证据确认竖排；仍保留物理列排序" if direction_used else "方向缺失/不适用，保留几何排序"
+    return (
+        f"🍎 Apple Vision OCR｜系统：{system}｜API：{api}｜Revision：{revision_part}｜"
+        f"识别级别：{level}｜语言：{language_part}｜文字方向：{direction}（{direction_note}）"
+    )
+
+
 # ── 页眉/页脚检测（沿用原脚本算法，稍作增强）────────────────────────────────
 
 def detect_running_headers(all_lines_per_page: list[list[str]]) -> set[str]:
@@ -390,6 +422,7 @@ def run(
     filter_running_headers: bool = True,
     ocr_mode: str = "ja_vertical",
     merge_horizontal_fragments: bool = True,
+    performance_callback=None,
 ) -> UnifiedDocument:
     """
     核心函数：对输入执行 OCR，返回 UnifiedDocument。
@@ -413,7 +446,7 @@ def run(
                         crop_top/crop_bottom（GUI 拖框选工具产生的参数）。
         backend:        "live_text" 使用 VisionKit ImageAnalyzer；"native_helper" 使用现代 RecognizeTextRequest；"shortcut" 使用原快捷指令。旧配置中的 "auto" 仅迁移为 live_text。
         vertical:       竖排阅读顺序提示；Helper 会按右到左、上到下排序观察结果。
-        vertical_preprocess: "crop_rotate_left" 时仅对单个狭长竖列紧裁并左旋 90°后识别一次。
+        vertical_preprocess: "crop_rotate_left" 时仅对单个狭长竖列保留宽纸白上下文并左旋 90°后识别一次，不缩放正文。
         filter_running_headers: 是否在组装文档前自动删除跨页重复页眉/页脚。
                         启用“逐列成句”时应传 False，避免误删页面边缘正文列。
 
@@ -476,6 +509,17 @@ def run(
     available, reason = ocr_backend.is_available()
     if not available:
         raise RuntimeError(f"OCR backend {backend!r} 不可用：{reason}")
+    if callable(performance_callback):
+        try:
+            performance_callback("runtime", 0.0, {
+                "engine": "apple_vision", "backend": backend, "device": "macOS Vision",
+            })
+            performance_callback("input_pages", 0.0, {
+                "total": len(image_paths), "ocr": text_page_total,
+                "skipped": len(image_paths) - text_page_total,
+            })
+        except Exception:
+            pass
     ocr_config = OCRConfig(
         shortcut_name=shortcut_name,
         vertical=vertical,
@@ -493,6 +537,9 @@ def run(
     raw_lines_per_page: list[list[str]] = []
     cancelled = False
     ocr_progress = 0
+    image_preparation_seconds = 0.0
+    recognition_seconds = 0.0
+    vision_runtime_logged = False
     for i, path in enumerate(image_paths, 1):
         if cancel_check is not None and cancel_check():
             cancelled = True
@@ -509,6 +556,7 @@ def run(
         else:
             if verbose:
                 print(f"  [{i:3d}/{len(image_paths)}] OCR: {os.path.basename(path)}", end=" ")
+            preparation_started = time.perf_counter()
             ocr_path = crop_for_ocr(
                 path,
                 crop_top=crop_top,
@@ -517,9 +565,17 @@ def run(
                 out_dir=temp_crop_dir,
                 reuse_existing=bool(reuse_existing_crops),
             )
+            image_preparation_seconds += time.perf_counter() - preparation_started
             # page 由调用方回填，不是 backend 自己知道的——backend.recognize()
             # 只认识"这一张图"，不知道自己在整本书里是第几页。
+            recognition_started = time.perf_counter()
             ocr_result = ocr_backend.recognize(ocr_path, ocr_config)
+            recognition_seconds += time.perf_counter() - recognition_started
+            if verbose and not vision_runtime_logged and getattr(ocr_result, "metadata", None):
+                runtime_line = _vision_runtime_log_line(dict(ocr_result.metadata))
+                if runtime_line:
+                    print(f"\n  {runtime_line}")
+                    vision_runtime_logged = True
             ocr_result.page = i
             raw = ocr_result.full_text
             lines = raw.splitlines()
@@ -531,6 +587,16 @@ def run(
                 progress_callback(ocr_progress, text_page_total, os.path.basename(path), path)
 
     ocr_backend.close()
+    if callable(performance_callback):
+        try:
+            performance_callback("image_preparation", image_preparation_seconds, {
+                "pages": ocr_progress,
+            })
+            performance_callback("recognition", recognition_seconds, {
+                "pages": ocr_progress, "backend": backend,
+            })
+        except Exception:
+            pass
 
     if cancelled:
         # 只保留已经识别完成的页面，其余截断，避免下游按索引访问越界

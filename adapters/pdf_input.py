@@ -12,10 +12,11 @@ from __future__ import annotations
 
 import hashlib
 import json
+import multiprocessing
 import os
 import re
 import threading
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import FIRST_COMPLETED, ProcessPoolExecutor, wait
 from pathlib import Path
 from typing import Callable
 
@@ -29,6 +30,35 @@ _RENDER_LOCKS_GUARD = threading.Lock()
 
 ProgressCallback = Callable[[int, int], None]
 PageReadyCallback = Callable[[str, int, int], None]
+
+_PDF_RENDER_CANCEL_EVENT = None
+
+
+def _init_pdf_render_worker(cancel_event) -> None:
+    global _PDF_RENDER_CANCEL_EVENT
+    _PDF_RENDER_CANCEL_EVENT = cancel_event
+
+
+def _render_pdf_chunk(pdf_path: str, indices: list[int], targets: list[str], dpi: int) -> list[int]:
+    """Render one chunk in an isolated process; PyMuPDF is not thread-safe."""
+    import fitz
+
+    completed: list[int] = []
+    matrix = fitz.Matrix(max(0.25, float(dpi) / 72.0), max(0.25, float(dpi) / 72.0))
+    with fitz.open(pdf_path) as document:
+        for index, target in zip(indices, targets):
+            if _PDF_RENDER_CANCEL_EVENT is not None and _PDF_RENDER_CANCEL_EVENT.is_set():
+                break
+            page = document.load_page(index)
+            pix = page.get_pixmap(
+                matrix=matrix,
+                colorspace=fitz.csRGB,
+                alpha=False,
+                annots=False,
+            )
+            _save_pixmap_fast(pix, Path(target))
+            completed.append(index)
+    return completed
 
 
 def natural_sort_key(path) -> list:
@@ -173,7 +203,6 @@ def pdf_to_images(
                     for stale in directory.glob("*.png"):
                         stale.unlink(missing_ok=True)
 
-                zoom = max(0.25, float(dpi) / 72.0)
                 missing_indices = [
                     index for index, target in enumerate(pages)
                     if not target.exists() or target.stat().st_size < 64
@@ -190,53 +219,52 @@ def pdf_to_images(
                 if progress_callback is not None and completed_count:
                     progress_callback(completed_count, total)
 
-                # PyMuPDF document objects are not shared across threads.  Each
-                # worker opens its own document and renders a contiguous chunk,
-                # which avoids the thread-safety problems of sharing one handle
-                # while still using multiple CPU cores for long PDFs.
                 if missing_indices:
-                    worker_count = min(4, max(1, (os.cpu_count() or 2) // 2), len(missing_indices))
-                    chunks = [missing_indices[offset::worker_count] for offset in range(worker_count)]
-                    progress_lock = threading.Lock()
-
-                    def render_chunk(indices):
-                        nonlocal completed_count
-                        local_document = fitz.open(str(source))
-                        local_matrix = fitz.Matrix(zoom, zoom)
-                        try:
-                            for page_index in indices:
-                                if cancel_check is not None and cancel_check():
-                                    raise RuntimeError("PDF 加载已取消")
-                                page = local_document.load_page(page_index)
-                                pix = page.get_pixmap(
-                                    matrix=local_matrix,
-                                    colorspace=fitz.csRGB,
-                                    alpha=False,
-                                    annots=False,
-                                )
-                                _save_pixmap_fast(pix, pages[page_index])
-                                pix = None
-                                if page_ready_callback is not None:
-                                    page_ready_callback(
-                                        str(pages[page_index]), page_index + 1, total,
-                                    )
-                                with progress_lock:
+                    # PyMuPDF explicitly does not support concurrent rendering
+                    # from multiple threads. Spawn isolated processes instead;
+                    # the GUI's import worker remains responsive without risking
+                    # interpreter crashes from threaded MuPDF calls.
+                    worker_count = min(3, max(1, (os.cpu_count() or 2) // 2), len(missing_indices))
+                    chunk_size = min(32, max(1, (len(missing_indices) + worker_count - 1) // worker_count))
+                    chunks = [missing_indices[offset:offset + chunk_size]
+                              for offset in range(0, len(missing_indices), chunk_size)]
+                    context = multiprocessing.get_context("spawn")
+                    cancel_event = context.Event()
+                    pending = {}
+                    with ProcessPoolExecutor(
+                        max_workers=worker_count,
+                        mp_context=context,
+                        initializer=_init_pdf_render_worker,
+                        initargs=(cancel_event,),
+                    ) as executor:
+                        for chunk in chunks:
+                            targets = [str(pages[index]) for index in chunk]
+                            future = executor.submit(
+                                _render_pdf_chunk, str(source), chunk, targets, int(dpi),
+                            )
+                            pending[future] = chunk
+                        while pending:
+                            if cancel_check is not None and cancel_check():
+                                cancel_event.set()
+                                raise RuntimeError("PDF 加载已取消")
+                            done, _ = wait(
+                                pending, timeout=0.2, return_when=FIRST_COMPLETED,
+                            )
+                            for future in done:
+                                chunk = pending.pop(future)
+                                rendered_indices = future.result()
+                                for page_index in rendered_indices:
+                                    if page_ready_callback is not None:
+                                        page_ready_callback(
+                                            str(pages[page_index]), page_index + 1, total,
+                                        )
                                     completed_count += 1
-                                    current = completed_count
-                                if progress_callback is not None:
-                                    progress_callback(current, total)
-                        finally:
-                            local_document.close()
-
-                    if worker_count == 1:
-                        render_chunk(chunks[0])
-                    else:
-                        with ThreadPoolExecutor(
-                            max_workers=worker_count, thread_name_prefix="pdf-render"
-                        ) as executor:
-                            futures = [executor.submit(render_chunk, chunk) for chunk in chunks if chunk]
-                            for future in as_completed(futures):
-                                future.result()
+                                    if progress_callback is not None:
+                                        progress_callback(completed_count, total)
+                                if len(rendered_indices) != len(chunk):
+                                    if cancel_check is not None and cancel_check():
+                                        cancel_event.set()
+                                        raise RuntimeError("PDF 加载已取消")
                 _write_manifest(directory, {
                     "version": _CACHE_VERSION,
                     "fingerprint": key,
@@ -307,13 +335,23 @@ def expand_inputs(
     page_ready_callback: PageReadyCallback | None = None,
     cancel_check: Callable[[], bool] | None = None,
 ) -> list[str]:
-    """Expand folders, PDFs, and images into naturally ordered image paths."""
+    """Expand folders, PDFs, and images into naturally ordered image paths.
+
+    Multi-model OCR resolves PDF/folder inputs once at run start and then hands
+    every role the same immutable image list.  Detect that hot path lexically
+    and return it directly: no repeated directory probes, PDF cache checks or
+    filesystem stats are needed for each later OCR engine.
+    """
     del work_dir
-    images: list[str] = []
-    for raw in paths:
+    expanded_paths = [Path(raw).expanduser() for raw in paths]
+    if expanded_paths and all(path.suffix.lower() in _IMAGE_EXTS for path in expanded_paths):
         if cancel_check is not None and cancel_check():
             raise RuntimeError("输入加载已取消")
-        path = Path(raw).expanduser()
+        return [str(path) for path in expanded_paths]
+    images: list[str] = []
+    for path in expanded_paths:
+        if cancel_check is not None and cancel_check():
+            raise RuntimeError("输入加载已取消")
         if path.is_dir():
             images.extend(sorted(
                 (str(item) for item in path.iterdir() if item.suffix.lower() in _IMAGE_EXTS),

@@ -1,0 +1,90 @@
+"""Reference UI metrics measured from the supplied 2160×1350 masters.
+
+The masters correspond to a 1440×900 logical Qt canvas rendered at 1.5×.
+Keep geometry in logical pixels here.  This makes the same widget tree scale
+naturally on Retina/HiDPI displays while still giving deterministic golden
+screenshots in the Linux offscreen test harness.
+"""
+from __future__ import annotations
+
+# Reference viewport
+REFERENCE_WIDTH = 1440
+REFERENCE_HEIGHT = 900
+REFERENCE_EXPORT_SCALE = 1.5
+
+# Shell / navigation
+SIDEBAR_WIDTH = 176
+SIDEBAR_OUTER_X = 0
+SIDEBAR_PAD_X = 12
+SIDEBAR_PAD_TOP = 18
+SIDEBAR_ITEM_HEIGHT = 38
+SIDEBAR_ITEM_RADIUS = 11
+SIDEBAR_ITEM_GAP = 5
+SIDEBAR_BRAND_GAP = 25
+BRAND_HEIGHT = 34
+
+# Page chrome
+PAGE_LEFT = 28
+PAGE_RIGHT = 28
+PAGE_TITLE_TOP = 18
+PAGE_TITLE_SIZE = 20
+PAGE_SUBTITLE_SIZE = 12
+PAGE_HEADER_BOTTOM = 6
+PAGE_TAB_HEIGHT = 34
+
+# Common controls
+CONTROL_HEIGHT = 34
+BUTTON_HEIGHT = 34
+BUTTON_RADIUS = 10
+INPUT_RADIUS = 10
+CARD_RADIUS = 14
+CARD_RADIUS_LARGE = 16
+CARD_BORDER = 1
+CARD_PAD_X = 14
+CARD_PAD_Y = 12
+SECTION_GAP = 12
+ROW_GAP = 8
+
+# OCR reference layout
+OCR_LEFT_WIDTH = 408
+OCR_LEFT_MIN = 408
+OCR_LEFT_MAX = 408
+OCR_LEFT_PAD_X = 14
+OCR_LEFT_PAD_TOP = 16
+OCR_CENTER_PAD_X = 18
+OCR_CENTER_PAD_TOP = 16
+OCR_BOTTOM_HEIGHT = 194
+OCR_CANVAS_RADIUS = 16
+OCR_ENGINE_CARD_HEIGHT = 54
+OCR_TOGGLE_HEIGHT = 39
+
+# PDF text-layer reference layout
+PDF_PAGE_MARGIN_X = 28
+PDF_PAGE_MARGIN_TOP = 3
+PDF_PAGE_MARGIN_BOTTOM = 22
+PDF_LEFT_WIDTH = 340
+PDF_COLUMN_GAP = 16
+PDF_PICK_HEIGHT = 84
+PDF_RUN_HEIGHT = 42
+
+# Image/text review reference layout
+REVIEW_PAGE_MARGIN_X = 28
+REVIEW_PAGE_MARGIN_TOP = 3
+REVIEW_PAGE_MARGIN_BOTTOM = 22
+REVIEW_LEFT_WIDTH = 249
+REVIEW_COLUMN_GAP = 16
+REVIEW_TEXT_HEIGHT = 149
+REVIEW_EDITOR_HEIGHT = 48
+
+# Page cards / editors
+CONTENT_MAX = 1180
+EDITOR_RADIUS = 14
+PREVIEW_RADIUS = 16
+
+# Typography in logical px. Qt applies platform font metrics on top.
+FONT_BODY = 12
+FONT_SMALL = 11
+FONT_TINY = 10
+FONT_TITLE = 20
+FONT_SECTION = 13
+FONT_CARD_TITLE = 12

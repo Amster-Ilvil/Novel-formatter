@@ -2,11 +2,11 @@
 # -*- coding: utf-8 -*-
 """Apple Vision character anchors for one printed Japanese vertical column.
 
-The column is masked to its dominant body-text band, tightly cropped and rotated
-left by the bundled Swift helper, then submitted exactly once to
-``RecognizeTextRequest`` in ``.fast`` mode.  The helper asks Vision for
-``boundingBox(for:)`` on every Swift ``Character`` and maps the rectangles back
-to the original vertical-column coordinates.
+The column is masked to its dominant body-text band, then the native backend
+reuses Novel Formatter's tested tight-crop + rotate-left preprocessing.  The
+bundled Swift helper submits that image exactly once in Vision ``.fast`` mode,
+asks ``boundingBox(for:)`` for every Swift ``Character``, and Python maps those
+rectangles back through the same affine transform used by normal OCR.
 
 This module only supplies geometric anchors.  The existing independent pipeline
 still crops every resulting box and performs its normal Apple single-glyph

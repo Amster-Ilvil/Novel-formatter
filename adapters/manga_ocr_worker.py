@@ -1,287 +1,214 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""Persistent Manga-OCR recognizer for already prepared short text regions.
+"""Offline kha-white/manga-ocr-base worker used only for disagreement review.
 
-The parent adapter owns page layout, vertical-column detection and long-column
-chunking.  This worker intentionally performs no rotation, no page masking and
-no fallback crop: Manga OCR natively supports vertical Japanese and must see the
-short vertical pixels exactly as printed.
+The worker never downloads model files.  The 424 MB checkpoint is supplied by
+NOVEL_FORMATTER_MANGA_OCR_MODEL (or the project/persistent model cache), while
+small official config/vocabulary files are bundled with Novel Formatter.
 """
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
-import re
 import sys
-from contextlib import nullcontext
+import time
+import unicodedata
 from pathlib import Path
 
-from PIL import Image, ImageOps
+MANGA_OCR_SHA256 = "c63e0bb5b3ff798c5991de18a8e0956c7ee6d1563aca6729029815eda6f5c2eb"
+SPECIAL_IDS = {0, 1, 2, 3, 4}
 
 
-def _configure_runtime(recognizer) -> tuple[object, str]:
-    """Apply safe inference-only optimizations and return a context factory."""
-    try:
-        import torch
-    except Exception:
-        return nullcontext, "default"
+def _emit(payload: dict) -> None:
+    sys.stdout.write(json.dumps(payload, ensure_ascii=False) + "\n")
+    sys.stdout.flush()
 
-    try:
-        requested_threads = int(os.environ.get("NOVEL_FORMATTER_MANGA_OCR_THREADS", "0") or 0)
-    except ValueError:
-        requested_threads = 0
-    if requested_threads <= 0:
-        requested_threads = min(8, max(1, os.cpu_count() or 4))
-    try:
-        torch.set_num_threads(requested_threads)
-    except Exception:
-        pass
 
-    device_label = str(getattr(recognizer, "device", "cpu"))
-    use_mps = os.environ.get("NOVEL_FORMATTER_MANGA_OCR_MPS", "1") != "0"
-    if use_mps:
+def _sha256(path: Path) -> str:
+    h = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(4 * 1024 * 1024), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def _select_device(torch, requested: str):
+    requested = str(requested or "auto").strip().lower()
+    if requested not in {"auto", "cpu", "mps", "cuda"}:
+        requested = "auto"
+    if requested in {"auto", "mps"} and getattr(torch.backends, "mps", None) is not None:
         try:
-            mps_ready = bool(
-                hasattr(torch.backends, "mps")
-                and torch.backends.mps.is_available()
-                and torch.backends.mps.is_built()
-            )
-            model = getattr(recognizer, "model", None)
-            if mps_ready and model is not None and "mps" not in device_label.lower():
-                device = torch.device("mps")
-                model.to(device)
-                recognizer.device = device
-                device_label = "mps"
+            if torch.backends.mps.is_available():
+                return torch.device("mps")
         except Exception:
             pass
-
-    return torch.inference_mode, device_label
-
-
-class InternalMangaOcr:
-    """Small, version-stable wrapper around the official model components.
-
-    The PyPI package can lag behind the repository's tokenizer initialization.
-    Using the official current tokenizer type explicitly prevents Transformers
-    from selecting an incompatible fast tokenizer while keeping the exact
-    ``kha-white/manga-ocr-base`` weights and post-processing contract.
-    """
-
-    def __init__(self, pretrained_model_name_or_path: str = "kha-white/manga-ocr-base"):
-        import torch
-        from transformers import (
-            AutoTokenizer,
-            GenerationMixin,
-            ViTImageProcessor,
-            VisionEncoderDecoderModel,
-        )
-
-        class MangaOcrModel(VisionEncoderDecoderModel, GenerationMixin):
-            pass
-
-        self.processor = ViTImageProcessor.from_pretrained(pretrained_model_name_or_path)
-        self.tokenizer = AutoTokenizer.from_pretrained(
-            pretrained_model_name_or_path,
-            tokenizer_type="bert-japanese",
-            use_fast=False,
-        )
-        self.model = MangaOcrModel.from_pretrained(pretrained_model_name_or_path)
-        self.model.eval()
-        self.device = torch.device("cpu")
-
-    @staticmethod
-    def _normalize_text(text: str) -> str:
-        import jaconv
-
-        value = "".join(str(text or "").split())
-        value = value.replace("…", "...")
-        value = re.sub(r"[・.]{2,}", lambda match: (match.end() - match.start()) * ".", value)
-        return jaconv.h2z(value, ascii=True, digit=True)
-
-    def batch(self, paths: list[str]) -> list[str]:
-        """Run one real tensor batch while preserving official preprocessing."""
-        images: list[Image.Image] = []
+        if requested == "mps":
+            raise RuntimeError("Manga OCR 请求 MPS，但当前 PyTorch/Mac 环境不可用")
+    if requested in {"auto", "cuda"}:
         try:
-            for path in paths:
-                with Image.open(path) as source:
-                    images.append(ImageOps.exif_transpose(source).convert("L").convert("RGB"))
-            pixel_values = self.processor(images=images, return_tensors="pt").pixel_values
-        finally:
-            for image in images:
-                image.close()
-        generated = self.model.generate(
-            pixel_values.to(self.model.device),
-            max_length=300,
-        ).cpu()
-        decoded = self.tokenizer.batch_decode(generated, skip_special_tokens=True)
-        return [self._normalize_text(text) for text in decoded]
-
-    def __call__(self, img_or_path) -> str:
-        if isinstance(img_or_path, (str, Path)):
-            return self.batch([str(img_or_path)])[0]
-        if isinstance(img_or_path, Image.Image):
-            # Keep the old object input contract for compatibility/debugging.
-            import tempfile
-            with tempfile.NamedTemporaryFile(suffix=".png") as fh:
-                img_or_path.convert("RGB").save(fh.name)
-                return self.batch([fh.name])[0]
-        raise ValueError(f"不支持的 Manga OCR 输入类型: {type(img_or_path)!r}")
+            if torch.cuda.is_available():
+                return torch.device("cuda")
+        except Exception:
+            pass
+        if requested == "cuda":
+            raise RuntimeError("Manga OCR 请求 CUDA，但当前运行时不可用")
+    return torch.device("cpu")
 
 
+def _clean_decoded(text: str) -> str:
+    # OCR evidence must remain model-faithful.  Only strip transport whitespace
+    # and normalize canonical Unicode; do not silently rewrite punctuation.
+    return unicodedata.normalize("NFC", "".join(str(text or "").split()))
 
-def _recognize(recognizer, inference_context, path: str) -> dict:
-    try:
-        with Image.open(path) as probe:
-            input_size = list(probe.size)
-        with inference_context():
-            text = str(recognizer(path) or "").strip()
-        blocks = [{
-            "text": text,
-            "confidence": 0.0,
-            "confidence_kind": "uncalibrated",
-            "box": None,
-            "input_size": input_size,
-            "orientation": "vertical-preserved",
-        }] if text else []
-        return {
-            "ok": True,
-            "path": path,
-            "blocks": blocks,
-            "input_size": input_size,
-            "orientation": "vertical-preserved",
-        }
-    except Exception as exc:
-        return {"ok": False, "path": path, "error": str(exc)}
 
-def _recognize_batch(recognizer, inference_context, paths: list[str]) -> list[dict]:
-    """Recognize a bounded path group; isolate failures without losing order."""
-    ordered = [str(path) for path in paths]
-    if not ordered:
-        return []
-    try:
-        sizes = []
-        for path in ordered:
-            with Image.open(path) as probe:
-                sizes.append(list(probe.size))
-        with inference_context():
-            texts = recognizer.batch(ordered)
-        if len(texts) != len(ordered):
+class Recognizer:
+    def __init__(self, weights: Path, metadata_dir: Path, device: str = "auto"):
+        import torch
+        from PIL import Image
+        from transformers import VisionEncoderDecoderConfig, VisionEncoderDecoderModel, ViTImageProcessor
+
+        self.torch = torch
+        self.Image = Image
+        threads = int(os.environ.get("NOVEL_FORMATTER_MANGA_OCR_THREADS", "0") or 0)
+        if threads > 0:
+            try:
+                torch.set_num_threads(max(1, min(32, threads)))
+                torch.set_num_interop_threads(max(1, min(8, threads // 2 or 1)))
+            except Exception:
+                pass
+        self.device = _select_device(torch, device)
+        self.weights = Path(weights)
+        self.metadata_dir = Path(metadata_dir)
+        digest = _sha256(self.weights)
+        if digest != MANGA_OCR_SHA256:
             raise RuntimeError(
-                f"Manga OCR 批量返回数量异常：输入 {len(ordered)}，返回 {len(texts)}"
+                "Manga OCR 权重 SHA256 不匹配；需要 kha-white/manga-ocr-base 原始 pytorch_model.bin，"
+                f"当前={digest}"
             )
-        items = []
-        for path, input_size, text in zip(ordered, sizes, texts):
-            value = str(text or "").strip()
-            blocks = [{
-                "text": value,
-                "confidence": 0.0,
-                "confidence_kind": "uncalibrated",
-                "box": None,
-                "input_size": input_size,
-                "orientation": "vertical-preserved",
-            }] if value else []
-            items.append({
-                "ok": True,
-                "path": path,
-                "blocks": blocks,
-                "input_size": input_size,
-                "orientation": "vertical-preserved",
-            })
-        return items
-    except Exception:
-        # A corrupt image or backend batch edge case must not invalidate the
-        # other physical columns. Fall back to the proven single-image path.
-        return [_recognize(recognizer, inference_context, path) for path in ordered]
+
+        config = VisionEncoderDecoderConfig.from_pretrained(
+            self.metadata_dir, local_files_only=True
+        )
+        self.model = VisionEncoderDecoderModel(config)
+        state = torch.load(self.weights, map_location="cpu", weights_only=True)
+        self.checkpoint_key_count = len(state)
+        self.dropped_compat_keys: list[str] = []
+        for key in ("decoder.bert.embeddings.position_ids",):
+            if key in state and key not in self.model.state_dict():
+                state.pop(key)
+                self.dropped_compat_keys.append(key)
+        self.model.load_state_dict(state, strict=True)
+        self.model.to(self.device).eval()
+        self.processor = ViTImageProcessor.from_pretrained(
+            self.metadata_dir, local_files_only=True
+        )
+        self.vocab = (self.metadata_dir / "vocab.txt").read_text(encoding="utf-8").splitlines()
+        if len(self.vocab) != 6144:
+            raise RuntimeError(f"Manga OCR vocab 应为 6144 项，实际 {len(self.vocab)}")
+
+    def _decode(self, ids) -> str:
+        parts: list[str] = []
+        for raw in ids:
+            idx = int(raw)
+            if idx in SPECIAL_IDS:
+                continue
+            if 0 <= idx < len(self.vocab):
+                parts.append(self.vocab[idx])
+        return _clean_decoded("".join(parts))
+
+    def recognize_one(self, path: str, *, max_length: int = 48, num_beams: int = 4) -> dict:
+        image = self.Image.open(path)
+        try:
+            image = image.convert("L").convert("RGB")
+            pixel_values = self.processor(images=image, return_tensors="pt").pixel_values.to(self.device)
+            with self.torch.inference_mode():
+                ids = self.model.generate(
+                    pixel_values,
+                    max_length=max(16, min(128, int(max_length))),
+                    num_beams=max(1, min(4, int(num_beams))),
+                    no_repeat_ngram_size=3,
+                    length_penalty=2.0,
+                    early_stopping=True,
+                    decoder_start_token_id=2,
+                    eos_token_id=3,
+                    pad_token_id=0,
+                )[0]
+            text = self._decode(ids.tolist())
+            # The upstream model does not expose a calibrated OCR probability.
+            # Keep this explicitly heuristic; local adjudication counts text as
+            # independent evidence, not as a probability score.
+            return {
+                "path": str(path),
+                "text": text,
+                "confidence": 0.88 if text else 0.0,
+                "confidence_kind": "heuristic",
+            }
+        finally:
+            try:
+                image.close()
+            except Exception:
+                pass
+
+    def recognize(self, paths: list[str], *, max_length: int = 48, num_beams: int = 4) -> list[dict]:
+        return [
+            self.recognize_one(path, max_length=max_length, num_beams=num_beams)
+            for path in paths
+        ]
 
 
-
-def main() -> None:
+def main() -> int:
     parser = argparse.ArgumentParser()
-    mode = parser.add_mutually_exclusive_group(required=True)
-    mode.add_argument("--manifest")
-    mode.add_argument("--stream", action="store_true")
+    parser.add_argument("--stream", action="store_true")
+    parser.add_argument("--weights", required=True)
+    parser.add_argument("--metadata-dir", required=True)
+    parser.add_argument("--device", default=os.environ.get("NOVEL_FORMATTER_MANGA_OCR_DEVICE", "auto"))
     args = parser.parse_args()
 
+    t0 = time.perf_counter()
     try:
-        model_name = os.environ.get("NOVEL_FORMATTER_MANGA_OCR_MODEL", "kha-white/manga-ocr-base")
-        recognizer = InternalMangaOcr(model_name)
-        inference_context, device_label = _configure_runtime(recognizer)
+        recognizer = Recognizer(Path(args.weights), Path(args.metadata_dir), args.device)
     except Exception as exc:
-        print(json.dumps({
-            "ok": False,
-            "path": "",
-            "error": f"Manga OCR 模型初始化失败: {exc}",
-        }, ensure_ascii=False), flush=True)
-        raise SystemExit(1)
+        _emit({"ready": False, "error": f"{type(exc).__name__}: {exc}"})
+        return 2
+    _emit({
+        "ready": True,
+        "device": str(recognizer.device),
+        "load_seconds": time.perf_counter() - t0,
+        "checkpoint_key_count": recognizer.checkpoint_key_count,
+        "dropped_compat_keys": recognizer.dropped_compat_keys,
+        "model_sha256": MANGA_OCR_SHA256,
+    })
 
-    if args.stream:
-        print(json.dumps({
-            "ok": True,
-            "ready": True,
-            "device": device_label,
-            "model": model_name,
-            "input_contract": "short-vertical-unrotated",
-        }, ensure_ascii=False), flush=True)
-        for line in sys.stdin:
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                request = json.loads(line)
-            except Exception as exc:
-                print(json.dumps({
-                    "ok": False,
-                    "path": "",
-                    "error": f"请求 JSON 无效: {exc}",
-                }, ensure_ascii=False), flush=True)
-                continue
-            if request.get("command") == "close":
-                print(json.dumps({"ok": True, "closed": True}, ensure_ascii=False), flush=True)
-                try:
-                    sys.stdout.flush()
-                    sys.stderr.flush()
-                finally:
-                    os._exit(0)
-            raw_paths = request.get("paths")
-            if isinstance(raw_paths, list):
-                paths = [str(path) for path in raw_paths if str(path)]
-                if not paths:
-                    response = {"ok": False, "items": [], "error": "缺少 paths"}
-                else:
-                    response = {
-                        "ok": True,
-                        "items": _recognize_batch(recognizer, inference_context, paths),
-                    }
-                if "request_id" in request:
-                    response["request_id"] = request["request_id"]
-                print(json.dumps(response, ensure_ascii=False), flush=True)
-                continue
-
-            path = str(request.get("path", ""))
-            if not path:
-                print(json.dumps({"ok": False, "path": "", "error": "缺少 path"}, ensure_ascii=False), flush=True)
-                continue
-            response = _recognize(recognizer, inference_context, path)
-            if "request_id" in request:
-                response["request_id"] = request["request_id"]
-            print(json.dumps(response, ensure_ascii=False), flush=True)
-        return
-
-    try:
-        with open(args.manifest, "r", encoding="utf-8") as fh:
-            paths = json.load(fh)
-    except Exception as exc:
-        print(json.dumps({
-            "ok": False,
-            "path": "",
-            "error": f"读取 manifest 失败: {exc}",
-        }, ensure_ascii=False), flush=True)
-        raise SystemExit(1)
-
-    for path in paths:
-        print(json.dumps(_recognize(recognizer, inference_context, str(path)), ensure_ascii=False), flush=True)
+    if not args.stream:
+        return 0
+    for line in sys.stdin:
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            request = json.loads(line)
+        except Exception as exc:
+            _emit({"ok": False, "error": f"invalid-json: {exc}"})
+            continue
+        if request.get("command") == "close":
+            return 0
+        request_id = int(request.get("request_id", 0) or 0)
+        paths = [str(item) for item in request.get("paths", [])]
+        max_length = int(request.get("max_length", 48) or 48)
+        num_beams = max(1, min(4, int(request.get("num_beams", 4) or 4)))
+        try:
+            items = recognizer.recognize(paths, max_length=max_length, num_beams=num_beams)
+            _emit({"request_id": request_id, "ok": True, "items": items})
+        except Exception as exc:
+            _emit({
+                "request_id": request_id,
+                "ok": False,
+                "error": f"{type(exc).__name__}: {exc}",
+            })
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

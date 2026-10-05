@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """Formatter workspace specific AI prompts.
 
-These prompts are deliberately independent from the Text Replacement workspace.
+These prompts are deliberately scoped only to the Formatter workspace.
 The Formatter first relies on deterministic local rules for short/simple fragments;
 AI is used only for long or structurally ambiguous passages.
 """

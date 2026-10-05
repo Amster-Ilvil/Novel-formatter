@@ -39,6 +39,7 @@ import argparse
 import json
 import os
 import sys
+import time
 
 try:
     # Direct worker execution adds adapters/ to sys.path.
@@ -184,7 +185,7 @@ def build_engine(
                 raise RuntimeError(
                     f"无法加载 {PADDLE_DETECTION_MODEL} + {PADDLE_RECOGNITION_MODEL}，"
                     "且 PaddleOCR 默认日文模型也不可用。请检查网络、删除 .venv-paddle 后重试，"
-                    "或改用 NDLOCR-Lite / Manga OCR。"
+                    "或改用 NDLOCR-Lite / 48px AR OCR。"
                 ) from fallback_exc
         return engine, "ocr"
 
@@ -196,6 +197,7 @@ def main():
     parser.add_argument("images", nargs="*", help="图片路径列表")
     parser.add_argument("--lang", default="japan")
     parser.add_argument("--pipeline", default="ocr", choices=["ocr", "structure", "vl"])
+    parser.add_argument("--batch-size", type=int, default=1, help="输入批量（Paddle 原生 list+batch_size）")
     parser.add_argument("--vl-backend", default="paddle", choices=["paddle", "mlx"])
     parser.add_argument("--vl-server-url", default="")
     parser.add_argument(
@@ -282,12 +284,102 @@ def main():
                 "path": path,
                 "blocks": blocks,
                 "backend": active_backend,
+                "batch_size": 1,
             }
         except Exception as exc:
             payload = {"ok": False, "path": path, "error": str(exc)}
         if request_id is not None:
             payload["request_id"] = request_id
         return payload
+
+    # PaddleOCR 3.x accepts a path list + batch_size and returns one Result per
+    # input sample. The old worker called predict(path) for every page, which
+    # serialized an otherwise batchable pipeline and left the M6 GPU/UM bandwidth
+    # underutilized. Keep a strict shape/length check and fall back to the old
+    # per-page path if an installed Paddle build violates that contract.
+    requested_batch_size = max(1, int(args.batch_size or 1))
+
+    def _flatten_result_blocks(results) -> list[dict]:
+        blocks: list[dict] = []
+        for res in results:
+            if pipeline == "vl":
+                blocks.extend(_blocks_from_vl_result(res))
+            elif pipeline == "structure":
+                data = getattr(res, "json", None) or res
+                if isinstance(data, dict) and "res" in data:
+                    data = data["res"]
+                if isinstance(data, dict) and data.get("overall_ocr_res"):
+                    blocks.extend(_blocks_from_ocr_result(data["overall_ocr_res"]))
+                else:
+                    blocks.extend(_blocks_from_ocr_result(res))
+            else:
+                blocks.extend(_blocks_from_ocr_result(res))
+        return blocks
+
+    def _payload_from_blocks(
+        path: str,
+        blocks: list[dict],
+        request_id=None,
+        backend=None,
+        batch_size: int = 1,
+    ) -> dict:
+        payload = {
+            "ok": True,
+            "path": path,
+            "blocks": blocks,
+            "backend": backend or getattr(engine, "_novel_formatter_vl_backend", ""),
+            "batch_size": max(1, int(batch_size or 1)),
+        }
+        if request_id is not None:
+            payload["request_id"] = request_id
+        return payload
+
+    def process_paths(paths: list[str], request_id=None):
+        if not paths:
+            return
+        # For a single page or explicitly forced batch=1, preserve the exact
+        # historical process_path implementation and its MLX->Paddle fallback.
+        if len(paths) == 1 or requested_batch_size <= 1:
+            yield process_path(paths[0], request_id)
+            return
+
+        active_backend = getattr(engine, "_novel_formatter_vl_backend", "")
+        batch_size = min(requested_batch_size, len(paths))
+        for start in range(0, len(paths), batch_size):
+            chunk = paths[start:start + batch_size]
+            started = time.perf_counter()
+            try:
+                results = list(engine.predict(chunk, batch_size=len(chunk)))
+                if len(results) != len(chunk):
+                    raise RuntimeError(
+                        f"Paddle 批量结果数量异常：输入 {len(chunk)}，输出 {len(results)}"
+                    )
+                for path, result in zip(chunk, results):
+                    yield _payload_from_blocks(
+                        path,
+                        _flatten_result_blocks([result]),
+                        request_id,
+                        active_backend,
+                        len(chunk),
+                    )
+            except Exception as batch_exc:
+                # A model/runtime incompatibility must never turn a successful
+                # single-page implementation into a hard failure. Fall back
+                # chunk-by-chunk, preserving MLX/VL safety behavior.
+                elapsed = max(0.0, time.perf_counter() - started)
+                print(
+                    f"PaddleOCR batch warning: 批量 {len(chunk)} 失败，回退逐页；耗时={elapsed:.3f}s：{batch_exc}",
+                    file=sys.stderr,
+                    flush=True,
+                )
+                # A persistent incompatibility should be learned for the rest
+                # of this request; otherwise every following chunk would pay the
+                # same failed batch attempt before falling back again.
+                for path in chunk:
+                    yield process_path(path, request_id)
+                for remaining in paths[start + len(chunk):]:
+                    yield process_path(remaining, request_id)
+                return
 
     if args.server:
         for line in sys.stdin:
@@ -298,14 +390,15 @@ def main():
             if request.get("command") == "close":
                 break
             request_id = request.get("request_id")
-            for path in list(request.get("images") or []):
-                print(json.dumps(process_path(str(path), request_id), ensure_ascii=False), flush=True)
+            paths = [str(path) for path in list(request.get("images") or [])]
+            for payload in process_paths(paths, request_id):
+                print(json.dumps(payload, ensure_ascii=False), flush=True)
             print(json.dumps({"batch_done": True, "request_id": request_id}, ensure_ascii=False), flush=True)
     else:
         if not args.images:
             parser.error("至少提供一个图片路径，或使用 --server")
-        for path in args.images:
-            print(json.dumps(process_path(path), ensure_ascii=False), flush=True)
+        for payload in process_paths([str(path) for path in args.images], None):
+            print(json.dumps(payload, ensure_ascii=False), flush=True)
 
 
 if __name__ == "__main__":

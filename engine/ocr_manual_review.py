@@ -50,6 +50,25 @@ def _logical_chars(text: str) -> list[str]:
     return [ch for ch in str(text or "") if ch not in _IGNORED_FOR_COUNT]
 
 
+def _ink_comparable_chars(text: str) -> list[str]:
+    """Characters comparable to the geometry-only black-ink glyph estimate.
+
+    Japanese punctuation/ellipses are frequently represented by small or
+    disconnected components, so counting them as full glyphs systematically
+    makes OCR look longer than the image estimate.  Keep letters, numbers,
+    symbols and marks, but ignore punctuation/separators/control characters.
+    """
+    output: list[str] = []
+    for ch in str(text or ""):
+        if ch in _IGNORED_FOR_COUNT:
+            continue
+        category = unicodedata.category(ch)
+        if category.startswith(("P", "Z", "C")):
+            continue
+        output.append(ch)
+    return output
+
+
 def _adjacent_repeat(text: str) -> tuple[str, list[int]] | None:
     """Find an adjacent repeated chunk such as 嫉妬嫉妬 or 込み込み.
 
@@ -58,11 +77,15 @@ def _adjacent_repeat(text: str) -> tuple[str, list[int]] | None:
     language automatically.
     """
     chars = list(str(text or ""))
-    for width in range(min(8, len(chars) // 2), 1, -1):
+    for width in range(min(8, len(chars) // 2), 2, -1):
         for start in range(0, len(chars) - width * 2 + 1):
             left = chars[start:start + width]
             right = chars[start + width:start + width * 2]
-            if left == right and any(_JAPANESE_RE.search(ch) for ch in left):
+            if (
+                left == right
+                and any(_JAPANESE_RE.search(ch) for ch in left)
+                and any(unicodedata.category(ch).startswith(("L", "N")) for ch in left)
+            ):
                 return "".join(left), list(range(start, start + width * 2))
     return None
 
@@ -177,34 +200,71 @@ def analyze_block(block: Block) -> ReviewRisk:
     if len(odd_digit_indices) >= 2 and _JAPANESE_RE.search(text):
         risk.add(12, "日文列中数字较多，请确认是否为 OCR 污染", odd_digit_indices)
 
+    # Several local OCR backends (notably Apple Live Text, Hayai and some
+    # manga recognizers) use 0.0 to mean "backend does not expose a calibrated
+    # block confidence", not "the recognizer is certain this result is bad".
+    # Treat zero/negative confidence as unavailable unless the adapter
+    # explicitly says the value is meaningful.  This prevents every physical
+    # column from being painted as high-risk simply because the backend has no
+    # confidence API.  Positive confidences keep the historical thresholds.
     confidence = float(block.confidence or 0.0)
-    if confidence < 0.60:
-        risk.add(55, f"OCR 置信度很低（{confidence:.2f}）")
-    elif confidence < 0.82:
-        risk.add(34, f"OCR 置信度偏低（{confidence:.2f}）")
-    elif confidence < 0.93:
-        risk.add(18, f"OCR 置信度一般（{confidence:.2f}），相近字仍需抽查")
+    confidence_available_flag = meta.get("ocr_confidence_available")
+    confidence_available = (
+        bool(confidence_available_flag)
+        if confidence_available_flag is not None
+        else confidence > 0.0
+    )
+    if confidence_available:
+        if confidence < 0.60:
+            risk.add(55, f"OCR 置信度很低（{confidence:.2f}）")
+        elif confidence < 0.82:
+            risk.add(34, f"OCR 置信度偏低（{confidence:.2f}）")
+        elif confidence < 0.93:
+            risk.add(18, f"OCR 置信度一般（{confidence:.2f}），相近字仍需抽查")
 
-    for opening, closing in _PAIRS:
-        if text.count(opening) != text.count(closing):
-            indices = [i for i, ch in enumerate(chars) if ch in {opening, closing}]
-            risk.add(32, f"括号/引号不平衡：{opening}{closing}", indices)
+    # A raw physical vertical column is not a linguistic sentence boundary.
+    # Quotes/brackets routinely open in one column and close in the next, so
+    # balance checks belong to the reflowed sentence stage.
+    raw_physical_column = bool(
+        meta.get("layout_group") == "fixed_region_column"
+        and not meta.get("column_sentence_reflow")
+        and not meta.get("atomic_ocr_sentence")
+    )
+    if not raw_physical_column:
+        for opening, closing in _PAIRS:
+            if text.count(opening) != text.count(closing):
+                indices = [i for i, ch in enumerate(chars) if ch in {opening, closing}]
+                risk.add(32, f"括号/引号不平衡：{opening}{closing}", indices)
 
     repeated = _adjacent_repeat(text)
     if repeated:
         chunk, indices = repeated
         risk.add(28, f"存在相邻重复片段“{chunk}”", indices)
 
-    estimated = int(meta.get("black_ink_estimated_chars", 0) or 0)
-    actual = len(_logical_chars(text))
+    # After column-sentence reflow the block text may contain several physical
+    # columns, while ``black_ink_estimated_chars`` still belongs to the owner
+    # (first) column.  Comparing the whole sentence against that one-column
+    # estimate creates systematic false positives.  Physical-column risk is
+    # already evaluated before reflow in the single-OCR workflow, so sentence
+    # blocks keep only sentence-level checks here.
+    reflowed_multi_column = bool(
+        meta.get("column_sentence_reflow")
+        and int(meta.get("column_count", 1) or 1) > 1
+    )
+    estimated = 0 if reflowed_multi_column else int(meta.get("black_ink_estimated_chars", 0) or 0)
+    actual = len(_ink_comparable_chars(text)) if estimated > 0 else len(_logical_chars(text))
     if estimated > 0:
         delta = actual - estimated
-        tolerance = max(2, round(estimated * 0.22))
+        # Geometry is deliberately coarse on short vertical columns.  Requiring
+        # at least a three-glyph delta prevents normal punctuation/connected
+        # components from turning short, otherwise clean dialogue columns into
+        # mandatory review items.  Large deviations remain high-risk.
+        tolerance = max(3, round(estimated * 0.25))
         if abs(delta) > tolerance:
             direction = "多" if delta > 0 else "少"
-            risk.add(42, f"OCR 字数比黑像素估计{direction} {abs(delta)}（OCR {actual} / 估计 {estimated}）")
-        elif abs(delta) >= max(2, round(estimated * 0.12)):
-            risk.add(18, f"OCR 字数与黑像素估计存在偏差（OCR {actual} / 估计 {estimated}）")
+            risk.add(42, f"OCR 主体字符比黑像素估计{direction} {abs(delta)}（OCR {actual} / 估计 {estimated}）")
+        elif abs(delta) >= max(3, round(estimated * 0.15)):
+            risk.add(18, f"OCR 主体字符与黑像素估计存在偏差（OCR {actual} / 估计 {estimated}）")
 
     segmentation = meta.get("handwriting_input_glyph_segmentation") or {}
     if isinstance(segmentation, dict):
@@ -266,6 +326,7 @@ def annotate_ocr_review_risks(doc: UnifiedDocument) -> dict:
     reviewed = 0
     suspicious = 0
     high = 0
+    confidence_unavailable = 0
     reason_counter: Counter[str] = Counter()
     page_counts: Counter[int] = Counter()
 
@@ -273,8 +334,15 @@ def annotate_ocr_review_risks(doc: UnifiedDocument) -> dict:
         if not _reviewable(block):
             continue
         reviewed += 1
-        risk = analyze_block(block)
         meta = dict(block.metadata or {})
+        try:
+            raw_confidence = float(block.confidence or 0.0)
+        except (TypeError, ValueError):
+            raw_confidence = 0.0
+        explicit_confidence = meta.get("ocr_confidence_available")
+        if explicit_confidence is False or (explicit_confidence is None and raw_confidence <= 0.0):
+            confidence_unavailable += 1
+        risk = analyze_block(block)
         meta["ocr_review_risk_score"] = int(risk.score)
         meta["ocr_review_reasons"] = list(risk.reasons)
         meta["ocr_review_indices"] = sorted(risk.indices)
@@ -293,6 +361,7 @@ def annotate_ocr_review_risks(doc: UnifiedDocument) -> dict:
         "columns": reviewed,
         "suspicious_columns": suspicious,
         "high_risk_columns": high,
+        "confidence_unavailable_columns": confidence_unavailable,
         "pages_with_issues": dict(sorted(page_counts.items())),
         "top_reasons": reason_counter.most_common(12),
     }

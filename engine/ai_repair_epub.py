@@ -29,15 +29,15 @@ import xml.etree.ElementTree as ET
 
 from builder.epub_builder import build_epub
 from models.document import Block, BlockType, UnifiedDocument
-from engine.text_compare import looks_like_chapter_title
+from engine.document_alignment import looks_like_chapter_title
 
 AI_REPAIR_SCHEMA = "novel_formatter.ai_repair_epub.v2"
 AI_REPAIR_EDITS_SCHEMA = "novel_formatter.ai_repair_edits.v2"
-AI_DISAGREEMENT_DECISIONS_SCHEMA = "novel_formatter.ai_disagreement_decisions.v1"
-_LEGACY_AI_REPAIR_SCHEMAS = {"novel_formatter.ai_repair_epub.v1", AI_REPAIR_SCHEMA}
-_LEGACY_AI_REPAIR_EDIT_SCHEMAS = {"novel_formatter.ai_repair_edits.v1", AI_REPAIR_EDITS_SCHEMA}
+AI_DISAGREEMENT_DECISIONS_SCHEMA_CURRENT = "novel_formatter.ai_disagreement_decisions.v3"
+CURRENT_AI_REPAIR_SCHEMAS = {AI_REPAIR_SCHEMA}
+CURRENT_AI_REPAIR_EDIT_SCHEMAS = {AI_REPAIR_EDITS_SCHEMA}
 
-# Compatibility files retained for older clients.
+# Current v2 exchange paths.  Older package layouts are rejected during development.
 MAP_PATH = "META-INF/ai-repair-map.json"
 GUIDE_PATH = "META-INF/AI_REPAIR_GUIDE.md"
 TEMPLATE_PATH = "META-INF/ai-repair-result-template.json"
@@ -90,6 +90,25 @@ _DASH_CHARS = "─━―—‐‑‒–ー一"
 
 class AIRepairEpubError(ValueError):
     """The external repair artifact is malformed, stale, or structurally unsafe."""
+
+
+class LegacyAdjudicationResultCompatibilityUnavailable(AIRepairEpubError):
+    """Stable compatibility seam; legacy result parsing is disabled pre-stable."""
+
+
+def _legacy_adjudication_result_compatibility_interface(
+    *_args, operation: str = "导入", **_kwargs
+):
+    """Reserved hook for post-stable legacy adjudication compatibility.
+
+    Callers and GUI entry points may keep using the same interfaces.  Until the
+    format stabilizes, this hook intentionally contains no legacy parser, schema
+    inference, fuzzy matching, or migration code.
+    """
+    raise LegacyAdjudicationResultCompatibilityUnavailable(
+        f"旧裁决结果兼容接口已保留，但当前开发版未启用{operation}实现；"
+        f"请使用 {AI_DISAGREEMENT_DECISIONS_SCHEMA_CURRENT}。"
+    )
 
 
 def _canonical_json(value: Any) -> bytes:
@@ -232,6 +251,8 @@ def _repair_block_from_item(item: dict, source: Block | None, *, export_revision
         item.get("delete_intentionally", False),
         field=f"条目 {item_id} 的 delete_intentionally",
     )
+    ruby_locked = copy.deepcopy(item.get("ruby_locked_annotations") or [])
+    content_format = "inline_tokens_v1" if ruby_locked else _content_format(block_type.value)
     block.metadata = {
         **(copy.deepcopy(getattr(block, "metadata", {}) or {})),
         "ai_repair_item_id": item_id,
@@ -241,7 +262,7 @@ def _repair_block_from_item(item: dict, source: Block | None, *, export_revision
         "ai_repair_column_ids": column_ids,
         "ai_repair_bbox": bbox,
         "ai_repair_row_index": row_index,
-        "ai_repair_content_format": _content_format(block_type.value),
+        "ai_repair_content_format": content_format,
         "ai_repair_baseline_sha256": _text_sha256(baseline),
         "ai_repair_export_revision": int(export_revision or 0),
         "source_column_ids": column_ids,
@@ -337,8 +358,8 @@ def build_repair_document(
             refresh_preserved_ruby(result)
         else:
             strip_ruby_overlay(result, strip_candidate_geometry=False, strip_logs=False)
-    except Exception:
-        pass
+    except Exception as exc:
+        raise AIRepairEpubError(f"Ruby 侧通道恢复失败：{exc}") from exc
     return result
 
 
@@ -607,7 +628,7 @@ def _map_item(
         "html_id": html_id,
         "page": int(item.get("page", 0) or 0),
         "block_type": block_type,
-        "content_format": _content_format(block_type),
+        "content_format": ("inline_tokens_v1" if item.get("ruby_locked_annotations") else _content_format(block_type)),
         "column_ids": [str(value) for value in (item.get("column_ids") or []) if str(value)],
         "original_text": baseline,
         "baseline_text": baseline,
@@ -1100,7 +1121,7 @@ def _publication_guide_text(
         "本包包含用户显式选择的 `reference/` 出版参考证据。它可提供日文层、结构和可靠 Ruby，"
         "但不得静默覆盖 `proposed_text`；正文不一致时必须转为复核。"
         if publication_reference_available else
-        "本包未包含出版参考 EPUB。不得从文字对比页旧路径、网络文本或其他版本静默补入正文。"
+        "本包未包含出版参考 EPUB。不得从旧版编辑工作区、网络文本或其他版本静默补入正文。"
     )
     ruby_note = (
         "有 `reference/` 中可靠对齐且底字完全一致的 Ruby 证据时，允许恢复对应 `<ruby><rt>`；"
@@ -1652,11 +1673,11 @@ def export_ai_publication_bundle(
     publication_reference_path: str | Path | None = None,
     package_mode: str = "forensic",
 ) -> dict:
-    """Export an AI repair package. V4 adjudicates only real disagreements."""
+    """Export an AI repair package. V5 is the role-aware disagreement workflow."""
     normalized_package_mode = str(package_mode or "forensic").strip().lower()
-    if normalized_package_mode in {"disagreement_v4", "v4", "adjudication", "conflict_only"}:
-        from engine.ai_disagreement_package_v4 import export_ai_disagreement_package_v4
-        return export_ai_disagreement_package_v4(
+    if normalized_package_mode in {"disagreement_v5", "v5", "adjudication", "conflict_only"}:
+        from engine.ai_disagreement_package_v5 import export_ai_disagreement_package_v5
+        return export_ai_disagreement_package_v5(
             primary_doc,
             package,
             output_directory,
@@ -1668,20 +1689,8 @@ def export_ai_publication_bundle(
             include_publication_reference=include_publication_reference,
             publication_reference_path=publication_reference_path,
         )
-    from engine.ai_publication_bundle_v2 import export_ai_publication_bundle_v2
-    return export_ai_publication_bundle_v2(
-        primary_doc,
-        package,
-        output_directory,
-        mode=mode,
-        vertical=vertical,
-        css_template=css_template,
-        custom_css=custom_css,
-        bundle_name=bundle_name,
-        create_zip=create_zip,
-        include_publication_reference=include_publication_reference,
-        publication_reference_path=publication_reference_path,
-        package_mode=package_mode,
+    raise AIRepairEpubError(
+        "当前开发版只支持当前 V5 多模型分歧裁决包；其它裁决/修复包格式均不兼容。"
     )
 
 def _result_schema() -> dict:
@@ -1997,8 +2006,11 @@ def read_ai_repair_map(epub_path: str | Path) -> dict:
             value = _json_loads_strict(archive.read(MAP_PATH), source=MAP_PATH)
     except KeyError as exc:
         raise AIRepairEpubError(f"该 EPUB 不包含 {MAP_PATH}。") from exc
-    if value.get("schema") not in _LEGACY_AI_REPAIR_SCHEMAS:
-        raise AIRepairEpubError(f"不支持的 AI 修复 EPUB schema：{value.get('schema')!r}")
+    if value.get("schema") not in CURRENT_AI_REPAIR_SCHEMAS:
+        raise AIRepairEpubError(
+            f"AI 修复 EPUB schema={value.get('schema')!r} 不受当前开发版支持；"
+            f"当前只接受 {AI_REPAIR_SCHEMA!r}。"
+        )
     expected_hash = _sha256({key: item for key, item in value.items() if key != "map_sha256"})
     if str(value.get("map_sha256", "")) != expected_hash:
         raise AIRepairEpubError("AI 修复映射已被修改或损坏。")
@@ -2305,191 +2317,24 @@ def extract_edits_from_repaired_epub(
     *,
     expected_package: dict | None = None,
 ) -> tuple[list[dict], dict]:
-    path = Path(epub_path).expanduser()
-    repair_map = read_ai_repair_map(path)
-    if expected_package is not None:
-        expected_structure = str(expected_package.get("structure_sha256", "") or "")
-        if expected_structure and repair_map.get("structure_sha256") != expected_structure:
-            raise AIRepairEpubError("修复 EPUB 不属于当前书：结构哈希不一致。")
-        current_map, _row_map, current_items = _current_item_maps(expected_package)
-        expected_ids = set(current_map)
-    else:
-        current_items = []
-        current_map = {}
-        expected_ids = {str(item.get("item_id", "") or "") for item in repair_map.get("items", [])}
-
-    map_items = {str(item.get("item_id", "") or ""): item for item in repair_map.get("items", [])}
-    if not expected_ids or set(map_items) != expected_ids:
-        raise AIRepairEpubError("修复 EPUB 的稳定 ID 集合与当前融合稿不一致。")
-
-    with _validated_epub(path) as archive:
-        tagged = _scan_tagged_elements(archive)
-        if set(tagged) != expected_ids:
-            missing = expected_ids - set(tagged)
-            extra = set(tagged) - expected_ids
-            raise AIRepairEpubError(f"修复 EPUB 的段落结构被改变：缺少 {len(missing)}，额外 {len(extra)}。")
-        current_images = {item["path"]: item for item in _archive_image_manifest(archive)}
-        for expected in repair_map.get("images", []):
-            path_name = str(expected.get("path", "") or "")
-            current = current_images.get(path_name)
-            if current is None or current.get("sha256") != expected.get("sha256"):
-                raise AIRepairEpubError(f"插图或封面被修改/缺失：{path_name}")
-
-        sorted_ids = sorted(expected_ids, key=lambda value: int(map_items[value].get("row_index", 0) or 0))
-        updates: list[dict] = []
-        for position, item_id in enumerate(sorted_ids):
-            archive_name, html_id, element = tagged[item_id]
-            map_item = map_items[item_id]
-            expected_target = str(map_item.get("epub_target", "") or "")
-            actual_target = f"{archive_name}#{html_id}"
-            if expected_target and actual_target != expected_target:
-                raise AIRepairEpubError(f"条目 {item_id} 被移动或锚点改变：{actual_target}")
-            _validate_tagged_inline(
-                element,
-                item_id=item_id,
-                content_format=str(map_item.get("content_format", "plain_text_with_newlines_v1") or "plain_text_with_newlines_v1"),
-            )
-            baseline = _normalise_plain_text(map_item.get("baseline_text", map_item.get("original_text", "")))
-            baseline_hash = str(map_item.get("baseline_text_sha256", "") or _text_sha256(baseline))
-            edited = _normalise_plain_text(_element_text(element))
-            delete_intentionally = _explicit_bool(
-                element.attrib.get("data-delete-intentionally", "false"),
-                field=f"条目 {item_id} 的 data-delete-intentionally",
-            )
-            if not edited and baseline and not delete_intentionally:
-                raise AIRepairEpubError(f"条目 {item_id} 被清空但没有 data-delete-intentionally=true。")
-            if edited == baseline and delete_intentionally == bool(map_item.get("delete_intentionally", False)):
-                continue
-            if expected_package is None:
-                current_item = {"edited_text": baseline, "candidates": map_item.get("candidates") or []}
-                previous_text = str(map_items[sorted_ids[position - 1]].get("baseline_text", "") or "") if position > 0 else ""
-                next_text = str(map_items[sorted_ids[position + 1]].get("baseline_text", "") or "") if position + 1 < len(sorted_ids) else ""
-            else:
-                current_item = current_map[item_id]
-                previous_text = _current_text(current_map[sorted_ids[position - 1]]) if position > 0 else ""
-                next_text = _current_text(current_map[sorted_ids[position + 1]]) if position + 1 < len(sorted_ids) else ""
-            updates.append(_resolve_update_against_current(
-                item_id=item_id,
-                current_item=current_item,
-                edited_text=edited,
-                delete_intentionally=delete_intentionally,
-                expected_baseline_sha256=baseline_hash,
-                baseline_text=baseline,
-                confidence="external_epub_edit",
-                reason="从稳定段落 ID 的修复 EPUB 导入",
-                previous_text=previous_text,
-                next_text=next_text,
-            ))
-    return updates, _import_report(
-        source=str(path),
-        source_type="epub",
-        total_items=len(expected_ids),
-        updates=updates,
-        metadata=repair_map,
+    """Compatibility interface retained; implementation returns after stable release."""
+    return _legacy_adjudication_result_compatibility_interface(
+        operation='旧 EPUB 裁决回写'
     )
 
 
 def _normalise_update_payload(payload: Any) -> tuple[list[dict], dict, list[dict]]:
-    metadata: dict = {}
-    transactions: list[dict] = []
-    if isinstance(payload, list):
-        return payload, metadata, transactions
-    if not isinstance(payload, dict):
-        raise AIRepairEpubError("AI 修复结果必须是 JSON 对象或数组。")
-    structural_keys = {
-        "schema", "package_id", "structure_sha256", "map_sha256",
-        "baseline_book_sha256", "export_revision", "updates", "editable_items", "transactions", "decisions",
-    }
-    looks_structured = any(key in payload for key in structural_keys)
-    if looks_structured:
-        forbidden_top = sorted(set(payload) - structural_keys)
-        if forbidden_top:
-            raise AIRepairEpubError(f"AI 修复 JSON 顶层包含未知字段：{', '.join(forbidden_top)}")
-    metadata = {
-        key: payload.get(key)
-        for key in (
-            "schema", "package_id", "structure_sha256", "map_sha256",
-            "baseline_book_sha256", "export_revision",
-        )
-        if key in payload
-    }
-    if payload.get("transactions") is not None:
-        if not isinstance(payload.get("transactions"), list):
-            raise AIRepairEpubError("transactions 必须是数组。")
-        transactions = list(payload.get("transactions") or [])
-    if isinstance(payload.get("decisions"), list):
-        converted = []
-        for decision in payload.get("decisions") or []:
-            if not isinstance(decision, dict):
-                converted.append(decision)
-                continue
-            converted.append({
-                "item_id": decision.get("item_id"),
-                "edited_text": decision.get("selected_text", ""),
-                "confidence": decision.get("confidence", ""),
-                "reason": decision.get("reason_code", ""),
-                "evidence": decision.get("evidence") or [],
-                "needs_review": False,
-                "_v4_source": decision.get("source", ""),
-            })
-        return converted, metadata, transactions
-    if isinstance(payload.get("updates"), list):
-        return list(payload["updates"]), metadata, transactions
-    if isinstance(payload.get("editable_items"), list):
-        return list(payload["editable_items"]), metadata, transactions
-    if transactions and not any(key in payload for key in ("updates", "editable_items")):
-        return [], metadata, transactions
-    # Compact {item_id: edited_text} is accepted only for exact known IDs later.
-    compact_exclusions = set(metadata) | {"transactions"}
-    compact = {key: value for key, value in payload.items() if key not in compact_exclusions}
-    if compact and all(isinstance(value, str) for value in compact.values()):
-        return [{"item_id": str(item_id), "edited_text": text} for item_id, text in compact.items()], metadata, transactions
-    if any(key in payload for key in ("item_id", "row_id", "edited_text", "edited_tokens")):
-        return [payload], metadata, transactions
-    raise AIRepairEpubError("AI 修复 JSON 中找不到 updates 或 transactions。")
+    """Compatibility interface retained; implementation returns after stable release."""
+    return _legacy_adjudication_result_compatibility_interface(
+        operation='旧 JSON/update-list/compact-map 归一化'
+    )
 
 
 def _flatten_transactions(transactions: list[dict], *, row_map: dict[str, int]) -> tuple[list[dict], int]:
-    flattened: list[dict] = []
-    seen_transaction_ids: set[str] = set()
-    for tx_index, transaction in enumerate(transactions):
-        if not isinstance(transaction, dict):
-            raise AIRepairEpubError(f"第 {tx_index + 1} 个事务不是对象。")
-        allowed = {"transaction_id", "operation", "item_ids", "updates", "reason", "confidence", "needs_review"}
-        forbidden = sorted(set(transaction) - allowed)
-        if forbidden:
-            raise AIRepairEpubError(f"事务第 {tx_index + 1} 项包含越权字段：{', '.join(forbidden)}")
-        transaction_id = str(transaction.get("transaction_id", "") or "").strip()
-        if not transaction_id or transaction_id in seen_transaction_ids:
-            raise AIRepairEpubError("原子事务 transaction_id 缺失或重复。")
-        seen_transaction_ids.add(transaction_id)
-        operation = str(transaction.get("operation", "") or "")
-        if operation != "rebalance_adjacent_items":
-            raise AIRepairEpubError(f"不支持的原子事务 operation：{operation!r}")
-        item_ids = [str(value or "").strip() for value in (transaction.get("item_ids") or [])]
-        updates = transaction.get("updates")
-        if not isinstance(updates, list) or len(item_ids) < 2 or len(updates) != len(item_ids):
-            raise AIRepairEpubError(f"事务 {transaction_id} 的 item_ids/updates 数量不一致或少于 2。")
-        if len(item_ids) > 20 or len(set(item_ids)) != len(item_ids):
-            raise AIRepairEpubError(f"事务 {transaction_id} 的 item_ids 重复或数量过多。")
-        if any(item_id not in row_map for item_id in item_ids):
-            raise AIRepairEpubError(f"事务 {transaction_id} 包含未知 ID。")
-        positions = [row_map[item_id] for item_id in item_ids]
-        if positions != sorted(positions) or any(right != left + 1 for left, right in zip(positions, positions[1:])):
-            raise AIRepairEpubError(f"事务 {transaction_id} 只能覆盖按阅读顺序连续的条目。")
-        update_ids = [str(update.get("item_id") or update.get("row_id") or "") if isinstance(update, dict) else "" for update in updates]
-        if update_ids != item_ids:
-            raise AIRepairEpubError(f"事务 {transaction_id} 的 updates 必须与 item_ids 同序且完整覆盖。")
-        for update in updates:
-            enriched = copy.deepcopy(update)
-            enriched["_transaction_id"] = transaction_id
-            enriched["_transaction_operation"] = operation
-            enriched["_transaction_member_ids"] = list(item_ids)
-            enriched["_transaction_reason"] = str(transaction.get("reason", "") or "")
-            enriched["_transaction_confidence"] = transaction.get("confidence", "")
-            enriched["_transaction_needs_review"] = bool(transaction.get("needs_review", True))
-            flattened.append(enriched)
-    return flattened, len(seen_transaction_ids)
+    """Compatibility interface retained; implementation returns after stable release."""
+    return _legacy_adjudication_result_compatibility_interface(
+        operation='旧原子事务裁决'
+    )
 
 
 def _import_report(*, source: str, source_type: str, total_items: int, updates: list[dict], metadata: dict, atomic_count: int = 0, package_id_mismatch: bool = False, baseline_book_mismatch: bool = False) -> dict:
@@ -2525,57 +2370,99 @@ def load_ai_repair_json(
     *,
     expected_package: dict,
 ) -> tuple[list[dict], dict]:
+    """Import only the current V5 decisions contract.
+
+    During the pre-stable development cycle there is deliberately no schema
+    inference, legacy update-list compatibility, compact map compatibility, or
+    EPUB write-back compatibility. A result must be the exact decisions.v3
+    envelope generated by the current V5 package.
+    """
     if isinstance(source, (str, Path)):
         path = Path(source).expanduser()
         try:
             raw = path.read_bytes()
         except Exception as exc:
-            raise AIRepairEpubError(f"无法读取 AI 修复 JSON：{exc}") from exc
+            raise AIRepairEpubError(f"无法读取 V5 裁决 JSON：{exc}") from exc
         payload = _json_loads_strict(raw, source=str(path))
         source_name = str(path)
     else:
         payload = copy.deepcopy(source)
         _validate_json_shape(payload)
         source_name = "memory"
-    raw_updates, metadata, raw_transactions = _normalise_update_payload(payload)
-    is_v4_decisions = metadata.get("schema") == AI_DISAGREEMENT_DECISIONS_SCHEMA
-    if metadata.get("schema") not in (None, "", *_LEGACY_AI_REPAIR_EDIT_SCHEMAS, AI_DISAGREEMENT_DECISIONS_SCHEMA):
-        raise AIRepairEpubError(f"不支持的修复结果 schema：{metadata.get('schema')!r}")
-    expected_structure = str(expected_package.get("structure_sha256", "") or "")
-    if metadata.get("structure_sha256") and str(metadata["structure_sha256"]) != expected_structure:
-        raise AIRepairEpubError("修复 JSON 不属于当前书：结构哈希不一致。")
-    package_id_mismatch = bool(
-        metadata.get("package_id")
-        and str(metadata["package_id"]) != str(expected_package.get("package_id", "") or "")
-    )
 
-    item_map, row_map, expected_items = _current_item_maps(expected_package)
-    current_book_hash = _baseline_book_sha256([
-        {
+    if not isinstance(payload, dict):
+        raise AIRepairEpubError("当前 V5 裁决结果顶层必须是 JSON 对象。")
+    result_schema = str(payload.get("schema") or "")
+    if result_schema != AI_DISAGREEMENT_DECISIONS_SCHEMA_CURRENT:
+        raise AIRepairEpubError(
+            f"不支持的裁决结果 schema：{result_schema or '<missing>'!r}；当前开发版只接受 {AI_DISAGREEMENT_DECISIONS_SCHEMA_CURRENT}，不兼容旧裁决结果。"
+        )
+    allowed_top = {"schema", "package_id", "structure_sha256", "decisions"}
+    forbidden_top = sorted(set(payload) - allowed_top)
+    if forbidden_top:
+        raise AIRepairEpubError(
+            "当前 V5 裁决结果包含不支持的顶层字段：" + ", ".join(forbidden_top)
+        )
+    package_id = str(payload.get("package_id") or "").strip()
+    structure_sha = str(payload.get("structure_sha256") or "").strip()
+    if not package_id or not structure_sha:
+        raise AIRepairEpubError("当前 V5 裁决结果必须包含 package_id 与 structure_sha256。")
+    decisions = payload.get("decisions")
+    if not isinstance(decisions, list):
+        raise AIRepairEpubError("当前 V5 裁决结果 decisions 必须是数组。")
+
+    expected_structure = str(expected_package.get("structure_sha256", "") or "")
+    expected_package_id = str(expected_package.get("package_id", "") or "")
+    if structure_sha != expected_structure:
+        raise AIRepairEpubError("裁决 JSON 不属于当前书：structure_sha256 不一致。")
+    if package_id != expected_package_id:
+        raise AIRepairEpubError("裁决 JSON 不属于当前裁决会话：package_id 不一致。")
+
+    allowed_decision_fields = {
+        "item_id", "selected_text", "source", "confidence", "reason_code", "evidence"
+    }
+    raw_updates: list[dict] = []
+    for index, decision in enumerate(decisions):
+        if not isinstance(decision, dict):
+            raise AIRepairEpubError(f"第 {index + 1} 条 V5 决策不是对象。")
+        forbidden = sorted(set(decision) - allowed_decision_fields)
+        if forbidden:
+            raise AIRepairEpubError(
+                f"第 {index + 1} 条 V5 决策包含越权字段：{', '.join(forbidden)}"
+            )
+        item_id = str(decision.get("item_id") or "").strip()
+        if not item_id:
+            raise AIRepairEpubError(f"第 {index + 1} 条 V5 决策缺少 item_id。")
+        if "selected_text" not in decision:
+            raise AIRepairEpubError(f"第 {index + 1} 条 V5 决策缺少 selected_text。")
+        evidence = decision.get("evidence")
+        if evidence is not None and not isinstance(evidence, list):
+            raise AIRepairEpubError(f"第 {index + 1} 条 V5 决策 evidence 必须是数组。")
+        raw_updates.append({
             "item_id": item_id,
-            "baseline_text_sha256": _text_sha256(_current_text(item_map[item_id])),
-            "delete_intentionally": bool(item_map[item_id].get("delete_intentionally", False)),
-        }
-        for item_id in sorted(item_map, key=lambda value: row_map[value])
-    ])
-    baseline_book_mismatch = bool(
-        metadata.get("baseline_book_sha256")
-        and str(metadata.get("baseline_book_sha256")) != current_book_hash
-    )
-    transaction_updates, atomic_count = _flatten_transactions(raw_transactions, row_map=row_map)
-    raw_updates = list(raw_updates) + transaction_updates
+            "edited_text": str(decision.get("selected_text") or ""),
+            "confidence": decision.get("confidence", ""),
+            "reason": str(decision.get("reason_code") or ""),
+            "evidence": list(evidence or []),
+            "needs_review": False,
+            "_v5_source": str(decision.get("source") or ""),
+        })
+
+    metadata = {
+        "schema": result_schema,
+        "package_id": package_id,
+        "structure_sha256": structure_sha,
+    }
+    item_map, row_map, expected_items = _current_item_maps(expected_package)
     expected_ids = set(item_map)
-    v4_editable_ids = None
-    if is_v4_decisions:
-        from engine.ai_disagreement_package_v4 import build_disagreement_records
-        v4_records, _v4_summary = build_disagreement_records(expected_package)
-        v4_editable_ids = {record["item_id"] for record in v4_records if record.get("model_action_required")}
+    from engine.ai_disagreement_package_v5 import build_disagreement_records
+    records, _summary = build_disagreement_records(expected_package)
+    adjudication_editable_ids = {
+        record["item_id"] for record in records if record.get("model_action_required")
+    }
     allowed = {
-        "item_id", "row_id", "baseline_text", "expected_baseline_sha256",
-        "edited_text", "edited_tokens", "delete_intentionally", "confidence",
-        "reason", "evidence", "needs_review",
-        "_transaction_id", "_transaction_operation", "_transaction_member_ids",
-        "_transaction_reason", "_transaction_confidence", "_transaction_needs_review", "_v4_source",
+        "item_id", "edited_text", "confidence", "reason", "evidence",
+        "needs_review", "_v5_source",
     }
     seen: set[str] = set()
     prepared: list[dict] = []
@@ -2588,53 +2475,34 @@ def load_ai_repair_json(
         forbidden = sorted(set(raw) - allowed)
         if forbidden:
             raise AIRepairEpubError(f"第 {index + 1} 条包含越权字段：{', '.join(forbidden)}")
-        item_id = str(raw.get("item_id") or raw.get("row_id") or "").strip()
+        item_id = str(raw.get("item_id") or "").strip()
         if item_id not in expected_ids:
             raise AIRepairEpubError(f"AI 返回未知或不可编辑 ID：{item_id or '(空)'}")
-        if v4_editable_ids is not None and item_id not in v4_editable_ids:
-            raise AIRepairEpubError(f"V4 决策试图修改已冻结一致条目：{item_id}")
+        if item_id not in adjudication_editable_ids:
+            raise AIRepairEpubError(f"V5 决策试图修改已冻结一致条目：{item_id}")
         if item_id in seen:
             raise AIRepairEpubError(f"AI 修复结果包含重复 ID：{item_id}")
         seen.add(item_id)
         edited_text = str(raw.get("edited_text", "") or "")
-        if raw.get("edited_tokens") is not None:
-            token_text = _tokens_to_text(raw.get("edited_tokens"), field=f"条目 {item_id} 的 edited_tokens")
-            if edited_text and _normalise_plain_text(edited_text) != _normalise_plain_text(token_text):
-                raise AIRepairEpubError(f"条目 {item_id} 的 edited_text 与 edited_tokens 不一致。")
-            edited_text = token_text
-        delete_intentionally = _explicit_bool(
-            raw.get("delete_intentionally", False),
-            field=f"条目 {item_id} 的 delete_intentionally",
-        )
-        if not _normalise_plain_text(edited_text) and not delete_intentionally:
-            raise AIRepairEpubError(f"条目 {item_id} 的 edited_text 为空；确需删除请设置 delete_intentionally=true。")
+        delete_intentionally = False
+        if not _normalise_plain_text(edited_text):
+            raise AIRepairEpubError(f"条目 {item_id} 的 selected_text 为空；当前 V5 不支持通过裁决结果删除条目。")
         position = position_by_id[item_id]
         previous_text = _current_text(item_map[ordered_ids[position - 1]]) if position > 0 else ""
         next_text = _current_text(item_map[ordered_ids[position + 1]]) if position + 1 < len(ordered_ids) else ""
-        transaction_id = str(raw.get("_transaction_id", "") or "")
-        reason = str(raw.get("reason", "") or "")
-        transaction_reason = str(raw.get("_transaction_reason", "") or "")
-        if transaction_reason:
-            reason = (reason + "；" + transaction_reason).strip("；")
-        confidence = raw.get("confidence", "")
-        if confidence in (None, "") and raw.get("_transaction_confidence") not in (None, ""):
-            confidence = raw.get("_transaction_confidence")
         prepared.append(_resolve_update_against_current(
             item_id=item_id,
             current_item=item_map[item_id],
             edited_text=edited_text,
-            delete_intentionally=delete_intentionally,
-            expected_baseline_sha256=str(raw.get("expected_baseline_sha256", "") or ""),
-            baseline_text=(str(raw.get("baseline_text", "") or "") if "baseline_text" in raw else None),
-            confidence=confidence,
-            reason=reason,
+            delete_intentionally=False,
+            expected_baseline_sha256="",
+            baseline_text=None,
+            confidence=raw.get("confidence", ""),
+            reason=str(raw.get("reason", "") or ""),
             evidence=raw.get("evidence") or [],
-            needs_review=bool(raw.get("needs_review", False) or raw.get("_transaction_needs_review", False)),
+            needs_review=bool(raw.get("needs_review", False)),
             previous_text=previous_text,
             next_text=next_text,
-            transaction_id=transaction_id,
-            transaction_operation=str(raw.get("_transaction_operation", "") or ""),
-            transaction_member_ids=list(raw.get("_transaction_member_ids") or []),
         ))
 
     return prepared, _import_report(
@@ -2643,9 +2511,9 @@ def load_ai_repair_json(
         total_items=len(expected_ids),
         updates=prepared,
         metadata=metadata,
-        atomic_count=atomic_count,
-        package_id_mismatch=package_id_mismatch,
-        baseline_book_mismatch=baseline_book_mismatch,
+        atomic_count=0,
+        package_id_mismatch=False,
+        baseline_book_mismatch=False,
     )
 
 
@@ -2655,6 +2523,26 @@ def load_ai_repair_result(
     expected_package: dict,
 ) -> tuple[list[dict], dict]:
     path = Path(source_path).expanduser()
-    if path.suffix.lower() == ".epub":
+    suffix = path.suffix.lower()
+    if suffix == ".epub":
         return extract_edits_from_repaired_epub(path, expected_package=expected_package)
+    if suffix == ".zip":
+        # Current V5 adjudication ZIPs return exactly one sparse decisions.json.
+        # Never treat arbitrary package contents as live OCR edits.
+        try:
+            with zipfile.ZipFile(path, "r") as archive:
+                candidates = [
+                    info for info in archive.infolist()
+                    if PurePosixPath(info.filename).name == "decisions.json"
+                    and not info.is_dir()
+                ]
+                if len(candidates) != 1:
+                    raise AIRepairEpubError("当前 V5 裁决 ZIP 中必须包含且只能包含一个 decisions.json。")
+                info = candidates[0]
+                if info.file_size > _MAX_JSON_BYTES:
+                    raise AIRepairEpubError("当前 V5 decisions.json 超过安全大小限制。")
+                payload = _json_loads_strict(archive.read(info), source=f"{path}!{info.filename}")
+        except zipfile.BadZipFile as exc:
+            raise AIRepairEpubError(f"AI 裁决 ZIP 已损坏：{exc}") from exc
+        return load_ai_repair_json(payload, expected_package=expected_package)
     return load_ai_repair_json(path, expected_package=expected_package)

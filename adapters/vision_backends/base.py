@@ -30,6 +30,13 @@ class OCRBlock:
     bbox: Optional[tuple[float, float, float, float]] = None  # (x, y, w, h)，归一化坐标
     language: str = ""
     candidates: list[tuple[str, float]] = field(default_factory=list)
+    # Modern Vision (macOS 27 SDK+) can expose native reading-direction and
+    # document-flow evidence.  Keep these optional so Live Text/Shortcuts and
+    # older Vision SDKs never need to fabricate values.
+    text_direction: str = ""
+    should_wrap_to_next_line: Optional[bool] = None
+    recognition_languages: list[str] = field(default_factory=list)
+    is_title: Optional[bool] = None
 
 
 @dataclass
@@ -50,6 +57,9 @@ class OCRResult:
     language: str = ""
     rotation: Optional[float] = None
     page: Optional[int] = None
+    # Backend/runtime facts (Vision API revision, supported languages, OS, etc.).
+    # This is diagnostics only; OCR correctness must never depend on its presence.
+    metadata: dict[str, object] = field(default_factory=dict)
 
 
 @dataclass
@@ -66,8 +76,8 @@ class OCRConfig:
     minimum_text_height_fraction: float = 0.005
     candidate_count: int = 3
     orientation: str = "auto"
-    vertical_preprocess: str = "none"  # Novel-formatter-1 原有路径：Python 侧紧裁后左旋
-    vertical_compatibility_mode: bool = False  # 新路径：Swift helper 内紧裁/左旋并回映坐标
+    vertical_preprocess: str = "none"  # 兼容路径：Python 侧保留宽白边后左旋，不缩放正文像素
+    vertical_compatibility_mode: bool = False  # 兼容/字符锚点路径：Python 宽上下文左旋，Swift 只做 Vision，随后 affine 回映
     character_boxes: bool = False  # Apple Vision fast 模式逐 Character 返回真实字符框
 
 

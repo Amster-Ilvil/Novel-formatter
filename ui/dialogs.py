@@ -16,6 +16,8 @@ from collections.abc import Callable
 from typing import Optional
 
 from PySide6.QtCore import QEvent, QObject, QTimer, Qt, Signal, Slot
+from ui.localization import LANG_ZH, normalize_language, translate_text
+from ui.theme_palette import darken_stylesheet
 from PySide6.QtGui import QFontDatabase
 from PySide6.QtWidgets import (
     QAbstractButton,
@@ -34,56 +36,62 @@ QMessageBox {
     background-color: #FFFFFF;
 }
 QMessageBox QLabel {
-    color: #1D1D1F;
+    color: #14202E;
     background: transparent;
-    min-width: 280px;
+    min-width: 320px;
+    font-size: 13px;
+}
+QMessageBox QLabel#qt_msgbox_label {
+    font-size: 14px;
+    font-weight: 650;
 }
 QMessageBox QPushButton {
-    min-width: 76px;
-    min-height: 30px;
-    padding: 4px 14px;
-    border-radius: 7px;
-    border: 1px solid #0071E3;
-    background-color: #0071E3;
+    min-width: 88px;
+    min-height: 34px;
+    padding: 4px 18px;
+    border-radius: 10px;
+    border: 1px solid #2459DC;
+    background-color: #2860E8;
     color: #FFFFFF;
-    font-weight: 600;
+    font-weight: 650;
 }
 QMessageBox QPushButton:hover {
-    background-color: #0077ED;
-    border-color: #0077ED;
+    background-color: #2459DC;
 }
 QMessageBox QPushButton:pressed {
-    background-color: #0058B8;
-    border-color: #0058B8;
+    background-color: #1C47B8;
+    border-color: #1C47B8;
 }
 QMessageBox QPushButton[dialogRole="secondary"] {
-    background-color: #ECEEF3;
-    color: #1D1D1F;
-    border-color: #C7C7CC;
+    background-color: #DCE9FB;
+    color: #14202E;
+    border-color: #DCE9FB;
+    font-weight: 550;
 }
 QMessageBox QPushButton[dialogRole="secondary"]:hover {
-    background-color: #F2F2F7;
-    border-color: #AFAFB5;
+    background-color: #CFE0F8;
+    border-color: #CFE0F8;
 }
 QMessageBox QPushButton[dialogRole="details"] {
-    background-color: #F2F6FC;
-    color: #005DBA;
-    border-color: #B9D5F2;
-    min-width: 92px;
+    background-color: #F7F8FA;
+    color: #2250D6;
+    border-color: #CDD3DA;
+    min-width: 96px;
+    font-weight: 600;
 }
 QMessageBox QPushButton[dialogRole="details"]:hover {
-    background-color: #E7F0FA;
-    border-color: #8DBBE8;
+    background-color: #E4EEFF;
+    border-color: #B8BEC7;
 }
 QMessageBox QTextEdit,
 QMessageBox QPlainTextEdit {
     background-color: #F7F8FA;
-    color: #242428;
-    border: 1px solid #D6D8DE;
-    border-radius: 7px;
-    padding: 8px;
-    selection-background-color: #DCE7FF;
-    selection-color: #1D1D1F;
+    color: #14202E;
+    border: 1px solid #CDD3DA;
+    border-radius: 10px;
+    padding: 10px;
+    selection-background-color: #E4EEFF;
+    selection-color: #14202E;
 }
 """
 
@@ -124,7 +132,7 @@ _SECONDARY_BUTTONS = {
 
 def _is_details_button(button: QAbstractButton) -> bool:
     text = button.text().replace("&", "").strip().lower()
-    return "detail" in text or "详情" in text
+    return "detail" in text or "详情" in text or "詳細" in text
 
 
 def _detail_editors(box: QMessageBox) -> list[QWidget]:
@@ -169,9 +177,12 @@ class DialogPolishFilter(QObject):
         # The dialog still looks responsive, but its standard button may appear
         # to ignore clicks because the close event is starved by repaint/layout
         # work.  Keep the operation idempotent and only react to Show/Polish.
-        if not box.property("nfDialogStyled"):
-            box.setProperty("nfDialogStyled", True)
-            box.setStyleSheet(_DIALOG_STYLE)
+        app = QApplication.instance()
+        dark = bool(app and app.property("nfDarkMode"))
+        theme_key = "dark" if dark else "light"
+        if box.property("nfDialogStyledTheme") != theme_key:
+            box.setProperty("nfDialogStyledTheme", theme_key)
+            box.setStyleSheet(darken_stylesheet(_DIALOG_STYLE) if dark else _DIALOG_STYLE)
         if box.minimumWidth() < 420:
             box.setMinimumWidth(420)
 
@@ -193,16 +204,18 @@ class DialogPolishFilter(QObject):
                 editor.setMinimumSize(520, 180)
             if not editor.property("nfDetailStyled"):
                 editor.setProperty("nfDetailStyled", True)
-                editor.setStyleSheet(
-                    "background:#F7F8FA;color:#242428;border:1px solid #D6D8DE;"
-                    "border-radius:7px;padding:8px;selection-background-color:#DCE7FF;"
-                    "selection-color:#1D1D1F;"
+                detail_style = (
+                    "background:#F7F8FA;color:#14202E;border:1px solid #D8DDE3;"
+                    "border-radius:7px;padding:8px;selection-background-color:#E4EEFF;"
+                    "selection-color:#14202E;"
                 )
+                editor.setStyleSheet(darken_stylesheet(detail_style) if dark else detail_style)
 
         for button in box.findChildren(QPushButton):
             standard = box.standardButton(button)
             if standard in _STANDARD_TEXT:
-                target_text = _STANDARD_TEXT[standard]
+                language = normalize_language(str(app.property("nfLanguage") or LANG_ZH)) if app else LANG_ZH
+                target_text = translate_text(_STANDARD_TEXT[standard], language)
                 if button.text() != target_text:
                     button.setText(target_text)
                 role = "secondary" if standard in _SECONDARY_BUTTONS else "primary"
@@ -230,7 +243,9 @@ class DialogPolishFilter(QObject):
                     button.setProperty("dialogRole", "details")
                     button.style().unpolish(button)
                     button.style().polish(button)
-                target_text = "隐藏详情" if _details_are_visible(box) else "显示详情"
+                language = normalize_language(str(app.property("nfLanguage") or LANG_ZH)) if app else LANG_ZH
+                source_text = "隐藏详情" if _details_are_visible(box) else "显示详情"
+                target_text = translate_text(source_text, language)
                 if button.text() != target_text:
                     button.setText(target_text)
                 if not button.property("nfDetailsHooked"):

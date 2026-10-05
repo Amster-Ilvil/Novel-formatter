@@ -43,6 +43,7 @@ from adapters.apple_vision_adapter import (
     detect_running_headers, auto_classify_pages, CHAPTER_RE,
 )
 from adapters.runtime_env import ensure_venv
+from utils.apple_silicon_runtime import is_m6, recommended_cpu_threads, recommended_paddle_batch
 from adapters.paddle_ocr_models import (
     PADDLE_DETECTION_MODEL,
     PADDLE_RECOGNITION_MODEL,
@@ -95,6 +96,17 @@ def setup_venv(verbose: bool = True, pipeline: str = "ocr") -> None:
         )
 
 
+def _paddle_worker_env(source: str | None) -> dict[str, str]:
+    env = paddle_source_environment(source)
+    if is_m6():
+        threads = str(recommended_cpu_threads())
+        env.setdefault("OMP_NUM_THREADS", threads)
+        env.setdefault("OPENBLAS_NUM_THREADS", threads)
+        env.setdefault("MKL_NUM_THREADS", threads)
+        env.setdefault("PYTHONUNBUFFERED", "1")
+    return env
+
+
 def _page_size(image_path: str) -> tuple[int, int]:
     from PIL import Image
     with Image.open(image_path) as img:
@@ -109,7 +121,11 @@ def _worker_command(
     probe: bool = False,
     vl_runtime: dict | None = None,
 ) -> list[str]:
-    cmd = [str(VENV_PYTHON), str(WORKER_SCRIPT), "--lang", lang, "--pipeline", pipeline]
+    cmd = [
+        str(VENV_PYTHON), str(WORKER_SCRIPT),
+        "--lang", lang, "--pipeline", pipeline,
+        "--batch-size", str(recommended_paddle_batch(pipeline)),
+    ]
     if pipeline == "vl":
         runtime = dict(vl_runtime or {})
         cmd.extend([
@@ -178,7 +194,7 @@ def _run_worker(
             stderr=subprocess.PIPE,
             text=True,
             bufsize=1,
-            env=paddle_source_environment(source),
+            env=_paddle_worker_env(source),
             **isolated_process_kwargs(),
         )
         stdout_pump = LinePump(proc.stdout, name="paddle-ocr-stdout")
@@ -301,7 +317,7 @@ def prepare_runtime(
             stderr=subprocess.STDOUT,
             text=True,
             bufsize=1,
-            env=paddle_source_environment(source),
+            env=_paddle_worker_env(source),
             **isolated_process_kwargs(),
         )
         output_pump = LinePump(proc.stdout, name="paddle-prepare-output")
@@ -397,6 +413,7 @@ def run(
     vl_backend: str = "auto",
     ocr_mode: str = "ja_vertical",
     merge_horizontal_fragments: bool = True,
+    performance_callback=None,
 ) -> UnifiedDocument:
     """
     核心函数：对输入执行 PaddleOCR，返回 UnifiedDocument。
@@ -418,6 +435,16 @@ def run(
         lang = profile.paddle_lang
     elif not str(lang or "").strip():
         lang = profile.paddle_lang
+
+    if callable(performance_callback):
+        try:
+            performance_callback("runtime", 0.0, {
+                "engine": "paddle_ocr",
+                "backend": str(vl_backend if pipeline == "vl" else pipeline),
+                "device": "worker-selected",
+            })
+        except Exception:
+            pass
 
     setup_venv(verbose=verbose, pipeline=pipeline)
 
@@ -451,6 +478,7 @@ def run(
         filter_running_headers=filter_running_headers,
         ocr_mode=ocr_mode,
         merge_horizontal_fragments=merge_horizontal_fragments,
+        performance_callback=performance_callback,
     )
     from adapters.ocr_runtime_catalog import mark_runtime_ready
     component_id = {"ocr": "paddle_ocr", "structure": "paddle_structure", "vl": "paddle_vl"}.get(

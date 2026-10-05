@@ -1,79 +1,90 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""OCR 输出的码位级规范化。
+"""Publication-safe Unicode normalization for Japanese OCR text.
 
-规则移植来源（只搬表和判定，不引依赖）：
-- jaconv：半角片假名→全角（含浊点/半浊点两码位合一，ｶ+ﾞ→ガ）
-- textlint-ja：NFD 分解假名（か+゛）、康熙部首码位混入（⾨ vs 門）、
-  非法控制字符——三条零误报字符规则
+Two policies are intentionally separated:
 
-全部规则均为"码位错误"级别修正：不改变文本语义，只把 OCR/复制粘贴
-产生的错误码位换成正规码位，对小说正文零风险。
+``publication`` (default)
+    Safe for authoritative/book text.  Compose kana/combining marks, widen
+    half-width Japanese kana/punctuation, normalize vertical presentation forms,
+    and drop illegal/invisible control garbage.  CJK radicals, compatibility
+    ideographs and IVS remain byte-for-byte intact.
+
+``compatibility``
+    Reader/search compatibility mode.  In addition to the publication rules,
+    Kangxi/CJK radical code points that have a standard NFKC ideograph mapping
+    are rewritten to that ideograph, and obvious kana-internal dash aliases are
+    normalized to the prolonged-sound mark.
+
+The previous formatter always rewrote radicals.  That improved searchability but
+could silently erase a deliberately chosen historical glyph.  Making the policy
+explicit keeps publication output conservative while still offering the older
+high-compatibility behaviour when requested.
 """
 from __future__ import annotations
 
 import re
 import unicodedata
 
-# 半角片假名/半角日文标点区（含 ｰ 长音、｡｢｣､ 标点、浊点半浊点）
-_HALFWIDTH_KANA_RUN = re.compile(r'[｡-ﾟ]+')
+from engine.ocr_unicode_standardizer import normalize_japanese_ocr_text
 
-# 康熙部首（U+2F00–2FD5）与 CJK 部首补充（U+2E80–2EF3）：OCR 常把普通汉字
-# 识别成这些"长得一样"的部首码位；NFKC 对它们有到统一汉字的标准映射。
-_RADICAL_CHAR = re.compile(r'[⺀-⻳⼀-⿕]')
-
-# C0 控制符（保留 \n \t）、C1 控制符、BOM/零宽垃圾
+_RADICAL_CHAR = re.compile(r'[\u2E80-\u2EF3\u2F00-\u2FD5]')
 _CONTROL_CHARS = re.compile(
-    r'[\x00-\x08\x0B\x0C\x0E-\x1F\x7F-​‎‏﻿]'
+    r'[\x00-\x08\x0B\x0C\x0E-\x1F\x7F-\x9F\u200B\u200E\u200F\uFEFF]'
 )
-
-# 夹在假名之间的连字符/减号/制表线变体 → 长音符。
-# 不碰 —(U+2014)/―(U+2015)：那是小说里正当的破折号。
 _KANA = r'[ぁ-ゟァ-ヺー]'
 _DASH_BETWEEN_KANA = re.compile(rf'(?<={_KANA})[‐‑‒–−─](?={_KANA})')
 
 
-def normalize_ocr_codepoints(text: str) -> tuple[str, dict[str, int]]:
-    """修正 OCR 常见的错误码位。返回 (修正后文本, 各类修正计数)。"""
+def _compatibility_radicals(text: str) -> tuple[str, int]:
+    changed = 0
+
+    def replace(match: re.Match[str]) -> str:
+        nonlocal changed
+        source = match.group(0)
+        target = unicodedata.normalize("NFKC", source)
+        if target != source:
+            changed += 1
+            return target
+        return source
+
+    return _RADICAL_CHAR.sub(replace, text), changed
+
+
+def normalize_ocr_codepoints(
+    text: str,
+    *,
+    policy: str = "publication",
+) -> tuple[str, dict[str, int]]:
+    """Normalize OCR code points according to a non-semantic policy.
+
+    ``policy`` accepts ``publication``/``conservative`` and
+    ``compatibility``/``reader``.  Unknown values deliberately fall back to the
+    conservative publication policy rather than performing a destructive NFKC.
+    """
     counts: dict[str, int] = {}
     if not text:
         return text, counts
 
-    # 1. NFD 分解假名合成（か+゛→が）。NFC 是纯正规组合，不动兼容字符。
-    composed = unicodedata.normalize("NFC", text)
-    if composed != text:
-        counts["nfd_kana"] = sum(1 for a, b in zip(text, composed) if a != b) or 1
-        text = composed
+    normalized, report = normalize_japanese_ocr_text(str(text))
+    for key, value in report.counts.items():
+        if value:
+            counts[key] = counts.get(key, 0) + int(value)
+    text = normalized
 
-    # 2. 半角片假名/半角日文标点 → 全角（NFKC 对该区做标准映射并自动合成浊点）
-    def _widen(m: re.Match) -> str:
-        return unicodedata.normalize("NFKC", m.group(0))
-
-    widened = _HALFWIDTH_KANA_RUN.sub(_widen, text)
-    if widened != text:
-        counts["halfwidth_kana"] = len(_HALFWIDTH_KANA_RUN.findall(text))
-        text = widened
-
-    # 3. 康熙部首码位 → 统一汉字
-    def _to_ideograph(m: re.Match) -> str:
-        mapped = unicodedata.normalize("NFKC", m.group(0))
-        return mapped if mapped != m.group(0) else m.group(0)
-
-    fixed = _RADICAL_CHAR.sub(_to_ideograph, text)
-    if fixed != text:
-        counts["kangxi_radical"] = len(_RADICAL_CHAR.findall(text))
-        text = fixed
-
-    # 4. 控制字符/零宽垃圾
     cleaned = _CONTROL_CHARS.sub("", text)
     if cleaned != text:
         counts["control_char"] = len(text) - len(cleaned)
         text = cleaned
 
-    # 5. 假名间的连字符变体 → 长音符
-    dashed = _DASH_BETWEEN_KANA.sub("ー", text)
-    if dashed != text:
-        counts["dash_variant"] = len(_DASH_BETWEEN_KANA.findall(text))
-        text = dashed
+    mode = str(policy or "publication").strip().lower()
+    if mode in {"compatibility", "compatible", "reader", "high_compat"}:
+        text, radical_count = _compatibility_radicals(text)
+        if radical_count:
+            counts["kangxi_radical"] = radical_count
+        dashed = _DASH_BETWEEN_KANA.sub("ー", text)
+        if dashed != text:
+            counts["dash_variant"] = len(_DASH_BETWEEN_KANA.findall(text))
+            text = dashed
 
     return text, counts

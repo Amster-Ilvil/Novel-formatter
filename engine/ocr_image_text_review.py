@@ -13,6 +13,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 import os
 import math
+import json
 import copy
 import hashlib
 import difflib
@@ -87,6 +88,9 @@ class OCRReviewEntry:
     # final candidate back to the exact OCR comparison row without touching any
     # source-model text.
     source_row_index: int = -1
+    # Stable sentence identity shared with OCR 对比. Unlike physical column IDs,
+    # this remains unique when many sentence rows come from the same OCR column.
+    sentence_group_id: str = ""
     # Explicit raw-model disagreement copied from MultiOcrRow.is_conflict.
     # ``None`` is reserved for legacy/single-OCR entries that need the old
     # candidate-text fallback.
@@ -101,6 +105,7 @@ class OCRReviewEntry:
             self.block_id,
             self.segment_key,
             self.preferred_image_path,
+            self.sentence_group_id,
             repr(self.regions),
             repr(self.column_texts),
         ])
@@ -452,14 +457,39 @@ def _bbox_region(block, page_path_by_no: dict[int, str]) -> dict | None:
     }
 
 
-def build_review_entries(doc: UnifiedDocument | None) -> list[OCRReviewEntry]:
+def build_review_entries(
+    doc: UnifiedDocument | None,
+    *,
+    fallback_page_images: list[str] | tuple[str, ...] | None = None,
+) -> list[OCRReviewEntry]:
     if doc is None:
         return []
+    fallback_images = [str(value or "") for value in (fallback_page_images or [])]
+    fallback_existing: dict[int, str] = {}
+    for index, value in enumerate(fallback_images, start=1):
+        existing = _existing_file(value)
+        if existing:
+            fallback_existing[index] = existing
+    fallback_by_name = {
+        Path(path).name: path for path in fallback_existing.values() if path
+    }
     page_path_by_no: dict[int, str] = {}
     for page in getattr(doc, "pages", []):
         page_no = _safe_int(getattr(page, "page_no", 0) or 0)
         if page_no > 0:
-            page_path_by_no[page_no] = str(getattr(page, "image_path", "") or "")
+            raw_path = str(getattr(page, "image_path", "") or "")
+            current = _existing_file(raw_path)
+            fallback = fallback_existing.get(page_no, "")
+            if not fallback and raw_path:
+                fallback = fallback_by_name.get(Path(raw_path).name, "")
+            page_path_by_no[page_no] = current or fallback or raw_path
+    # Restored OCR snapshots can legitimately lack PageInfo records while the
+    # page manager still owns the durable workspace copies.  Make those pages
+    # available to region resolution instead of leaving every sentence image
+    # path empty.
+    for page_no, fallback in fallback_existing.items():
+        if fallback and not _existing_file(page_path_by_no.get(page_no, "")):
+            page_path_by_no[page_no] = fallback
     entries: list[OCRReviewEntry] = []
     for index, block in enumerate(getattr(doc, "blocks", [])):
         if block.type not in _TEXT_TYPES:
@@ -600,6 +630,7 @@ def build_review_entries(doc: UnifiedDocument | None) -> list[OCRReviewEntry]:
                     fusion_candidate_confidences=candidate_confidences,
                     selected_candidate_index=selected_candidate_index,
                     source_row_index=_safe_int(group.get("row_index", -1), -1),
+                    sentence_group_id=str(group.get("sentence_group_id", "") or ""),
                     source_ocr_disagreement=(
                         bool(group.get("fusion_has_ocr_disagreement"))
                         if "fusion_has_ocr_disagreement" in group else None
@@ -782,6 +813,81 @@ def _is_readable_image(path: Path) -> bool:
         return False
 
 
+def _review_layout_sidecar_path(image_path: str | Path) -> Path:
+    path = Path(image_path)
+    return path.with_name(path.name + ".layout.json")
+
+
+def _write_review_layout_sidecar(image_path: str | Path, intervals) -> None:
+    """Persist logical-column x intervals for the composed review image.
+
+    Intervals are normalized against the final rendered image and are stored in
+    logical OCR reading order (column 1 first, which is the right-most strip in
+    Japanese vertical mode).  The sidecar lives beside the temporary PNG and is
+    therefore removed automatically with the review cache.
+    """
+    normalized: list[list[float]] = []
+    for raw in intervals or ():
+        if not isinstance(raw, (list, tuple)) or len(raw) < 2:
+            continue
+        try:
+            left = max(0.0, min(1.0, float(raw[0])))
+            right = max(left, min(1.0, float(raw[1])))
+        except (TypeError, ValueError, OverflowError):
+            continue
+        normalized.append([round(left, 8), round(right, 8)])
+    target = _review_layout_sidecar_path(image_path)
+    temporary = target.with_name(f".{target.name}.{os.getpid()}.{threading.get_ident()}.tmp")
+    try:
+        temporary.write_text(
+            json.dumps({"version": 1, "column_intervals": normalized}, ensure_ascii=False),
+            encoding="utf-8",
+        )
+        temporary.replace(target)
+    finally:
+        try:
+            temporary.unlink(missing_ok=True)
+        except OSError:
+            pass
+
+
+def load_review_image_column_intervals(
+    image_path: str | Path,
+    *,
+    expected_count: int = 0,
+) -> tuple[tuple[float, float], ...]:
+    """Load exact logical-column intervals written by :func:`render_review_image`.
+
+    Old cache files and preferred source images have no sidecar; callers should
+    then fall back to conservative equal-width navigation.  Malformed/stale
+    sidecars are ignored rather than risking a wrong OCR-column highlight.
+    """
+    try:
+        payload = json.loads(_review_layout_sidecar_path(image_path).read_text(encoding="utf-8"))
+    except (OSError, ValueError, TypeError, json.JSONDecodeError):
+        return ()
+    raw = payload.get("column_intervals") if isinstance(payload, dict) else None
+    if not isinstance(raw, list):
+        return ()
+    intervals: list[tuple[float, float]] = []
+    for value in raw:
+        if not isinstance(value, (list, tuple)) or len(value) < 2:
+            return ()
+        try:
+            left = float(value[0])
+            right = float(value[1])
+        except (TypeError, ValueError, OverflowError):
+            return ()
+        if not (math.isfinite(left) and math.isfinite(right)):
+            return ()
+        if left < 0.0 or right > 1.0 or right <= left:
+            return ()
+        intervals.append((left, right))
+    if expected_count and len(intervals) != int(expected_count):
+        return ()
+    return tuple(intervals)
+
+
 def _save_png_atomic(image: Image.Image, output: Path) -> None:
     """Write a cache image atomically so interrupted saves are never reused."""
     temporary = output.with_name(
@@ -811,6 +917,20 @@ def render_review_image(entry: OCRReviewEntry, output_path: str | Path) -> str:
     if not entry.regions:
         return ""
 
+    # One-column review can hand the GUI the exact model input path directly.
+    # This avoids even a lossless re-encode and makes visual QA byte-identical
+    # to the canonical PNG used by the recognizer.
+    if len(entry.regions) == 1 and isinstance(entry.regions[0], dict):
+        region = entry.regions[0]
+        canonical_path = _existing_file(region.get("canonical_image_path"))
+        expected_sha = str(region.get("canonical_input_sha256", "") or "").strip().lower()
+        if canonical_path:
+            try:
+                if not expected_sha or hashlib.sha256(Path(canonical_path).read_bytes()).hexdigest().lower() == expected_sha:
+                    return canonical_path
+            except Exception:
+                pass
+
     output = Path(output_path)
     output.parent.mkdir(parents=True, exist_ok=True)
     if _is_readable_image(output):
@@ -829,14 +949,29 @@ def render_review_image(entry: OCRReviewEntry, output_path: str | Path) -> str:
             if not isinstance(region, dict):
                 incomplete = True
                 continue
+
+            # Phase43: 图文对照 must show the *same canonical pixels* that were
+            # sent to OCR.  Earlier code loosely re-cropped the original page
+            # with extra context, which could visually re-introduce Ruby that the
+            # recognizer never saw.  Prefer the exact prepared PNG first.
+            canonical_path = _existing_file(region.get("canonical_image_path"))
+            canonical_sha = str(region.get("canonical_input_sha256", "") or "").strip().lower()
+            if canonical_path:
+                try:
+                    if canonical_sha:
+                        digest = hashlib.sha256(Path(canonical_path).read_bytes()).hexdigest().lower()
+                        if digest != canonical_sha:
+                            canonical_path = ""
+                    if canonical_path:
+                        with Image.open(canonical_path) as opened:
+                            strips.append(opened.convert("RGB"))
+                        continue
+                except Exception:
+                    canonical_path = ""
+
             page_path = str(region.get("page_path") or "")
             bbox = region.get("bbox")
-            if (
-                not page_path
-                or not Path(page_path).exists()
-                or not isinstance(bbox, (list, tuple))
-                or len(bbox) < 4
-            ):
+            if not page_path or not Path(page_path).exists():
                 incomplete = True
                 continue
             source = source_cache.get(page_path)
@@ -848,6 +983,77 @@ def render_review_image(entry: OCRReviewEntry, output_path: str | Path) -> str:
                     incomplete = True
                     continue
                 source_cache[page_path] = source
+            if not strips:
+                background = _paper_colour(source)
+
+            # Restored workspaces normally lose the transient temp PNG. Rebuild
+            # it from the persisted detector geometry and the same transport
+            # functions instead of approximating the crop from bbox coordinates.
+            geometry = region.get("column_geometry")
+            if isinstance(geometry, dict):
+                try:
+                    from adapters.column_ocr_adapter import (
+                        DetectedColumn, _column_visibility_viewport, _tighten_ink_framing,
+                    )
+                    def _boxes(name):
+                        values = geometry.get(name) or ()
+                        return tuple(
+                            (int(v[0]), int(v[1]), int(v[2]), int(v[3]))
+                            for v in values
+                            if isinstance(v, (list, tuple)) and len(v) >= 4
+                        )
+                    column = DetectedColumn(
+                        left=int(geometry.get("left", 0) or 0),
+                        top=int(geometry.get("top", 0) or 0),
+                        right=int(geometry.get("right", 0) or 0),
+                        bottom=int(geometry.get("bottom", 0) or 0),
+                        hard_left=int(geometry.get("hard_left", 0) or 0),
+                        hard_right=int(geometry.get("hard_right", 0) or 0),
+                        ink_score=0.0,
+                        content_spans=tuple(
+                            (int(v[0]), int(v[1]))
+                            for v in (geometry.get("content_spans") or ())
+                            if isinstance(v, (list, tuple)) and len(v) >= 2
+                        ),
+                        estimated_chars=int(geometry.get("estimated_chars", 0) or 0),
+                        full_height_slot=bool(geometry.get("full_height_slot", False)),
+                        supplemental_boxes=_boxes("supplemental_boxes"),
+                        excluded_boxes=_boxes("excluded_boxes"),
+                        ruby_guard_boxes=_boxes("ruby_guard_boxes"),
+                        ruby_candidate_boxes=_boxes("ruby_candidate_boxes"),
+                        ruby_candidate_confidence=float(geometry.get("ruby_candidate_confidence", 0.0) or 0.0),
+                    )
+                    if column.right > column.left and column.bottom > column.top:
+                        profile = str(region.get("column_ocr_transport_profile", "") or "")
+                        rebuilt = _column_visibility_viewport(
+                            source, column, mode="compact", background=background,
+                            preserve_body_pixels=bool(region.get("column_preserve_body_pixels", False)),
+                            transport_profile=profile,
+                        )
+                        # Production _prepare_page_crops performs the same second
+                        # idempotent framing pass before saving the model PNG.
+                        framed = _tighten_ink_framing(rebuilt, column.width, profile)
+                        rebuilt.close()
+                        if canonical_sha:
+                            import io
+                            payload = io.BytesIO()
+                            framed.save(payload, format="PNG", compress_level=1)
+                            if hashlib.sha256(payload.getvalue()).hexdigest().lower() != canonical_sha:
+                                framed.close()
+                                incomplete = True
+                                continue
+                        strips.append(framed)
+                        continue
+                except Exception:
+                    # Legacy workspaces may not have enough geometry. They fall
+                    # through to the conservative old review crop below.
+                    pass
+
+            # Legacy fallback only: old workspaces created before the canonical
+            # transport contract have bbox data but no persisted column geometry.
+            if not isinstance(bbox, (list, tuple)) or len(bbox) < 4:
+                incomplete = True
+                continue
             try:
                 x, y, w, h = [float(value) for value in bbox[:4]]
             except (TypeError, ValueError, OverflowError):
@@ -856,8 +1062,6 @@ def render_review_image(entry: OCRReviewEntry, output_path: str | Path) -> str:
             if not all(math.isfinite(value) for value in (x, y, w, h)):
                 incomplete = True
                 continue
-            if not strips:
-                background = _paper_colour(source)
             left = max(0, min(source.width - 1, round(x * source.width)))
             top = max(0, min(source.height - 1, round(y * source.height)))
             right = max(left + 1, min(source.width, round((x + w) * source.width)))
@@ -889,8 +1093,6 @@ def render_review_image(entry: OCRReviewEntry, output_path: str | Path) -> str:
                     crop.close()
                     crop = cleaned.image
                 except Exception:
-                    # Review must remain usable even if a third-party Pillow
-                    # build cannot run the optional cleanup pass.
                     pass
             strips.append(crop)
         # A partial crop is more dangerous than no crop because it visually pairs
@@ -901,6 +1103,7 @@ def render_review_image(entry: OCRReviewEntry, output_path: str | Path) -> str:
             return ""
         if len(strips) == 1:
             _save_png_atomic(strips[0], output)
+            _write_review_layout_sidecar(output, ((0.0, 1.0),))
             return str(output)
 
         widths = [strip.width for strip in strips]
@@ -913,11 +1116,16 @@ def render_review_image(entry: OCRReviewEntry, output_path: str | Path) -> str:
         canvas = Image.new("RGB", (canvas_width, canvas_height), background)
         try:
             cursor = canvas_width - margin_x
+            intervals: list[tuple[float, float]] = []
             for strip in strips:
+                right = cursor
                 cursor -= strip.width
-                canvas.paste(strip, (cursor, margin_y))
+                left = cursor
+                canvas.paste(strip, (left, margin_y))
+                intervals.append((left / canvas_width, right / canvas_width))
                 cursor -= gap
             _save_png_atomic(canvas, output)
+            _write_review_layout_sidecar(output, intervals)
         finally:
             canvas.close()
         return str(output)
@@ -927,3 +1135,48 @@ def render_review_image(entry: OCRReviewEntry, output_path: str | Path) -> str:
         for source in source_cache.values():
             source.close()
 
+
+
+def build_comparison_reference_entry(doc, row, *, fallback_page_images=None):
+    """Resolve one comparison row using its immutable primary-block lineage.
+
+    This works on a small shallow document view and does not regenerate OCR or
+    synthesize an image from candidate text. Ambiguous legacy rows use their
+    recorded source segment; rows without source lineage have no reference.
+    """
+    if doc is None or row is None:
+        return None
+    indices = tuple(getattr(row, "primary_block_indices", ()) or ())
+    if not indices and getattr(row, "primary_block_index", None) is not None:
+        indices = (row.primary_block_index,)
+    blocks = [doc.blocks[int(i)] for i in indices if 0 <= int(i) < len(doc.blocks)]
+    if not blocks:
+        return None
+    view = copy.copy(doc)
+    view.blocks = blocks
+    entries = build_review_entries(view, fallback_page_images=fallback_page_images)
+    if not entries:
+        return None
+    exact = next((entry for entry in entries if entry.source_row_index == int(row.index)), None)
+    if exact is not None:
+        return exact
+    ids = tuple(str(value) for value in (getattr(row, "column_ids", ()) or ()))
+    if ids:
+        regions_by_id = {}
+        for entry in entries:
+            for index, region in enumerate(entry.regions):
+                column_id = str(region.get("column_id") or (entry.column_ids[index] if index < len(entry.column_ids) else ""))
+                if column_id in ids:
+                    regions_by_id.setdefault(column_id, region)
+        if all(column_id in regions_by_id for column_id in ids):
+            return OCRReviewEntry(
+                block_id=str(blocks[0].id), block_index=int(indices[0]),
+                text=str(row.output_text or ""), page=int(row.page or 0),
+                column_ids=ids, column_count=len(ids),
+                regions=[copy.deepcopy(regions_by_id[column_id]) for column_id in ids],
+                source_row_index=int(row.index),
+            )
+        # Do not substitute an unrelated source column when lineage is partial.
+        return None
+    segment = max(0, int(getattr(row, "primary_segment_index", 0) or 0))
+    return entries[segment] if segment < len(entries) else None

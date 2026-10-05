@@ -7,35 +7,114 @@ import json
 import os
 import queue
 import subprocess
+import sys
 import tempfile
 import threading
 import time
 from pathlib import Path
 from typing import Iterator
 
-from adapters.manga_ocr_adapter import (
-    MangaOcrSession,
-    _compact_text,
-    _japanese_ratio,
-    _looks_like_full_page,
-    prepare_manga_ocr_segments,
+from adapters.json_worker_session import JsonWorkerSessionBase
+from adapters.vertical_crop_segments import (
+    OcrCropSegment,
+    compact_text,
+    japanese_ratio,
+    looks_like_full_page,
+    prepare_vertical_ocr_segments,
 )
 from adapters.runtime_env import ensure_venv
+from adapters.ocr_prefetch import accelerator_prefetch_enabled, iter_prefetched_windows, windowed
 from adapters.manga_48px_runtime import ensure_runtime_files
+from utils.apple_silicon_runtime import is_m6, recommended_cpu_threads, torch_worker_env
 
 ROOT = Path(__file__).parent.parent
 VENV_DIR = ROOT / ".venv-manga-48px"
 WORKER_SCRIPT = Path(__file__).parent / "manga_48px_worker.py"
 MODEL_CACHE = ROOT / ".model-cache" / "manga-48px-ar"
+MANGA_48PX_TORCH_PACKAGE = os.environ.get(
+    "NOVEL_FORMATTER_MANGA_48PX_TORCH",
+    "torch>=2.14,<2.15" if is_m6() else "torch>=2.3,<3",
+)
+
+# Real-book ablation: horizontal Sentence-Reflow remains strong through roughly
+# 60 glyphs, then AR decoding quality collapses sharply.  Fail closed instead
+# of injecting a truncated third-model candidate into adjudication.
+MANGA_48PX_MAX_REFLOW_CHARS = max(16, min(96, int(
+    os.environ.get("NOVEL_FORMATTER_MANGA_48PX_MAX_REFLOW_CHARS", "60") or 60
+)))
+
+# AR beam decoding can enter a pathological long-running branch on an otherwise
+# ordinary short column.  Keep CPU batches deliberately small and bound every
+# request by a per-segment watchdog budget; a timed-out worker is killed and
+# restarted so one bad crop cannot stall a full book.
+MANGA_48PX_CPU_REQUEST_BATCH = 2
+MANGA_48PX_ACCEL_REQUEST_BATCH = 16
+MANGA_48PX_ITEM_WATCHDOG_SECONDS = 6.0
+
+
+def _decode_cap_for_expected(expected_chars: int) -> int:
+    need = max(16, int(expected_chars or 1) + 12)
+    for cap in (24, 32, 48, 64, 80, 96, 128, 160, 192, 224, 255):
+        if need <= cap:
+            return cap
+    return 255
 
 
 def setup_venv(verbose: bool = True) -> Path:
+    # Advanced/offline deployments may point at an already-provisioned Python.
+    # This prevents a valid cloud/local runtime from touching pip or the network
+    # merely because the project-private venv was created with another interpreter.
+    explicit = os.environ.get("NOVEL_FORMATTER_MANGA_48PX_PYTHON", "").strip()
+    if explicit:
+        path = Path(explicit).expanduser()
+        if path.is_file():
+            return path
+    marker = "import torch, einops, numpy; from PIL import Image; assert torch.__version__"
+    if is_m6():
+        marker += (
+            "; v=torch.__version__.split('+',1)[0].split('.'); "
+            "n=tuple(int(''.join(c for c in p if c.isdigit()) or 0) for p in v[:2]); "
+            "assert n >= (2,14), 'M6 48px requires PyTorch 2.14+'"
+        )
+    # Prefer an already-provisioned runtime.  The recognizer must never stall an
+    # OCR run by silently trying to upgrade pip/setuptools or download PyTorch.
+    # This is especially important for offline production Macs and cloud QA.
+    def _runtime_ready(python: Path) -> bool:
+        if not python.is_file():
+            return False
+        try:
+            proc = subprocess.run(
+                [str(python), "-c", marker],
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=30,
+            )
+            return proc.returncode == 0
+        except Exception:
+            return False
+
+    private_python = VENV_DIR / ("Scripts/python.exe" if os.name == "nt" else "bin/python")
+    if _runtime_ready(private_python):
+        return private_python
+    current_python = Path(sys.executable).resolve()
+    if _runtime_ready(current_python):
+        return current_python
+
+    auto_install = str(os.environ.get("NOVEL_FORMATTER_MANGA_48PX_AUTO_INSTALL", "0") or "0").strip().lower()
+    if auto_install not in {"1", "true", "yes", "on"}:
+        raise RuntimeError(
+            "48px AR OCR 运行依赖尚未准备。为避免 OCR 启动时隐式联网，程序不会自动升级 pip/下载 PyTorch。"
+            "请先在设置中的 OCR 运行环境安装/修复依赖，或设置 NOVEL_FORMATTER_MANGA_48PX_PYTHON 指向已安装 torch/einops/Pillow 的 Python。"
+        )
+
+    torch_package = os.environ.get(
+        "NOVEL_FORMATTER_MANGA_48PX_TORCH",
+        "torch>=2.14,<2.15" if is_m6() else "torch>=2.3,<3",
+    )
     return ensure_venv(
         VENV_DIR,
         label="Manga 48px AR OCR",
-        marker_code="import torch, einops, numpy; from PIL import Image; assert torch.__version__",
+        marker_code=marker,
         packages=[
-            os.environ.get("NOVEL_FORMATTER_MANGA_48PX_TORCH", "torch>=2.3,<3"),
+            torch_package,
             "numpy>=1.26,<3",
             "Pillow>=10,<13",
             "einops>=0.8,<1",
@@ -45,19 +124,20 @@ def setup_venv(verbose: bool = True) -> Path:
 
 
 def _worker_env() -> dict[str, str]:
-    env = os.environ.copy()
+    env = torch_worker_env(os.environ.copy())
+    env.setdefault("NOVEL_FORMATTER_MANGA_48PX_THREADS", str(recommended_cpu_threads()))
     env.setdefault("PYTORCH_ENABLE_MPS_FALLBACK", "1")
     env.setdefault("TOKENIZERS_PARALLELISM", "false")
     return env
 
 
 def validate_manga_48px_text(text: str, expected_chars: int, model_confidence: float) -> tuple[bool, float, str]:
-    value = _compact_text(text)
+    value = compact_text(text)
     if not value:
         return False, 0.0, "48px AR OCR 返回空文本"
     if len(value) >= 250:
         return False, 0.0, "48px AR OCR 输出触及序列上限，已拒绝异常结果"
-    if _japanese_ratio(value) < 0.48:
+    if japanese_ratio(value) < 0.48:
         return False, 0.0, "48px AR OCR 输出的日文字符比例异常"
     expected = max(1, int(expected_chars or 1))
     ratio = len(value) / expected
@@ -71,7 +151,7 @@ def validate_manga_48px_text(text: str, expected_chars: int, model_confidence: f
     return True, confidence, ""
 
 
-class Manga48pxSession(MangaOcrSession):
+class Manga48pxSession(JsonWorkerSessionBase):
     """Persistent official 48px AR model shared across all column passes.
 
     The large model is prepared in the parent OCR thread before the worker is
@@ -79,9 +159,10 @@ class Manga48pxSession(MangaOcrSession):
     blocked on ``stdout.readline()`` with no progress or actionable error.
     """
 
-    def __init__(self, *, cancel_check=None, verbose: bool = True, load_progress_callback=None):
-        super().__init__(cancel_check=cancel_check, verbose=verbose)
+    def __init__(self, *, cancel_check=None, verbose: bool = True, load_progress_callback=None, engine_options=None):
+        super().__init__(cancel_check=cancel_check, verbose=verbose, worker_label="48px AR OCR")
         self.load_progress_callback = load_progress_callback
+        self.options = dict(engine_options or {})
 
     def _emit_load(self, stage: str, current: int, total: int, detail: str) -> None:
         callback = self.load_progress_callback
@@ -119,10 +200,12 @@ class Manga48pxSession(MangaOcrSession):
                         "请查看下方诊断；程序已停止等待，不会永久卡住。\n" + tail
                     )
 
-    def __enter__(self):
-        self._emit_load("environment", 0, 1, "检查 48px AR 独立运行环境")
+    def _start_worker(self, *, announce_environment: bool = False) -> None:
+        if announce_environment:
+            self._emit_load("environment", 0, 1, "检查 48px AR 独立运行环境")
         python = setup_venv(verbose=self.verbose)
-        self._emit_load("environment", 1, 1, "48px AR 运行环境已就绪 · 检查官方权重")
+        if announce_environment:
+            self._emit_load("environment", 1, 1, "48px AR 运行环境已就绪 · 检查官方权重")
         MODEL_CACHE.mkdir(parents=True, exist_ok=True)
         ensure_runtime_files(
             MODEL_CACHE,
@@ -161,9 +244,21 @@ class Manga48pxSession(MangaOcrSession):
         if fallback:
             detail += f" · {fallback}"
         self._emit_load("model", 1, 1, detail)
+
+    def _restart_worker_after_timeout(self) -> None:
+        self.close(force=True)
+        if self.cancel_check is not None and self.cancel_check():
+            raise RuntimeError("用户取消 48px AR OCR")
+        self._start_worker(announce_environment=False)
+
+    def __enter__(self):
+        self._start_worker(announce_environment=True)
         return self
 
-    def recognize(self, crop_paths: list[str], *, progress_callback=None) -> dict[str, tuple[str, float, str | None]]:
+    def recognize(
+        self, crop_paths: list[str], *, progress_callback=None,
+        input_metadata: dict[str, dict] | None = None,
+    ) -> dict[str, tuple[str, float, str | None]]:
         """Recognize physical columns in bounded multi-column batches.
 
         The old path sent one JSON request per column, so a 400-page book could
@@ -177,6 +272,7 @@ class Manga48pxSession(MangaOcrSession):
             raise RuntimeError("48px AR OCR worker 尚未启动")
         results: dict[str, tuple[str, float, str | None]] = {}
         ordered_paths = [str(path) for path in crop_paths]
+        metadata = {str(k): dict(v or {}) for k, v in (input_metadata or {}).items()}
         total = max(1, len(ordered_paths))
         try:
             source_window = int(os.environ.get("NOVEL_FORMATTER_MANGA_48PX_SOURCE_WINDOW", "32") or 32)
@@ -187,65 +283,223 @@ class Manga48pxSession(MangaOcrSession):
         with tempfile.TemporaryDirectory(prefix="novel_formatter_48px_chunks_") as temp_dir:
             chunk_root = Path(temp_dir)
             completed = 0
-            for window_start in range(0, len(ordered_paths), source_window):
-                if self.cancel_check is not None and self.cancel_check():
-                    break
-                window = ordered_paths[window_start:window_start + source_window]
+
+            def prepare_window(window_start: int, window):
                 prepared: list[tuple[str, list, int, str]] = []
                 flat_paths: list[str] = []
-
                 for local_index, source_path in enumerate(window, start=1):
                     global_index = window_start + local_index
                     try:
-                        segments, column_count = prepare_manga_ocr_segments(
-                            source_path,
-                            chunk_root / f"i{global_index:05d}",
-                            max_aspect=15.0,
-                            max_chars=30,
-                            # source_path is already the common column layer's
-                            # authoritative Ruby-free compact physical column.
-                            # Never run page-level column detection on it again.
-                            already_isolated=True,
-                        )
+                        item_meta = metadata.get(str(source_path), {})
+                        if str(item_meta.get("layout") or "") == "horizontal_reflow":
+                            # The native 48px worker already consumes horizontal
+                            # strips and only auto-rotates tall vertical crops.
+                            # Real-book ablation shows a hard quality cliff above
+                            # ~60 glyphs, so overlong sentence evidence fails closed
+                            # and the comparison keeps the independent column/page
+                            # models instead of accepting a truncated AR result.
+                            expected_chars = max(1, int(item_meta.get("expected_chars") or 1))
+                            if expected_chars > MANGA_48PX_MAX_REFLOW_CHARS:
+                                segments = []
+                                column_count = 1
+                                error = (
+                                    "48px AR OCR 整句超过安全长度"
+                                    f"（{expected_chars} > {MANGA_48PX_MAX_REFLOW_CHARS}），已跳过该证据"
+                                )
+                                prepared.append((source_path, list(segments), int(column_count), error))
+                                continue
+                            segments = [OcrCropSegment(str(source_path), expected_chars, 0, 0)]
+                            column_count = 1
+                        else:
+                            segments, column_count = prepare_vertical_ocr_segments(
+                                source_path,
+                                chunk_root / f"i{global_index:05d}",
+                                max_aspect=15.0,
+                                max_chars=30,
+                                already_isolated=True,
+                                physical_column_boxes=item_meta.get("physical_column_boxes") or (),
+                            )
                         error = "" if segments else "48px AR OCR 输入区域没有检测到印刷文字"
                     except Exception as exc:
                         segments, column_count = [], 0
                         error = f"48px AR OCR 输入分段失败: {exc}"
                     prepared.append((source_path, list(segments), int(column_count), error))
                     flat_paths.extend(segment.path for segment in segments)
+                return prepared, flat_paths
+
+            # If any multi-item AR batch times out, keep the worker alive but
+            # degrade the remainder of this recognition run to batch=1.  This
+            # avoids repeatedly pairing a pathological segment with healthy peers
+            # across later pages while preserving fast batching on runs that never
+            # exhibit the long-tail branch.
+            adaptive_batch_cap: int | None = None
+
+            windows = windowed(ordered_paths, source_window)
+            prefetch = accelerator_prefetch_enabled(
+                self.device, os.environ.get("NOVEL_FORMATTER_OCR_DOUBLE_BUFFER", "auto")
+            )
+            for window_start, window, prepared_payload in iter_prefetched_windows(
+                windows, prepare_window, enabled=prefetch
+            ):
+                if self.cancel_check is not None and self.cancel_check():
+                    break
+                prepared, flat_paths = prepared_payload
 
                 returned: dict[str, dict] = {}
-                request_error = ""
+                segment_errors: dict[str, str] = {}
                 if flat_paths:
-                    self._request_id += 1
-                    request_id = self._request_id
-                    request = {
-                        "request_id": request_id,
-                        "paths": flat_paths,
-                        "beams_k": 5,
-                        "max_seq_length": 255,
+                    segment_lookup = {
+                        segment.path: segment
+                        for _source, segments, _count, _error in prepared
+                        for segment in segments
                     }
+                    cap_buckets: dict[int, list[str]] = {}
+                    for segment_path in flat_paths:
+                        segment = segment_lookup[segment_path]
+                        cap = _decode_cap_for_expected(segment.expected_chars)
+                        cap_buckets.setdefault(cap, []).append(segment_path)
+
                     try:
-                        self.proc.stdin.write(json.dumps(request, ensure_ascii=False) + "\n")
-                        self.proc.stdin.flush()
-                        data = self._read_response()
-                        if int(data.get("request_id", -1) or -1) != request_id:
-                            raise RuntimeError("48px AR OCR 请求响应串位")
-                        if not data.get("ok"):
-                            raise RuntimeError(str(data.get("error", "未知错误")))
-                        returned = {
-                            str(item.get("path", "")): item
-                            for item in data.get("items", [])
+                        configured_batch = int(os.environ.get(
+                            "NOVEL_FORMATTER_MANGA_48PX_REQUEST_BATCH", "0"
+                        ) or 0)
+                    except ValueError:
+                        configured_batch = 0
+                    default_batch = (
+                        MANGA_48PX_CPU_REQUEST_BATCH
+                        if str(self.device or "").lower().startswith("cpu")
+                        else MANGA_48PX_ACCEL_REQUEST_BATCH
+                    )
+                    request_batch = max(1, min(32, configured_batch or default_batch))
+                    # Sparse conflict review values failure isolation over raw
+                    # throughput. One pathological AR beam must not force healthy
+                    # neighbour columns through recursive retries and model reloads.
+                    selective_review = bool(
+                        self.options.get("review_only")
+                        or self.options.get("disagreement_review")
+                        or any(bool(metadata.get(path, {}).get("disagreement_review")) for path in ordered_paths)
+                    )
+                    if selective_review and "NOVEL_FORMATTER_MANGA_48PX_REQUEST_BATCH" not in os.environ:
+                        # The former review path forced batch=1. On an M-series GPU this
+                        # turned ~2k disagreement columns into thousands of tiny beam
+                        # requests and was slower than the two full main models combined.
+                        # Keep small CPU batches, but let accelerators amortize the AR
+                        # decoder. Pathological beams are isolated by recursive bisection.
+                        request_batch = min(request_batch, 2 if str(self.device or "").lower().startswith("cpu") else 8)
+                    try:
+                        per_item_timeout = float(os.environ.get(
+                            "NOVEL_FORMATTER_MANGA_48PX_ITEM_TIMEOUT",
+                            str(MANGA_48PX_ITEM_WATCHDOG_SECONDS),
+                        ) or MANGA_48PX_ITEM_WATCHDOG_SECONDS)
+                    except ValueError:
+                        per_item_timeout = MANGA_48PX_ITEM_WATCHDOG_SECONDS
+                    per_item_timeout = max(5.0, min(120.0, per_item_timeout))
+
+                    def run_bounded_batch(batch_paths: list[str], cap: int) -> None:
+                        """Run one 48px request and isolate pathological crops on failure.
+
+                        A timeout in a multi-item request used to discard the whole batch.
+                        Instead, kill/restart the worker and bisect the batch recursively.
+                        Normal siblings are therefore recovered while only the crop that
+                        repeatedly times out is failed closed.
+                        """
+                        nonlocal adaptive_batch_cap
+                        if not batch_paths:
+                            return
+                        if self.cancel_check is not None and self.cancel_check():
+                            for path in batch_paths:
+                                segment_errors[path] = "用户取消"
+                            return
+                        if self.proc is None or self.proc.stdin is None:
+                            try:
+                                self._start_worker(announce_environment=False)
+                            except Exception as exc:
+                                for path in batch_paths:
+                                    segment_errors[path] = f"48px AR OCR worker 重启失败: {exc}"
+                                return
+                        self._request_id += 1
+                        request_id = self._request_id
+                        request = {
+                            "request_id": request_id,
+                            "paths": batch_paths,
+                            "beams_k": 5,
+                            "max_seq_length": cap,
                         }
-                    except Exception as exc:
-                        request_error = str(exc)
+                        # The worker evaluates a tensor batch as one inference, not
+                        # N serial inferences. Multiplying the watchdog by batch size
+                        # lets one pathological beam hold a 4-item CPU batch for 48s
+                        # before isolation even starts. Give the batch a bounded base
+                        # budget plus small scheduling slack instead.
+                        timeout = per_item_timeout + 2.0 * max(0, len(batch_paths) - 1)
+                        try:
+                            assert self.proc is not None and self.proc.stdin is not None
+                            self.proc.stdin.write(json.dumps(request, ensure_ascii=False) + "\n")
+                            self.proc.stdin.flush()
+                            try:
+                                data = self._read_response(timeout=timeout)
+                            except TypeError as exc:
+                                # Backward-compatible with tiny test/fake sessions that
+                                # override _read_response() without the optional timeout.
+                                # Production JsonWorkerSessionBase always accepts timeout.
+                                if "timeout" not in str(exc):
+                                    raise
+                                data = self._read_response()
+                            if int(data.get("request_id", -1) or -1) != request_id:
+                                raise RuntimeError("48px AR OCR 请求响应串位")
+                            if not data.get("ok"):
+                                raise RuntimeError(str(data.get("error", "未知错误")))
+                            for item in data.get("items", []):
+                                returned[str(item.get("path", ""))] = item
+                            missing = [path for path in batch_paths if path not in returned]
+                            if missing:
+                                raise RuntimeError(
+                                    "48px AR OCR 批请求缺少返回项: "
+                                    + ", ".join(Path(path).name for path in missing[:4])
+                                )
+                        except Exception as exc:
+                            message = (
+                                f"48px AR OCR 单条 watchdog 触发"
+                                f"（batch={len(batch_paths)}, cap={cap}, timeout={timeout:.0f}s）: {exc}"
+                            )
+                            try:
+                                self._restart_worker_after_timeout()
+                            except Exception as restart_exc:
+                                self.close(force=True)
+                                message += f"; worker 重启失败: {restart_exc}"
+                                for path in batch_paths:
+                                    segment_errors[path] = message
+                                return
+                            if len(batch_paths) > 1:
+                                # Isolate the current long-tail request, but do not
+                                # collapse the remainder of a 2k-column review to batch=1.
+                                # Learn a smaller cap and retain useful accelerator batching.
+                                adaptive_batch_cap = max(2, min(
+                                    int(adaptive_batch_cap or request_batch),
+                                    max(2, len(batch_paths) // 2),
+                                ))
+                                mid = max(1, len(batch_paths) // 2)
+                                run_bounded_batch(batch_paths[:mid], cap)
+                                run_bounded_batch(batch_paths[mid:], cap)
+                            else:
+                                segment_errors[batch_paths[0]] = message
+
+                    for cap in sorted(cap_buckets):
+                        bucket = cap_buckets[cap]
+                        offset = 0
+                        while offset < len(bucket):
+                            batch_size = max(1, min(request_batch, int(adaptive_batch_cap or request_batch)))
+                            run_bounded_batch(bucket[offset:offset + batch_size], cap)
+                            offset += batch_size
 
                 for source_path, segments, column_count, prepare_error in prepared:
-                    failure = prepare_error or request_error
+                    failure = prepare_error
                     column_texts: dict[int, list[str]] = {}
                     confidences: list[float] = []
                     if not failure:
                         for segment in segments:
+                            if segment.path in segment_errors:
+                                failure = segment_errors[segment.path]
+                                break
                             item = returned.get(segment.path)
                             if item is None:
                                 failure = f"48px AR OCR 未返回分段: {Path(segment.path).name}"
@@ -260,7 +514,7 @@ class Manga48pxSession(MangaOcrSession):
                                 failure = reason
                                 break
                             column_texts.setdefault(segment.column_index, []).append(
-                                _compact_text(text)
+                                compact_text(text)
                             )
                             confidences.append(confidence)
 
@@ -296,16 +550,22 @@ class Manga48pxSession(MangaOcrSession):
 
 
 def recognize_crops(
-    crop_paths: list[str], manifest_path: str, *, cancel_check=None, verbose: bool = True
+    crop_paths: list[str], manifest_path: str, *, cancel_check=None, verbose: bool = True,
+    input_metadata: dict[str, dict] | None = None,
 ) -> Iterator[tuple[str, list[dict] | None, str | None]]:
     del manifest_path
     ordered = [str(path) for path in crop_paths]
-    page_like = {path for path in ordered if _looks_like_full_page(path)}
+    metadata = {str(k): dict(v or {}) for k, v in (input_metadata or {}).items()}
+    page_like = {
+        path for path in ordered
+        if str(metadata.get(path, {}).get("layout") or "") != "horizontal_reflow"
+        and looks_like_full_page(path)
+    }
     safe_paths = [path for path in ordered if path not in page_like]
     results: dict[str, tuple[str, float, str | None]] = {}
     if safe_paths:
         with Manga48pxSession(cancel_check=cancel_check, verbose=verbose) as session:
-            results = session.recognize(safe_paths)
+            results = session.recognize(safe_paths, input_metadata=metadata)
     for path in ordered:
         if path in page_like:
             yield path, None, "48px AR OCR 收到疑似整页图片；请先启用物理分列后逐列识别。"

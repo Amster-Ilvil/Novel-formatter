@@ -23,6 +23,10 @@ from enum import Enum
 from typing import Optional
 import hashlib
 import json
+try:
+    import orjson as _orjson
+except ImportError:  # optional acceleration; standard json remains supported
+    _orjson = None
 import time
 import uuid
 from pathlib import Path
@@ -78,9 +82,17 @@ class BoundingBox:
 
     @classmethod
     def from_apple_vision(cls, box: dict) -> BoundingBox:
-        """Apple Vision 返回的 {x, y, w, h} 已是归一化坐标"""
-        return cls(x=box.get("x", 0), y=box.get("y", 0),
-                   w=box.get("w", 0), h=box.get("h", 0))
+        """Convert Apple Vision lower-left normalized coordinates to our upper-left system."""
+        x = float(box.get("x", 0) or 0)
+        y = float(box.get("y", 0) or 0)
+        w = float(box.get("w", box.get("width", 0)) or 0)
+        h = float(box.get("h", box.get("height", 0)) or 0)
+        return cls(
+            x=max(0.0, min(1.0, x)),
+            y=max(0.0, min(1.0, 1.0 - y - h)),
+            w=max(0.0, min(1.0, w)),
+            h=max(0.0, min(1.0, h)),
+        )
 
 
 @dataclass
@@ -186,12 +198,18 @@ class Metadata:
     writing_direction: str = "vertical-rl"
     ocr_profile_version: int = 1
     formatter_profile: str = "ja_light_novel"
+    # publication=preserve CJK glyph identity; compatibility=map Kangxi radicals for reader/search compatibility
+    unicode_normalization_policy: str = "publication"
     isbn: str = ""
     description: str = ""
     source_engine: str = ""    # 使用的 OCR 引擎名称
     preserve_ocr_layout: bool = False  # 固定原 OCR 块/段落结构，跳过会重排段落的 Formatter 步骤
     pdf_text_layer_mode: bool = False  # PDF 可选文字层专用 Formatter；与普通图片 OCR 规则隔离
     pdf_keep_afterwords: bool = False  # 默认不保留作者前书/后记；仅在界面明确勾选时保留
+    pdf_remove_generated_matter: bool = True  # PDFNovels/站点生成前后置页默认清理，与作者前后书独立
+    pdf_restore_indents: bool = True  # PDF格式处理：出版段首缩进，默认开启
+    pdf_format_processed: bool = False
+    pdf_format_report: dict = field(default_factory=dict)
     pdf_text_source_char_counts: dict = field(default_factory=dict)  # 无损字符保全基线（忽略布局空白）
     pdf_text_source_chars: int = 0
     pdf_text_output_chars: int = 0
@@ -199,6 +217,23 @@ class Metadata:
     pdf_text_extra_chars: int = 0
     pdf_text_character_guard_passed: bool = True
     pdf_text_guard_report: dict = field(default_factory=dict)
+    # Selectable-PDF stacked-page provenance. One physical PDF page may contain
+    # two logical pages arranged top/bottom. Keep the mapping explicit so
+    # formatter/publication stages never need to infer it again.
+    pdf_text_split_mode: str = ""  # auto | off | force
+    pdf_text_physical_page_count: int = 0
+    pdf_text_logical_page_count: int = 0
+    pdf_text_stacked_page_count: int = 0
+    pdf_text_page_map: dict = field(default_factory=dict)
+    pdf_text_stacked_split_reports: dict = field(default_factory=dict)
+    # Read-only bridge from Page Manager. Only explicitly confirmed labels may
+    # suppress native PDF text extraction.
+    pdf_text_page_overrides: dict = field(default_factory=dict)
+    pdf_text_skipped_physical_pages: list = field(default_factory=list)
+    pdf_text_page_manager_report: dict = field(default_factory=dict)
+    pdf_text_furigana_chars_skipped: int = 0
+    pdf_text_page_number_chars_skipped: int = 0
+    pdf_text_page_number_columns_skipped: int = 0
     ai_processing_mode: str = ""  # correction | typeset
     ai_layout_locked: bool = False  # EPUB 必须优先使用 AI 返回的文本与段落结构
     ai_epub_css: str = ""  # AI 纠错排版返回的完整 EPUB CSS；仅 typeset 版本使用
@@ -231,6 +266,11 @@ class Metadata:
     column_sentence_reflow_version: int = 0
     column_sentence_reflow_max_columns: int = 0
     column_ocr_audit: dict = field(default_factory=dict)  # per-page expected/recognized/model/DOCX column IDs
+    # Durable, per-physical-column OCR input provenance.  Block metadata can be
+    # projected/reflowed away later (especially page-role -> sentence projection),
+    # so the exact prepared/actual input hashes also live at document level.
+    # Values are JSON-safe dictionaries keyed by stable physical column_id.
+    column_ocr_input_records: dict = field(default_factory=dict)
     column_ocr_integrity_passed: bool = False
     # Geometry-only Ruby candidates captured while normal OCR is already splitting columns.
     # They contain no recognized Ruby text and never participate in OCR voting/fusion.
@@ -246,6 +286,13 @@ class Metadata:
     ruby_overlay_transfer_report: dict = field(default_factory=dict)
     ocr_review_report: dict = field(default_factory=dict)  # OCR + 手动输入疑点筛查汇总
     page_asset_sync_signature: str = ""  # Page Manager overlay signature; avoids redundant full-document sync
+    # Standalone multimodal image-book workflow.  These fields are deliberately
+    # metadata-only so traditional OCR/Formatter contracts remain untouched.
+    ai_image_provider: str = ""
+    ai_image_model: str = ""
+    ai_image_pipeline_version: str = ""
+    ai_image_report: dict = field(default_factory=dict)
+    ai_translation_target: str = ""
 
     def to_dict(self) -> dict:
         return {k: v for k, v in self.__dict__.items() if v}
@@ -264,10 +311,23 @@ class TocEntry:
 
 # ── 版本仓库：内容寻址存储（做法类似 Git 的 blob + commit）───────────────────
 
+def _serialize_blob_bytes(data: dict) -> bytes:
+    """Serialize repository content once, using an optional fast encoder.
+
+    Large selectable-PDF documents can contain tens of thousands of blocks.
+    Serializing the same snapshot twice with the stdlib encoder (once for the
+    hash and again for writing) dominated the complete 4693-page workflow.
+    ``orjson`` is used when already available, but remains optional so offline
+    installs without it keep working through the standard-library fallback.
+    """
+    if _orjson is not None:
+        return _orjson.dumps(data)
+    return json.dumps(data, sort_keys=True, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+
+
 def _compute_blob_id(data: dict) -> str:
     """内容的 SHA-1 哈希。相同内容→相同 id，天然去重。"""
-    json_bytes = json.dumps(data, sort_keys=True, ensure_ascii=False).encode("utf-8")
-    return hashlib.sha1(json_bytes).hexdigest()
+    return hashlib.sha1(_serialize_blob_bytes(data)).hexdigest()
 
 
 class Repository:
@@ -291,14 +351,17 @@ class Repository:
         return self.objects_dir / blob_id[:2] / blob_id[2:]
 
     def store_blob(self, content: dict) -> str:
-        """存储一份内容（文档快照或 commit 元数据），返回内容寻址 id"""
-        blob_id = _compute_blob_id(content)
+        """存储一份内容（文档快照或 commit 元数据），返回内容寻址 id。
+
+        Serialize once and write those exact bytes.  This preserves content
+        addressing while avoiding a second full JSON traversal for huge books.
+        """
+        payload = _serialize_blob_bytes(content)
+        blob_id = hashlib.sha1(payload).hexdigest()
         blob_file = self._blob_path(blob_id)
         if not blob_file.exists():
             blob_file.parent.mkdir(parents=True, exist_ok=True)
-            blob_file.write_text(
-                json.dumps(content, ensure_ascii=False, indent=2), encoding="utf-8"
-            )
+            blob_file.write_bytes(payload)
         return blob_id
 
     def read_blob(self, blob_id: str) -> dict:
@@ -463,8 +526,14 @@ class UnifiedDocument:
     def from_dict(cls, d: dict) -> UnifiedDocument:
         doc = cls()
         m = d.get("metadata", {})
+        # Metadata.to_dict() intentionally serializes dynamic extension fields
+        # from ``__dict__`` (multi-OCR roles/transports, future adapter audit
+        # fields, etc.).  Older restore code only assigned fields predeclared on
+        # the dataclass and therefore silently discarded those extensions after
+        # a workspace restart.  Metadata is not slotted, so preserve every
+        # serialized field for a lossless/forward-compatible round trip.
         for k, v in m.items():
-            if hasattr(doc.metadata, k):
+            if isinstance(k, str) and k:
                 setattr(doc.metadata, k, v)
         for p in d.get("pages", []):
             doc.pages.append(PageInfo(

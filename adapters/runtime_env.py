@@ -3,18 +3,21 @@
 """Helpers for isolated OCR runtimes.
 
 Torch/ONNX OCR packages often lag behind the newest CPython release.  The main
-application may run on Python 3.14, while Manga-OCR/NDLOCR-Lite need a
+application may run on Python 3.14, while some local OCR engines need a
 3.10-3.13 interpreter.  This module locates a genuinely executable compatible
 Python instead of trusting that a hard-coded path merely exists.
 """
 from __future__ import annotations
 
+import json
 import os
+import platform
 import shutil
 import subprocess
 import sys
+import time
 from pathlib import Path
-from typing import Iterable
+from typing import Callable, Iterable
 
 
 
@@ -94,37 +97,80 @@ def _candidate_paths() -> Iterable[str]:
                 yield from add(proc.stdout.strip().splitlines()[-1])
 
 
-def probe_python(path: str, min_minor: int = 10, max_minor: int = 13) -> tuple[bool, str]:
-    """Return ``(usable, detail)`` for a Python candidate."""
+def _host_is_apple_silicon() -> bool:
+    """Detect Apple Silicon even when the parent app itself is under Rosetta."""
+    if sys.platform != "darwin":
+        return False
+    if platform.machine().strip().lower() in {"arm64", "aarch64"}:
+        return True
+    try:
+        proc = subprocess.run(
+            ["/usr/sbin/sysctl", "-in", "sysctl.proc_translated"],
+            capture_output=True, text=True, timeout=5,
+        )
+        return proc.returncode == 0 and (proc.stdout or "").strip() == "1"
+    except Exception:
+        return False
+
+
+def probe_python(
+    path: str, min_minor: int = 10, max_minor: int = 13,
+    *, require_native_apple_silicon: bool | None = None,
+) -> tuple[bool, str]:
+    """Return ``(usable, detail)`` for a Python candidate.
+
+    On Apple Silicon, an x86_64/Rosetta interpreter can create a perfectly
+    importable venv while making PyTorch MPS unavailable.  Treat that runtime
+    as incompatible before installing hundreds of MB of OCR dependencies.
+    """
     candidate = Path(path).expanduser()
     if not candidate.exists():
         return False, "文件不存在"
+    if require_native_apple_silicon is None:
+        require_native_apple_silicon = _host_is_apple_silicon()
+    code = (
+        "import json,platform,sys,venv; "
+        "v=f'{sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro}'; "
+        "print(json.dumps({'version':v,'machine':platform.machine().lower(),"
+        "'bits':64 if sys.maxsize>2**32 else 32})); "
+        "raise SystemExit(0 if sys.version_info.major==3 and "
+        f"{min_minor}<=sys.version_info.minor<={max_minor} else 8)"
+    )
     try:
         proc = subprocess.run(
-            [str(candidate), "-c", (
-                "import sys,venv; "
-                "print(f'{sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro}'); "
-                "raise SystemExit(0 if sys.version_info.major==3 and "
-                f"{min_minor}<=sys.version_info.minor<={max_minor} else 8)"
-            )],
-            capture_output=True,
-            text=True,
-            timeout=15,
+            [str(candidate), "-c", code], capture_output=True, text=True, timeout=15,
         )
     except Exception as exc:
         return False, f"无法启动: {exc}"
-    version = (proc.stdout or proc.stderr or "未知版本").strip().splitlines()[-1]
+    raw = (proc.stdout or proc.stderr or "").strip().splitlines()
+    payload = {}
+    if raw:
+        try:
+            payload = json.loads(raw[-1])
+        except Exception:
+            payload = {"version": raw[-1]}
+    version = str(payload.get("version") or "未知版本")
+    machine = str(payload.get("machine") or "").strip().lower()
+    bits = int(payload.get("bits") or 0)
+    detail = version + (f" · {machine}" if machine else "") + (f" · {bits}-bit" if bits else "")
     if proc.returncode != 0:
-        return False, f"版本不兼容或 venv 不可用: {version}"
-    return True, version
+        return False, f"版本不兼容或 venv 不可用: {detail}"
+    if require_native_apple_silicon and machine not in {"arm64", "aarch64"}:
+        return False, f"Apple Silicon 需要原生 arm64 Python，当前为 {detail}"
+    return True, detail
 
 
 def find_compatible_python(
-    *, min_minor: int = 10, max_minor: int = 13, label: str = "OCR"
+    *, min_minor: int = 10, max_minor: int = 13, label: str = "OCR",
+    require_native_apple_silicon: bool | None = None,
+    progress_callback: Callable[[str], None] | None = None,
 ) -> Path:
     failures: list[str] = []
     for candidate in _candidate_paths():
-        ok, detail = probe_python(candidate, min_minor=min_minor, max_minor=max_minor)
+        ok, detail = probe_python(
+            candidate, min_minor=min_minor, max_minor=max_minor,
+            require_native_apple_silicon=require_native_apple_silicon,
+        )
         if ok:
             return Path(candidate).resolve()
         failures.append(f"- {candidate}: {detail}")
@@ -154,9 +200,52 @@ def ensure_venv(
     verbose: bool = True,
     min_minor: int = 10,
     max_minor: int = 13,
+    require_native_apple_silicon: bool | None = None,
+    progress_callback: Callable[[str], None] | None = None,
 ) -> Path:
-    """Create/repair a venv and install dependencies idempotently."""
+    """Create/repair a venv and install dependencies idempotently.
+
+    ``progress_callback`` is optional and is used by heavyweight OCR runtimes
+    to emit a heartbeat while Python/venv/pip subprocesses are still healthy.
+    Existing callers keep the exact blocking ``subprocess.run`` behavior when
+    no callback is supplied.
+    """
     py = venv_python(venv_dir)
+
+    def emit_progress(detail: str) -> None:
+        if callable(progress_callback):
+            try:
+                progress_callback(str(detail or ""))
+            except Exception:
+                pass
+
+    def run_checked(cmd, *, timeout: float, detail: str) -> None:
+        if not callable(progress_callback):
+            subprocess.run(cmd, check=True, timeout=timeout)
+            return
+        emit_progress(detail)
+        proc = subprocess.Popen(cmd)
+        deadline = time.monotonic() + max(1.0, float(timeout))
+        last_emit = 0.0
+        while proc.poll() is None:
+            now = time.monotonic()
+            if now >= deadline:
+                try:
+                    proc.kill()
+                except Exception:
+                    pass
+                try:
+                    proc.wait(timeout=5)
+                except Exception:
+                    pass
+                raise subprocess.TimeoutExpired(cmd, timeout)
+            if now - last_emit >= 5.0:
+                last_emit = now
+                emit_progress(detail)
+            time.sleep(0.25)
+        if proc.returncode:
+            raise subprocess.CalledProcessError(proc.returncode, cmd)
+        emit_progress(detail)
 
     def valid_existing() -> bool:
         if not py.exists():
@@ -172,32 +261,32 @@ def ensure_venv(
     # Existing venvs can outlive or point at a removed framework Python.
     # Verify the interpreter itself before trying to repair packages inside it.
     if py.exists():
-        try:
-            alive = subprocess.run(
-                [str(py), "-c", (
-                    "import sys; "
-                    f"raise SystemExit(0 if sys.version_info.major==3 and {min_minor}<=sys.version_info.minor<={max_minor} else 8)"
-                )],
-                capture_output=True,
-                timeout=15,
-            ).returncode == 0
-        except Exception:
-            alive = False
+        alive, _detail = probe_python(
+            str(py), min_minor=min_minor, max_minor=max_minor,
+            require_native_apple_silicon=require_native_apple_silicon,
+        )
         if not alive:
+            if verbose:
+                print(f"♻️  {label} 运行环境需要重建：{_detail}")
             shutil.rmtree(venv_dir, ignore_errors=True)
 
     if not py.exists():
         base = find_compatible_python(
-            min_minor=min_minor, max_minor=max_minor, label=label
+            min_minor=min_minor, max_minor=max_minor, label=label,
+            require_native_apple_silicon=require_native_apple_silicon,
         )
         if verbose:
             print(f"🔧  首次使用 {label}：用 {base} 创建 {venv_dir} ...")
         venv_dir.parent.mkdir(parents=True, exist_ok=True)
-        subprocess.run([str(base), "-m", "venv", str(venv_dir)], check=True, timeout=300)
-        subprocess.run(
+        run_checked(
+            [str(base), "-m", "venv", str(venv_dir)],
+            timeout=300,
+            detail=f"正在创建 {label} 独立运行环境",
+        )
+        run_checked(
             [str(py), "-m", "pip", "install", "--upgrade", "pip", "setuptools", "wheel"],
-            check=True,
             timeout=1800,
+            detail=f"正在准备 {label} Python 基础依赖",
         )
 
     if not valid_existing():
@@ -208,7 +297,11 @@ def ensure_venv(
             cmd.extend(["-r", str(requirements)])
         else:
             cmd.extend(packages or [])
-        subprocess.run(cmd, check=True, timeout=3600)
+        run_checked(
+            cmd,
+            timeout=3600,
+            detail=f"正在安装/修复 {label} 依赖（首次使用可能下载较大运行库）",
+        )
         proc = subprocess.run([str(py), "-c", marker_code], capture_output=True, text=True, timeout=60)
         if proc.returncode != 0:
             raise RuntimeError(

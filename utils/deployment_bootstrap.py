@@ -372,7 +372,7 @@ def install_main_dependencies(
         [
             str(python_executable),
             "-c",
-            "import PySide6, PIL, fitz, docx, httpx; print('ready')",
+            "import PySide6, PIL, fitz, fontTools, docx, httpx; print('ready')",
         ],
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
@@ -453,18 +453,6 @@ def _hayai_ocr_ready() -> bool:
         return False
 
 
-def _manga_ocr_ready() -> bool:
-    roots = (
-        ROOT / ".model-cache" / "manga-ocr",
-        ROOT / ".model-cache" / "manga-ocr" / "hub",
-    )
-    for root in roots:
-        try:
-            if any(path.is_file() and path.stat().st_size >= 500_000 for path in root.rglob("*")):
-                return True
-        except OSError:
-            continue
-    return False
 
 
 def _manga_48px_ready() -> bool:
@@ -490,7 +478,7 @@ def _install_ndlocr(progress_callback: ProgressCallback | None) -> ComponentResu
 def _install_hayai_ocr(progress_callback: ProgressCallback | None) -> ComponentResult:
     if _hayai_ocr_ready():
         return ComponentResult("hayai_ocr", "ready", "已安装；未检查更新")
-    _emit(progress_callback, "model", 0, 1, "准备 Hayai OCR v2.1 依赖和模型")
+    _emit(progress_callback, "model", 0, 1, "准备 Hayai OCR 依赖和模型")
     from adapters.hayai_ocr_adapter import WORKER_SCRIPT, _resolved_model_cache, setup_venv
 
     python = setup_venv(verbose=True, backend="torch")
@@ -509,38 +497,12 @@ def _install_hayai_ocr(progress_callback: ProgressCallback | None) -> ComponentR
         timeout=5400,
     )
     if proc.returncode != 0 or '"ready": true' not in (proc.stdout or "").lower():
-        raise RuntimeError("Hayai OCR v2.1 模型初始化失败：" + _redact(proc.stderr or proc.stdout))
+        raise RuntimeError("Hayai OCR 模型初始化失败：" + _redact(proc.stderr or proc.stdout))
     if not _hayai_ocr_ready():
-        raise RuntimeError("Hayai OCR v2.1 下载结束后未检测到完整权重")
+        raise RuntimeError("Hayai OCR 下载结束后未检测到完整权重")
     return ComponentResult("hayai_ocr", "installed", "首次部署安装完成")
 
 
-def _install_manga_ocr(progress_callback: ProgressCallback | None) -> ComponentResult:
-    if _manga_ocr_ready():
-        return ComponentResult("manga_ocr", "ready", "已安装；未检查更新")
-    _emit(progress_callback, "model", 0, 1, "准备 Manga OCR 依赖和模型")
-    from adapters.manga_ocr_adapter import MODEL_CACHE, WORKER_SCRIPT, setup_venv
-
-    python = setup_venv(verbose=True)
-    cache = Path(MODEL_CACHE)
-    cache.mkdir(parents=True, exist_ok=True)
-    env = dict(os.environ)
-    env["HF_HOME"] = str(cache)
-    env["HUGGINGFACE_HUB_CACHE"] = str(cache / "hub")
-    env["TRANSFORMERS_CACHE"] = str(cache / "transformers")
-    proc = subprocess.run(
-        [str(python), str(WORKER_SCRIPT), "--stream"],
-        input=json.dumps({"command": "close"}, ensure_ascii=False) + "\n",
-        text=True,
-        capture_output=True,
-        env=env,
-        timeout=5400,
-    )
-    if proc.returncode != 0 or '"ready": true' not in (proc.stdout or "").lower():
-        raise RuntimeError("Manga OCR 模型初始化失败：" + _redact(proc.stderr or proc.stdout))
-    if not _manga_ocr_ready():
-        raise RuntimeError("Manga OCR 下载结束后未检测到完整权重")
-    return ComponentResult("manga_ocr", "installed", "首次部署安装完成")
 
 
 def _install_manga_48px(progress_callback: ProgressCallback | None) -> ComponentResult:
@@ -653,27 +615,6 @@ def _install_paddle(progress_callback: ProgressCallback | None) -> ComponentResu
     raise RuntimeError("PaddleOCR 模型准备失败：" + "；".join(errors[-2:]))
 
 
-def _install_yomitoku(progress_callback: ProgressCallback | None) -> ComponentResult:
-    _emit(progress_callback, "model", 0, 1, "准备 YomiToku 依赖和模型")
-    from adapters.runtime_env import venv_python
-    from adapters.yomitoku_adapter import MODEL_CACHE, VENV_DIR, WORKER_SCRIPT, setup_venv
-
-    setup_venv(verbose=True)
-    cache = Path(MODEL_CACHE)
-    env = dict(os.environ)
-    env["HF_HOME"] = str(cache / "huggingface")
-    env["TORCH_HOME"] = str(cache / "torch")
-    proc = subprocess.run(
-        [str(venv_python(Path(VENV_DIR))), str(WORKER_SCRIPT), "--server", "--mode", "fast", "--device", "auto"],
-        input=json.dumps({"command": "close"}, ensure_ascii=False) + "\n",
-        text=True,
-        capture_output=True,
-        env=env,
-        timeout=5400,
-    )
-    if proc.returncode != 0 or '"ready": true' not in (proc.stdout or "").lower():
-        raise RuntimeError("YomiToku 模型初始化失败：" + _redact(proc.stderr or proc.stdout))
-    return ComponentResult("yomitoku", "installed", "首次部署安装完成")
 
 
 def resolve_profile(hardware: HardwareSummary, requested: str = "auto") -> tuple[str, tuple[str, ...]]:
@@ -693,11 +634,11 @@ def resolve_profile(hardware: HardwareSummary, requested: str = "auto") -> tuple
     plans = {
         "none": (),
         "lite": ("ndlocr_lite",),
-        "standard": ("ndlocr_lite", "manga_ocr", "manga_48px"),
+        "standard": ("ndlocr_lite", "manga_48px"),
         # Keep the historical profile byte-for-byte in meaning. Hayai is installed
         # only after the user explicitly selects it in the GUI; adding a new OCR
         # engine must never silently enlarge an existing deployment profile.
-        "full": ("ndlocr_lite", "manga_ocr", "manga_48px", "paddle_ocr", "yomitoku"),
+        "full": ("ndlocr_lite", "manga_48px", "paddle_ocr"),
     }
     return value, plans[value]
 
@@ -705,10 +646,8 @@ def resolve_profile(hardware: HardwareSummary, requested: str = "auto") -> tuple
 _INSTALLERS = {
     "ndlocr_lite": _install_ndlocr,
     "hayai_ocr": _install_hayai_ocr,
-    "manga_ocr": _install_manga_ocr,
     "manga_48px": _install_manga_48px,
     "paddle_ocr": _install_paddle,
-    "yomitoku": _install_yomitoku,
 }
 
 

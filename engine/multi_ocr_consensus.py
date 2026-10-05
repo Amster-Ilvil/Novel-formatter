@@ -5,7 +5,7 @@
 The normal comparison workspace remains sentence based.  This module operates
 one stage earlier, while every OCR result still has an immutable ``column_id``.
 Two engines can therefore settle exact matches immediately, while only
-conflicting physical columns are sent to an optional third engine or to later
+conflicting physical columns are sent to additional engines or to later
 sentence-context recovery.
 """
 from __future__ import annotations
@@ -127,8 +127,8 @@ def build_column_consensus(docs: Sequence[UnifiedDocument]) -> ColumnConsensusPl
 
     The first two engines settle ordinary exact/normalised agreements.  Columns
     containing digits, levels or structured status text are selectively sent to
-    an independent third engine even when two candidates agree.  With three
-    engines, a diverse 2:1 majority is provisional; sensitive dissent remains
+    additional independent engines even when two candidates agree. With three or
+    more engines, a majority may still be provisional; sensitive dissent remains
     reviewable and is never hidden by a raw confidence score.
     """
     plan = ColumnConsensusPlan(model_count=len(docs))
@@ -149,7 +149,7 @@ def build_column_consensus(docs: Sequence[UnifiedDocument]) -> ColumnConsensusPl
     for column_id in all_ids:
         reliability_rows.append([mapping.get(column_id, ColumnValue("", 0.0)).text for mapping in maps])
     reliabilities = estimate_model_reliability(reliability_rows, labels)
-    # A selectively invoked third model contains consensus-seeded blocks for
+    # A selectively invoked additional model contains consensus-seeded blocks for
     # untouched columns.  Its low whole-book availability is intentional and
     # must not trip the full-pass health gate; only its real target outputs vote.
     for doc_index, doc in enumerate(docs):
@@ -161,7 +161,7 @@ def build_column_consensus(docs: Sequence[UnifiedDocument]) -> ColumnConsensusPl
             rel = reliabilities[labels[doc_index]]
             rel.usable_ratio = 1.0
             rel.voting_enabled = True
-            rel.reason = "selective_third_model_pass_not_full_book"
+            rel.reason = "selective_additional_model_pass_not_full_book"
     plan.model_reliability = {label: value.as_dict() for label, value in reliabilities.items()}
 
     for column_id in plan.ordered_ids:
@@ -194,11 +194,21 @@ def build_column_consensus(docs: Sequence[UnifiedDocument]) -> ColumnConsensusPl
             plan.verification_ids.add(column_id)
             continue
 
-        if decision.status in {"exact_consensus", "normalized_consensus", "majority_consensus"}:
+        if decision.status in {"exact_consensus", "normalized_consensus"}:
             plan.agreed_ids.add(column_id)
             if decision.requires_review:
                 plan.unresolved_ids.add(column_id)
-                plan.sensitive_dissent_ids.add(column_id)
+                plan.verification_ids.add(column_id)
+            continue
+
+        if decision.status == "majority_consensus":
+            # 924 Stable Core semantics: a dissenting independent OCR result
+            # keeps the physical column in the true-conflict set. The majority
+            # is retained only as a provisional candidate for later AI/human
+            # adjudication or a fully verified targeted retry.
+            plan.conflict_ids.add(column_id)
+            plan.unresolved_ids.add(column_id)
+            plan.sensitive_dissent_ids.add(column_id)
             continue
 
         plan.conflict_ids.add(column_id)
@@ -217,11 +227,55 @@ def build_column_consensus(docs: Sequence[UnifiedDocument]) -> ColumnConsensusPl
 
 
 def seed_from_document(doc: UnifiedDocument) -> dict[str, dict[str, object]]:
-    _ordered, values = extract_column_values(doc)
-    return {
-        column_id: {
-            "text": value.text,
-            "confidence": float(value.confidence or 0.0),
+    """Return one reusable baseline value per immutable physical column.
+
+    Reflowed sentence blocks retain the original first-column ``column_id`` for
+    lineage, but the authoritative complete baseline lives in
+    ``source_column_ids`` + ``source_column_primary_texts``.  Prefer that array
+    representation whenever present so sentence/review roles never mistake one
+    merged sentence for a single physical column and re-run the missing columns.
+
+    This helper is intentionally permissive because its output is only used as
+    a *seed*.  Whether a value is independent OCR evidence is decided later by
+    the per-model seed flags in the comparison layer.
+    """
+    result: dict[str, dict[str, object]] = {}
+
+    for block in doc.blocks:
+        metadata = block.metadata if isinstance(block.metadata, dict) else {}
+        confidence = float(getattr(block, "confidence", 0.0) or 0.0)
+
+        raw_ids = metadata.get("source_column_ids") or []
+        if isinstance(raw_ids, str):
+            raw_ids = [raw_ids]
+        source_ids = [str(value) for value in raw_ids if str(value)]
+        if source_ids:
+            raw_texts = metadata.get("source_column_primary_texts") or []
+            if isinstance(raw_texts, str):
+                raw_texts = [raw_texts]
+            source_texts = [str(value or "") for value in raw_texts]
+            if len(source_texts) != len(source_ids):
+                raw_texts = metadata.get("source_column_texts") or []
+                if isinstance(raw_texts, str):
+                    raw_texts = [raw_texts]
+                source_texts = [str(value or "") for value in raw_texts]
+            if len(source_texts) != len(source_ids):
+                source_texts = [""] * max(0, len(source_ids) - 1) + [str(block.text or "")]
+            for column_id, text in zip(source_ids, source_texts):
+                result[column_id] = {
+                    "text": str(text or ""),
+                    "confidence": confidence,
+                }
+            # Do not also interpret the retained first-column ``column_id`` on a
+            # reflowed block; the full source-column array already supersedes it.
+            continue
+
+        column_id = str(metadata.get("column_id", "") or "")
+        if not column_id:
+            continue
+        result[column_id] = {
+            "text": str(block.text or ""),
+            "confidence": confidence,
         }
-        for column_id, value in values.items()
-    }
+
+    return result

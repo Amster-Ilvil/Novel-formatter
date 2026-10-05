@@ -31,6 +31,8 @@ import sys
 import tempfile
 import uuid
 import zipfile
+import unicodedata
+from datetime import datetime, timezone
 from functools import wraps
 from pathlib import Path
 from textwrap import dedent
@@ -38,6 +40,7 @@ from textwrap import dedent
 sys.path.insert(0, str(Path(__file__).parent.parent))
 from models.document import UnifiedDocument, Block, BlockType
 from utils.atomic_io import atomic_write_text
+from engine.illustration_spread import detect_likely_illustration_spreads
 
 def _workspace_for_output(output_path: str) -> Path:
     out = Path(output_path).expanduser()
@@ -55,6 +58,29 @@ def _cleanup_workspace(func):
         finally:
             shutil.rmtree(workspace, ignore_errors=True)
     return wrapper
+
+
+# Codec resources are already compressed internally. EPUB 3.3 recommends not
+# deflating them again; storing them improves build/read performance and avoids
+# wasting CPU for negligible size gains. Text/XML/CSS remain Deflate-compressed.
+_EPUB_PRECOMPRESSED_SUFFIXES = {
+    ".jpg", ".jpeg", ".png", ".gif", ".webp", ".avif", ".jxl",
+    ".mp3", ".m4a", ".aac", ".ogg", ".opus", ".mp4", ".webm",
+    ".woff", ".woff2",
+}
+
+
+def _publication_labels(lang: str) -> dict[str, str]:
+    primary = str(lang or "").lower().split("-", 1)[0]
+    if primary == "ja":
+        return {"toc": "目次", "landmarks": "ガイド", "start": "本文", "cover": "表紙"}
+    if primary == "zh":
+        return {"toc": "目录", "landmarks": "导航", "start": "正文", "cover": "封面"}
+    return {"toc": "Contents", "landmarks": "Guide", "start": "Start reading", "cover": "Cover"}
+
+
+def _zip_compression_for(path: Path) -> int:
+    return zipfile.ZIP_STORED if path.suffix.lower() in _EPUB_PRECOMPRESSED_SUFFIXES else zipfile.ZIP_DEFLATED
 
 
 # ── CSS 模板 ─────────────────────────────────────────────────────────────────
@@ -172,6 +198,10 @@ DEFAULT_TEMPLATE = "denki"
 # 第一个真正章节之前的内容（封面/扉页/目录扫描页/网站样板文字等）统一装进这个
 # 标题固定的桶里。它不是一个真正的章节标题，不应该出现在读者可见的目录里。
 FRONT_MATTER_TITLE = "前书页"
+
+# Publication-only structural markers.  These are content markers, not TOC entries.
+_VOLUME_END_RE = re.compile(r"^第[\s　]*[一二三四五六七八九十百千〇零\d０-９]+[\s　]*巻[\s　]*了$")
+_SCENE_BREAKS = {"◆", "◇", "＊", "＊＊＊", "×××", "【完】", "︻完︼"}
 
 _EPUB_IMAGE_MIME = {
     ".jpg": "image/jpeg",
@@ -343,7 +373,7 @@ def resolve_epub_css(
 
 # ── XHTML 生成辅助 ────────────────────────────────────────────────────────────
 
-def _xhtml_wrap(title: str, body_content: str, css_filename: str = "style.css") -> str:
+def _xhtml_wrap(title: str, body_content: str, css_filename: str = "style.css", lang: str = "ja") -> str:
     """
     注意：body_content 是多行、且自带缩进的变量内容（章节正文/nav 列表等），
     不能把它嵌进 f-string 以后再整体 dedent() —— dedent() 是按"所有行公共前导
@@ -358,7 +388,8 @@ def _xhtml_wrap(title: str, body_content: str, css_filename: str = "style.css") 
         <!DOCTYPE html>
         <html xmlns="http://www.w3.org/1999/xhtml"
               xmlns:epub="http://www.idpf.org/2007/ops"
-              xml:lang="ja">
+              xml:lang="{_esc(lang)}"
+              lang="{_esc(lang)}">
         <head>
           <meta charset="UTF-8"/>
           <title>{_esc(title)}</title>
@@ -374,14 +405,53 @@ def _xhtml_wrap(title: str, body_content: str, css_filename: str = "style.css") 
 
 
 def _esc(s: str) -> str:
-    """XML/HTML 转义"""
+    """XML/HTML 转义；所有文本节点在最终写出前统一为 NFC。"""
+    s = unicodedata.normalize("NFC", str(s or ""))
     return (s.replace("&", "&amp;")
              .replace("<", "&lt;")
              .replace(">", "&gt;")
              .replace('"', "&quot;"))
 
 
-def _ruby_to_xhtml(text: str) -> str:
+_TCY_RE = re.compile(
+    r"(?<![0-9０-９])(?:[0-9０-９]{2})(?![0-9０-９])|[!?！？]{2}"
+)
+
+
+def _esc_with_tcy(text: str, *, vertical: bool = False) -> str:
+    """Escape text and mark publication-safe tate-chu-yoko tokens.
+
+    Only the high-confidence Japanese vertical cases are automatic: exactly two
+    digits and two-character !/? combinations.  Longer numbers remain upright
+    vertical text unless the source already contains explicit styling.
+    """
+    value = str(text or "")
+    if not vertical:
+        return _esc(value)
+    parts: list[str] = []
+    last = 0
+    for match in _TCY_RE.finditer(value):
+        if match.start() > last:
+            parts.append(_esc(value[last:match.start()]))
+        parts.append(f'<span class="tcy">{_esc(match.group(0))}</span>')
+        last = match.end()
+    if last < len(value):
+        parts.append(_esc(value[last:]))
+    return "".join(parts) if parts else _esc(value)
+
+
+def _ruby_markup(base: str, reading: str, *, vertical: bool, fallback: bool) -> str:
+    base_html = _esc_with_tcy(base, vertical=vertical)
+    reading_html = _esc(reading)
+    if fallback:
+        return (
+            f'<ruby>{base_html}<rp>（</rp><rt>{reading_html}</rt>'
+            f'<rp>）</rp></ruby>'
+        )
+    return f'<ruby>{base_html}<rt>{reading_html}</rt></ruby>'
+
+
+def _ruby_to_xhtml(text: str, *, vertical: bool = False, fallback: bool = False) -> str:
     """Convert supported ruby notations to XHTML without swallowing following prose.
 
     Preferred input is Aozora-style ``｜漢字《よみ》`` because the reading has an
@@ -398,11 +468,11 @@ def _ruby_to_xhtml(text: str) -> str:
         last = 0
         for m in aozora.finditer(value):
             if m.start() > last:
-                parts.append(_esc(value[last:m.start()]))
-            parts.append(f'<ruby>{_esc(m.group(1))}<rt>{_esc(m.group(2))}</rt></ruby>')
+                parts.append(_esc_with_tcy(value[last:m.start()], vertical=vertical))
+            parts.append(_ruby_markup(m.group(1), m.group(2), vertical=vertical, fallback=fallback))
             last = m.end()
         if last < len(value):
-            parts.append(_esc(value[last:]))
+            parts.append(_esc_with_tcy(value[last:], vertical=vertical))
         return ''.join(parts)
 
     marker = re.compile(r"([^\s|]{1,24})\|([ぁ-ゖァ-ヺー]{1,32})")
@@ -424,12 +494,12 @@ def _ruby_to_xhtml(text: str) -> str:
         if not reading:
             continue
         if m.start() > last:
-            parts.append(_esc(value[last:m.start()]))
-        parts.append(f'<ruby>{_esc(m.group(1))}<rt>{_esc(reading)}</rt></ruby>')
+            parts.append(_esc_with_tcy(value[last:m.start()], vertical=vertical))
+        parts.append(_ruby_markup(m.group(1), reading, vertical=vertical, fallback=fallback))
         last = effective_end
     if last < len(value):
-        parts.append(_esc(value[last:]))
-    return ''.join(parts) if parts else _esc(value)
+        parts.append(_esc_with_tcy(value[last:], vertical=vertical))
+    return ''.join(parts) if parts else _esc_with_tcy(value, vertical=vertical)
 
 
 def _ruby_source_matches_current_text(marked: str, current_text: str) -> bool:
@@ -442,7 +512,7 @@ def _ruby_source_matches_current_text(marked: str, current_text: str) -> bool:
     if not re.search(r"[｜|][^《]+《[^》]+》", marked or ""):
         return False
     plain = re.sub(r"[｜|]([^《\n]+)《([^》\n]+)》", r"\1", str(marked or ""))
-    return _sanitize_export_text(plain) == _sanitize_export_text(current_text or "")
+    return _comparison_export_text(plain) == _comparison_export_text(current_text or "")
 
 
 def _ruby_export_source(block: Block, *, allow_ruby: bool = True) -> str:
@@ -472,10 +542,19 @@ _ORPHAN_CLOSING_QUOTES = {"」", "』"}
 _MIXED_ELLIPSIS_RE = re.compile(r"(?=[.．・…]{2,})(?=[.．・…]*[.．…])[.．・…]{2,}")
 
 def _sanitize_export_text(text: str) -> str:
-    """EPUB 最终导出防线：统一省略号并清掉首尾无意义空白。"""
-    text = (text or "").strip(" \t\r\n")
-    text = _MIXED_ELLIPSIS_RE.sub("……", text)
-    return text
+    """EPUB export boundary: NFC + outer whitespace only; never rewrite prose.
+
+    Comparison may treat visually equivalent ellipsis forms as aliases, but the
+    publication builder must not silently collapse ``…………`` to ``……`` or drop
+    a middle dot from source text.  Any editorial punctuation change belongs in
+    an explicit Formatter/audit step before export.
+    """
+    return unicodedata.normalize("NFC", str(text or "")).strip(" \t\r\n")
+
+
+def _comparison_export_text(text: str) -> str:
+    """Comparison-only alias normalization used for stale-Ruby validation."""
+    return _MIXED_ELLIPSIS_RE.sub("……", _sanitize_export_text(text))
 
 
 def _repair_plain_to_xhtml(text: str) -> str:
@@ -483,9 +562,14 @@ def _repair_plain_to_xhtml(text: str) -> str:
     return "<br/>".join(_esc(part) for part in str(text or "").split("\n"))
 
 
-def _repair_ruby_to_xhtml(text: str) -> str:
+def _repair_ruby_to_xhtml(
+    text: str, *, vertical: bool = False, fallback: bool = False
+) -> str:
     """Ruby conversion with the same explicit newline preservation."""
-    return "<br/>".join(_ruby_to_xhtml(part) for part in str(text or "").split("\n"))
+    return "<br/>".join(
+        _ruby_to_xhtml(part, vertical=vertical, fallback=fallback)
+        for part in str(text or "").split("\n")
+    )
 
 def _repair_attrs(b: Block) -> str:
     """Return opt-in stable AI-repair attributes without affecting normal EPUBs."""
@@ -531,7 +615,9 @@ def _repair_attrs(b: Block) -> str:
     return " " + " ".join(attrs)
 
 
-def _block_to_xhtml(b: Block, *, allow_ruby: bool = True) -> str:
+def _block_to_xhtml(
+    b: Block, *, allow_ruby: bool = True, vertical: bool = False, ruby_fallback: bool = False
+) -> str:
     """把单个 Block 转成 XHTML；Ruby OFF 时绝不读取 Ruby side-channel。"""
     raw = _sanitize_export_text(b.text or "")
     attrs = _repair_attrs(b)
@@ -540,8 +626,15 @@ def _block_to_xhtml(b: Block, *, allow_ruby: bool = True) -> str:
 
     def render(value: str) -> str:
         if has_ruby:
-            return _repair_ruby_to_xhtml(value) if attrs else _ruby_to_xhtml(value)
-        return _repair_plain_to_xhtml(value) if attrs else _esc(value)
+            return (
+                _repair_ruby_to_xhtml(value, vertical=vertical, fallback=ruby_fallback)
+                if attrs else _ruby_to_xhtml(value, vertical=vertical, fallback=ruby_fallback)
+            )
+        if attrs:
+            return "<br/>".join(
+                _esc_with_tcy(part, vertical=vertical) for part in str(value or "").split("\n")
+            )
+        return _esc_with_tcy(value, vertical=vertical)
 
     if b.type == BlockType.RUBY:
         content = render(ruby_raw)
@@ -556,11 +649,19 @@ def _block_to_xhtml(b: Block, *, allow_ruby: bool = True) -> str:
     if b.type == BlockType.SECTION:
         value = ruby_raw if has_ruby else raw
         value = re.sub(r"^\s*#+\s*", "", value).strip()
+        # ``第一巻了`` is a volume-end colophon marker.  It must not look like
+        # a subordinate heading or accidentally acquire heading semantics in
+        # reader navigation; center it as a terminal publication marker instead.
+        if _VOLUME_END_RE.match(value):
+            return f'    <p class="volume-end"{attrs}>{render(value)}</p>\n'
         return f"    <h2{attrs}>{render(value)}</h2>\n"
 
     if b.type == BlockType.DIALOGUE:
         value = (ruby_raw if has_ruby else raw).lstrip("　")
         return f'    <p class="dialogue"{attrs}>{render(value)}</p>\n'
+
+    if raw.strip() in _SCENE_BREAKS:
+        return f'    <p class="section-break"{attrs}>{render(raw.strip())}</p>\n'
 
     # 普通段落：统计开头的全角空格数量。
     value = ruby_raw if has_ruby else raw
@@ -612,8 +713,9 @@ def build_epub(
     ruby_export_enabled = bool(getattr(meta, "ruby_preservation_enabled", False))
     book_id = str(uuid.uuid4())
     title  = meta.title  or "Untitled"
-    author = meta.author or "Unknown"
-    lang   = meta.language or "ja"
+    author = str(meta.author or "").strip()
+    lang   = str(meta.language or "ja").strip() or "ja"
+    labels = _publication_labels(lang)
 
     css_content, css_source = resolve_epub_css(doc, css_template, custom_css)
 
@@ -634,14 +736,41 @@ p.normal {
     text-indent: 1em !important;
 }
 p.dialogue,
-p.section-break {
+p.section-break,
+p.volume-end {
     text-indent: 0 !important;
+}
+p.section-break {
+    text-align: center;
+    letter-spacing: 0.15em;
+    margin: 1em 0;
+    break-inside: avoid;
+}
+p.volume-end {
+    text-align: center;
+    letter-spacing: 0.12em;
+    margin: 2em 0;
+    break-inside: avoid;
 }
 /* 竖排标点统一使用正文方向，避免混合句点/省略号产生基线错位。 */
 html, body, p {
     text-orientation: mixed;
     font-variant-east-asian: normal;
 }
+/* 出版级禁则与纵中横。阅读器不支持某一扩展属性时会自然忽略。 */
+html, body, p, h1, h2 {
+    line-break: strict;
+    -webkit-line-break: strict;
+    word-break: normal;
+    overflow-wrap: normal;
+}
+.tcy {
+    text-combine-upright: all;
+    -webkit-text-combine: horizontal;
+    -epub-text-combine: horizontal;
+}
+ruby { ruby-position: over; }
+ruby rt { ruby-position: over; -webkit-ruby-position: before; }
 """
 
     if not vertical:
@@ -705,6 +834,30 @@ html, body, p {
     # 按对象身份缓存索引，避免章节循环中反复执行 list.index 的 O(n²) 扫描。
     block_index_by_identity = {id(block): index for index, block in enumerate(doc.blocks)}
 
+    # Double-page illustrations are never stitched automatically.  We only
+    # attach EPUB spine hints when explicit metadata exists or the conservative
+    # inner-edge continuity detector is highly confident.
+    spread_by_block: dict[int, str] = {}
+    for block_index, block in enumerate(doc.blocks):
+        if block.type != BlockType.IMAGE_REF:
+            continue
+        explicit = str((block.metadata or {}).get("page_spread") or "").strip().lower()
+        if explicit in {"left", "right", "center"}:
+            spread_by_block[block_index] = explicit
+    try:
+        auto_spreads = detect_likely_illustration_spreads(doc)
+    except Exception:
+        auto_spreads = []
+    for pair in auto_spreads:
+        if vertical:
+            spread_by_block.setdefault(pair.first_block_index, "right")
+            spread_by_block.setdefault(pair.second_block_index, "left")
+        else:
+            spread_by_block.setdefault(pair.first_block_index, "left")
+            spread_by_block.setdefault(pair.second_block_index, "right")
+    if verbose and auto_spreads:
+        print(f"  🖼️  跨页插图：检测到 {len(auto_spreads)} 组高置信度見開き，仅写入 page-spread 提示，不拼图")
+
     # ── 将 blocks 分组为章节 ─────────────────────────────────────────────────
     # chapter 0 = 书前（序言之前的内容）
     chapters: list[tuple[str, list[Block]]] = []
@@ -754,11 +907,13 @@ html, body, p {
     # 仍然写入 spine/manifest 保证翻页顺序正确，但不出现在读者可见的目录里，
     # 避免"目次"被大量"挿絵"/"（続き）"条目淹没。
     content_files: list[tuple[str, str, str, bool]] = []
+    # content document id -> EPUB itemref spread property (left/right/center).
+    content_spread: dict[str, str] = {}
 
     # 封面页
     if cover_img_href:
-        cover_body = f'  <div class="cover-page">\n    <img src="../{cover_img_href}" alt="{_esc(title)}"/>\n  </div>'
-        xhtml = _xhtml_wrap(title, cover_body)
+        cover_body = f'  <div class="cover-page" epub:type="cover">\n    <img src="../{cover_img_href}" alt="{_esc(title)}"/>\n  </div>'
+        xhtml = _xhtml_wrap(title, cover_body, lang=lang)
         fname = "content/cover.xhtml"
         (oebps / fname).write_text(xhtml, encoding="utf-8")
         content_files.append(("cover-page", fname, "表紙", False))
@@ -789,7 +944,7 @@ html, body, p {
             frag_id = ch_id if fragment_idx == 1 else f"{ch_id}_p{fragment_idx}"
             body = f'  <section epub:type="chapter">\n' + "".join(lines) + "  </section>"
             frag_title = ch_title if is_first else f"{ch_title}（続き）"
-            xhtml = _xhtml_wrap(frag_title, body)
+            xhtml = _xhtml_wrap(frag_title, body, lang=lang)
             fname = f"content/{frag_id}.xhtml"
             (oebps / fname).write_text(xhtml, encoding="utf-8")
             # 前书桶不是真正的章节标题，哪怕是它的第一个片段也不该进目录——
@@ -811,15 +966,20 @@ html, body, p {
                 img_info = image_manifest.get(block_index)
                 if img_info:
                     img_id, img_href = img_info
+                    alt_text = str((b.metadata or {}).get("alt_text") or "").strip() or "挿絵"
                     illus_body = (
                         f'  <div class="illus-page">\n'
-                        f'    <img src="../{img_href}" alt="挿絵"/>\n'
+                        f'    <img src="../{img_href}" alt="{_esc(alt_text)}"/>\n'
                         f'  </div>'
                     )
-                    illus_xhtml = _xhtml_wrap("挿絵", illus_body)
+                    illus_xhtml = _xhtml_wrap(alt_text, illus_body, lang=lang)
                     illus_fname = f"content/{ch_id}_illus_{img_id}.xhtml"
                     (oebps / illus_fname).write_text(illus_xhtml, encoding="utf-8")
-                    content_files.append((f"{ch_id}-{img_id}", illus_fname, "挿絵", False))
+                    illus_fid = f"{ch_id}-{img_id}"
+                    content_files.append((illus_fid, illus_fname, "挿絵", False))
+                    spread = spread_by_block.get(block_index)
+                    if spread in {"left", "right", "center"}:
+                        content_spread[illus_fid] = spread
                     chapter_has_content = True
             else:
                 clean_text = _sanitize_export_text(b.text or "")
@@ -835,6 +995,8 @@ html, body, p {
                     # Ruby switch gates only findtext side-channel metadata on
                     # ordinary prose blocks.
                     allow_ruby=(ruby_export_enabled or export_block.type == BlockType.RUBY),
+                    vertical=vertical,
+                    ruby_fallback=True,
                 )
                 lines.append(xhtml_piece)
                 chapter_has_content = True
@@ -858,25 +1020,93 @@ html, body, p {
     def _nav_href(href: str) -> str:
         return href[len("content/"):] if href.startswith("content/") else href
 
+    toc_entries = [
+        (fid, href, ctitle)
+        for fid, href, ctitle, in_toc in content_files
+        if in_toc
+    ]
+    if not content_files:
+        raise ValueError("EPUB 没有可进入 spine 的内容，已拒绝生成空出版物")
+    if not toc_entries:
+        # EPUB Navigation Document requires toc/nav > ol to contain at least
+        # one li.  Books without CHAPTER blocks therefore receive a conservative
+        # fallback entry to the first readable content document.
+        fallback = next((item for item in content_files if item[0] != "cover-page"), content_files[0])
+        toc_entries = [(fallback[0], fallback[1], labels["start"])]
+
     toc_items = "\n".join(
         f'      <li><a href="{_nav_href(href)}">{_esc(ctitle)}</a></li>'
-        for fid, href, ctitle, in_toc in content_files if in_toc
+        for _fid, href, ctitle in toc_entries
     )
+    first_body = next(
+        ((fid, href, ctitle) for fid, href, ctitle, in_toc in content_files if in_toc),
+        next(((fid, href, ctitle) for fid, href, ctitle, _ in content_files if fid != "cover-page"), toc_entries[0]),
+    )
+    landmark_items: list[str] = []
+    cover_entry = next(((fid, href, ctitle) for fid, href, ctitle, _ in content_files if fid == "cover-page"), None)
+    if cover_entry is not None:
+        landmark_items.append(
+            f'      <li><a epub:type="cover" href="{_nav_href(cover_entry[1])}">{_esc(labels["cover"])}</a></li>'
+        )
+    landmark_items.append(
+        f'      <li><a epub:type="bodymatter" href="{_nav_href(first_body[1])}">{_esc(labels["start"])}</a></li>'
+    )
+    landmarks = "\n".join(landmark_items)
     nav_body = dedent(f"""\
       <nav epub:type="toc">
-        <h1>目次</h1>
+        <h1>{_esc(labels["toc"])}</h1>
         <ol>
     {toc_items}
         </ol>
       </nav>
+      <nav epub:type="landmarks">
+        <h2>{_esc(labels["landmarks"])}</h2>
+        <ol>
+    {landmarks}
+        </ol>
+      </nav>
     """)
-    nav_xhtml = _xhtml_wrap("目次", nav_body)
+    nav_xhtml = _xhtml_wrap(labels["toc"], nav_body, lang=lang)
     (oebps / "content" / "nav.xhtml").write_text(nav_xhtml, encoding="utf-8")
+
+    # EPUB2-compatible NCX fallback. EPUB3 readers use nav.xhtml, while older
+    # Kindle/Kobo toolchains still inspect toc.ncx. Keep it derived from the
+    # same authoritative content_files list so the two navigation trees cannot
+    # silently diverge.
+    ncx_points: list[str] = []
+    play_order = 0
+    for fid, href, ctitle in toc_entries:
+        play_order += 1
+        ncx_points.append(
+            f'    <navPoint id="navPoint-{play_order}" playOrder="{play_order}">\n'
+            f'      <navLabel><text>{_esc(ctitle)}</text></navLabel>\n'
+            f'      <content src="{_esc(href)}"/>\n'
+            f'    </navPoint>'
+        )
+    ncx = (
+        '<?xml version="1.0" encoding="UTF-8"?>\n'
+        '<ncx xmlns="http://www.daisy.org/z3986/2005/ncx/" version="2005-1" '
+        f'xml:lang="{_esc(lang)}">\n'
+        '  <head>\n'
+        f'    <meta name="dtb:uid" content="urn:uuid:{book_id}"/>\n'
+        '    <meta name="dtb:depth" content="1"/>\n'
+        '    <meta name="dtb:totalPageCount" content="0"/>\n'
+        '    <meta name="dtb:maxPageNumber" content="0"/>\n'
+        '  </head>\n'
+        f'  <docTitle><text>{_esc(title)}</text></docTitle>\n'
+        '  <navMap>\n'
+        + "\n".join(ncx_points)
+        + ('\n' if ncx_points else '')
+        + '  </navMap>\n'
+        '</ncx>\n'
+    )
+    (oebps / "toc.ncx").write_text(ncx, encoding="utf-8")
 
     # ── content.opf ─────────────────────────────────────────────────────────
     # manifest items
     manifest_lines = [
         '    <item id="nav" href="content/nav.xhtml" media-type="application/xhtml+xml" properties="nav"/>',
+        '    <item id="ncx" href="toc.ncx" media-type="application/x-dtbncx+xml"/>',
         '    <item id="css" href="styles/style.css" media-type="text/css"/>',
     ]
     if cover_img_href:
@@ -902,31 +1132,78 @@ html, body, p {
     spine_fids = [fid for fid, _, _, _ in content_files]
     if include_nav_in_spine:
         spine_fids.insert(nav_insert_index, "nav")
-    spine_lines = [f'    <itemref idref="{fid}"/>' for fid in spine_fids]
+    spine_lines = []
+    for fid in spine_fids:
+        spread = content_spread.get(fid)
+        if spread in {"left", "right", "center"}:
+            spine_lines.append(
+                f'    <itemref idref="{fid}" properties="page-spread-{spread}"/>'
+            )
+        else:
+            spine_lines.append(f'    <itemref idref="{fid}"/>')
 
-    # cover meta
+    # cover meta + rendition hint.  ``page-spread-*`` remains the authoritative
+    # per-page instruction; rendition:spread only tells EPUB3 readers that the
+    # publication may contain paired spreads.
     cover_meta = f'\n    <meta name="cover" content="{cover_img_id}"/>' if cover_img_id else ""
+    if content_spread:
+        cover_meta += '\n    <meta property="rendition:spread">auto</meta>'
 
     # 竖排日文书从右往左翻页；横排则是常规从左往右翻页
     page_direction = "rtl" if vertical else "ltr"
+    modified = datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
 
     # 和 _xhtml_wrap 同样的坑：manifest_lines/spine_lines/cover_meta 都是多行、
     # 自带缩进的变量内容，不能整体塞进一个大的 dedent(f"""...""") 里——那样
     # 公共前导空白会被这些内部缩进拉偏，导致 <?xml ...?> 声明前残留空格，
     # 变成不合法的 XML。所以把静态骨架拆成几段各自 dedent，变量内容原样拼接。
+    optional_metadata: list[str] = []
+    if author:
+        optional_metadata.append(f"    <dc:creator>{_esc(author)}</dc:creator>")
+    publisher = str(meta.publisher or "").strip()
+    if publisher:
+        optional_metadata.append(f"    <dc:publisher>{_esc(publisher)}</dc:publisher>")
+    description = str(getattr(meta, "description", "") or "").strip()
+    if description:
+        optional_metadata.append(f"    <dc:description>{_esc(description)}</dc:description>")
+    isbn = str(getattr(meta, "isbn", "") or "").strip()
+    if isbn:
+        optional_metadata.append(f"    <dc:identifier id=\"isbn\">{_esc(isbn)}</dc:identifier>")
+        compact_isbn = re.sub(r"[^0-9Xx]", "", isbn)
+        # ONIX codelist 5 distinguishes legacy ISBN-10 (02) from ISBN-13 (15).
+        # Do not label a merely ISBN-shaped unknown identifier as the wrong type.
+        identifier_type = "02" if len(compact_isbn) == 10 else "15" if len(compact_isbn) == 13 else ""
+        if identifier_type:
+            optional_metadata.append(
+                f'    <meta refines="#isbn" property="identifier-type" scheme="onix:codelist5">{identifier_type}</meta>'
+            )
+    series = str(getattr(meta, "series", "") or "").strip()
+    volume = str(getattr(meta, "volume", "") or "").strip()
+    if series:
+        optional_metadata.append(
+            f'    <meta property="belongs-to-collection" id="series-collection">{_esc(series)}</meta>'
+        )
+        optional_metadata.append(
+            '    <meta refines="#series-collection" property="collection-type">series</meta>'
+        )
+        if re.fullmatch(r"\d+(?:\.\d+)*", volume):
+            optional_metadata.append(
+                f'    <meta refines="#series-collection" property="group-position">{_esc(volume)}</meta>'
+            )
+    optional_metadata_xml = ("\n" + "\n".join(optional_metadata)) if optional_metadata else ""
+
     opf_head = dedent(f"""\
         <?xml version="1.0" encoding="UTF-8"?>
         <package xmlns="http://www.idpf.org/2007/opf"
                  version="3.0"
-                 xml:lang="{lang}"
+                 xml:lang="{_esc(lang)}"
                  unique-identifier="uid">
 
           <metadata xmlns:dc="http://purl.org/dc/elements/1.1/">
             <dc:title>{_esc(title)}</dc:title>
-            <dc:creator>{_esc(author)}</dc:creator>
-            <dc:language>{lang}</dc:language>
-            <dc:publisher>{_esc(meta.publisher or '')}</dc:publisher>
-            <dc:identifier id="uid">urn:uuid:{book_id}</dc:identifier>""")
+            <dc:language>{_esc(lang)}</dc:language>
+            <dc:identifier id="uid">urn:uuid:{book_id}</dc:identifier>
+            <meta property="dcterms:modified">{modified}</meta>""") + optional_metadata_xml
     opf_mid = dedent("""
 
           </metadata>
@@ -937,7 +1214,7 @@ html, body, p {
 
           </manifest>
 
-          <spine page-progression-direction="{page_direction}">
+          <spine toc="ncx" page-progression-direction="{page_direction}">
         """)
     opf_tail = dedent("""
 
@@ -957,7 +1234,7 @@ html, body, p {
     (tmp / "META-INF" / "container.xml").write_text(dedent("""\
         <?xml version="1.0" encoding="UTF-8"?>
         <container version="1.0"
-                   xmlns="urn:oasis:schemas:container">
+                   xmlns="urn:oasis:names:tc:opendocument:xmlns:container">
           <rootfiles>
             <rootfile full-path="EPUB/content.opf"
                       media-type="application/oebps-package+xml"/>
@@ -983,10 +1260,9 @@ html, body, p {
                 "application/epub+zip",
                 compress_type=zipfile.ZIP_STORED,
             )
-            for fpath in tmp.rglob("*"):
-                if fpath.is_file():
-                    arcname = str(fpath.relative_to(tmp))
-                    zf.write(fpath, arcname)
+            for fpath in sorted((p for p in tmp.rglob("*") if p.is_file()), key=lambda p: str(p.relative_to(tmp))):
+                arcname = str(fpath.relative_to(tmp)).replace(os.sep, "/")
+                zf.write(fpath, arcname, compress_type=_zip_compression_for(fpath))
 
         # Reopen before commit to catch central-directory/truncation failures.
         with zipfile.ZipFile(staged_out, "r") as check_zip:

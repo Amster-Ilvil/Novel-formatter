@@ -33,11 +33,32 @@ _LIGHT_TEXT: Final[re.Pattern[str]] = re.compile(
 _EXPLICIT_TEXT_COLOR: Final[re.Pattern[str]] = re.compile(r"(?i)\bcolor\s*:")
 
 _CLICKABLE_BG: Final[str] = "#FFFFFF"
-_CLICKABLE_LABEL_BG: Final[str] = "#F7F9FC"
-_DARK_TEXT: Final[str] = "#202733"
-_DISABLED_TEXT: Final[str] = "#475467"
+_CLICKABLE_LABEL_BG: Final[str] = "#F7F8FA"
+_DARK_TEXT: Final[str] = "#14202E"
+_DISABLED_TEXT: Final[str] = "#5B6B80"
 _NORMAL_MARKER: Final[str] = "nf-secondary-button-contrast"
 _PRIMARY_MARKER: Final[str] = "nf-primary-disabled-contrast"
+
+
+def _dark_mode() -> bool:
+    app = QApplication.instance()
+    return bool(app is not None and app.property("nfDarkMode"))
+
+
+def _secondary_background() -> str:
+    return "#1B1F24" if _dark_mode() else _CLICKABLE_BG
+
+
+def _label_background() -> str:
+    return "#171A20" if _dark_mode() else _CLICKABLE_LABEL_BG
+
+
+def _secondary_text() -> str:
+    return "#F2F4F7" if _dark_mode() else _DARK_TEXT
+
+
+def _disabled_text() -> str:
+    return "#778392" if _dark_mode() else _DISABLED_TEXT
 
 
 def _is_clickable_text_label(widget: QLabel) -> bool:
@@ -54,6 +75,9 @@ def _is_clickable_text_label(widget: QLabel) -> bool:
 
 
 def _replacement(widget: QWidget) -> str:
+    # Keep local QSS in the canonical light palette.  The application theme
+    # manager converts it after this guard runs, preventing double conversion
+    # when a control is first shown in dark mode.
     if isinstance(widget, QLabel):
         return _CLICKABLE_LABEL_BG
     return _CLICKABLE_BG
@@ -122,18 +146,18 @@ def _ensure_push_button_contrast(button: QPushButton) -> None:
     if role == "primary":
         # Enabled primary text remains white.  Disabled primary controls use
         # dark text so they stay readable even if a platform drops the fill.
-        _set_button_palette(button, "#FFFFFF", _DISABLED_TEXT)
+        _set_button_palette(button, "#FFFFFF", _disabled_text())
         if _PRIMARY_MARKER in current or "nf-primary-button-contrast" in current:
             return
         appendix = f"""
 /* {_PRIMARY_MARKER} */
-QPushButton:disabled {{ color: {_DISABLED_TEXT}; background-color: #EAF3FF; border-color: #C5DCF7; }}
+QPushButton:disabled {{ color: {_DISABLED_TEXT}; background-color: #E4EEFF; border-color: #CDD3DA; }}
 """
     elif role == "danger":
         _set_button_palette(button, "#B42318", "#7A271A")
         return
     else:
-        _set_button_palette(button, _DARK_TEXT, _DISABLED_TEXT)
+        _set_button_palette(button, _secondary_text(), _disabled_text())
         if _NORMAL_MARKER in current:
             return
         # A non-primary white button must never retain a local white text rule.
@@ -186,6 +210,9 @@ class NoWhiteClickableGuard(QObject):
     }
 
     def eventFilter(self, watched: QObject, event: QEvent) -> bool:  # noqa: N802
+        app = QApplication.instance()
+        if app is not None and app.property("nfSuspendClickableGuard"):
+            return False
         if event.type() not in self._EVENTS or not isinstance(watched, QWidget):
             return False
 

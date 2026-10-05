@@ -11,6 +11,8 @@ import atexit
 import json
 import os
 import shutil
+import subprocess
+import sys
 import tempfile
 import threading
 import time
@@ -45,6 +47,44 @@ def _safe_remove_tree(path: Path) -> bool:
     except FileNotFoundError:
         return False
     except OSError:
+        return False
+
+
+def _spawn_remove_tree(path: Path) -> bool:
+    """Best-effort detached removal used on the GUI close path.
+
+    Removing tens of thousands of OCR preview/crop files synchronously can keep
+    the Qt main thread inside ``closeEvent`` long enough for macOS to label the
+    app as not responding.  A detached tiny Python child owns only the path
+    string and survives the parent process long enough to finish cleanup.  If
+    process creation fails we intentionally leave the marked session behind;
+    the normal stale-session recovery will reclaim it on a later start.
+    """
+    try:
+        kwargs = {
+            "stdin": subprocess.DEVNULL,
+            "stdout": subprocess.DEVNULL,
+            "stderr": subprocess.DEVNULL,
+            "close_fds": True,
+        }
+        if os.name == "nt":
+            kwargs["creationflags"] = (
+                getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+                | getattr(subprocess, "DETACHED_PROCESS", 0)
+            )
+        else:
+            kwargs["start_new_session"] = True
+        subprocess.Popen(
+            [
+                sys.executable,
+                "-c",
+                "import shutil,sys; shutil.rmtree(sys.argv[1], ignore_errors=True)",
+                str(path),
+            ],
+            **kwargs,
+        )
+        return True
+    except Exception:
         return False
 
 
@@ -97,9 +137,9 @@ class SessionTempRegistry:
             if _pid_is_alive(pid):
                 continue
             if marker.exists() and pid > 0:
-                _safe_remove_tree(child)
+                _spawn_remove_tree(child)
             elif now - created >= stale_seconds:
-                _safe_remove_tree(child)
+                _spawn_remove_tree(child)
 
     def make_dir(self, prefix: str) -> Path:
         clean = "".join(ch if ch.isalnum() or ch in "-_" else "_" for ch in str(prefix or "tmp"))
@@ -161,6 +201,16 @@ class SessionTempRegistry:
             self._owned.clear()
         _safe_remove_tree(root)
 
+    def cleanup_async(self) -> bool:
+        """Detach large session-tree deletion from an interactive app close."""
+        with self._lock:
+            if self._closed:
+                return True
+            self._closed = True
+            root = self.root
+            self._owned.clear()
+        return _spawn_remove_tree(root)
+
 
 _registry_lock = threading.Lock()
 _registry: SessionTempRegistry | None = None
@@ -181,3 +231,14 @@ def cleanup_session_temp() -> None:
         _registry = None
     if registry is not None:
         registry.cleanup()
+
+
+def cleanup_session_temp_async() -> bool:
+    """Release the active registry immediately and delete its tree off-process."""
+    global _registry
+    with _registry_lock:
+        registry = _registry
+        _registry = None
+    if registry is None:
+        return True
+    return registry.cleanup_async()

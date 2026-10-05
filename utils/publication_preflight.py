@@ -12,10 +12,11 @@ from __future__ import annotations
 import copy
 from dataclasses import dataclass, field, asdict
 import re
+import unicodedata
 from difflib import SequenceMatcher
 from typing import Iterable
 
-from engine.text_compare import (
+from engine.document_alignment import (
     looks_like_chapter_title,
     normalise_for_alignment,
     split_dialogue_segments,
@@ -115,7 +116,7 @@ class PublicationPreflight:
         if self.chapter_like_count and not self.chapter_count:
             messages.append(f"检测到 {self.chapter_like_count} 个章节标题，但目录章节为 0")
         if self.unplaced_image_count:
-            messages.append(f"有 {self.unplaced_image_count} 张插图尚未在文本对比中定位")
+            messages.append(f"有 {self.unplaced_image_count} 张插图尚未完成正文锚点定位")
         if self.duplicate_runs:
             longest = max(run.length for run in self.duplicate_runs)
             messages.append(f"检测到 {len(self.duplicate_runs)} 组连续重复正文（最长 {longest} 段）")
@@ -300,6 +301,39 @@ def _issue(
     )
 
 
+def _unicode_export_risks(text: str) -> list[tuple[str, str, str, bool]]:
+    """Return conservative Unicode publication risks without changing glyph identity."""
+    value = str(text or "")
+    risks: list[tuple[str, str, str, bool]] = []
+    if unicodedata.normalize("NFC", value) != value:
+        risks.append((
+            "unicode_not_nfc", "medium",
+            "正文包含分解型 Unicode（NFD）；导出时将规范为 NFC", True,
+        ))
+    codepoints = [ord(ch) for ch in value]
+    if any(0x2F00 <= cp <= 0x2FD5 for cp in codepoints):
+        risks.append((
+            "kangxi_radical_codepoint", "medium",
+            "正文包含康熙部首区字符；出版模式将保留字形身份，请确认目标阅读器字体覆盖", False,
+        ))
+    if any((0xFE00 <= cp <= 0xFE0F) or (0xE0100 <= cp <= 0xE01EF) for cp in codepoints):
+        risks.append((
+            "unicode_variation_sequence", "medium",
+            "正文包含 Unicode Variation Selector/IVS；需确认目标字体支持对应异体字", False,
+        ))
+    if any(
+        (0xE000 <= cp <= 0xF8FF)
+        or (0xF0000 <= cp <= 0xFFFFD)
+        or (0x100000 <= cp <= 0x10FFFD)
+        for cp in codepoints
+    ):
+        risks.append((
+            "private_use_character", "medium",
+            "正文包含 PUA 外字；通用阅读器可能显示为方框，建议在发布前确认字体/替代字形", False,
+        ))
+    return risks
+
+
 def _inspect_text_issues(doc: UnifiedDocument) -> tuple[PublicationTextIssue, ...]:
     issues: list[PublicationTextIssue] = []
     previous_text: tuple[int, Block] | None = None
@@ -310,6 +344,9 @@ def _inspect_text_issues(doc: UnifiedDocument) -> tuple[PublicationTextIssue, ..
         stripped = text.strip()
         if not stripped:
             continue
+
+        for code, severity, message, auto_fixable in _unicode_export_risks(stripped):
+            issues.append(_issue(index, block, code, severity, message, auto_fixable=auto_fixable))
 
         if stripped.count("「") != stripped.count("」"):
             issues.append(_issue(index, block, "dialogue_quote_imbalance", "high", "会话引号不平衡"))
@@ -461,6 +498,14 @@ def repair_high_confidence_publication_issues(doc: UnifiedDocument) -> tuple[Uni
         previous = _previous_text_block_without_barrier(rebuilt)
         text = str(block.text or "")
         stripped = text.strip()
+
+        nfc_fixed = unicodedata.normalize("NFC", stripped)
+        if nfc_fixed != stripped:
+            block = _copy_block_with_text(block, nfc_fixed, "normalize_unicode_nfc")
+            text = block.text
+            stripped = text.strip()
+            changed += 1
+            details.append(f"第 {source_index + 1} 块规范 Unicode NFC")
 
         confusable_fixed = _KATAKANA_ONE_RE.sub("ー", stripped)
         confusable_fixed = _DEGREE_AS_PERIOD_RE.sub("。", confusable_fixed)

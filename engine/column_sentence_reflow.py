@@ -26,7 +26,9 @@ CLOSING_QUOTES = "」』）】》〉〕］〗〙〛”’\"'"
 STRONG_TERMINALS = "。．！？!?｡!?"
 ELLIPSIS_TERMINALS = ("……", "…", "‥‥", "...")
 DASH_TERMINALS = ("——", "――", "━━", "──")
-REFLOW_VERSION = 9
+REFLOW_VERSION = 10
+
+_BARE_SECTION_MARKER_RE = re.compile(r"^[0-9０-９]{1,3}[.．]?$")
 
 TITLE_RE = re.compile(
     r"^(?:序章|終章|プロローグ|エピローグ|後記|あとがき|幕間|"
@@ -245,6 +247,97 @@ def _looks_title(block: Block) -> bool:
     return bool(text and TITLE_RE.match(text) and len(text) <= 100)
 
 
+def _looks_numeric_section_marker(block: Block) -> bool:
+    """Return True for a tiny standalone numbered section-divider column.
+
+    Japanese light novels commonly print bare section numbers (``4``, ``16``)
+    as a short vertical column between paragraphs.  They are structural atoms,
+    not sentence prefixes.  Numeric text alone is not enough: require physical
+    OCR-column provenance plus short source geometry so ordinary numeric prose
+    such as a full-height ``100`` column cannot be promoted to a section.
+    """
+    if block.type not in BODY_TYPES:
+        return False
+    text = normalize_column_text(block.text)
+    if not text or not _BARE_SECTION_MARKER_RE.fullmatch(text):
+        return False
+
+    column_ids = _source_column_ids(block)
+    if len(column_ids) != 1:
+        return False
+
+    metadata = block.metadata or {}
+    estimated_chars = metadata.get("black_ink_estimated_chars")
+    try:
+        estimated_chars = int(estimated_chars)
+    except (TypeError, ValueError):
+        estimated_chars = 0
+
+    bounds = _bbox_tuple(block)
+    short_geometry = bool(bounds is not None and bounds[3] <= 0.12)
+    if not short_geometry:
+        try:
+            top = float(metadata.get("column_top"))
+            bottom = float(metadata.get("column_bottom"))
+            # Pixel-space fallback for imported/raw OCR documents whose bbox was
+            # not retained.  Real divider columns in the tested 1200x1600 book
+            # are ~67-72 px high; 180 px leaves generous scanner variance while
+            # still rejecting ordinary body columns.
+            short_geometry = 0 < (bottom - top) <= 180
+        except (TypeError, ValueError):
+            short_geometry = False
+
+    return short_geometry and (estimated_chars <= 2 or len(text.rstrip(".．")) <= 2)
+
+
+def _mark_numeric_section_marker_atomic(block: Block) -> None:
+    """Promote one physical numeric divider column to an atomic SECTION."""
+    block.text = (block.text or "").strip(" \t\r\n　")
+    block.type = BlockType.SECTION
+    section_ids = _source_column_ids(block)
+    section_seed_flags = _source_column_seed_flags(block)
+    section_input_hashes = _source_column_metadata_values(
+        block,
+        scalar_key="column_ocr_input_sha256",
+        array_key="source_column_ocr_input_sha256",
+    )
+    section_input_profiles = _source_column_metadata_values(
+        block,
+        scalar_key="column_ocr_input_profile",
+        array_key="source_column_ocr_input_profile",
+        default="custom",
+    )
+    section_profile_hashes = _source_column_metadata_values(
+        block,
+        scalar_key="column_ocr_input_profile_sha256",
+        array_key="source_column_ocr_input_profile_sha256",
+    )
+    section_region = _review_region(block)
+    block.metadata = {
+        **(block.metadata or {}),
+        "section_marker_atomic": True,
+        "atomic_ocr_sentence": True,
+        "source_column_ids": section_ids,
+        "source_column_texts": [normalize_column_text(block.text)],
+        "source_column_consensus_seed_flags": section_seed_flags,
+        "source_column_ocr_input_sha256": section_input_hashes,
+        "source_column_ocr_input_profile": section_input_profiles,
+        "source_column_ocr_input_profile_sha256": section_profile_hashes,
+        # Structural divider is terminal as an atomic comparison item even
+        # though it intentionally has no sentence punctuation.
+        "source_column_terminal_flags": [True],
+        "column_count": 1,
+        "flush_reason": "section_marker_atomic",
+        "sentence_terminal": True,
+        "ocr_review_regions": [section_region] if section_region is not None else [],
+        "ocr_review_preferred_image_path": str(
+            (block.metadata or {}).get("ocr_review_sentence_image_path", "") or ""
+        ),
+        "ocr_review_layout": "single_column",
+        "ocr_review_column_count": 1,
+    }
+
+
 def _merge_type(parts: list[Block], text: str) -> BlockType:
     if text.startswith(("「", "『")) or text.endswith(("」", "』")):
         return BlockType.DIALOGUE
@@ -346,6 +439,29 @@ def _review_region(block: Block) -> dict | None:
         "column_filter_fragments": bool(metadata.get("column_filter_fragments", False)),
         "column_smart_crop": bool(metadata.get("column_smart_crop", False)),
         "column_ruby_strength": str(metadata.get("column_ruby_strength", "standard") or "standard"),
+        # Prefer the exact canonical PNG that was sent to the recognizer.  The
+        # path is transient, so full detector geometry is retained below as a
+        # deterministic rebuild contract for restored workspaces.
+        "canonical_image_path": str(metadata.get("column_ocr_input_image_path", "") or ""),
+        "canonical_input_sha256": str(metadata.get("column_ocr_input_sha256", "") or ""),
+        "column_ocr_transport_profile": str(metadata.get("column_ocr_transport_profile", "") or ""),
+        "column_preserve_body_pixels": bool(metadata.get("column_preserve_body_pixels", False)),
+        "column_geometry": {
+            "left": int(metadata.get("column_left", 0) or 0),
+            "top": int(metadata.get("column_top", 0) or 0),
+            "right": int(metadata.get("column_right", 0) or 0),
+            "bottom": int(metadata.get("column_bottom", 0) or 0),
+            "hard_left": int(metadata.get("column_hard_left", 0) or 0),
+            "hard_right": int(metadata.get("column_hard_right", 0) or 0),
+            "content_spans": list(metadata.get("black_ink_content_spans", []) or []),
+            "estimated_chars": int(metadata.get("black_ink_estimated_chars", 0) or 0),
+            "full_height_slot": bool(metadata.get("column_full_height_slot", False)),
+            "supplemental_boxes": list(metadata.get("column_supplemental_boxes", []) or []),
+            "excluded_boxes": list(metadata.get("column_excluded_boxes", []) or []),
+            "ruby_guard_boxes": list(metadata.get("column_ruby_guard_boxes", []) or []),
+            "ruby_candidate_boxes": list(metadata.get("ruby_candidate_boxes", []) or []),
+            "ruby_candidate_confidence": float(metadata.get("ruby_candidate_confidence", 0.0) or 0.0),
+        },
     }
 
 
@@ -355,7 +471,7 @@ def _is_ocr_column_document(doc: UnifiedDocument) -> bool:
     source = str(getattr(doc.metadata, "source_engine", "") or "").lower()
     known = (
         "ocr", "vision", "ndlocr", "paddle", "manga",
-        "pdf_craft", "google_vision", "hybrid",
+        "google_vision", "hybrid",
     )
     if any(token in source for token in known):
         return True
@@ -700,6 +816,11 @@ def reflow_columns_into_sentences(
         first.type = _merge_type(pending, first.text)
         first.ocr_raw = first.ocr_raw or original_texts[0]
         first.modified_by = _append_modified_by(first.modified_by, "column_sentence_reflow")
+        effective_seed_flags = (
+            [False] * len(source_column_ids)
+            if context_applied
+            else source_column_seed_flags
+        )
         first.metadata = {
             **(first.metadata or {}),
             "column_sentence_reflow": True,
@@ -708,7 +829,9 @@ def reflow_columns_into_sentences(
             "source_column_ids": source_column_ids,
             "source_column_texts": effective_column_texts,
             "source_column_primary_texts": texts,
-            "source_column_consensus_seed_flags": source_column_seed_flags,
+            # Once an accepted sentence-context OCR changes the effective text,
+            # that slot is independent evidence rather than seeded reuse.
+            "source_column_consensus_seed_flags": effective_seed_flags,
             "source_column_ocr_input_sha256": source_input_hashes,
             "source_column_ocr_input_profile": source_input_profiles,
             "source_column_ocr_input_profile_sha256": source_profile_hashes,
@@ -767,6 +890,10 @@ def reflow_columns_into_sentences(
         if loop_index % 32 == 0 and callable(cancel_check) and cancel_check():
             raise InterruptedError("OCR 已停止")
         text = normalize_column_text(block.text)
+        if _looks_numeric_section_marker(block):
+            flush(reason="section_marker_boundary")
+            _mark_numeric_section_marker_atomic(block)
+            continue
         if _looks_title(block):
             flush(reason="title_boundary")
             block.text = (block.text or "").strip(" \t\r\n")

@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """Low-token, evidence-ordered AI adjudication for multi-model OCR packages.
 
-The module operates on ``novel_formatter.ocr_roundtrip.v1`` multi-model packages.
+The module operates on ``novel_formatter.ocr_roundtrip.v2`` multi-model packages.
 It never asks the model to rewrite the full package.  Only risky rows are sent as
 compact records; immutable IDs, page geometry, column lineage, assets and EPUB
 structure stay local and are validated by the normal round-trip importer.
@@ -28,6 +28,8 @@ from difflib import SequenceMatcher
 from pathlib import Path
 from typing import Callable, Iterable, Sequence
 
+from ai.request_limiter import retry_delay_seconds
+from ai.redaction import redact_secrets
 from ai.token_counter import estimate_tokens
 from engine.ai_document_processor import parse_json_reply
 from engine.reference_assist import ReferenceCorpus, normalise_reference_content
@@ -75,6 +77,10 @@ class AdjudicationOptions:
     reference_min_score: float = 0.82
     reference_strong_score: float = 0.96
     auto_apply_medium: bool = True
+    # Optional stable row-id scope.  The GUI uses this to freeze rows already
+    # resolved by deterministic local adjudication while still giving the model
+    # full neighbouring context from the complete package.
+    target_row_ids: tuple[str, ...] = ()
 
     def normalised(self) -> "AdjudicationOptions":
         return AdjudicationOptions(
@@ -87,6 +93,7 @@ class AdjudicationOptions:
             reference_min_score=max(0.70, min(0.99, float(self.reference_min_score or 0.82))),
             reference_strong_score=max(0.85, min(0.999, float(self.reference_strong_score or 0.96))),
             auto_apply_medium=bool(self.auto_apply_medium),
+            target_row_ids=tuple(str(value) for value in (self.target_row_ids or ()) if str(value)),
         )
 
 
@@ -112,20 +119,20 @@ class AdjudicationProtocolError(ValueError):
 
 
 ADJUDICATOR_PROMPT = r"""You are a Japanese commercial-publication OCR adjudicator. Restore the text that is actually supported by evidence; never polish, translate, continue, summarize, modernize, or invent.
-Evidence order: R=aligned publication reference > agreement of 2/3 OCRs > physical columns > neighbouring blocks/pages > Japanese grammar/terminology > one OCR.
+Evidence order: strongly aligned R=publication reference is high-weight evidence; agreement of multiple genuinely independent OCRs plus the source-image/physical-column evidence may override R when they clearly contradict it. Then use physical columns > neighbouring blocks/pages > Japanese grammar/terminology > one OCR. Never treat R as infallible.
 Only IDs in t are editable. x is read-only context. Preserve wording, names, numbers, negation and exact symbols. Distinguish 一/ー/―/—/─/‐/－, …/‥/・・・, all quote/bracket forms, small kana, dakuten and full/half width. Delete repetition only with at least two independent signals. A shorter OCR must not erase a supported sentence/column; a longer OCR must be checked for duplication or neighbour-column adhesion.
-When R is confidently aligned, reproduce the matching reference text exactly. When evidence is insufficient, do not guess: put the ID in q.
-Input compact keys: t=[{i:short integer alias,p:page,y:type,o:current,c:[[models,text,max_confidence,agreement_count]],v:[[models,[column texts]]],r:[score,line1,line2,reference excerpt] or null,b:previous text,a:next text,k:risk codes}], x={b:previous-overlap anchors,a:next-overlap anchors}, g:[[term,preferred]], m:reference|ocr_only.
+When R is confidently aligned and is not contradicted by source-image/physical-column evidence plus multiple independent OCRs, reproduce the matching reference text exactly. If R is clearly contradicted, preserve the scan-supported reading and put evidence code RC in the update; if the contradiction cannot be resolved, put the ID in q with reason reference_conflict. When evidence is insufficient, do not guess: put the ID in q.
+Input compact keys: t=[{i:short integer alias,p:page,y:type,o:current,c:[[models,text,max_confidence,agreement_count]],v:[[models,[column texts]]],z:[independent_visual_transcription,visual_proposal,visual_confidence,[visual_issues]] or null,r:[score,line1,line2,reference excerpt] or null,b:previous text,a:next text,k:risk codes}], x={b:previous-overlap anchors,a:next-overlap anchors}, g:[[term,preferred]], m:reference|ocr_only. z is produced by a first pass that saw source pixels before the contextual pass; treat a non-Q transcription as strong scan evidence, but never let z override local safety rules.
 The i value is the only editable identifier. Copy that exact integer alias into every u/q entry; never invent an ID and never use the array position unless it equals i.
 Return one compact JSON object only. Omit unchanged rows. Schema:
 {"u":[[i,edited_text,confidence,change_type,[evidence_codes],delete_intentionally]],"q":[[i,short_reason]]}
-confidence is exact_reference|high_consensus|medium_context|low_uncertain. change_type is single_char|kana|punctuation|missing_text|duplicate|cross_column|order|title_noise|other. evidence_codes use R,C2,C3,V,X,G. delete_intentionally is 0 unless the source row must intentionally become empty. Never return explanations, Markdown, unknown IDs, changed IDs, coordinates or structure.
+confidence is exact_reference|high_consensus|medium_context|low_uncertain. change_type is single_char|kana|punctuation|missing_text|duplicate|cross_column|order|title_noise|other. evidence_codes use R,RC,C2,C3,V,X,G. delete_intentionally is 0 unless the source row must intentionally become empty. Never return explanations, Markdown, unknown IDs, changed IDs, coordinates or structure.
 INPUT:
 {{INPUT}}"""
 
 
-AUDITOR_PROMPT = r"""Independently audit proposed Japanese OCR corrections. You do not receive the first model's explanation. Check only: missing text, repetition, neighbour-column adhesion, order, reference mismatch, symbol/number/name/negation changes, unsupported rewriting, and accidental empty text. Reference R outranks all OCRs. Do not rewrite or propose prose.
-Input: a=[{i:short integer alias,o:before,n:proposal,c:[[model,text]],v:[[model,[columns]]],r:[score,excerpt] or null,b:previous,a:next}]. Copy the exact i alias into failures; never invent an ID.
+AUDITOR_PROMPT = r"""Independently audit proposed Japanese OCR corrections. You do not receive the first model's explanation. Check only: missing text, repetition, neighbour-column adhesion, order, reference mismatch, symbol/number/name/negation changes, unsupported rewriting, and accidental empty text. Reference R is strong evidence but is not infallible. If source-image/physical-column evidence plus multiple genuinely independent OCRs clearly contradict R, flag reference_mismatch rather than rejecting the scan-supported proposal merely because it differs from R. Do not rewrite or propose prose.
+Input: a=[{i:short integer alias,o:before,n:proposal,c:[[model,text]],v:[[model,[columns]]],z:[independent_visual_transcription,visual_proposal,visual_confidence,[visual_issues]] or null,r:[score,excerpt] or null,b:previous,a:next}]. Copy the exact i alias into failures; never invent an ID.
 Return failures only as compact JSON: {"f":[[i,"high"|"medium",issue_code,short_reason]]}. Omit passes. issue_code: missing|duplicate|cross_column|order|reference_mismatch|symbol|name_number_negation|rewrite|empty|other.
 INPUT:
 {{INPUT}}"""
@@ -423,7 +430,7 @@ def _compact_columns(item: dict) -> list[list]:
 
 def _compact_candidates(item: dict) -> list[list]:
     # Identical model texts are grouped rather than discarded.  This preserves
-    # the strongest low-token signal: whether two or three independent OCRs
+    # the strongest low-token signal: how many independent OCRs
     # agree, without repeating the same Japanese string in the prompt.
     grouped: dict[str, dict] = {}
     order: list[str] = []
@@ -583,12 +590,22 @@ def _wire_item(
     # The immutable row_id is deliberately kept local.  Sending a short integer
     # alias saves tokens and prevents models from truncating or fabricating the
     # long hash-bearing ID.
+    visual = item.get("visual_evidence") if isinstance(item.get("visual_evidence"), dict) else None
+    visual_wire = None
+    if visual:
+        visual_wire = [
+            _head_text(str(visual.get("image_transcription", "") or ""), 512),
+            _head_text(str(visual.get("proposed_text", "") or ""), 512),
+            str(visual.get("confidence", "") or ""),
+            [str(value) for value in (visual.get("audit_issues") or [])[:8]],
+        ]
     wire = {
         "p": int(item.get("page", 0) or 0),
         "y": str(item.get("block_type", "") or ""),
         "o": str(item.get("edited_text", item.get("original_fused_text", "")) or ""),
         "c": _compact_candidates(item),
         "v": _compact_columns(item),
+        "z": visual_wire,
         "r": (
             [evidence["score"], evidence["line_start"], evidence["line_end"], evidence["text"]]
             if evidence else None
@@ -666,6 +683,13 @@ def _call_json(provider, prompt: str, *, retries: int, cancel_check: Callable[[]
             return parse_json_reply(reply)
         except Exception as exc:
             last_error = exc
+            if attempt < retries:
+                delay = retry_delay_seconds(exc, attempt, base=0.75, cap=15.0, jitter=0.25)
+                deadline = time.monotonic() + delay
+                while time.monotonic() < deadline:
+                    if cancel_check and cancel_check():
+                        raise AdjudicationCancelled("AI 审定已取消。")
+                    time.sleep(min(0.20, max(0.0, deadline - time.monotonic())))
     raise AdjudicationProtocolError(f"AI 返回无法解析，已重试 {retries} 次：{last_error}") from last_error
 
 
@@ -917,6 +941,49 @@ def _proposal_support_count(item: dict, proposed: str) -> int:
     return count
 
 
+def _unsupported_kanji_only_rewrite(before: str, proposed: str, sources: Sequence[str]) -> bool:
+    """Detect unsupported Han-character substitutions on kana-free Japanese rows.
+
+    Kana is the strongest cheap language signal, but Japanese headings, names and
+    proper nouns can be kanji-only.  In that case a model can silently modernise
+    or translate a glyph (for example a traditional/Japanese form into a
+    simplified-Chinese form) while still looking lexically close enough to pass
+    ordinary similarity checks.
+
+    For kana-free CJK rows we therefore require every newly introduced Han
+    character to be present in at least one independent OCR/physical-column
+    source.  Exact OCR candidates and strong publication references are handled
+    before this guard, so this only blocks unsupported model invention.
+    """
+    left = _strict_text_key(before)
+    right = _strict_text_key(proposed)
+    if not left or not right:
+        return False
+    if _JAPANESE_RE.search(left):
+        return False
+    if len(_CJK_RE.findall(left)) < 2:
+        return False
+    if re.search(r"[A-Za-zぁ-ゖァ-ヺ]", left):
+        return False
+
+    independent = [
+        _strict_text_key(source)
+        for source in sources
+        if _strict_text_key(source) and _strict_text_key(source) != left
+    ]
+    if not independent:
+        return left != right
+
+    matcher = SequenceMatcher(None, left, right, autojunk=False)
+    for tag, _i1, _i2, j1, j2 in matcher.get_opcodes():
+        if tag == "equal":
+            continue
+        for char in right[j1:j2]:
+            if _CJK_RE.fullmatch(char) and not any(char in source for source in independent):
+                return True
+    return False
+
+
 def _calibrate_proposal_confidence(item: dict, proposal: dict, reference: dict | None, *, reference_strong_score: float) -> dict:
     calibrated = dict(proposal)
     confidence = str(calibrated.get("confidence", "medium_context") or "medium_context")
@@ -950,7 +1017,12 @@ def _proposal_safe(item: dict, proposal: dict, reference: dict | None, *, refere
     for candidate in item.get("physical_column_candidates") or []:
         if isinstance(candidate, dict):
             column_sources.extend(str(value or "") for value in (candidate.get("column_texts") or []))
-    sources = [before, str(item.get("character_fused_text", "") or ""), *_candidate_texts(item), *column_sources]
+    visual = item.get("visual_evidence") if isinstance(item.get("visual_evidence"), dict) else {}
+    visual_sources = [
+        str(visual.get("image_transcription", "") or ""),
+        str(visual.get("proposed_text", "") or ""),
+    ]
+    sources = [before, str(item.get("character_fused_text", "") or ""), *_candidate_texts(item), *column_sources, *visual_sources]
     reference_supported = False
     if reference:
         ref_text = str(reference.get("text", "") or "")
@@ -967,6 +1039,11 @@ def _proposal_safe(item: dict, proposal: dict, reference: dict | None, *, refere
     p = _compact_text(text)
     b = _compact_text(before)
     similarity, coverage = _source_similarity(text, sources)
+    exact_source_supported = any(
+        _strict_text_key(text) == _strict_text_key(source)
+        for source in sources
+        if _strict_text_key(source)
+    )
     if not b:
         # Empty fused rows are the easiest place for an LLM to hallucinate.
         # Require either strong publication evidence or meaningful overlap with
@@ -991,12 +1068,29 @@ def _proposal_safe(item: dict, proposal: dict, reference: dict | None, *, refere
             return False, "length"
         if 5 <= len(b) < 20 and not (0.30 <= ratio <= 2.40):
             return False, "length"
+        # A direct choice of any OCR candidate is always legitimate evidence.
+        # A newly composed long sentence, however, must remain close to the
+        # current fused text unless a strong publication reference supports it.
+        # This keeps the adjudicator a verifier/corrector instead of an
+        # unconstrained prose rewriter.
+        if len(b) >= 20 and not exact_source_supported:
+            edit_ratio = 1.0 - SequenceMatcher(None, b, p, autojunk=False).ratio()
+            if edit_ratio > 0.35:
+                return False, "edit_distance"
     threshold = 0.46 if len(b) >= 40 else 0.30
     if not reference_supported and similarity < threshold and coverage < threshold:
         return False, "unsupported_rewrite"
     # Prevent a model from translating Japanese into Chinese or English.
     if _JAPANESE_RE.search(before) and not _JAPANESE_RE.search(text) and len(p) >= 8:
         return False, "language_changed"
+    # Kana-free Japanese titles/names need a separate evidence guard because
+    # script detection alone cannot distinguish Japanese kanji from Chinese Han.
+    if (
+        not reference_supported
+        and not exact_source_supported
+        and _unsupported_kanji_only_rewrite(before, text, sources)
+    ):
+        return False, "unsupported_kanji_rewrite"
     return True, "source_supported"
 
 
@@ -1006,6 +1100,15 @@ def _audit_wire(item: dict, proposal: dict, reference: dict | None, previous: st
         "n": str(proposal.get("text", "") or ""),
         "c": [[entry[0], entry[1]] for entry in _compact_candidates(item)],
         "v": _compact_columns(item),
+        "z": (
+            [
+                _head_text(str(item.get("visual_evidence", {}).get("image_transcription", "") or ""), 512),
+                _head_text(str(item.get("visual_evidence", {}).get("proposed_text", "") or ""), 512),
+                str(item.get("visual_evidence", {}).get("confidence", "") or ""),
+                [str(value) for value in (item.get("visual_evidence", {}).get("audit_issues") or [])[:8]],
+            ]
+            if isinstance(item.get("visual_evidence"), dict) else None
+        ),
         "r": [reference.get("score"), reference.get("text")] if reference else None,
         "b": previous,
         "a": following,
@@ -1118,9 +1221,11 @@ def adjudicate_package(
     if not all(id_to_index) or len(id_to_index) != len(items):
         raise ValueError("OCR 对比包 row_id 缺失或重复。")
 
+    target_id_set = set(opts.target_row_ids)
     target_indices = [
         index for index, item in enumerate(items)
-        if (not opts.risk_only) or _is_risky(item)
+        if (not target_id_set or str(item.get("row_id", "") or "") in target_id_set)
+        and ((not opts.risk_only) or _is_risky(item))
     ]
     pages = _annotate_pages(items)
     windows = _make_page_windows(items, target_indices, opts)
@@ -1234,7 +1339,7 @@ def adjudicate_package(
                 warning = {
                     "section": "request",
                     "returned_id": "",
-                    "reason": f"AI 批次请求失败，已保留原文并转人工复核：{exc}",
+                    "reason": f"AI 批次请求失败，已保留原文并转人工复核：{redact_secrets(exc, secrets=[str(getattr(provider, 'api_key', '') or '')])}",
                     "entry_preview": "",
                     "stage": "adjudication",
                     "page_start": start,
@@ -1274,7 +1379,7 @@ def adjudicate_package(
                 parse_warnings = [{
                     "section": "batch",
                     "returned_id": "",
-                    "reason": str(exc),
+                    "reason": redact_secrets(exc, secrets=[str(getattr(provider, "api_key", "") or "")]),
                     "entry_preview": "",
                 }]
 
@@ -1307,7 +1412,7 @@ def adjudicate_package(
                     parse_warnings.append({
                         "section": "repair",
                         "returned_id": "",
-                        "reason": f"ID 修复重试失败：{exc}",
+                        "reason": f"ID 修复重试失败：{redact_secrets(exc, secrets=[str(getattr(provider, 'api_key', '') or '')])}",
                         "entry_preview": "",
                     })
 
@@ -1468,7 +1573,7 @@ def adjudicate_package(
                 audit_warnings = [{
                     "section": "request",
                     "returned_id": "",
-                    "reason": f"独立审计批次请求失败：{exc}",
+                    "reason": f"独立审计批次请求失败：{redact_secrets(exc, secrets=[str(getattr(provider, 'api_key', '') or '')])}",
                     "entry_preview": "",
                 }]
                 parsed_failures = {}
@@ -1480,7 +1585,7 @@ def adjudicate_package(
                     audit_warnings = [{
                         "section": "f",
                         "returned_id": "",
-                        "reason": str(exc),
+                        "reason": redact_secrets(exc, secrets=[str(getattr(provider, "api_key", "") or "")]),
                         "entry_preview": "",
                     }]
             audit_failures.update(parsed_failures)

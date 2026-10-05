@@ -20,6 +20,7 @@ FORMAT_EXTENSIONS: dict[str, str] = {
     "docx": ".docx",
     "markdown": ".md",
     "text": ".txt",
+    "tei": ".xml",
 }
 
 SAVE_FILTERS: tuple[tuple[str, str], ...] = (
@@ -27,6 +28,7 @@ SAVE_FILTERS: tuple[tuple[str, str], ...] = (
     ("json", "JSON 数据 (*.json)"),
     ("markdown", "Markdown 文本 (*.md)"),
     ("text", "纯文本 (*.txt)"),
+    ("tei", "TEI P5 XML (*.xml *.tei)"),
 )
 
 _TEXT_BLOCK_TYPES = {
@@ -51,6 +53,8 @@ def format_from_filter(selected_filter: str, path: str = "") -> str:
             return fmt
 
     suffix = Path(path).suffix.lower()
+    if suffix == ".tei":
+        return "tei"
     for fmt, ext in FORMAT_EXTENSIONS.items():
         if suffix == ext:
             return fmt
@@ -64,7 +68,7 @@ def ensure_export_extension(path: str, fmt: str) -> str:
     this mirrors normal desktop save-dialog behaviour and avoids ``name.txt.md``.
     """
     p = Path(path)
-    known = {ext.lower() for ext in FORMAT_EXTENSIONS.values()}
+    known = {ext.lower() for ext in FORMAT_EXTENSIONS.values()} | {".tei"}
     if p.suffix.lower() in known:
         return str(p)
     ext = FORMAT_EXTENSIONS.get(fmt, ".docx")
@@ -118,12 +122,15 @@ def export_text_result(doc: UnifiedDocument, output_path: str, fmt: str) -> str:
     comparatively slow and the GUI runs that operation in a worker thread.
     """
     fmt = str(fmt or "").lower()
-    if fmt not in {"json", "markdown", "text"}:
+    if fmt not in {"json", "markdown", "text", "tei"}:
         raise ValueError(f"不支持的文本导出格式: {fmt}")
 
     normalized = ensure_export_extension(output_path, fmt)
     target = Path(normalized)
     target.parent.mkdir(parents=True, exist_ok=True)
+    if fmt == "tei":
+        from adapters.tei_adapter import export_tei
+        return export_tei(doc, target)
     if fmt == "json":
         payload = doc.to_json()
     elif fmt == "markdown":

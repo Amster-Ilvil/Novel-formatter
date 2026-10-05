@@ -9,6 +9,7 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 
 from utils.atomic_io import atomic_write_json
+from ai.secure_store import delete_secret, load_secret, persistence_available, save_secret
 
 APP_DIR_NAME = "NovelFormatter"
 
@@ -90,10 +91,12 @@ class AISettings:
     batch_tokens: int = 0
     request_timeout: int = 180
     json_mode: bool = True
+    glm_thinking: bool = False
     deepseek_thinking: bool = False
     deepseek_reasoning_effort: str = "high"
     deepseek_user_id: str = "novel_formatter"
     ocr_repair_mode: str = "readability"  # readability | strict
+    glossary_path: str = ""
     performance_profile_version: int = 4
 
     @property
@@ -119,6 +122,7 @@ class AISettings:
             "ai_batch_tokens": self.batch_tokens,
             "request_timeout": self.request_timeout,
             "json_mode": self.json_mode,
+            "glm_thinking": self.glm_thinking,
             "provider_name": self.provider,
             "deepseek_thinking": self.deepseek_thinking,
             "deepseek_reasoning_effort": self.deepseek_reasoning_effort,
@@ -136,6 +140,8 @@ def provider_defaults(provider: str) -> tuple[str, str]:
         "anthropic": ("claude-sonnet-4-5", ""),
         "gemini": ("gemini-2.0-flash", ""),
         "deepseek": ("deepseek-v4-flash", "https://api.deepseek.com"),
+        "zhipu": ("glm-5.3-flash", "https://open.bigmodel.cn/api/paas/v4"),
+        "zai": ("glm-5.3-flash", "https://api.z.ai/api/paas/v4/"),
         "openrouter": ("openai/gpt-4o", "https://openrouter.ai/api/v1"),
         "ollama": ("qwen3:8b", "http://127.0.0.1:11434/v1"),
         "custom": ("", ""),
@@ -162,10 +168,15 @@ def load_ai_settings() -> AISettings:
 
     provider = str(data.get("provider") or os.environ.get("NOVEL_FORMATTER_AI_PROVIDER") or "openai").lower()
     default_model, default_url = provider_defaults(provider)
-    # Session-only key has priority. A persisted key is used only when the JSON
-    # actually contains it. Environment variables remain the final fallback.
-    persisted_key = str(data.get("api_key", "")) if "api_key" in data else ""
-    api_key = _SESSION_API_KEY or persisted_key or os.environ.get("NOVEL_FORMATTER_AI_KEY", "")
+    # Session-only key has priority, then OS-backed credential storage.  A
+    # plaintext JSON key is read only for backward compatibility with pre-2026
+    # configs and is removed on the next save.
+    secure_key = load_secret()
+    legacy_persisted_key = str(data.get("api_key", "")) if "api_key" in data else ""
+    api_key = (
+        _SESSION_API_KEY or secure_key or legacy_persisted_key
+        or os.environ.get("NOVEL_FORMATTER_AI_KEY", "")
+    )
     legacy_performance_defaults = (
         int(data.get("performance_profile_version", 0) or 0) < 2
         and int(data.get("concurrency", 4) or 0) == 4
@@ -207,35 +218,71 @@ def load_ai_settings() -> AISettings:
         batch_tokens=int(data.get("batch_tokens", os.environ.get("NOVEL_FORMATTER_AI_BATCH_TOKENS", 0))),
         request_timeout=int(data.get("request_timeout", os.environ.get("NOVEL_FORMATTER_AI_TIMEOUT", 180))),
         json_mode=bool(data.get("json_mode", True)),
+        glm_thinking=bool(data.get("glm_thinking", False)),
         deepseek_thinking=deepseek_thinking,
         deepseek_reasoning_effort=str(data.get("deepseek_reasoning_effort", "high") or "high"),
         deepseek_user_id=str(data.get("deepseek_user_id", "novel_formatter") or "novel_formatter"),
         ocr_repair_mode=(str(data.get("ocr_repair_mode", "readability") or "readability") if str(data.get("ocr_repair_mode", "readability") or "readability") in {"readability", "strict"} else "readability"),
+        glossary_path=str(data.get("glossary_path", os.environ.get("NOVEL_FORMATTER_AI_GLOSSARY", "")) or ""),
         performance_profile_version=4,
     )
 
-def save_ai_settings(settings: AISettings, persist_api_key: bool = True) -> Path:
-    """Save non-secret settings and optionally the API key.
+def has_persisted_api_key() -> bool:
+    """Return whether a key exists in OS storage or a legacy JSON config."""
+    if load_secret():
+        return True
+    try:
+        if CONFIG_PATH.exists():
+            raw = json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
+            return bool(raw.get("api_key"))
+    except Exception:
+        pass
+    return False
 
-    When persist_api_key is False, any previously stored key is removed from the
-    JSON file and the supplied key is kept only in process memory. Saving an
-    empty key always removes the persisted key and clears the session key.
+
+def api_key_storage_backend() -> str:
+    if sys_platform() == "darwin" and persistence_available():
+        return "macOS Keychain"
+    if os.name == "nt" and persistence_available():
+        return "Windows DPAPI"
+    return "session-only"
+
+
+def save_ai_settings(settings: AISettings, persist_api_key: bool = True) -> Path:
+    """Save non-secret settings; never write a new API key as plaintext JSON.
+
+    On macOS the credential is stored in Keychain; on Windows it is encrypted
+    with DPAPI. Platforms without a dependency-free system credential store
+    keep the supplied key in process memory only. Legacy plaintext JSON keys are
+    accepted on load for migration, then removed by this save path.
     """
     payload = asdict(settings)
     key = normalise_api_key(payload.pop("api_key", ""))
     if key:
         key = validate_api_key(key)
-    if persist_api_key and key:
-        payload["api_key"] = key
-        clear_session_api_key()
-    elif key:
-        set_session_api_key(key)
-    else:
-        clear_session_api_key()
 
+    stored = False
+    if persist_api_key and key:
+        stored = save_secret(key)
+        if stored:
+            clear_session_api_key()
+            payload["api_key_storage"] = "system"
+        else:
+            # Security beats convenience: do not fall back to plaintext JSON.
+            set_session_api_key(key)
+            payload["api_key_storage"] = "session"
+    elif key:
+        delete_secret()
+        set_session_api_key(key)
+        payload["api_key_storage"] = "session"
+    else:
+        delete_secret()
+        clear_session_api_key()
+        payload["api_key_storage"] = "none"
+
+    # Explicitly discard any stale legacy field from the payload.
+    payload.pop("api_key", None)
     CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
-    # Same-directory temporary file + fsync + replace keeps the settings valid
-    # even if the app or Mac is interrupted during save.
     atomic_write_json(CONFIG_PATH, payload, ensure_ascii=False, indent=2)
     try:
         CONFIG_PATH.chmod(stat.S_IRUSR | stat.S_IWUSR)

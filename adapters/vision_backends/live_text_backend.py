@@ -17,7 +17,8 @@ from pathlib import Path
 
 from .base import VisionBackend, OCRResult, OCRBlock, OCRConfig, BackendCapabilities
 from .native_helper_backend import (
-    SOURCE, BINARY, ensure_helper_binary, _make_client, _mac_version_major,
+    SOURCE, BINARY, ensure_helper_binary, _mac_version_major,
+    _request_with_resilient_client,
     HelperInfrastructureError, VisionRecognitionError,
 )
 
@@ -26,6 +27,7 @@ class LiveTextHelperBackend(VisionBackend):
     def __init__(self):
         import threading
         self._client = None
+        self._client_binary_signature = None
         self._client_lock = threading.RLock()
 
     @property
@@ -64,23 +66,13 @@ class LiveTextHelperBackend(VisionBackend):
             "vertical": bool(config.vertical),
         }
         try:
-            with self._client_lock:
-                if self._client is None:
-                    self._client = _make_client(binary)
-                try:
-                    response = self._client.request(
-                        payload,
-                        max(1.0, float(config.timeout)),
-                        cancel_check=getattr(self, "cancel_check", None),
-                    )
-                except TypeError as exc:
-                    # Compatibility with older plugin/test clients that
-                    # still expose request(payload, timeout).
-                    if "cancel_check" not in str(exc):
-                        raise
-                    response = self._client.request(
-                        payload, max(1.0, float(config.timeout))
-                    )
+            response = _request_with_resilient_client(
+                self,
+                binary,
+                payload,
+                max(1.0, float(config.timeout)),
+                cancel_check=getattr(self, "cancel_check", None),
+            )
         except HelperInfrastructureError:
             raise
         except Exception as exc:
@@ -94,11 +86,15 @@ class LiveTextHelperBackend(VisionBackend):
             raise VisionRecognitionError(error)
 
         text = str(response.get("text") or "").strip()
-        blocks = [OCRBlock(text=line) for line in text.splitlines() if line.strip()]
+        # ImageAnalysis.transcript exposes neither per-line confidence nor
+        # alternatives. Keep confidence explicitly unknown instead of inheriting
+        # OCRBlock's numeric default and presenting it as measured certainty.
+        blocks = [OCRBlock(text=line, confidence=0.0) for line in text.splitlines() if line.strip()]
         return OCRResult(
             full_text=text,
             blocks=blocks,
             language=(config.languages[0] if config.languages else ""),
+            metadata=dict(response.get("metadata") or {}),
         )
 
     def close(self) -> None:
@@ -108,3 +104,4 @@ class LiveTextHelperBackend(VisionBackend):
                     self._client.close()
                 finally:
                     self._client = None
+                    self._client_binary_signature = None

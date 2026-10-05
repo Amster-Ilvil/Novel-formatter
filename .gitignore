@@ -1,4 +1,5 @@
 # Local Python environments and downloaded OCR assets
+.venv/
 .venv*/
 venv/
 env/
@@ -41,6 +42,13 @@ dist/
 *.sqlite
 *.sqlite3
 *.db
+
+# OCR model weights (keep model source code under models/)
+*.safetensors
+*.onnx
+*.pt
+*.pth
+*.ckpt
 
 # IDE metadata
 .idea/

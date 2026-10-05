@@ -49,6 +49,7 @@ AI_STEP_ENABLED = True
 JP_CHAPTER_NUMBER = r'[一二三四五六七八九十百千〇零\d０-９]+'
 CHAPTER_UNIT = r'[章話節巻回幕篇編]'
 CHAPTER_CONTINUATION = r'(?:は|が|を|に|で|と|も|の|です|だ|という)'
+VOLUME_END_RE = re.compile(rf'^第[\s　]*{JP_CHAPTER_NUMBER}[\s　]*巻[\s　]*了$')
 CHAPTER_RE = re.compile(
     rf'^(序章|終章|プロローグ|フロローグ|ブロローグ|エピローグ|後記|あとがき|'
     rf'幕間(?:[\s　:：・—―-].*)?|'
@@ -79,18 +80,39 @@ DIALOGUE_END   = ('」', '』', '）')
 
 # 标点替换规则
 PUNCT_RULES = [
-    # 混合半角/全角句点、中点和省略号会在竖排阅读器中使用不同字形基线，
-    # 形成一高一低的 '..…'。只要连续标点中含句点或省略号且长度>=2，
-    # 统一为日文规范的双省略号。单个中点仍保留。
-    (re.compile(r'(?=[.．・…]{2,})(?=[.．・…]*[.．…])[.．・…]{2,}'), '……'),
+    # 混合半角/全角句点、中点和省略号会在竖排阅读器中使用不同字形基线。
+    # 明显由 OCR 拼出来的混合连续标点统一成一组日文二倍省略号；纯粹的
+    # ``……``/``…………`` 强度则由 _normalize_japanese_punctuation_sequences 保留。
+    (re.compile(r'(?=[.．・…]{2,})(?=[.．・…]*[.．])[.．・…]{2,}'), '……'),
     (re.compile(r'\.{2,}'),    '……'),
-    (re.compile(r'…{2,}'),     '……'),
-    (re.compile(r'-{2,}'),     '——'),
-    (re.compile(r'ー{2,}'),    '——'),
     (re.compile(r'\(([^)]{1,20})\)'), r'（\1）'),
     (re.compile(r'　+$'),      ''),
     (re.compile(r' +$'),       ''),
 ]
+
+
+def _normalize_japanese_punctuation_sequences(text: str) -> str:
+    """Enforce Japanese publication pairs without flattening expressive length.
+
+    ``…`` and horizontal dashes are conventionally set in two-character units.
+    Odd runs are extended by one character; already-even runs (including four or
+    six characters used for dramatic pauses) keep their original strength.
+    Repeated prolonged-sound marks ``ーー`` are *not* dashes and are deliberately
+    untouched because they can encode a character's drawn-out voice.
+    """
+    def even_ellipsis(match: re.Match) -> str:
+        count = len(match.group(0))
+        return '…' * (count if count % 2 == 0 else count + 1)
+
+    def even_dash(match: re.Match) -> str:
+        count = len(match.group(0))
+        count = count if count % 2 == 0 else count + 1
+        return '―' * count
+
+    value = re.sub(r'…+', even_ellipsis, str(text or ''))
+    value = re.sub(r'[—―─]+', even_dash, value)
+    value = re.sub(r'-{2,}', even_dash, value)
+    return value
 
 CHAPTER_TITLE_SPACE_RE = re.compile(
     rf'^((?:プロローグ|序章|終章|エピローグ|'
@@ -200,6 +222,30 @@ def _detect_toc_like_pages(doc: UnifiedDocument) -> set[int]:
     return {page for page, ids in page_ids.items() if len(ids) >= 2}
 
 
+def _looks_like_positional_page_number(block: Block) -> bool:
+    """Return True only when a bare number has page-number geometry.
+
+    Standalone numbers are also legitimate light-novel section/chapter markers
+    (for example ``００１``), so text alone is never enough to delete them.
+    """
+    text = str(block.text or "").strip()
+    if not BARE_NUMBER_RE.match(text):
+        return False
+    bbox = getattr(block, "bbox", None)
+    if bbox is None:
+        return False
+    try:
+        x, y = float(bbox.x), float(bbox.y)
+        w, h = max(0.0, float(bbox.w)), max(0.0, float(bbox.h))
+    except (TypeError, ValueError):
+        return False
+    # Printed folios/nonbles are small and sit at a physical page edge.  Keep
+    # central numeric headings even when they consist of digits only.
+    edge = y <= 0.10 or (y + h) >= 0.90 or x <= 0.06 or (x + w) >= 0.94
+    compact = (w * h) <= 0.035 and min(w, h) <= 0.12
+    return bool(edge and compact)
+
+
 def clean_metadata_blocks(doc: UnifiedDocument) -> UnifiedDocument:
     """
     删除类型为 HEADER_FOOTER 的块，以及：
@@ -290,7 +336,11 @@ def clean_metadata_blocks(doc: UnifiedDocument) -> UnifiedDocument:
             if CHAPTER_RE.match(normalized) or CHAPTER_RE.match(t):
                 kept.append(b)
                 continue
-            if not skip_bare_digit_rule and BARE_NUMBER_RE.match(t):
+            if (
+                not skip_bare_digit_rule
+                and BARE_NUMBER_RE.match(t)
+                and _looks_like_positional_page_number(b)
+            ):
                 removed += 1
                 continue
             cid = cluster_of.get(t)
@@ -717,9 +767,9 @@ def _get_page_layout_text_blocks(blocks: list[Block]) -> dict[int, list[Block]]:
 
 
 def _restore_consumed_boundary_if_needed(previous: Block, placeholder: Block) -> bool:
-    """恢复被文本替换覆盖掉的跨页续句，但绝不越过占位块。
+    """恢复历史处理可能留下的跨页续句，但绝不越过占位块。
 
-    文本替换可能重写上一页末块，却保留下一页已清空的物理块。此时再次 Formatter
+    历史正文处理可能重写上一页末块，却保留下一页已清空的物理块。此时再次 Formatter
     不能选取下一页第二段；若上一页末块已经不含原续句，则从占位块 ``ocr_raw``
     恢复一次。返回是否实际恢复了文字。
     """
@@ -752,7 +802,7 @@ def _restore_consumed_boundary_if_needed(previous: Block, placeholder: Block) ->
 
 
 def merge_cross_page_sentences_layout_safe(doc: UnifiedDocument) -> UnifiedDocument:
-    """固定排版/文本替换后的安全跨页接续。
+    """固定排版后的安全跨页接续。
 
     仅把下一页首正文块的文字追加到上一页末正文块，并清空来源块文字；
     不删除 Block，不改变页码、坐标、顺序、图片锚点或其它结构信息。
@@ -1012,7 +1062,7 @@ def _should_merge_pair(current_text: str, next_text: str, *, pdf_text_mode: bool
     """宽松判断 OCR 断列。
 
     只要前块没有明确句末标点、后块不是新对白/标题/列表，就优先视为
-    同一句的续写。文本对比工作区负责处理少量复杂误合并，因此这里以
+    同一句的续写。复杂误合并由 OCR 校对/图文对照复核，因此这里以
     恢复跨列、跨行和跨页连续阅读为优先。
     """
     if _should_merge_with_next(current_text):
@@ -1051,7 +1101,7 @@ _MERGEABLE_TYPES = {BlockType.PARAGRAPH, BlockType.DIALOGUE}
 def merge_broken_sentences(doc: UnifiedDocument) -> UnifiedDocument:
     """
     竖排 OCR 宽松断句合并。当前块没有明确句末标点、下一块不像
-    新标题/新对白时优先接回；复杂边界留给文本对比工作区人工校正。
+    新标题/新对白时优先接回；复杂边界留给 OCR 校对或图文对照人工校正。
 
     对白（DIALOGUE）也要参与合并，不能只处理 PARAGRAPH：一句对白因为
     列高/页面限制被切成两三段时，开头那一段光看自己"「"没有配对的
@@ -1948,6 +1998,11 @@ def detect_chapters(doc: UnifiedDocument) -> UnifiedDocument:
         if not t:
             continue
         normalized = re.sub(r'[\s　]+', '', t)
+        if VOLUME_END_RE.match(t) or VOLUME_END_RE.match(normalized):
+            if b.type == BlockType.CHAPTER:
+                b.type = BlockType.SECTION
+                b.modified_by = "detect_chapters"
+            continue
         if b.type == BlockType.CHAPTER:
             # 已经是 CHAPTER 类型的块（比如 EPUB/DOCX 导入时按 <h1> 或原有格式
             # 标记出来的）本身就是权威的章节标题，不管文字长不长得像
@@ -2176,13 +2231,16 @@ def normalize_punctuation(doc: UnifiedDocument) -> UnifiedDocument:
 
         original = b.text
 
-        # 码位级规范化（NFD 假名合成/半角片假名/康熙部首/控制符/连字符变体）
-        b.text, cp_counts = normalize_ocr_codepoints(b.text)
+        # 码位级规范化分为出版级保守模式与阅读器兼容模式。默认不改写
+        # 康熙部首/IVS/兼容汉字，避免历史字形被静默替换。
+        unicode_policy = str(getattr(doc.metadata, "unicode_normalization_policy", "publication") or "publication")
+        b.text, cp_counts = normalize_ocr_codepoints(b.text, policy=unicode_policy)
         for key, n in cp_counts.items():
             codepoint_counts[key] = codepoint_counts.get(key, 0) + n
 
         for pattern, repl in PUNCT_RULES:
             b.text = pattern.sub(repl, b.text)
+        b.text = _normalize_japanese_punctuation_sequences(b.text)
 
         for pattern, repl in OCR_TYPOS:
             b.text = pattern.sub(repl, b.text)
@@ -2200,7 +2258,8 @@ def normalize_punctuation(doc: UnifiedDocument) -> UnifiedDocument:
 
     cp_note = ""
     if codepoint_counts:
-        labels = {"nfd_kana": "NFD假名合成", "halfwidth_kana": "半角片假名",
+        labels = {"nfc": "组合字符", "spacing_dakuten": "间隔浊点",
+                  "halfwidth_kana": "半角片假名", "presentation_form": "竖排兼容标点",
                   "kangxi_radical": "康熙部首", "control_char": "控制符",
                   "dash_variant": "连字符变体"}
         cp_note = "；码位修正：" + "、".join(
@@ -2398,6 +2457,7 @@ def run_pipeline(
     verbose: bool = True,
     progress_callback: Optional[Callable[[str, int, int], None]] = None,
     repo_path: str | None = None,
+    commit_each_step: bool = True,
 ) -> UnifiedDocument:
     """
     运行 Formatter Pipeline。
@@ -2415,6 +2475,8 @@ def run_pipeline(
         verbose: 打印每步日志
         progress_callback: 进度回调 (step_name, current_step, total_steps)
         repo_path: 版本仓库目录（None = 自动分配临时目录，或沿用 doc 已有仓库）
+        commit_each_step: 是否每个内部步骤都写版本历史。通用 Formatter 默认 True；
+                          PDF 专用格式处理可设 False，并在整个 PDF 格式阶段结束后只提交一次。
 
     Returns:
         处理后的新 UnifiedDocument（.repo/.commit_id 指向最新提交）
@@ -2488,7 +2550,7 @@ def run_pipeline(
     effective_repo_path = repo_path
     if doc.repo is not None:
         effective_repo_path = str(doc.repo.path)
-    elif effective_repo_path is None:
+    elif effective_repo_path is None and commit_each_step:
         effective_repo_path = new_temp_repo_path()
 
     current = doc
@@ -2499,7 +2561,7 @@ def run_pipeline(
             continue
         preserve_layout = is_preserve_ocr_layout_enabled(current)
         # 只有用户明确勾选“固定原 OCR 排版”时才启用保守处理；默认模式
-        # 无论是否经过文本替换或 AI，都允许再次执行完整宽松 Formatter。
+        # 无论是否经过历史正文处理或 AI，都允许再次执行完整宽松 Formatter。
         if step_id == "cross_page_merge" and preserve_layout:
             fn = merge_cross_page_sentences_layout_safe
         preserve_layout_unsafe = (
@@ -2513,10 +2575,14 @@ def run_pipeline(
             result.repo = current.repo
             result.commit_id = current.commit_id
             last_log = result.processing_log[-1]
-            commit_id = result.commit(effective_repo_path, step_id, last_log.get("message", ""))
+            if commit_each_step:
+                commit_id = result.commit(effective_repo_path, step_id, last_log.get("message", ""))
+            else:
+                commit_id = ""
             current = result
             if verbose:
-                print(f"  ⏭  {step_id} ... [{commit_id[:8]}] {last_log.get('message', 'skipped')}")
+                suffix = f"[{commit_id[:8]}] " if commit_id else ""
+                print(f"  ⏭  {step_id} ... {suffix}{last_log.get('message', 'skipped')}")
             continue
         if verbose:
             print(f"  ▶  {step_id} ...", end=" ")
@@ -2542,11 +2608,15 @@ def run_pipeline(
         result.commit_id = current.commit_id
 
         last_log = result.processing_log[-1] if result.processing_log else {}
-        commit_id = result.commit(effective_repo_path, step_id, last_log.get("message", ""))
+        if commit_each_step:
+            commit_id = result.commit(effective_repo_path, step_id, last_log.get("message", ""))
+        else:
+            commit_id = ""
         current = result
 
         if verbose:
-            print(f"[{commit_id[:8]}] {last_log.get('message', 'done')}")
+            suffix = f"[{commit_id[:8]}] " if commit_id else ""
+            print(f"{suffix}{last_log.get('message', 'done')}")
 
     if progress_callback:
         progress_callback("done", total, total)

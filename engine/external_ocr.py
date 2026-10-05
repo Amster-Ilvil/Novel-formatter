@@ -16,7 +16,7 @@ import unicodedata
 from typing import Iterable, Sequence
 
 from models.document import Block, BlockType, UnifiedDocument
-from engine.text_compare import (
+from engine.document_alignment import (
     AlignedLine, CompareLine, align_lines, apply_compare_records, document_lines,
     inherit_right_structure_from_alignment, looks_like_chapter_title,
     normalise_for_alignment, parse_image_marker,
@@ -185,7 +185,7 @@ def _reference_scores(corpus, a: str, b: str) -> tuple[float, float]:
 
 
 def _similarity(a: str, b: str) -> float:
-    from engine.text_compare import line_similarity
+    from engine.document_alignment import line_similarity
     return line_similarity(a, b)
 
 

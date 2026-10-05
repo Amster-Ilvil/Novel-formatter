@@ -114,16 +114,11 @@ _ENGINE_PROFILES: tuple[tuple[str, EngineProfile], ...] = (
     ("paddle_structure", EngineProfile("paddle_structure", 0.040, True)),
     ("ndlocr", EngineProfile("ndlocr_lite", 0.040, True)),
     ("google_vision", EngineProfile("google_vision", 0.040, True)),
-    ("yomitoku", EngineProfile("yomitoku", 0.025, True)),
     ("apple_vision", EngineProfile("apple_vision", 0.035, True, False)),
-    # Manga-OCR currently returns a fixed 0.92 in this project, not a measured
-    # probability. It may support another engine but is never sufficient alone.
-    ("manga_ocr", EngineProfile("manga_ocr", 0.100, False)),
     # Hayai v2.1 also returns generated sequence text without calibrated token probabilities.
     # Treat its score as heuristic evidence only; cross-engine/stability gates remain authoritative.
     ("hayai_ocr", EngineProfile("hayai_ocr", 0.090, False)),
     ("manga_48px", EngineProfile("manga_48px", 0.120, False)),
-    ("pdf_craft", EngineProfile("pdf_craft", 0.080, False)),
     ("paddle_vl", EngineProfile("paddle_vl", 0.100, False)),
 )
 
@@ -132,7 +127,7 @@ def _engine_match_key(value: str) -> str:
     """Normalize both stable engine IDs and human-facing labels for matching.
 
     OCR evidence can arrive from saved metadata using either ``hayai_ocr`` or
-    labels such as ``Hayai OCR v2.1``. Treat separators/version suffixes as
+    labels such as ``Hayai OCR v2.5-nova``. Treat separators/version suffixes as
     presentation details so confidence policy cannot silently fall back to the
     generic profile merely because the GUI label was persisted.
     """

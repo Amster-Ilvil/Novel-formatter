@@ -280,10 +280,20 @@ def load_column_sidecars(root: str | Path | None) -> dict[str, tuple[dict, Path]
     if not base.exists():
         return {}
     chosen: dict[str, tuple[dict, Path]] = {}
-    for sidecar in base.rglob("p*_columns.json"):
+    # Legacy OCR runs persisted ``p*_columns.json`` next to transport crops.
+    # Shared structure prewarm (Phase26+) persists the same authoritative
+    # original-page column/Ruby-candidate geometry under
+    # ``geometry_<fingerprint>/p*_geometry.json``.  Ruby smart-ROI must accept
+    # both: otherwise a successful 0-OCR geometry prewarm is invisible to the
+    # Ruby side-channel and silently schedules zero ROIs.
+    sidecars = list(base.rglob("p*_columns.json"))
+    sidecars.extend(base.rglob("p*_geometry.json"))
+    for sidecar in sorted(set(sidecars)):
         try:
             payload = json.loads(sidecar.read_text(encoding="utf-8"))
         except Exception:
+            continue
+        if not isinstance(payload, dict):
             continue
         page_path = str(payload.get("page_path") or "")
         if not page_path:

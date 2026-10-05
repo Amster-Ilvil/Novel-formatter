@@ -9,10 +9,118 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
+import platform
 import sys
 from pathlib import Path
 from types import SimpleNamespace
 
+
+
+_ORT_POLICY: dict = {
+    "requested": "cpu", "effective": "cpu", "available": [],
+    "sessions": [], "fallbacks": [],
+}
+
+
+def _apple_silicon() -> bool:
+    return sys.platform == "darwin" and platform.machine().strip().lower() in {"arm64", "aarch64"}
+
+
+def _provider_plan(mode: str, available: list[str], model_name: str, cache_dir: str) -> list:
+    """Return providers for one NDLOCR ONNX session.
+
+    ``hybrid`` accelerates only the DEIM page detector.  Character recognition
+    remains CPU by default to minimize any risk of numerical OCR changes.
+    """
+    raw = str(mode or "auto").strip().lower()
+    if raw not in {"auto", "cpu", "hybrid", "coreml"}:
+        raw = "auto"
+    has_coreml = "CoreMLExecutionProvider" in set(available or [])
+    if raw == "auto":
+        raw = "hybrid" if (_apple_silicon() and has_coreml) else "cpu"
+    name = str(model_name or "").lower()
+    use_coreml = has_coreml and (raw == "coreml" or (raw == "hybrid" and "deim" in name))
+    if not use_coreml:
+        return ["CPUExecutionProvider"]
+    units = os.environ.get("NOVEL_FORMATTER_NDLOCR_COREML_UNITS", "CPUAndNeuralEngine").strip() or "CPUAndNeuralEngine"
+    options = {
+        "ModelFormat": "MLProgram",
+        "MLComputeUnits": units,
+        "RequireStaticInputShapes": "0",
+        "EnableOnSubgraphs": "0",
+    }
+    if cache_dir:
+        options["ModelCacheDirectory"] = cache_dir
+    return [("CoreMLExecutionProvider", options), "CPUExecutionProvider"]
+
+
+def _install_ort_provider_policy(root: Path):
+    import onnxruntime as ort
+    requested = os.environ.get("NOVEL_FORMATTER_NDLOCR_PROVIDER", "auto").strip().lower() or "auto"
+    available = list(ort.get_available_providers())
+    cache_dir = os.environ.get("NOVEL_FORMATTER_NDLOCR_COREML_CACHE", "").strip()
+    if cache_dir:
+        Path(cache_dir).mkdir(parents=True, exist_ok=True)
+    effective = requested
+    if effective == "auto":
+        effective = "hybrid" if (_apple_silicon() and "CoreMLExecutionProvider" in available) else "cpu"
+    if effective in {"hybrid", "coreml"} and "CoreMLExecutionProvider" not in available:
+        effective = "cpu"
+    _ORT_POLICY.update({
+        "requested": requested, "effective": effective, "available": available,
+        "sessions": [], "fallbacks": [],
+    })
+    original = ort.InferenceSession
+
+    def managed_session(model_path, *args, **kwargs):
+        model_name = Path(str(model_path)).name if not isinstance(model_path, (bytes, bytearray)) else "memory-model"
+        providers = _provider_plan(effective, available, model_name, cache_dir)
+
+        # NDLOCR-Lite 1.3.x explicitly passes ['CPUExecutionProvider'] even on
+        # macOS. Replace only that exact CPU-only choice when our policy asks for
+        # CoreML. Any future upstream CUDA/custom provider remains authoritative.
+        positional = list(args)
+        explicit = kwargs.get("providers", None)
+        positional_provider = len(positional) >= 2
+        if explicit is None and positional_provider:
+            explicit = positional[1]
+        explicit_names = [
+            item[0] if isinstance(item, tuple) else item
+            for item in (explicit or [])
+        ]
+        wants_coreml = any((item[0] if isinstance(item, tuple) else item) == "CoreMLExecutionProvider" for item in providers)
+        if explicit_names and explicit_names != ["CPUExecutionProvider"]:
+            return original(model_path, *args, **kwargs)
+        if not wants_coreml and explicit_names:
+            return original(model_path, *args, **kwargs)
+        if positional_provider:
+            positional[1] = providers
+            args = tuple(positional)
+        else:
+            kwargs["providers"] = providers
+        try:
+            session = original(model_path, *args, **kwargs)
+            actual = list(session.get_providers()) if hasattr(session, "get_providers") else []
+            _ORT_POLICY["sessions"].append({"model": model_name, "providers": actual})
+            return session
+        except Exception as exc:
+            if not wants_coreml:
+                raise
+            _ORT_POLICY["fallbacks"].append({"model": model_name, "error": str(exc)})
+            if positional_provider:
+                positional = list(args)
+                positional[1] = ["CPUExecutionProvider"]
+                session = original(model_path, *tuple(positional), **kwargs)
+            else:
+                kwargs["providers"] = ["CPUExecutionProvider"]
+                session = original(model_path, *args, **kwargs)
+            actual = list(session.get_providers()) if hasattr(session, "get_providers") else ["CPUExecutionProvider"]
+            _ORT_POLICY["sessions"].append({"model": model_name, "providers": actual})
+            return session
+
+    ort.InferenceSession = managed_session
+    return ort
 
 def _pick_model(model_dir: Path, kind: str) -> Path:
     models = sorted(model_dir.glob("*.onnx"))
@@ -71,6 +179,7 @@ def _load_runtime(root: Path):
     src = root / "src"
     sys.path.insert(0, str(src))
     try:
+        _install_ort_provider_policy(root)
         import numpy as np
         from PIL import Image
         import ocr as ndlocr
@@ -90,8 +199,11 @@ def _load_runtime(root: Path):
             rec_weights50=str(_pick_model(model_dir, "50")),
             rec_weights=str(_pick_model(model_dir, "100")),
             rec_classes=str(config_dir / "NDLmoji.yaml"),
+            # Official NDLOCR-Lite currently executes through ONNX Runtime on
+            # CPU in this integration.  The M6 path therefore tunes CPU/vec
+            # execution rather than pretending the model is an MPS model.
             device="cpu",
-            enable_tcy=False,
+            enable_tcy=os.environ.get("NOVEL_FORMATTER_NDLOCR_TCY", "0") != "0",
             simple_mode=False,
         )
         detector = ndlocr.get_detector(ns)
@@ -191,7 +303,7 @@ def main() -> None:
         raise SystemExit(1)
 
     if args.server:
-        print(json.dumps({"type": "ready", "ok": True}, ensure_ascii=False), flush=True)
+        print(json.dumps({"type": "ready", "ok": True, "provider": _ORT_POLICY}, ensure_ascii=False), flush=True)
         _serve(root, runtime)
         return
     if not args.images:

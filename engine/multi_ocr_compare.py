@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""Conservative comparison and fusion for two or three OCR documents.
+"""Conservative comparison and fusion for two to six OCR documents.
 
 Model 1 remains the structural authority.  Fixed-region column OCR gets a
 stronger path than ordinary text comparison: every model sees the same physical
@@ -14,17 +14,18 @@ many-to-many dynamic-programming aligner handles 1↔N / N↔1 OCR line differen
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from collections import Counter
 import copy
 from difflib import SequenceMatcher
 import math
 import re
 import uuid
-from typing import Sequence
+from typing import Mapping, Sequence
 
 from models.document import Block, BlockType, BoundingBox, UnifiedDocument
 from engine.external_ocr import line_quality
 from engine.adaptive_ocr_ensemble import canonical_japanese, decide_ensemble, standard_japanese_key
-from engine.text_compare import (
+from engine.document_alignment import (
     CompareLine,
     align_lines,
     line_similarity,
@@ -40,6 +41,310 @@ _TEXT_TYPES = {
     BlockType.SECTION, BlockType.RUBY, BlockType.TOC_ENTRY,
 }
 _MAX_GROUP_SPAN = 3
+
+# Book-local consistency is used only to choose a provisional display/export
+# candidate while a whole-sentence conflict remains visible.  It never clears
+# the conflict and never rewrites OCR text.  Long recurring n-grams are a safe
+# way to preserve established spellings such as character/place names without
+# introducing a dictionary or language-model correction.
+_BOOK_NGRAM_MIN = 3
+_BOOK_NGRAM_MAX = 8
+_BOOK_NGRAM_MIN_COUNT = 2
+_REVIEW_TIEBREAK_MARGIN = 0.030
+_REVIEW_BRIDGE_SIMILARITY = 0.965
+_BOOK_GUARD_MARGIN = 0.80
+
+
+def _book_ngram_profile(rows: Sequence["MultiOcrRow"]) -> dict[str, int]:
+    counts: Counter[str] = Counter()
+    for row in rows:
+        independent = row._independent_comparison_values()
+        if len(independent) < 2 or len({value for _idx, value in independent}) != 1:
+            continue
+        text = next((str(row.texts[idx] or "") for idx, _value in independent if str(row.texts[idx] or "").strip()), "")
+        if not text:
+            continue
+        value = normalise_for_alignment(text)
+        for width in range(_BOOK_NGRAM_MIN, _BOOK_NGRAM_MAX + 1):
+            for start in range(0, max(0, len(value) - width + 1)):
+                gram = value[start:start + width]
+                if gram and not any(ch.isspace() for ch in gram):
+                    counts[gram] += 1
+    return {gram: count for gram, count in counts.items() if count >= _BOOK_NGRAM_MIN_COUNT}
+
+
+def _book_consistency_score(text: str, profile: Mapping[str, int] | None) -> float:
+    if not profile:
+        return 0.0
+    value = normalise_for_alignment(str(text or ""))
+    if not value:
+        return 0.0
+    score = 0.0
+    for width in range(_BOOK_NGRAM_MIN, _BOOK_NGRAM_MAX + 1):
+        weight = max(1, width - 2)
+        for start in range(0, max(0, len(value) - width + 1)):
+            count = int(profile.get(value[start:start + width], 0) or 0)
+            if count >= _BOOK_NGRAM_MIN_COUNT:
+                score += math.log1p(count) * weight
+    return score / max(1, len(value))
+
+
+def _review_label_index(labels: Sequence[str] | None, available_indices: set[int]) -> int | None:
+    for index, label in enumerate(list(labels or ())):
+        if index not in available_indices:
+            continue
+        value = str(label or "").casefold()
+        if "分歧复核" in value or "review" in value:
+            return index
+    return None
+
+
+_HARD_PLACEHOLDERS = ("□", "�")
+_TERMINAL_SUFFIX_CHARS = set("。！？!?…‥」』】）》〉〕］）)～~")
+_NUMERIC_CHAPTER_RE = re.compile(r"^[0-9０-９]{1,3}$")
+
+
+def _contains_hard_placeholder(text: str) -> bool:
+    value = str(text or "")
+    return any(marker in value for marker in _HARD_PLACEHOLDERS)
+
+
+def _strip_hard_placeholders(text: str) -> str:
+    value = str(text or "")
+    for marker in _HARD_PLACEHOLDERS:
+        value = value.replace(marker, "")
+    return value
+
+
+def _healthy_structural_dissent_choice(
+    texts: Sequence[str],
+    current_index: int,
+) -> tuple[int, str] | None:
+    """Protect provisional output from a correlated but structurally broken 2:1.
+
+    Hayai/48px can share the same narrow-column failure mode.  Therefore an
+    apparent 2:1 majority is not sufficient when that majority contains an
+    unresolved placeholder or is an obvious strict-prefix truncation while a
+    dissenting OCR contains a complete, structurally healthy sentence.  This
+    function changes only the provisional candidate; ``row.is_conflict`` still
+    derives from the independent OCR evidence and remains true.
+    """
+    if not (0 <= int(current_index) < len(texts)):
+        return None
+    current = str(texts[current_index] or "")
+    if not current.strip():
+        return None
+
+    candidates = [
+        (idx, str(value or ""))
+        for idx, value in enumerate(texts)
+        if idx != current_index and str(value or "").strip()
+    ]
+    if not candidates:
+        return None
+
+    current_has_placeholder = _contains_hard_placeholder(current)
+    clean_current = _strip_hard_placeholders(current)
+    current_norm = normalise_for_alignment(clean_current)
+
+    scored: list[tuple[float, int, str, str]] = []
+    for idx, candidate in candidates:
+        if _contains_hard_placeholder(candidate):
+            continue
+        candidate_norm = normalise_for_alignment(candidate)
+        if not candidate_norm:
+            continue
+        quality = line_quality(candidate)
+
+        # Placeholder majority: prefer only a candidate that is recognisably the
+        # same sentence, or the sole healthy non-placeholder candidate when the
+        # majority is nothing but an omission marker.
+        if current_has_placeholder:
+            if not current_norm:
+                compatibility = 1.0
+            else:
+                compatibility = line_similarity(current_norm, candidate_norm)
+                if current_norm in candidate_norm or candidate_norm in current_norm:
+                    compatibility = max(compatibility, .92)
+            if compatibility >= .55:
+                scored.append((quality.score + compatibility, idx, candidate, "placeholder"))
+            continue
+
+        # Strict-prefix truncation is especially common at a closing quote or
+        # final punctuation.  Do not treat arbitrary longer rewrites as a
+        # completion: the extra tail must be tiny and structural.
+        raw_base = current.rstrip()
+        raw_candidate = candidate.rstrip()
+        if raw_candidate.startswith(raw_base) and len(raw_candidate) > len(raw_base):
+            suffix = raw_candidate[len(raw_base):]
+            if 0 < len(suffix) <= 3 and all(ch in _TERMINAL_SUFFIX_CHARS for ch in suffix):
+                scored.append((quality.score + 1.0, idx, candidate, "terminal_suffix"))
+
+    if not scored:
+        return None
+    scored.sort(reverse=True)
+    _score, best_idx, _candidate, mode = scored[0]
+    if mode == "placeholder":
+        return best_idx, (
+            "多数候选含未决占位符/黑块，而少数候选提供结构完整的同句文本；"
+            "仅以健康少数作为暂定输出，整句仍保留为真正分歧"
+        )
+    return best_idx, (
+        "多数候选是健康少数候选的明显截断前缀，少数候选仅补齐句末标点/闭合符；"
+        "仅以完整候选作为暂定输出，整句仍保留为真正分歧"
+    )
+
+
+def _numeric_chapter_column_ids(records: Sequence["_ColumnRecord"]) -> set[str]:
+    """Detect a book-level run of standalone numeric chapter columns.
+
+    A numeric chapter marker is physically its own first column but legacy
+    sentence reflow joined it to the following body column (``4アグー…``).  We
+    only enable this structural repair when the *whole document* contains a
+    strong recurring pattern, which prevents ordinary isolated numerals from
+    being promoted to chapter titles.
+    """
+    candidates: list[_ColumnRecord] = []
+    numeric_values: list[int] = []
+    for record in records:
+        value = normalize_column_text(str(record.text or "")).strip()
+        if (
+            record.position_in_block == 0
+            and record.block_column_count >= 2
+            and _NUMERIC_CHAPTER_RE.fullmatch(value)
+        ):
+            try:
+                number = int(value.translate(str.maketrans("０１２３４５６７８９", "0123456789")))
+            except ValueError:
+                continue
+            if 1 <= number <= 999:
+                candidates.append(record)
+                numeric_values.append(number)
+    if len(candidates) < 6:
+        return set()
+
+    # Require convincing chapter-sequence evidence somewhere in the book.
+    # Corrupted OCR chapter numbers are still split once this mode is proven,
+    # but no missing heading is fabricated.
+    sequential_links = sum(
+        1 for left, right in zip(numeric_values, numeric_values[1:])
+        if right == left + 1
+    )
+    if sequential_links < 4:
+        return set()
+    return {record.column_id for record in candidates}
+
+
+def _book_guard_choice(
+    texts: Sequence[str],
+    current_index: int,
+    profile: Mapping[str, int] | None,
+) -> tuple[int, str] | None:
+    """Override a raw 2:1 spelling only when book-local evidence is decisive.
+
+    This protects recurring proper nouns/special terms from a correlated pair
+    of recognisers making the same one-glyph mistake (for example a full-size
+    kana in a name).  The row stays a conflict; only its provisional candidate
+    changes.
+    """
+    if not profile or not (0 <= current_index < len(texts)):
+        return None
+    base = str(texts[current_index] or "")
+    if not base.strip():
+        return None
+    base_score = _book_consistency_score(base, profile)
+    best_index = current_index
+    best_score = base_score
+    for index, candidate in enumerate(texts):
+        if index == current_index or not str(candidate or "").strip():
+            continue
+        score = _book_consistency_score(str(candidate), profile)
+        if score > best_score:
+            best_index, best_score = index, score
+    if best_index == current_index or best_score - base_score < _BOOK_GUARD_MARGIN:
+        return None
+    # Fail closed: the established spelling guard is only for very local OCR
+    # confusions, never for sentence-level rewrites or missing clauses.
+    guarded_text = str(texts[best_index] or "")
+    base_norm = normalise_for_alignment(base)
+    guarded_norm = normalise_for_alignment(guarded_text)
+    similarity = line_similarity(base_norm, guarded_norm)
+    if similarity < 0.94:
+        return None
+    changes = [
+        opcode for opcode in SequenceMatcher(None, base_norm, guarded_norm, autojunk=False).get_opcodes()
+        if opcode[0] != "equal"
+    ]
+    if len(changes) != 1:
+        return None
+    _tag, i1, i2, j1, j2 = changes[0]
+    if max(i2 - i1, j2 - j1) > 2:
+        return None
+    if line_quality(guarded_text).warnings:
+        return None
+    return best_index, (
+        "书内高频一致拼写与当前多数候选冲突；仅将已反复确认的书内拼写作为暂定输出，"
+        "整句仍保留为分歧，不视为本地裁决"
+    )
+
+
+def _review_tiebreak_choice(
+    texts: Sequence[str],
+    labels: Sequence[str] | None,
+) -> tuple[int, str] | None:
+    """Use a selective review OCR as soft evidence for an all-different row.
+
+    A review model is not allowed to erase the conflict.  When all candidates
+    differ, however, its geometry-targeted re-read can choose the safer
+    *provisional* text: either a healthy bridge candidate one small edit from
+    both main models, or the main candidate to which the review output is
+    clearly closer.
+    """
+    available = [idx for idx, text in enumerate(texts) if str(text or "").strip()]
+    if len(available) < 3:
+        return None
+    review_index = _review_label_index(labels, set(available))
+    if review_index is None:
+        return None
+    main_indices = [idx for idx in available if idx != review_index]
+    if len(main_indices) < 2:
+        return None
+    review_text = str(texts[review_index] or "")
+    review_quality = line_quality(review_text)
+    similarities = sorted(
+        ((line_similarity(review_text, str(texts[idx] or "")), idx) for idx in main_indices),
+        reverse=True,
+    )
+    best_similarity, best_main = similarities[0]
+    second_similarity = similarities[1][0]
+
+    # If the review is a clean same-length bridge and differs only locally from
+    # both mains, keeping the review itself is safer than arbitrarily preferring
+    # either main.  It is still marked as a conflict for AI/human confirmation.
+    main_lengths = [len(normalise_for_alignment(str(texts[idx] or ""))) for idx in main_indices]
+    review_length = len(normalise_for_alignment(review_text))
+    review_label = str(labels[review_index] if labels and review_index < len(labels) else "")
+    allow_review_as_provisional = "48px AR OCR" in review_label
+    if (
+        allow_review_as_provisional
+        and not review_quality.warnings
+        and main_lengths
+        and all(length == review_length for length in main_lengths[:2])
+        and all(line_similarity(review_text, str(texts[idx] or "")) >= _REVIEW_BRIDGE_SIMILARITY for idx in main_indices[:2])
+    ):
+        return review_index, (
+            "48px AR 整句复核形成健康桥接候选；"
+            "暂定采用复核文本，但整句仍保留为真正分歧"
+        )
+
+    if best_similarity - second_similarity >= _REVIEW_TIEBREAK_MARGIN:
+        if line_quality(str(texts[best_main] or "")).warnings:
+            return None
+        return best_main, (
+            "分歧复核模型虽未与任一主模型完全一致，但与其中一个主模型明显更接近；"
+            "仅据此选择暂定输出，整句仍保留为真正分歧"
+        )
+    return None
 
 
 def _block_metadata(block: Block) -> dict:
@@ -93,6 +398,19 @@ class MultiOcrRow:
     character_fusion_auto_selected: bool = False
     local_reocr_recommended: bool = False
     character_fusion_evidence: dict = field(default_factory=dict)
+    # V2.0: Consensus Entropy is diagnostic/routing metadata only. It must
+    # never select a model, synthesize text, or clear a whole-sentence conflict.
+    consensus_entropy_scores: tuple[float, ...] = ()
+    consensus_entropy_best_index: int = -1
+    consensus_entropy_min: float = 1.0
+    consensus_entropy_mean: float = 1.0
+    consensus_entropy_max: float = 1.0
+    consensus_entropy_difficulty: str = "insufficient"
+    consensus_entropy_review_required: bool = True
+    # Raw OCR candidates may differ while their compare-only Unicode keys are
+    # equivalent. Keep that distinction auditable instead of calling it byte/
+    # codepoint-exact consensus. Authoritative text is still never rewritten.
+    comparison_equivalence_only: bool = False
     # Optional equivalence keys created by the OCR compare "标准化修复" action.
     # They are never exported and are used only while their source snapshot still
     # matches ``texts``; any later manual edit automatically invalidates them.
@@ -116,12 +434,19 @@ class MultiOcrRow:
             and tuple(self.comparison_key_sources) == sources
         ):
             return [str(value or "") for value in self.comparison_keys]
-        return [normalise_for_alignment(value) for value in sources]
+        # Default to the export-safe/compare-only Japanese OCR key so visually
+        # equivalent Unicode punctuation, IVS and layout controls do not create
+        # false whole-sentence conflicts. The source OCR strings are untouched.
+        from engine.ocr_unicode_standardizer import japanese_ocr_comparison_key
+        return [japanese_ocr_comparison_key(value)[0] for value in sources]
 
     @property
     def output_text(self) -> str:
-        if self.character_fusion_auto_selected and self.character_fused_text:
-            return self.character_fused_text
+        # V2.0 hard boundary: ordinary multi-model comparison remains an
+        # authoritative *whole-sentence* disagreement. Character-fusion fields
+        # remain diagnostic-only in the current schema and can never become
+        # output text here. Evidence-level repair is owned exclusively by
+        # the explicit external-Paddle local adjudicator.
         if 0 <= self.chosen_index < len(self.texts):
             return self.texts[self.chosen_index]
         return next((text for text in self.texts if text), "")
@@ -162,6 +487,120 @@ class MultiOcrRow:
         return len(independent) >= 2 and len(set(independent)) > 1
 
     @property
+    def needs_more_local_evidence(self) -> bool:
+        """Whether another disagreement-review OCR call is still worthwhile.
+
+        ``is_conflict`` is historical/audit truth and remains True whenever any
+        independently executed models disagree.  Local evidence acquisition has
+        a different job: obtain enough independent candidates for a reliable AI
+        or human decision without blindly running every configured model.
+
+        Two disagreeing models are insufficient, so request one more model.  At
+        three or more independent observations, a repeated candidate (A/B/A or
+        A/B/B) is already high-value evidence and later local review slots can be
+        skipped while the row stays a visible conflict.  If every candidate is
+        still unique (A/B/C), another review model can add useful information.
+        """
+        if not self.is_conflict:
+            return False
+        independent = [value for _index, value in self._independent_comparison_values()]
+        if len(independent) < 3:
+            return True
+        counts: dict[str, int] = {}
+        for value in independent:
+            counts[value] = counts.get(value, 0) + 1
+        return max(counts.values(), default=0) < 2
+
+    @property
+    def high_value_review_evidence(self) -> bool:
+        """Whether an expensive third OCR pass is likely to add useful evidence.
+
+        The normal two-main-model workflow deliberately keeps every independent
+        sentence disagreement visible for AI/human adjudication.  A disagreement
+        reviewer such as 48px AR is much more expensive than text comparison, so
+        it should not blindly re-read every punctuation/kana micro-difference.
+
+        Request a third OCR observation only for structurally risky rows: low
+        candidate similarity, hard placeholders, meaningful length divergence,
+        or quote/bracket imbalance.  Near-identical one-glyph/typographic rows
+        stay conflicts and are exported with the original sentence image for
+        AI/human adjudication.  This changes *evidence acquisition only*; it does
+        not auto-accept either main model and therefore preserves the no-blind-2:1
+        policy.
+        """
+        if not self.needs_more_local_evidence:
+            return False
+        independent = [
+            (index, str(self.texts[index] or ""))
+            for index, _value in self._independent_comparison_values()
+            if 0 <= index < len(self.texts)
+        ]
+        if len(independent) < 2:
+            return False
+        # The current role topology has two main models.  If a future topology
+        # reaches this point with >2 unique candidates, a reviewer is still useful.
+        if len(independent) > 2:
+            return True
+        left = independent[0][1]
+        right = independent[1][1]
+        if not left.strip() or not right.strip():
+            return True
+        if _contains_hard_placeholder(left) or _contains_hard_placeholder(right):
+            return True
+        if abs(len(left) - len(right)) > 2:
+            return True
+        # Quote/bracket count mismatches are structural, even when the remaining
+        # text is nearly identical.
+        for marker in "「」『』（）()【】［］[]〈〉《》":
+            if left.count(marker) != right.count(marker):
+                return True
+        return line_similarity(left, right) < 0.94
+
+    @property
+    def local_review_priority(self) -> float:
+        """Priority for spending a bounded expensive third-model OCR budget.
+
+        This is *routing only*. It never changes the row verdict or treats the
+        third model as a deciding vote. Higher scores mean the two main models
+        disagree in a way where looking at pixels is more valuable: missing
+        text/placeholders, structural punctuation mismatches, large length gaps
+        or low textual similarity.
+        """
+        if not self.high_value_review_evidence:
+            return float("-inf")
+        values = [
+            str(self.texts[index] or "")
+            for index, _value in self._independent_comparison_values()
+            if 0 <= index < len(self.texts)
+        ]
+        if len(values) < 2:
+            return float("-inf")
+        left, right = values[0], values[1]
+        score = 0.0
+        if not left.strip() or not right.strip():
+            score += 140.0
+        if _contains_hard_placeholder(left) or _contains_hard_placeholder(right):
+            score += 120.0
+        gap = abs(len(left) - len(right))
+        score += min(80.0, gap * 4.0)
+        quote_delta = sum(
+            abs(left.count(marker) - right.count(marker))
+            for marker in "「」『』（）()【】［］[]〈〉《》"
+        )
+        score += min(80.0, quote_delta * 20.0)
+        score += max(0.0, 1.0 - line_similarity(left, right)) * 100.0
+        # Lower OCR confidence raises priority modestly, but never outweighs
+        # structural evidence by itself.
+        confidences = [
+            float(self.model_confidences[index] or 0.0)
+            for index, _value in self._independent_comparison_values()
+            if 0 <= index < len(self.model_confidences)
+        ]
+        if confidences:
+            score += max(0.0, 1.0 - min(confidences)) * 20.0
+        return score
+
+    @property
     def provisional_consensus(self) -> bool:
         """Two independent models agree while at least one model was skipped.
 
@@ -191,11 +630,24 @@ class MultiOcrRow:
         return len(independent) >= 2 and len(set(independent)) == 1
 
     @property
+    def single_model_result(self) -> bool:
+        """A valid sentence produced by exactly one configured main model.
+
+        Role-based multi-OCR deliberately allows only one of column/page/sentence
+        to be selected.  That is not a model disagreement and must not turn the
+        entire book into the disagreement-review queue.
+        """
+        independent = [value for _index, value in self._independent_comparison_values()]
+        return len(self.texts) == 1 and len(independent) == 1
+
+    @property
     def review_classification(self) -> str:
         if self.is_conflict:
             return "conflict"
         if self.provisional_consensus:
             return "provisional_consensus"
+        if self.single_model_result:
+            return "single_model"
         return "exact_consensus"
 
 
@@ -220,6 +672,8 @@ class MultiOcrComparison:
     character_fused_rows: int = 0
     character_auto_selected_rows: int = 0
     local_reocr_rows: int = 0
+    high_entropy_rows: int = 0
+    unicode_equivalence_rows: int = 0
 
     @property
     def summary(self) -> str:
@@ -250,8 +704,19 @@ class MultiOcrComparison:
             f"；建议局部重识别 {self.local_reocr_rows} 句"
             if self.local_reocr_rows else ""
         )
+        entropy = f"；高分歧度 {self.high_entropy_rows} 句" if self.high_entropy_rows else ""
+        unicode_equiv = (
+            f"；Unicode/标点等价一致 {self.unicode_equivalence_rows} 句"
+            if self.unicode_equivalence_rows else ""
+        )
+        if len(self.labels) == 1:
+            return (
+                f"{mode}{title}{repairs}{empty}{true_empty}{single_only}{char_fused}{local_reocr}{entropy}{unicode_equiv}；共 {len(self.rows)} 行；"
+                f"单模型结果 {self.exact_rows}；真正分歧 0；低置信 {self.low_confidence_rows}；"
+                f"其他模型独有句 {self.insertion_rows}。"
+            )
         return (
-            f"{mode}{title}{repairs}{empty}{true_empty}{single_only}{char_fused}{local_reocr}；共 {len(self.rows)} 行；"
+            f"{mode}{title}{repairs}{empty}{true_empty}{single_only}{char_fused}{local_reocr}{entropy}{unicode_equiv}；共 {len(self.rows)} 行；"
             f"真正一致 {self.exact_rows}；两模型共同候选 {self.provisional_consensus_rows}；"
             f"真正分歧 {self.conflict_rows}；低置信 {self.low_confidence_rows}；"
             f"其他模型独有句 {self.insertion_rows}。"
@@ -370,8 +835,23 @@ def _auto_choose(
     texts: Sequence[str], comparison_values: Sequence[str] | None = None,
     labels: Sequence[str] | None = None,
     model_confidences: Sequence[float] | None = None,
+    book_ngram_profile: Mapping[str, int] | None = None,
+    excluded_indices: Sequence[int] | None = None,
 ) -> tuple[int, float, str, tuple[str, ...]]:
-    available = [(idx, text) for idx, text in enumerate(texts) if str(text or "").strip()]
+    # Fast-consensus / role-scheduler placeholders are copied evidence, not
+    # independent OCR observations. They may remain in ``texts`` so UI/history
+    # preserve a rectangular candidate matrix, but they must never create a
+    # synthetic majority or influence provisional candidate selection.
+    seeded_excluded = {
+        int(index) for index in (excluded_indices or ())
+        if 0 <= int(index) < len(texts)
+    }
+    model_labels = list(labels or ())
+    direct_excluded = seeded_excluded
+    available = [
+        (idx, text) for idx, text in enumerate(texts)
+        if idx not in direct_excluded and str(text or "").strip()
+    ]
     compare_values = list(comparison_values or ())
 
     def compare_value(index: int, text: str) -> str:
@@ -380,13 +860,23 @@ def _auto_choose(
         return normalise_for_alignment(text)
 
     if not available:
+        # If a configuration contains only a Manga review slot, preserve a
+        # usable text rather than returning an invalid index. Such a topology is
+        # not a valid multi-role run, but legacy/restored data should fail soft.
+        fallback = [
+            (idx, text) for idx, text in enumerate(texts)
+            if idx not in seeded_excluded and str(text or "").strip()
+        ]
+        if fallback:
+            idx, text = fallback[0]
+            return idx, 0.42, "仅复核模型有文字；保留显示并强制人工确认", ("复核模型不能直接形成本地裁决",)
         return 0, 0.0, "所有模型均为空", ("空文本",)
     if len(available) == 1:
         idx, text = available[0]
         q = line_quality(text)
         length = len(compare_value(idx, text))
         warnings = list(q.warnings)
-        warnings.append("其他模型对应物理列为空")
+        warnings.append("其他独立主模型对应物理列为空")
         if length >= 40:
             warnings.append("长句仅有单模型结果，可能存在整段漏识")
         confidence = min(.56, .45 + q.score * .11)
@@ -395,22 +885,75 @@ def _auto_choose(
         return (
             idx,
             confidence,
-            "仅该模型的对应物理列识别到文字；保留候选并强制进入人工复核",
+            "仅该主模型的对应物理列识别到文字；保留候选并强制进入人工复核",
             tuple(dict.fromkeys(warnings)),
         )
 
+    # ``selection_texts`` controls what can become provisional body text.
+    # ``review_evidence_texts`` additionally keeps Manga review output available
+    # for soft tie-breaking between main-role candidates.
+    selection_texts = [
+        "" if index in direct_excluded else str(text or "")
+        for index, text in enumerate(texts)
+    ]
+    review_evidence_texts = [
+        "" if index in seeded_excluded else str(text or "")
+        for index, text in enumerate(texts)
+    ]
+    raw_masked_confidences = [
+        0.0 if index in direct_excluded else float(model_confidences[index] or 0.0)
+        if model_confidences is not None and index < len(model_confidences) else 0.0
+        for index in range(len(texts))
+    ]
+    # Confidence values from Hayai/NDL/48px/Apple are not calibrated on a common
+    # probability scale.  The free3 full-book run showed this could make the
+    # provisional display collapse toward the model that simply reports larger
+    # numeric confidences (48px won ~3.1k/4.0k rows).  Across distinct OCR
+    # engines, selection therefore uses text agreement + structural quality only;
+    # raw confidences remain stored for per-engine diagnostics and UI display.
+    distinct_labels = {
+        str(label or "").strip().casefold()
+        for index, label in enumerate(model_labels[:len(texts)])
+        if index not in direct_excluded and str(texts[index] or "").strip()
+    }
+    masked_confidences = (
+        [0.0] * len(raw_masked_confidences)
+        if len(distinct_labels) >= 2
+        else raw_masked_confidences
+    )
+
     adaptive = decide_ensemble(
-        texts, labels, model_confidences,
+        selection_texts, labels, masked_confidences,
         verify_sensitive_two_model_agreement=False,
     )
     if adaptive.status in {"exact_consensus", "normalized_consensus", "majority_consensus"}:
         adaptive_warnings = list(adaptive.warnings or ())
         if adaptive.requires_review:
-            adaptive_warnings.append("高风险字段存在模型异议，自动结果仅作暂定")
+            if adaptive.status == "majority_consensus":
+                adaptive_warnings.append("独立模型仍有异议：多数候选仅作暂定，必须继续裁决")
+            else:
+                adaptive_warnings.append("高风险字段需要独立验证，自动结果仅作暂定")
+        chosen_index = int(adaptive.chosen_index)
+        reason = str(adaptive.reason)
+        confidence = float(adaptive.confidence)
+        if adaptive.status == "majority_consensus":
+            structural = _healthy_structural_dissent_choice(selection_texts, chosen_index)
+            if structural is not None:
+                chosen_index, structural_reason = structural
+                reason = f"{reason}；{structural_reason}"
+                confidence = min(confidence, .72)
+                adaptive_warnings.append("结构性坏多数被健康少数覆盖；该行仍需复核")
+            else:
+                guarded = _book_guard_choice(selection_texts, chosen_index, book_ngram_profile)
+                if guarded is not None:
+                    chosen_index, guard_reason = guarded
+                    reason = f"{reason}；{guard_reason}"
+                    confidence = min(confidence, .74)
+                    adaptive_warnings.append("书内一致拼写守卫覆盖多数候选；该行仍需复核")
         return (
-            int(adaptive.chosen_index),
-            float(adaptive.confidence),
-            str(adaptive.reason),
+            chosen_index,
+            confidence,
+            reason,
             tuple(dict.fromkeys(adaptive_warnings)),
         )
 
@@ -421,15 +964,29 @@ def _auto_choose(
     if len(consensus) >= 2:
         best_idx, best_text = max(consensus, key=lambda item: line_quality(item[1]).score)
         warnings = list(line_quality(best_text).warnings)
-        missing_count = max(0, len(texts) - len(available))
+        reason = f"{len(consensus)} 个模型文字一致，采用一致组中噪声最少的结果"
+        structural = _healthy_structural_dissent_choice(selection_texts, best_idx)
+        if structural is not None and len(consensus) < len(available):
+            best_idx, structural_reason = structural
+            best_text = str(texts[best_idx] or "")
+            warnings = list(line_quality(best_text).warnings)
+            warnings.append("结构性坏多数被健康少数覆盖；该行仍需复核")
+            reason += f"；{structural_reason}"
+        missing_count = max(0, (len(texts) - len(direct_excluded)) - len(available))
         if missing_count:
             warnings.append(f"{missing_count} 个模型对应物理列为空")
         confidence = .98 if len(consensus) == len(available) else .91
+        if structural is not None and len(consensus) < len(available):
+            confidence = min(confidence, .72)
         if missing_count:
             confidence = min(confidence, .86)
-        return best_idx, confidence, (
-            f"{len(consensus)} 个模型文字一致，采用一致组中噪声最少的结果"
-        ), tuple(dict.fromkeys(warnings))
+        return best_idx, confidence, reason, tuple(dict.fromkeys(warnings))
+
+    review_choice = _review_tiebreak_choice(review_evidence_texts, labels)
+    if review_choice is not None:
+        review_index, review_reason = review_choice
+        review_warnings = tuple(line_quality(str(texts[review_index] or "")).warnings)
+        return review_index, .58, review_reason, review_warnings
 
     lengths = sorted(len(compare_value(idx, text)) for idx, text in available)
     median_length = lengths[len(lengths) // 2] or 1
@@ -445,8 +1002,6 @@ def _auto_choose(
         length = len(compare_value(idx, text))
         length_ratio = min(length, median_length) / max(length, median_length, 1)
         score = quality.score * .58 + consensus_score * .27 + length_ratio * .15
-        if idx == 0:
-            score += .025
         scored.append((score, idx, quality.warnings))
     scored.sort(reverse=True)
     top_score, top_idx, warnings = scored[0]
@@ -474,6 +1029,13 @@ def _auto_choose(
 
 
 def _finalize_comparison(comparison: MultiOcrComparison) -> MultiOcrComparison:
+    """Finalize whole-sentence OCR comparison without evidence-level fusion.
+
+    V2.0 deliberately does *not* call ``character_level_fusion`` here. Three
+    OCR hypotheses that disagree remain one reviewable sentence conflict even
+    when a character-level majority can be constructed. Only the explicit
+    external-Paddle local adjudication path may resolve conflict positions.
+    """
     comparison.exact_rows = 0
     comparison.conflict_rows = 0
     comparison.provisional_consensus_rows = 0
@@ -483,15 +1045,32 @@ def _finalize_comparison(comparison: MultiOcrComparison) -> MultiOcrComparison:
     comparison.unresolved_empty_cells = 0
     comparison.true_empty_rows = 0
     comparison.single_model_only_rows = 0
+    # Retained in the schema for backwards roundtrip compatibility, but new V2
+    # comparisons never populate or auto-select a character-fusion candidate.
     comparison.character_fused_rows = 0
     comparison.character_auto_selected_rows = 0
     comparison.local_reocr_rows = 0
-    from engine.character_level_fusion import build_character_fusion
+    comparison.unicode_equivalence_rows = 0
+    high_entropy_rows = 0
+    from engine.consensus_entropy import calculate_consensus_entropy
+    book_ngram_profile = _book_ngram_profile(comparison.rows)
+
     for index, row in enumerate(comparison.rows):
         row.index = index
+        nonvoting_indices = {
+            int(seed_index) for seed_index in (row.consensus_seeded_models or ())
+            if 0 <= int(seed_index) < len(row.texts)
+        }
+        # Review slots are evidence for AI/human adjudication, not local votes;
+        # they cannot create an automatic 2:1/3:1 majority.
+        for label_index, label in enumerate(comparison.labels):
+            value = str(label or "").casefold()
+            if "分歧复核" in value or "review" in value:
+                nonvoting_indices.add(label_index)
         choice, confidence, reason, warnings = _auto_choose(
             row.texts, row.effective_comparison_values(),
-            comparison.labels, row.model_confidences,
+            comparison.labels, row.model_confidences, book_ngram_profile,
+            tuple(sorted(nonvoting_indices)),
         )
         if row.alignment_repaired:
             reason += "；已依据相邻物理列和其他模型候选修复一行偏移"
@@ -499,42 +1078,56 @@ def _finalize_comparison(comparison: MultiOcrComparison) -> MultiOcrComparison:
             confidence = min(confidence, .88)
         if row.consensus_seeded_models:
             seeded_labels = "、".join(
-                f"模型{index + 1}" for index in row.consensus_seeded_models
+                f"模型{seed_index + 1}" for seed_index in row.consensus_seeded_models
             )
             reason += f"；{seeded_labels}对已一致物理列未重复推理，沿用前序共识底稿"
             warnings = tuple(dict.fromkeys((
                 *warnings,
                 f"{seeded_labels}含共识复用列（不是重复 OCR 输出）",
             )))
-        fusion = build_character_fusion(
+
+        # Clear legacy synthetic evidence so newly finalized rows cannot leak a
+        # previous character-level answer into ordinary comparison/export.
+        row.character_fused_text = ""
+        row.character_fusion_confidence = 0.0
+        row.character_fusion_reason = ""
+        row.character_fusion_warnings = ()
+        row.character_fusion_auto_selected = False
+        row.local_reocr_recommended = False
+        row.character_fusion_evidence = {}
+
+        profile = calculate_consensus_entropy(
             row.texts,
-            comparison.labels,
-            physical_column_ids=row.column_ids,
-            model_confidences=row.model_confidences,
+            comparison_keys=row.effective_comparison_values(),
+            excluded_indices=row.consensus_seeded_models,
         )
-        row.character_fused_text = str(fusion.text or "")
-        row.character_fusion_confidence = float(fusion.confidence or 0.0)
-        row.character_fusion_reason = str(fusion.reason or "")
-        row.character_fusion_warnings = tuple(fusion.warnings or ())
-        row.character_fusion_auto_selected = bool(fusion.auto_select and fusion.text)
-        row.local_reocr_recommended = bool(fusion.local_reocr_recommended)
-        row.character_fusion_evidence = dict(fusion.evidence or {})
-        if row.character_fusion_reason and row.character_fusion_warnings:
-            reason += f"；{row.character_fusion_reason}"
-            warnings = tuple(dict.fromkeys((*warnings, *row.character_fusion_warnings)))
-        if row.character_fused_text:
-            comparison.character_fused_rows += 1
-            if row.character_fusion_reason and not row.character_fusion_warnings:
-                reason += f"；{row.character_fusion_reason}"
-            if row.character_fusion_auto_selected:
-                comparison.character_auto_selected_rows += 1
-                confidence = max(confidence, row.character_fusion_confidence)
-            else:
-                confidence = min(confidence, max(.52, row.character_fusion_confidence))
-        if row.local_reocr_recommended:
-            comparison.local_reocr_rows += 1
-            warnings = tuple(dict.fromkeys((*warnings, "三模型证据仍冲突，建议只对本物理列局部重识别")))
-            confidence = min(confidence, .59)
+        row.consensus_entropy_scores = profile.scores
+        row.consensus_entropy_best_index = profile.best_index
+        row.consensus_entropy_min = profile.minimum
+        row.consensus_entropy_mean = profile.mean
+        row.consensus_entropy_max = profile.maximum
+        row.consensus_entropy_difficulty = profile.difficulty
+        row.consensus_entropy_review_required = profile.review_required
+        raw_nonempty = [str(value or "") for value in row.texts if str(value or "").strip()]
+        effective_nonempty = [
+            str(value or "") for _idx, value in row._nonempty_comparison_values()
+        ]
+        row.comparison_equivalence_only = bool(
+            len(raw_nonempty) >= 2
+            and len(set(raw_nonempty)) > 1
+            and len(effective_nonempty) >= 2
+            and len(set(effective_nonempty)) == 1
+        )
+        if row.comparison_equivalence_only:
+            comparison.unicode_equivalence_rows += 1
+            warnings = tuple(dict.fromkeys((
+                *warnings,
+                "Unicode/标点表现码位不同，但比较键等价；原始 OCR 字符保持不变",
+            )))
+        if profile.difficulty == "high" and row.is_conflict:
+            high_entropy_rows += 1
+            warnings = tuple(dict.fromkeys((*warnings, "多模型分歧度较高：优先人工/Paddle外部证据复核")))
+
         row.chosen_index = choice
         row.confidence = confidence
         row.reason = reason
@@ -543,7 +1136,7 @@ def _finalize_comparison(comparison: MultiOcrComparison) -> MultiOcrComparison:
             comparison.conflict_rows += 1
         elif row.provisional_consensus:
             comparison.provisional_consensus_rows += 1
-            reason += "；两个独立模型文字一致，第3模型由快速共识复用，仍需 AI 或人工确认"
+            reason += "；两个独立模型文字一致，后续模型由快速共识复用，仍需 AI 或人工确认"
             warnings = tuple(dict.fromkeys((
                 *warnings,
                 "两模型共同候选：跳过的模型未提供独立 OCR 证据",
@@ -554,10 +1147,11 @@ def _finalize_comparison(comparison: MultiOcrComparison) -> MultiOcrComparison:
             row.confidence = confidence
         elif row.exact_consensus:
             comparison.exact_rows += 1
+        elif row.single_model_result:
+            comparison.exact_rows += 1
+            reason += "；当前仅配置一个主识别模型，本句作为单模型结果保留，不计为模型分歧"
+            row.reason = reason
         else:
-            # Defensive fallback for malformed/legacy rows with insufficient
-            # independent evidence. Keep them reviewable rather than inflating
-            # the exact-consensus statistic.
             comparison.conflict_rows += 1
             reason += "；独立 OCR 证据不足，不能计入真正一致"
             warnings = tuple(dict.fromkeys((*warnings, "独立 OCR 证据不足：需要人工确认")))
@@ -590,16 +1184,18 @@ def _finalize_comparison(comparison: MultiOcrComparison) -> MultiOcrComparison:
             row.alignment_status = "single_model_only"
             comparison.single_model_only_rows += 1
             comparison.unresolved_empty_cells += max(0, len(row.texts) - nonempty)
-        elif row.character_fusion_auto_selected:
-            row.alignment_status = "character_fused"
-        elif row.local_reocr_recommended:
-            row.alignment_status = "local_reocr_recommended"
         elif row.is_conflict:
             row.alignment_status = "conflict"
         elif row.provisional_consensus:
             row.alignment_status = "provisional_consensus"
+        elif row.single_model_result:
+            row.alignment_status = "single_model"
         else:
             row.alignment_status = "exact"
+
+    comparison.high_entropy_rows = high_entropy_rows
+    from engine.ocr_pipeline_diagnostics import audit_comparison
+    audit_comparison(comparison).raise_for_errors("OCR 对齐结果损坏")
     return comparison
 
 
@@ -820,7 +1416,10 @@ def _compare_by_shared_columns(
     pending: list[_ColumnRecord] = []
     segment_counts: dict[int, int] = {}
 
-    def emit(records: Sequence[_ColumnRecord], *, atomic: bool = False) -> None:
+    def emit(
+        records: Sequence[_ColumnRecord], *, atomic: bool = False,
+        block_type_override: str | None = None,
+    ) -> None:
         if not records:
             return
         column_ids = tuple(record.column_id for record in records)
@@ -857,8 +1456,9 @@ def _compare_by_shared_columns(
                 )
         seeded_models = tuple(
             model_index
-            for model_index, mapping in enumerate(model_maps)
-            if any(
+            for model_index, (extraction, mapping) in enumerate(zip(bundles, model_maps))
+            if column_ids not in extraction.sentence_candidates
+            and any(
                 column_id in mapping and mapping[column_id].consensus_seeded
                 for column_id in column_ids
             )
@@ -875,16 +1475,25 @@ def _compare_by_shared_columns(
             primary_block_indices=tuple(dict.fromkeys(record.block_index for record in records)),
             primary_block_id=first.block_id,
             primary_segment_index=segment_index,
-            block_type=first.block_type,
+            block_type=str(block_type_override or first.block_type),
             page=first.page,
             column_ids=column_ids,
             atomic=atomic,
             consensus_seeded_models=seeded_models,
         ))
 
+    numeric_chapter_ids = _numeric_chapter_column_ids(primary_records)
+
     index = 0
     while index < len(primary_records):
         record = primary_records[index]
+        if record.column_id in numeric_chapter_ids:
+            if pending:
+                emit(pending)
+                pending = []
+            emit([record], atomic=True, block_type_override=BlockType.CHAPTER.value)
+            index += 1
+            continue
         if record.atomic_title:
             if pending:
                 emit(pending)
@@ -943,7 +1552,7 @@ def physical_column_text_snapshot(doc: UnifiedDocument) -> tuple[dict[str, str],
     """Return immutable column-ID text used by multi-model alignment.
 
     External round-trip packages store this compact snapshot so a later import
-    can audit exact physical-column lineage without embedding two or three full
+    can audit exact physical-column lineage without embedding two to six full
     300-page documents.
     """
     extraction = _extract_column_records(doc)
@@ -1391,8 +2000,8 @@ def compare_ocr_documents(
     labels: Sequence[str] | None = None,
 ) -> MultiOcrComparison:
     docs = list(documents)
-    if not 2 <= len(docs) <= 3:
-        raise ValueError("OCR 对比只支持 2～3 份结果")
+    if not 1 <= len(docs) <= 6:
+        raise ValueError("OCR 对比只支持 1～6 份结果")
     model_labels = list(labels or [])
     while len(model_labels) < len(docs):
         model_labels.append(f"OCR 模型 {len(model_labels) + 1}")
@@ -1537,8 +2146,8 @@ def realign_ocr_texts(
     block is collapsed back to exactly one atomic title row.
     """
     texts = list(source_texts)
-    if not 2 <= len(texts) <= 3:
-        raise ValueError("OCR 对比只支持 2～3 份结果")
+    if not 1 <= len(texts) <= 6:
+        raise ValueError("OCR 对比只支持 1～6 份结果")
     documents = [_document_from_editor_text(text) for text in texts]
     comparison = _compare_by_text_alignment(documents, list(labels or []))
     _remap_primary_structure(comparison, template)
@@ -1549,19 +2158,33 @@ def refresh_row_character_fusion(
     row: MultiOcrRow,
     labels: Sequence[str],
 ) -> MultiOcrRow:
-    """Recalculate the synthetic character candidate after manual OCR edits."""
-    from engine.character_level_fusion import build_character_fusion
-    fusion = build_character_fusion(
-        row.texts, labels, physical_column_ids=row.column_ids,
-        model_confidences=row.model_confidences,
+    """Compatibility hook that preserves V2.0 whole-sentence semantics.
+
+    Older callers invoke this after editing a source candidate.  Recompute only
+    the CE diagnostic and clear legacy synthetic fusion fields; do not construct
+    a new character-level candidate.
+    """
+    del labels
+    from engine.consensus_entropy import calculate_consensus_entropy
+    row.character_fused_text = ""
+    row.character_fusion_confidence = 0.0
+    row.character_fusion_reason = ""
+    row.character_fusion_warnings = ()
+    row.character_fusion_auto_selected = False
+    row.local_reocr_recommended = False
+    row.character_fusion_evidence = {}
+    profile = calculate_consensus_entropy(
+        row.texts,
+        comparison_keys=row.effective_comparison_values(),
+        excluded_indices=row.consensus_seeded_models,
     )
-    row.character_fused_text = str(fusion.text or "")
-    row.character_fusion_confidence = float(fusion.confidence or 0.0)
-    row.character_fusion_reason = str(fusion.reason or "")
-    row.character_fusion_warnings = tuple(fusion.warnings or ())
-    row.character_fusion_auto_selected = bool(fusion.auto_select and fusion.text)
-    row.local_reocr_recommended = bool(fusion.local_reocr_recommended)
-    row.character_fusion_evidence = dict(fusion.evidence or {})
+    row.consensus_entropy_scores = profile.scores
+    row.consensus_entropy_best_index = profile.best_index
+    row.consensus_entropy_min = profile.minimum
+    row.consensus_entropy_mean = profile.mean
+    row.consensus_entropy_max = profile.maximum
+    row.consensus_entropy_difficulty = profile.difficulty
+    row.consensus_entropy_review_required = profile.review_required
     return row
 
 
@@ -1708,6 +2331,10 @@ def build_fused_document(
     delete_flags: Sequence[bool] | None = None,
     ruby_overlay_source: UnifiedDocument | dict | None = None,
 ) -> UnifiedDocument:
+    from engine.ocr_pipeline_diagnostics import audit_comparison
+
+    pipeline_audit = audit_comparison(comparison)
+    pipeline_audit.raise_for_errors("无法生成融合文档")
     lines = list(result_lines if result_lines is not None else selected_lines(comparison))
     if len(lines) != len(comparison.rows):
         raise ValueError(
@@ -2218,13 +2845,9 @@ def build_fused_document(
                 fusion_candidate_labels.append(f"纠错前·{base_label}")
                 fusion_candidate_confidences.append(0.0)
             selected_candidate_index = int(row.chosen_index)
-            character_candidate = str(row.character_fused_text or "")
-            if character_candidate and character_candidate not in fusion_candidate_texts:
-                fusion_candidate_texts.append(character_candidate)
-                fusion_candidate_labels.append("字符融合")
-                fusion_candidate_confidences.append(float(row.character_fusion_confidence or 0.0))
-                if value == character_candidate:
-                    selected_candidate_index = len(fusion_candidate_texts) - 1
+            # V2.0 intentionally never adds legacy character-fusion text to the
+            # ordinary review candidate list. Whole-sentence OCR candidates stay
+            # intact until an explicit external-Paddle local adjudication occurs.
             current_nonempty_candidate_count = sum(
                 1 for item in row.texts if str(item or "").strip()
             )
@@ -2240,6 +2863,7 @@ def build_fused_document(
             )
             review_sentence_groups.append({
                 "row_index": int(row.index),
+                "sentence_group_id": str(row.sentence_group_id or ""),
                 "text": value,
                 "column_ids": row_column_ids,
                 "column_texts": row_column_texts,
@@ -2453,7 +3077,12 @@ def build_fused_document(
                     current.id = uuid.uuid4().hex
                 current.ocr_raw = current.ocr_raw or block.text
                 current.text = value
-                current.type = _derived_body_type(value, block.type)
+                row_block_type = str(row.block_type or "")
+                title_type_values = {item.value for item in _TITLE_TYPES}
+                if row_block_type in title_type_values:
+                    current.type = BlockType(row_block_type)
+                else:
+                    current.type = _derived_body_type(value, block.type)
                 current.modified_by = (current.modified_by + ",multi_ocr_fusion").strip(",")
                 current.metadata = {
                     **(current.metadata or {}),
@@ -2462,6 +3091,10 @@ def build_fused_document(
                     "multi_ocr_split_count": len(nonempty_rows),
                     "multi_ocr_column_ids": list(row.column_ids),
                 }
+                if row_block_type in title_type_values:
+                    current.metadata["chapter_title_atomic"] = True
+                    current.metadata["atomic_ocr_sentence"] = True
+                    current.metadata["multi_ocr_numeric_chapter_recovered"] = True
                 current.metadata.setdefault("multi_ocr_audit", []).append({
                     "before": block.text,
                     "after": value,
@@ -2564,6 +3197,7 @@ def build_fused_document(
         "multi_ocr_character_auto_selected_rows": comparison.character_auto_selected_rows,
         "multi_ocr_local_reocr_queue": local_reocr_queue,
         "multi_ocr_decisions": decisions,
+        "multi_ocr_pipeline_audit": pipeline_audit.to_dict(),
     })
     result.add_log("multi_ocr_fusion", comparison.summary, changed)
     # Ruby is a locked structural side-channel, never an OCR voting candidate.
@@ -2689,7 +3323,7 @@ def refresh_comparison_after_text_standardization(
 
     The caller owns ``comparison`` and should pass a copy when the original OCR
     result must remain immutable.  Alignment metadata and physical column IDs are
-    retained; only text-derived confidence, conflicts and character fusion are
-    refreshed.
+    retained; only text-derived confidence, whole-sentence conflict state,
+    Unicode-equivalence audit metadata and CE diagnostics are refreshed.
     """
     return _finalize_comparison(comparison)

@@ -2,10 +2,45 @@
 """Thread-safe rolling RPM/TPM limiter for concurrent AI requests."""
 from __future__ import annotations
 
+import random
 import threading
 import time
 from collections import deque
 
+
+
+def retry_delay_seconds(
+    exc: Exception | None,
+    attempt: int,
+    *,
+    base: float = 0.75,
+    cap: float = 30.0,
+    jitter: float = 0.25,
+) -> float:
+    """Return Retry-After-aware exponential backoff with bounded jitter."""
+    response = getattr(exc, "response", None) if exc is not None else None
+    headers = (
+        getattr(response, "headers", None)
+        or (getattr(exc, "headers", None) if exc is not None else None)
+        or {}
+    )
+    retry_after = None
+    try:
+        retry_after = headers.get("retry-after") or headers.get("Retry-After")
+    except Exception:
+        retry_after = None
+    if retry_after is not None:
+        try:
+            value = max(0.25, min(float(retry_after), float(cap)))
+            # Retry-After is authoritative; add only a tiny positive spread so
+            # several parallel requests do not all wake on the same millisecond.
+            return min(float(cap), value * random.uniform(1.0, 1.05))
+        except (TypeError, ValueError):
+            pass
+    exponent = max(0, int(attempt))
+    value = min(float(cap), float(base) * (2 ** exponent))
+    spread = max(0.0, min(0.9, float(jitter)))
+    return max(0.05, min(float(cap), value * random.uniform(1.0 - spread, 1.0 + spread)))
 
 
 class RequestLimiter:

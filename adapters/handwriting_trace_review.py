@@ -1439,13 +1439,13 @@ def apply_review_payload(doc: UnifiedDocument, payload: Iterable[dict]) -> tuple
 
 
 _HTML_TEMPLATE = r'''<!DOCTYPE html>
-<html lang="zh-CN">
+<html lang="__HTML_LANG__">
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>OCR + 日语手写人工纠错</title>
 <style>
-:root { color-scheme: light; --ink:#1d1d1f; --muted:#6e6e73; --line:#dedee3; --blue:#0071e3; --bg:#f5f5f7; }
+:root { color-scheme: __COLOR_SCHEME__; --ink:#1d1d1f; --muted:#6e6e73; --line:#dedee3; --blue:#0071e3; --bg:#f5f5f7; }
 * { box-sizing:border-box; }
 html, body { margin:0; height:100%; overflow:hidden; font-family:-apple-system,BlinkMacSystemFont,"Hiragino Sans","Yu Gothic UI","Noto Sans CJK JP",sans-serif; color:var(--ink); background:var(--bg); }
 #app { height:100%; display:grid; grid-template-columns:minmax(240px, 0.85fr) minmax(350px, 1.15fr) minmax(360px, 1.2fr); gap:10px; padding:10px; }
@@ -1481,6 +1481,25 @@ button.primary { background:var(--blue); color:#fff; border-color:var(--blue); }
 .suggestion { display:inline-flex; gap:4px; align-items:center; margin:2px 4px 2px 0; padding:4px 7px; border:1px solid #c9cbd3; border-radius:7px; background:#eceef3; cursor:pointer; }
 .suggestion small { color:var(--muted); }
 .hidden { display:none !important; }
+body.nf-dark { --ink:#F2F4F7; --muted:#AAB4C0; --line:#3A434F; --blue:#4C9AFF; --bg:#111318; }
+body.nf-dark .panel { background:#1B1F24; }
+body.nf-dark .head, body.nf-dark .toolbar, body.nf-dark .candidates { border-color:var(--line); }
+body.nf-dark button, body.nf-dark .kmatch, body.nf-dark .candidate, body.nf-dark .suggestion {
+  background:#2A313A; border-color:#4C5866; color:var(--ink);
+}
+body.nf-dark button:hover, body.nf-dark .kmatch:hover, body.nf-dark .candidate:hover {
+  background:#263A55; border-color:#5B77A0;
+}
+body.nf-dark button.primary { background:var(--blue); border-color:var(--blue); color:#fff; }
+body.nf-dark #sourceScroll { background:#161A20; }
+body.nf-dark #canvasArea, body.nf-dark #editor { background:#1B1F24; }
+/* Printed glyph evidence must stay on a neutral white surface in either theme. */
+body.nf-dark #sourceImage, body.nf-dark #can { background:white; border-color:#687483; }
+body.nf-dark #columnText { background:#171B21; color:var(--ink); border-color:#4C5866; }
+body.nf-dark .notice { background:#332B18; border-color:#6E5A2A; color:#F2D999; }
+body.nf-dark .risk { background:#222831; border-color:var(--line); color:var(--ink); }
+body.nf-dark .risk.high { background:#3B2528; border-color:#805058; color:#FFB3B6; }
+body.nf-dark .risk.medium { background:#332B18; border-color:#6E5A2A; color:#F2D999; }
 </style>
 <script>
 if (!CanvasRenderingContext2D.prototype.reset) {
@@ -1489,7 +1508,7 @@ if (!CanvasRenderingContext2D.prototype.reset) {
 </script>
 <script src="jlect-jhr.compressed.js"></script>
 </head>
-<body>
+<body class="__THEME_CLASS__">
 <div id="app">
   <section class="panel">
     <div class="head"><strong>① OCR 原图定位</strong><span id="columnMeta" class="meta"></span></div>
@@ -1527,9 +1546,9 @@ if (!CanvasRenderingContext2D.prototype.reset) {
     <div id="editor">
       <div class="notice">当前文本来自你选择的普通 OCR（推荐 NDL OCR）并保持原样。程序只标记疑点，不自动改字。点击左侧原图定位后，可用描摹候选、键盘、macOS 日语输入源或系统手写输入进行替换、插入和删除。</div>
       <div id="riskBox" class="risk"></div>
-      <div><b style="font-size:11px;color:#6e6e73">预计算候选冲突</b><div id="preCandidates"></div></div>
+      <div><b style="font-size:11px;color:var(--muted)">预计算候选冲突</b><div id="preCandidates"></div></div>
       <textarea id="columnText" lang="ja" spellcheck="false"></textarea>
-      <div><b style="font-size:11px;color:#6e6e73">常用符号</b><div id="symbols" class="symbols"></div></div>
+      <div><b style="font-size:11px;color:var(--muted)">常用符号</b><div id="symbols" class="symbols"></div></div>
       <div class="toolbar" style="padding:0;border:0">
         <button class="primary" id="focusIme">⌨ 使用 macOS 日语输入法</button>
         <button id="insertMode">当前：替换单字</button>
@@ -1744,14 +1763,101 @@ window.addEventListener('load',()=>loadColumn(state.issueIndices.length?state.is
 </body></html>'''
 
 
-def build_review_html(records: list[dict]) -> str:
+_HTML_CHROME_TRANSLATIONS = {
+    "en_US": {
+        "OCR + 日语手写人工纠错": "OCR + Japanese Handwriting Manual Correction",
+        "① OCR 原图定位": "① OCR Original Image",
+        "← 上一列": "← Previous Column", "下一列 →": "Next Column →",
+        "⚠ 上一疑点": "⚠ Previous Issue", "下一疑点 ⚠": "Next Issue ⚠",
+        "↑ 上一字": "↑ Previous Character", "下一字 ↓": "Next Character ↓",
+        "② 分笔描摹 / 候选": "② Stroke Tracing / Candidates",
+        "在左侧点击目标字。画布会把原印刷字放到底层；可沿字形分笔描摹，也可点“自动描摹候选”。候选只供参考，绝不会静默覆盖 OCR。": "Click the target character on the left. The canvas places the printed glyph underneath; trace it stroke by stroke or choose “Auto-trace Candidates”. Candidates are references only and never silently overwrite OCR.",
+        "自动描摹候选": "Auto-trace Candidates", "清空画笔": "Clear Strokes", "撤销一笔": "Undo Stroke",
+        "近似候选": "Similar Candidates", "同笔画数候选": "Same-stroke-count Candidates",
+        "模糊候选": "Fuzzy Candidates", "包含相同笔画": "Shared-stroke Candidates", "错误笔顺候选": "Wrong-order Candidates",
+        "③ 修改 OCR 底稿": "③ Edit OCR Baseline",
+        "当前文本来自你选择的普通 OCR（推荐 NDL OCR）并保持原样。程序只标记疑点，不自动改字。点击左侧原图定位后，可用描摹候选、键盘、macOS 日语输入源或系统手写输入进行替换、插入和删除。": "The current text is kept exactly as returned by your selected standard OCR (NDL OCR recommended). The app flags suspicious areas but never changes characters automatically. After locating the original glyph on the left, use tracing candidates, the keyboard, macOS Japanese input, or system handwriting input to replace, insert, or delete characters.",
+        "预计算候选冲突": "Precomputed Candidate Conflicts", "常用符号": "Common Symbols",
+        "⌨ 使用 macOS 日语输入法": "⌨ Use macOS Japanese Input",
+        "当前：替换单字": "Current: Replace Character", "删除当前字": "Delete Current Character",
+        "恢复本列 OCR": "Restore Column OCR", "标记本列已核对": "Mark Column Reviewed",
+        "第 ${state.charIndex+1}/${arr.length || 1} 字": "Character ${state.charIndex+1}/${arr.length || 1}",
+        "已写入「${value}」；本列尚需点击“标记已核对”或继续检查。": "Wrote “${value}”. Continue checking this column or click “Mark Column Reviewed”.",
+        "疑点 ${score}/100": "Issue score ${score}/100", "未发现明显结构性疑点": "No obvious structural issue found",
+        "仍可按原图人工抽查。": "You can still spot-check against the original image.",
+        "无高置信冲突候选；可手动描摹或直接输入。": "No high-confidence conflicting candidates; trace manually or type directly.",
+        "第 ${item.page} 页 · 右起第 ${item.column} 列": "Page ${item.page} · Column ${item.column} from right",
+        " · 疑点 ": " · Issue ", "本列已标记核对。": "This column is marked reviewed.",
+        "已定位到疑点列，请对照原图确认。": "Issue column located; verify it against the original image.",
+        "当前为 OCR 底稿，尚未标记核对。": "Current text is the OCR baseline and is not yet marked reviewed.",
+        "当前没有自动标记的疑点列。": "No automatically flagged issue columns.",
+        "输入框已聚焦：现在可直接使用 macOS 日语输入法或系统手写输入，提交内容会作为本列最终结果。": "The input field is focused. You can now use macOS Japanese input or system handwriting input; submitted text becomes the final result for this column.",
+        "当前：插入新字": "Current: Insert Character", "已删除当前字；请继续核对。": "Deleted the current character; continue checking.",
+        "自动描摹生成 ${paths.length} 笔，请从候选中人工选择；未直接改动文本。": "Auto-trace generated ${paths.length} stroke(s). Choose a candidate manually; text was not changed directly.",
+    },
+    "ja_JP": {
+        "OCR + 日语手写人工纠错": "OCR + 日本語手書き手動修正",
+        "① OCR 原图定位": "① OCR 原画像位置確認",
+        "← 上一列": "← 前の列", "下一列 →": "次の列 →",
+        "⚠ 上一疑点": "⚠ 前の疑点", "下一疑点 ⚠": "次の疑点 ⚠",
+        "↑ 上一字": "↑ 前の文字", "下一字 ↓": "次の文字 ↓",
+        "② 分笔描摹 / 候选": "② 筆画トレース / 候補",
+        "在左侧点击目标字。画布会把原印刷字放到底层；可沿字形分笔描摹，也可点“自动描摹候选”。候选只供参考，绝不会静默覆盖 OCR。": "左側で対象文字をクリックしてください。キャンバス下層に元の印刷文字を表示し、字形に沿って筆画をなぞるか「自動トレース候補」を使用できます。候補は参考用で、OCRを自動上書きすることはありません。",
+        "自动描摹候选": "自動トレース候補", "清空画笔": "筆画をクリア", "撤销一笔": "1画戻す",
+        "近似候选": "近似候補", "同笔画数候选": "同画数候補", "模糊候选": "あいまい候補",
+        "包含相同笔画": "共通筆画を含む候補", "错误笔顺候选": "誤筆順候補",
+        "③ 修改 OCR 底稿": "③ OCR 下書きを修正",
+        "当前文本来自你选择的普通 OCR（推荐 NDL OCR）并保持原样。程序只标记疑点，不自动改字。点击左侧原图定位后，可用描摹候选、键盘、macOS 日语输入源或系统手写输入进行替换、插入和删除。": "現在のテキストは選択した通常OCR（NDL OCR推奨）の結果をそのまま保持しています。疑わしい箇所だけを示し、文字は自動修正しません。左側の原画像で位置を確認し、トレース候補、キーボード、macOS日本語入力、システム手書き入力で置換・挿入・削除できます。",
+        "预计算候选冲突": "事前計算した候補差異", "常用符号": "よく使う記号",
+        "⌨ 使用 macOS 日语输入法": "⌨ macOS 日本語入力を使用",
+        "当前：替换单字": "現在：1文字置換", "删除当前字": "現在文字を削除",
+        "恢复本列 OCR": "この列のOCRを復元", "标记本列已核对": "この列を確認済みにする",
+        "第 ${state.charIndex+1}/${arr.length || 1} 字": "${state.charIndex+1}/${arr.length || 1} 文字目",
+        "已写入「${value}」；本列尚需点击“标记已核对”或继续检查。": "「${value}」を書き込みました。この列の確認を続けるか「この列を確認済みにする」を押してください。",
+        "疑点 ${score}/100": "疑点スコア ${score}/100", "未发现明显结构性疑点": "明らかな構造上の疑点はありません",
+        "仍可按原图人工抽查。": "原画像と照合して手動抽出確認できます。",
+        "无高置信冲突候选；可手动描摹或直接输入。": "高信頼度の競合候補はありません。手動トレースまたは直接入力できます。",
+        "第 ${item.page} 页 · 右起第 ${item.column} 列": "${item.page} ページ · 右から ${item.column} 列目",
+        " · 疑点 ": " · 疑点 ", "本列已标记核对。": "この列は確認済みです。",
+        "已定位到疑点列，请对照原图确认。": "疑点列へ移動しました。原画像と照合してください。",
+        "当前为 OCR 底稿，尚未标记核对。": "現在はOCR下書きで、まだ確認済みにされていません。",
+        "当前没有自动标记的疑点列。": "自動でマークされた疑点列はありません。",
+        "输入框已聚焦：现在可直接使用 macOS 日语输入法或系统手写输入，提交内容会作为本列最终结果。": "入力欄にフォーカスしました。macOS日本語入力またはシステム手書き入力を使用でき、確定した内容がこの列の最終結果になります。",
+        "当前：插入新字": "現在：文字を挿入", "已删除当前字；请继续核对。": "現在文字を削除しました。確認を続けてください。",
+        "自动描摹生成 ${paths.length} 笔，请从候选中人工选择；未直接改动文本。": "自動トレースで ${paths.length} 画を生成しました。候補から手動で選択してください。テキストは直接変更していません。",
+    },
+}
+
+_HTML_LANGS = {"zh_CN": "zh-CN", "en_US": "en", "ja_JP": "ja"}
+
+
+def _translate_review_html_chrome(template: str, language: str) -> str:
+    """Translate only trusted UI literals before OCR/user data is injected."""
+    mapping = _HTML_CHROME_TRANSLATIONS.get(str(language), {})
+    for source, target in sorted(mapping.items(), key=lambda item: len(item[0]), reverse=True):
+        template = template.replace(source, target)
+    return template
+
+
+def build_review_html(records: list[dict], *, language: str = "zh_CN", dark: bool = False) -> str:
+    from ui.localization import normalize_language, translate_text
+
+    language = normalize_language(language)
     safe_records = []
     for record in records:
         item = clean_json_value(dict(record))
         item["image"] = Path(clean_text(item.get("image", ""))).name
+        reasons = item.get("risk_reasons")
+        if isinstance(reasons, list):
+            # These are program-generated review diagnostics, not OCR/document text.
+            item["risk_reasons"] = [translate_text(str(value), language) for value in reasons]
         safe_records.append(item)
     data = safe_json_dumps(safe_records, ensure_ascii=False).replace("</", "<\\/")
-    return _HTML_TEMPLATE.replace("__REVIEW_DATA__", data)
+    template = _translate_review_html_chrome(_HTML_TEMPLATE, language)
+    template = template.replace("__HTML_LANG__", _HTML_LANGS.get(language, "zh-CN"))
+    template = template.replace("__COLOR_SCHEME__", "dark" if dark else "light")
+    template = template.replace("__THEME_CLASS__", "nf-dark" if dark else "nf-light")
+    return template.replace("__REVIEW_DATA__", data)
 
 
 class HandwritingTraceReviewDialog:
@@ -1767,8 +1873,12 @@ class HandwritingTraceReviewDialog:
     ):
         from PySide6.QtCore import QUrl
         from PySide6.QtWidgets import (
-            QDialog, QHBoxLayout, QLabel, QMessageBox, QPushButton, QVBoxLayout,
+            QApplication, QDialog, QHBoxLayout, QLabel, QPushButton, QVBoxLayout,
         )
+        from ui.localized_dialogs import (
+            LocalizedMessageBox as QMessageBox, current_ui_language, ui_message,
+        )
+        self._ui_message = ui_message
         try:
             from PySide6.QtWebEngineCore import QWebEngineSettings
             from PySide6.QtWebEngineWidgets import QWebEngineView
@@ -1799,7 +1909,13 @@ class HandwritingTraceReviewDialog:
         shutil.copy2(_JLECT_JS, root / _JLECT_JS.name)
         if _JLECT_LICENSE.exists():
             shutil.copy2(_JLECT_LICENSE, root / "JLECT_LICENSE.txt")
-        (root / "review.html").write_text(build_review_html(records), encoding="utf-8")
+        app = QApplication.instance()
+        review_language = current_ui_language()
+        review_dark = bool(app is not None and app.property("nfDarkMode"))
+        (root / "review.html").write_text(
+            build_review_html(records, language=review_language, dark=review_dark),
+            encoding="utf-8",
+        )
 
         layout = QVBoxLayout(self._dialog)
         layout.setContentsMargins(10, 10, 10, 10)
@@ -1998,10 +2114,12 @@ class OCRManualReviewDialog:
             QPixmap, QShortcut, QTextCursor,
         )
         from PySide6.QtWidgets import (
-            QApplication, QComboBox, QDialog, QFrame, QHBoxLayout, QLabel, QLineEdit, QMessageBox,
+            QApplication, QComboBox, QDialog, QFrame, QHBoxLayout, QLabel, QLineEdit,
             QPlainTextEdit, QPushButton, QScrollArea, QSizePolicy, QSplitter,
             QVBoxLayout, QWidget,
         )
+        from ui.localized_dialogs import LocalizedMessageBox as QMessageBox, ui_message
+        self._ui_message = ui_message
 
         class ClickableImageLabel(QLabel):
             clickedRatio = Signal(float)
@@ -2323,10 +2441,10 @@ class OCRManualReviewDialog:
         macocr_row = QHBoxLayout()
         self._macocr_result = QLineEdit()
         self._macocr_result.setReadOnly(True)
-        self._macocr_result.setPlaceholderText("仅在手动点击后运行 macOCR；不会后台自动识别")
-        self._macocr_column_btn = QPushButton("macOCR 识别本列并复制")
+        self._macocr_result.setPlaceholderText("仅在手动点击后运行 Apple OCR；不会后台自动识别")
+        self._macocr_column_btn = QPushButton("Apple OCR 识别本列并复制")
         self._macocr_column_btn.setProperty("role", "secondary")
-        self._macocr_apply_btn = QPushButton("用 macOCR 替换本列")
+        self._macocr_apply_btn = QPushButton("用 Apple OCR 替换本列")
         self._macocr_apply_btn.setProperty("role", "secondary")
         self._macocr_apply_btn.setEnabled(False)
         self._open_column_btn = QPushButton("用 Mac 预览打开本列（⌘O）")
@@ -2563,11 +2681,11 @@ class OCRManualReviewDialog:
 
     def _start_column_macocr(self, *, copy_result: bool) -> None:
         if self._column_ocr_running:
-            self._status.setText("macOCR 正在识别当前列，请稍候。")
+            self._status.setText("Apple OCR 正在识别当前列，请稍候。")
             return
         image_path = self._current_column_path()
         if not image_path.exists():
-            self._status.setText("本列原图不存在，无法运行 macOCR。")
+            self._status.setText("本列原图不存在，无法运行 Apple OCR。")
             return
         generation = self._column_ocr_generation + 1
         self._column_ocr_generation = generation
@@ -2575,7 +2693,7 @@ class OCRManualReviewDialog:
         target_text = self._current_text()
         self._column_ocr_running = True
         self._macocr_column_btn.setEnabled(False)
-        self._status.setText("正在手动运行 macOCR 识别当前单列；逐字框不会被替换…")
+        self._status.setText("正在手动运行 Apple OCR 识别当前单列；逐字框不会被替换…")
         signals = self._ColumnOCRSignals()
         self._column_ocr_signals = signals
 
@@ -2716,21 +2834,21 @@ class OCRManualReviewDialog:
         self._render_column_image()
         self._render_glyph_crop()
         if text:
-            self._status.setText("macOCR 本列结果已显示并复制到剪贴板；可选择替换本列。")
+            self._status.setText("Apple OCR 本列结果已显示并复制到剪贴板；可选择替换本列。")
         else:
-            self._status.setText("macOCR 完成了字符框对齐，但未返回可复制文本。")
+            self._status.setText("Apple OCR 完成了字符框对齐，但未返回可复制文本。")
 
     def _column_macocr_failed(self, payload) -> None:
         if int(payload.get("generation", -1)) != self._column_ocr_generation:
             return
         self._column_ocr_running = False
         self._macocr_column_btn.setEnabled(True)
-        message = str(payload.get("message") or "macOCR 未返回结果")
+        message = str(payload.get("message") or "Apple OCR 未返回结果")
         record_index = int(payload.get("record_index", -1))
         if 0 <= record_index < len(self._records):
             self._records[record_index]["macocr_alignment_error"] = message
         if record_index == self._index:
-            self._status.setText(f"macOCR 当前列识别失败：{message}")
+            self._status.setText(f"Apple OCR 当前列识别失败：{message}")
 
     def _apply_macocr_column(self) -> None:
         text = self._macocr_result.text().strip()
@@ -2738,7 +2856,7 @@ class OCRManualReviewDialog:
             return
         self._editor.setPlainText(text)
         self._reviewed.add(str(self._current().get("block_id", "")))
-        self._status.setText("已用 macOCR 结果替换本列；应用人工纠错结果后写回正文。")
+        self._status.setText("已用 Apple OCR 结果替换本列；应用人工纠错结果后写回正文。")
 
     def _clear_candidates(self, message: str = "候选只针对当前框运行，不会自动覆盖正文。") -> None:
         self._candidate_generation += 1
@@ -3340,9 +3458,7 @@ class OCRManualReviewDialog:
             answer = self._message_box.question(
                 self._dialog,
                 "仍有空列未输入",
-                f"还有 {len(unresolved)} 列 OCR 三次均为空，尚未人工输入。\n\n"
-                "继续后会保留醒目的 □ 标记，不会静默删除这些列；建议返回逐列补全。\n\n"
-                "仍要应用当前结果吗？",
+                self._ui_message("handwriting.empty_columns.confirm", count=len(unresolved)),
                 self._message_box.StandardButton.Yes | self._message_box.StandardButton.No,
                 self._message_box.StandardButton.No,
             )

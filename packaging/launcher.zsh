@@ -218,6 +218,18 @@ fi
 STATUS=$?
 print "BOOT_STAGE=exit status=$STATUS"
 if [[ $STATUS -ne 0 ]]; then
-  show_error "程序依赖准备或启动失败（代码 $STATUS）。可查看应用支持目录中的本地日志。"
+  case "$STATUS" in
+    139|245)
+      print "BOOT_STAGE=gui_crash signal=11 status=$STATUS"
+      show_error "程序发生原生崩溃（SIGSEGV）。EPUB 如果已经写出通常仍是有效文件；请查看应用支持目录中的 launcher.log。当前版本默认禁用不稳定的 Qt WebEngine EPUB 预览。"
+      ;;
+    134)
+      print "BOOT_STAGE=gui_crash signal=6 status=$STATUS"
+      show_error "程序发生原生异常退出（SIGABRT）。请查看应用支持目录中的 launcher.log。"
+      ;;
+    *)
+      show_error "程序准备或运行失败（代码 $STATUS）。可查看应用支持目录中的本地日志。"
+      ;;
+  esac
 fi
 exit $STATUS

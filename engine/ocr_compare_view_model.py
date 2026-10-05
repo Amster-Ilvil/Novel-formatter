@@ -27,7 +27,53 @@ EXPLICIT_FUSION_SELECTION_ORIGINS = frozenset({
     "restored_human",
     "external_ai_package",
     "ai_adjudication_result",
+    "ai_visual_batch_adjudication",
+    "ai_gpt_grade_adjudication",
+    "ai_overlay",
+    "local_targeted_retry_majority_adjudication",
 })
+
+# Stable history groups used by the OCR comparison UI.  These values are kept
+# independent from display text so restored sessions and future localization do
+# not change adjudication history filtering.  Automatic exact consensus is not
+# an adjudication and is deliberately excluded.
+DECISION_HISTORY_GROUPS = {
+    "local": frozenset({"local_targeted_retry_majority_adjudication"}),
+    "human": frozenset({
+        "human_ocr_compare", "human_image_review", "human_manual_edit", "restored_human",
+    }),
+    # "本地 AI" means the in-app AI adjudication workflow.  Results that
+    # were exported, processed elsewhere and then imported back are kept in a
+    # separate cloud/external bucket even though both ultimately become
+    # non-destructive fusion candidates.
+    "local_ai": frozenset({"ai_visual_batch_adjudication", "ai_gpt_grade_adjudication"}),
+    "cloud_ai": frozenset({
+        "external_ai_package", "ai_adjudication_result", "ai_overlay",
+    }),
+}
+
+DECISION_HISTORY_LABELS = {
+    "local": "本地裁决",
+    "human": "人工裁决",
+    "local_ai": "本地 AI 裁决",
+    "cloud_ai": "云端 AI 裁决",
+}
+
+def fusion_decision_origin_group(value: str) -> str:
+    """Return the stable history group for one explicit fusion decision.
+
+    Empty/automatic/unknown origins return ``""`` and therefore do not appear
+    in the adjudicated-history view.  In particular, exact consensus is a model
+    agreement rather than a human/local/AI adjudication.
+    """
+    origin = str(value or "")
+    for group, origins in DECISION_HISTORY_GROUPS.items():
+        if origin in origins:
+            return group
+    return ""
+
+def fusion_decision_origin_label(value: str) -> str:
+    return DECISION_HISTORY_LABELS.get(fusion_decision_origin_group(value), "")
 
 
 def is_explicit_fusion_selection_origin(value: str) -> bool:
@@ -409,11 +455,14 @@ def build_fusion_states(
             texts,
             preferred_model_index=preferred_index,
             auto_choose=auto_choose,
-            synthetic_text=str(getattr(row, "character_fused_text", "") or ""),
-            synthetic_auto_selected=bool(getattr(row, "character_fusion_auto_selected", False)),
-            synthetic_confidence=float(getattr(row, "character_fusion_confidence", 0.0) or 0.0),
-            synthetic_reason=str(getattr(row, "character_fusion_reason", "") or ""),
-            local_reocr_recommended=bool(getattr(row, "local_reocr_recommended", False)),
+            # V2.0: ordinary multi-model review is whole-sentence only.
+            # Legacy character-fusion fields from old packages are intentionally
+            # not surfaced as a selectable/auto-selected synthetic candidate.
+            synthetic_text="",
+            synthetic_auto_selected=False,
+            synthetic_confidence=0.0,
+            synthetic_reason="",
+            local_reocr_recommended=False,
             # v8 semantics: two-model common candidates are usable output,
             # not a second confirmation queue.  The classification remains
             # visible for audit, but never blanks the only sentence.
@@ -461,19 +510,33 @@ def resolve_stable_row_index(
     rows: Sequence[object],
     requested_row_index: int,
     incoming_columns: Sequence[str] = (),
+    incoming_sentence_group_id: str = "",
 ) -> int | None:
-    """Resolve a cross-view row without trusting a stale numeric position.
+    """Resolve one cross-view sentence without collapsing rows sharing a column.
 
-    The shared row index is fastest when it still refers to the same complete
-    physical-column group.  After recovery or re-alignment, the exact ordered
-    column identity is authoritative. Ambiguous matches are rejected rather
-    than writing a decision to the wrong OCR sentence.
+    ``sentence_group_id`` is authoritative for modern sessions. Physical column
+    IDs are only a legacy recovery hint because one printed vertical column can
+    legitimately contain many independent sentence rows. A stale numeric row is
+    accepted only when its stable sentence identity also matches (when supplied).
     """
     columns = tuple(str(value) for value in (incoming_columns or ()) if str(value))
+    group_id = str(incoming_sentence_group_id or "")
     try:
         requested = int(requested_row_index)
     except (TypeError, ValueError, OverflowError):
         requested = -1
+
+    if group_id:
+        if 0 <= requested < len(rows):
+            current_group = str(getattr(rows[requested], "sentence_group_id", "") or "")
+            if current_group == group_id:
+                return requested
+        group_matches = [
+            index for index, row in enumerate(rows)
+            if str(getattr(row, "sentence_group_id", "") or "") == group_id
+        ]
+        return group_matches[0] if len(group_matches) == 1 else None
+
     if 0 <= requested < len(rows):
         if not columns:
             return requested

@@ -11,8 +11,8 @@ QPlainTextEdit {
     padding: 10px 14px;
     font-family: "Menlo", "Monaco", "Courier New";
     font-size: 12px;
-    selection-background-color: #DCE8FF;
-    selection-color: #1D1D1F;
+    selection-background-color: #E4EEFF;
+    selection-color: #14202E;
 }
 '''
 

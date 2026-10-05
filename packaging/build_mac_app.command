@@ -41,6 +41,7 @@ rsync -a \
   --exclude 'build/' \
   --exclude 'tools/apple_vision_helper/.module-cache/' \
   --exclude 'packaging/' \
+  --include '/build_apple_vision_helper.command' \
   --exclude 'legacy/' \
   --exclude '*.command' \
   --exclude '*.app/' \

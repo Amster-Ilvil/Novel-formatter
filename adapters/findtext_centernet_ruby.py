@@ -14,10 +14,14 @@ First use is isolated in ``.venv-findtext-centernet`` and
 """
 from __future__ import annotations
 
+import atexit
 import copy
+from contextlib import contextmanager
+from datetime import datetime
 import hashlib
 import http.client
 import json
+import math
 import os
 import queue
 import re
@@ -174,10 +178,30 @@ class RubyLine:
     # tuple order follows ``pairs``.  Older/upstream payloads without character
     # boxes simply leave this empty; text matching still works as before.
     pair_boxes: tuple[tuple[float, float, float, float], ...] = ()
+    # Optional per-reading geometry, in the same pair order as ``pair_boxes``.
+    # It is alignment evidence only; authoritative prose remains the Ruby base.
+    pair_reading_boxes: tuple[tuple[float, float, float, float], ...] = ()
 
     @property
     def pairs(self) -> tuple[tuple[str, str], ...]:
         return tuple((m.group(1), m.group(2)) for m in RUBY_RE.finditer(self.aozora))
+
+
+@dataclass(frozen=True)
+class _RubyMatchContext:
+    """A local authoritative text/geometry view used only for Ruby anchoring.
+
+    findtextCenterNet already provides per-line/per-Ruby geometry.  GUI fusion
+    may later merge several physical columns into one long ``Block.text``.
+    Keep the fused block authoritative, but score Ruby against the smallest
+    surviving physical text context when review lineage is available.
+    """
+
+    text: str
+    bbox: tuple[float, float, float, float] | None
+    scope: str = "block"
+    row_index: int = -1
+    column_id: str = ""
 
 
 @dataclass(frozen=True)
@@ -202,6 +226,7 @@ class RubyPreservationReport:
     cache_misses: int = 0
     failed_rois: int = 0
     error: str = ""
+    backend: str = ""
 
     def to_dict(self) -> dict:
         return {
@@ -225,6 +250,7 @@ class RubyPreservationReport:
             "cache_misses": self.cache_misses,
             "failed_rois": self.failed_rois,
             "error": self.error,
+            "backend": self.backend,
         }
 
 
@@ -259,7 +285,9 @@ def _source_dir() -> Path:
 def _runtime_python(source_dir: Path) -> Path:
     override = os.environ.get("NOVEL_FORMATTER_FINDTEXT_CENTERNET_PYTHON", "").strip()
     if override:
-        return Path(override).expanduser().resolve()
+        # Keep virtual-environment launchers as symlinks: Python uses the
+        # invoked path to discover the venv's pyvenv.cfg and site-packages.
+        return Path(os.path.abspath(Path(override).expanduser()))
     # External source overrides may intentionally share the current Python.
     if source_dir != DEFAULT_SOURCE_DIR and os.environ.get(
         "NOVEL_FORMATTER_FINDTEXT_CENTERNET_USE_CURRENT_PYTHON", ""
@@ -431,8 +459,10 @@ def _download_curl_once(
     started = time.monotonic()
     last_report = 0.0
     _emit(log_callback, f"🌐 {label}：系统 curl 已启动，正在接收数据…")
+    from adapters.subprocess_watchdog import isolated_process_kwargs
     process = subprocess.Popen(
         command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+        **isolated_process_kwargs(),
     )
     try:
         while process.poll() is None:
@@ -449,10 +479,7 @@ def _download_curl_once(
             time.sleep(0.5)
         stdout, stderr = process.communicate(timeout=5)
     except Exception:
-        try:
-            process.kill()
-        except Exception:
-            pass
+        _terminate_download_process(process)
         raise
     current = partial.stat().st_size if partial.exists() else 0
     _emit(
@@ -840,23 +867,12 @@ def _xet_line_expected_probe(line: str) -> bool:
 
 
 def _terminate_download_process(proc) -> None:
-    try:
-        proc.terminate()
-    except Exception:
-        pass
-    try:
-        proc.wait(timeout=5)
-        return
-    except Exception:
-        pass
-    try:
-        proc.kill()
-    except Exception:
-        pass
-    try:
-        proc.wait(timeout=5)
-    except Exception:
-        pass
+    # Hugging Face Xet can spawn its own helper process.  OCR/model setup must
+    # therefore terminate the full worker process group rather than only the
+    # immediate Python/curl parent; otherwise a cancelled download can keep
+    # consuming CPU/network after Novel Formatter has moved on.
+    from adapters.subprocess_watchdog import terminate_process
+    terminate_process(proc, grace=5.0)
 
 
 def _hf_xet_download(python: Path, *, filename: str, target: Path, spec: dict, log_callback=None) -> bool:
@@ -891,9 +907,11 @@ def _hf_xet_download(python: Path, *, filename: str, target: Path, spec: dict, l
     # concurrency, and on weak links aggressive concurrency can make recovery
     # worse.  User-provided HF_TOKEN/HF_XET_* settings are inherited unchanged.
     _emit(log_callback, f"⚡ {filename}：尝试 Hugging Face Xet；若停滞将自动切换可续传 HTTP…")
+    from adapters.subprocess_watchdog import isolated_process_kwargs
     proc = subprocess.Popen(
         [str(python), "-u", "-c", script],
         stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1, env=env,
+        **isolated_process_kwargs(),
     )
     q = queue.Queue()
     result_path = ""
@@ -1702,48 +1720,53 @@ def _normalise_context(text: str) -> str:
     return re.sub(r"\s+", "", value)
 
 
-def _line_pair_boxes(
+def _line_pair_geometry(
     item: dict, payload: dict, pairs: tuple[tuple[str, str], ...], *,
     offset_x: float = 0.0, offset_y: float = 0.0,
-) -> tuple[tuple[float, float, float, float], ...]:
-    """Recover per-base geometry from findtextCenterNet character boxes.
+) -> tuple[
+    tuple[tuple[float, float, float, float], ...],
+    tuple[tuple[float, float, float, float], ...],
+]:
+    """Recover base + reading geometry from findtextCenterNet character boxes.
 
-    Upstream emits every decoded character with ``blockidx``/``lineidx`` and
-    ``rubybase`` flags.  Group consecutive ruby-base characters, then map the
-    groups to the Aozora pairs from the corresponding line.  Geometry is used
-    only as alignment evidence; it never becomes OCR text or a fusion vote.
+    Ruby readings are intentionally allowed to extend beyond their base span.
+    We therefore map base and reading runs independently instead of clipping a
+    reading to the base bounding box.  This preserves Japanese overhang as
+    auditable geometry while keeping OCR text and fusion completely unchanged.
     """
     if not pairs:
-        return ()
+        return (), ()
     raw_boxes = payload.get("box") or []
     if not isinstance(raw_boxes, list):
-        return ()
+        return (), ()
     blockidx = item.get("blockidx")
     lineidx = item.get("lineidx")
     if blockidx is None or lineidx is None:
-        return ()
+        return (), ()
 
-    ordered: list[dict] = []
-    for raw in raw_boxes:
-        if not isinstance(raw, dict):
-            continue
-        if raw.get("blockidx") != blockidx or raw.get("lineidx") != lineidx:
-            continue
-        ordered.append(raw)
+    ordered = [
+        raw for raw in raw_boxes
+        if isinstance(raw, dict)
+        and raw.get("blockidx") == blockidx
+        and raw.get("lineidx") == lineidx
+    ]
 
-    groups: list[list[dict]] = []
-    current: list[dict] = []
-    for raw in ordered:
-        is_base = bool(raw.get("rubybase"))
-        if is_base:
-            current.append(raw)
-        elif current:
-            groups.append(current)
-            current = []
-    if current:
-        groups.append(current)
-    if not groups:
-        return ()
+    def flag(raw: dict, kind: str) -> bool:
+        if kind == "base":
+            return bool(raw.get("rubybase"))
+        return bool(raw.get("ruby")) and not bool(raw.get("rubybase"))
+
+    def runs(kind: str) -> list[list[dict]]:
+        out: list[list[dict]] = []
+        current: list[dict] = []
+        for raw in ordered:
+            if flag(raw, kind):
+                current.append(raw)
+            elif current:
+                out.append(current); current = []
+        if current:
+            out.append(current)
+        return out
 
     def group_text(group: list[dict]) -> str:
         return "".join(str(raw.get("text") or "") for raw in group)
@@ -1768,28 +1791,45 @@ def _line_pair_boxes(
             max(v[2] for v in coords), max(v[3] for v in coords),
         )
 
-    unused = set(range(len(groups)))
-    mapped: list[tuple[float, float, float, float]] = []
-    for pair_index, (base, _reading) in enumerate(pairs):
-        base_norm = _normalise_context(base)
-        chosen = None
-        for group_index in sorted(unused):
-            if _normalise_context(group_text(groups[group_index])) == base_norm:
-                chosen = group_index
-                break
-        # When upstream character text and Aozora text differ only enough to
-        # defeat exact matching, preserve deterministic reading order iff the
-        # group cardinality itself is unambiguous.
-        if chosen is None and len(groups) == len(pairs) and pair_index < len(groups):
-            chosen = pair_index
-        if chosen is None or chosen not in unused:
+    def map_groups(groups: list[list[dict]], expected: list[str]) -> tuple[tuple[float, float, float, float], ...]:
+        if not groups:
             return ()
-        box = group_box(groups[chosen])
-        if box is None:
-            return ()
-        unused.remove(chosen)
-        mapped.append(box)
-    return tuple(mapped)
+        unused = set(range(len(groups)))
+        mapped: list[tuple[float, float, float, float]] = []
+        for pair_index, expected_text in enumerate(expected):
+            wanted = _normalise_context(expected_text)
+            exact = [
+                i for i in sorted(unused)
+                if _normalise_context(group_text(groups[i])) == wanted
+            ]
+            chosen = exact[0] if len(exact) == 1 else None
+            # Upstream normally emits one run per Ruby pair.  If character OCR
+            # differs but run cardinality is exact, preserve deterministic pair
+            # order rather than discarding useful geometry.
+            if chosen is None and len(groups) == len(expected) and pair_index in unused:
+                chosen = pair_index
+            if chosen is None or chosen not in unused:
+                return ()
+            box = group_box(groups[chosen])
+            if box is None:
+                return ()
+            unused.remove(chosen)
+            mapped.append(box)
+        return tuple(mapped)
+
+    base_boxes = map_groups(runs("base"), [base for base, _ in pairs])
+    reading_boxes = map_groups(runs("reading"), [reading for _, reading in pairs])
+    return base_boxes, reading_boxes
+
+
+def _line_pair_boxes(
+    item: dict, payload: dict, pairs: tuple[tuple[str, str], ...], *,
+    offset_x: float = 0.0, offset_y: float = 0.0,
+) -> tuple[tuple[float, float, float, float], ...]:
+    """Backward-compatible base-geometry helper."""
+    return _line_pair_geometry(
+        item, payload, pairs, offset_x=offset_x, offset_y=offset_y
+    )[0]
 
 
 def _parse_payload(
@@ -1813,7 +1853,7 @@ def _parse_payload(
         y1 = float(item.get("y1") or 0.0) + float(offset_y)
         x2 = float(item.get("x2") or 0.0) + float(offset_x)
         y2 = float(item.get("y2") or 0.0) + float(offset_y)
-        pair_boxes = _line_pair_boxes(
+        pair_boxes, pair_reading_boxes = _line_pair_geometry(
             item, payload, pairs, offset_x=offset_x, offset_y=offset_y
         )
         key = (aozora, plain, round(x1, 2), round(y1, 2), round(x2, 2), round(y2, 2))
@@ -1823,6 +1863,7 @@ def _parse_payload(
         out.append(RubyLine(
             page=page, aozora=aozora, plain=plain,
             x1=x1, y1=y1, x2=x2, y2=y2, pair_boxes=pair_boxes,
+            pair_reading_boxes=pair_reading_boxes,
         ))
     return out
 
@@ -1873,6 +1914,7 @@ def _link_or_copy(source: Path, target: Path) -> None:
 def _run_process(
     command: list[str], *, cwd: Path, cancel_check=None, timeout: float = 3600.0
 ) -> tuple[int, str, str]:
+    from adapters.subprocess_watchdog import isolated_process_kwargs, terminate_process
     proc = subprocess.Popen(
         command,
         cwd=str(cwd),
@@ -1881,24 +1923,117 @@ def _run_process(
         text=True,
         encoding="utf-8",
         errors="replace",
+        **isolated_process_kwargs(),
     )
     started = time.monotonic()
     while proc.poll() is None:
         if callable(cancel_check) and cancel_check():
-            proc.terminate()
-            try:
-                proc.wait(timeout=5)
-            except subprocess.TimeoutExpired:
-                proc.kill()
+            terminate_process(proc, grace=5.0)
             raise InterruptedError("Ruby 识别已停止")
         if time.monotonic() - started > timeout:
-            proc.kill()
+            terminate_process(proc, grace=2.0)
             raise TimeoutError("findtextCenterNet Ruby 识别超时")
         time.sleep(0.10)
     stdout, stderr = proc.communicate()
     return int(proc.returncode or 0), stdout, stderr
 
 
+def _run_upstream_cli_batch(
+    specs: list[tuple[int, str, int, int, str]], python: Path, source_dir: Path, *,
+    cancel_check=None, log_callback=None,
+) -> dict[str, tuple[dict | None, str | None]]:
+    """Run upstream CLI once for all fallback ROIs, not once per crop."""
+    if not specs:
+        return {}
+    for _page_no, staged_path, _offset_x, _offset_y, _display_name in specs:
+        if callable(cancel_check) and cancel_check():
+            raise InterruptedError("Ruby 识别已停止")
+        Path(staged_path + ".json").unlink(missing_ok=True)
+
+    _emit(
+        log_callback,
+        f"↪️ findtext 长驻 worker 未就绪：改用原项目 CLI 单进程处理 {len(specs)} 个剩余 ROI，避免逐裁片重复加载模型…",
+    )
+    started = time.monotonic()
+    command = [str(python), "run_ocr.py", *[str(Path(spec[1]).resolve()) for spec in specs]]
+    code, stdout, stderr = _run_process(command, cwd=source_dir, cancel_check=cancel_check)
+    failure_detail = " | ".join(
+        (stderr or stdout or "上游 CLI 未返回输出").strip().splitlines()[-4:]
+    )
+    results: dict[str, tuple[dict | None, str | None]] = {}
+    succeeded = 0
+    for _page_no, staged_path, _offset_x, _offset_y, _display_name in specs:
+        result_path = Path(staged_path + ".json")
+        key = str(Path(staged_path).resolve())
+        try:
+            if result_path.is_file():
+                try:
+                    payload = json.loads(result_path.read_text(encoding="utf-8"))
+                except Exception as exc:
+                    results[key] = (None, f"上游 JSON 无法解析：{exc}")
+                else:
+                    if isinstance(payload, dict):
+                        results[key] = (payload, None)
+                        succeeded += 1
+                    else:
+                        results[key] = (None, "上游 JSON 顶层不是对象")
+            else:
+                results[key] = (
+                    None,
+                    failure_detail if code else "上游 CLI 未生成该 ROI 的 JSON",
+                )
+        finally:
+            result_path.unlink(missing_ok=True)
+    _emit(
+        log_callback,
+        f"↪️ findtext CLI fallback 完成 · 成功 {succeeded}/{len(specs)} 个 ROI · {time.monotonic() - started:.1f}s",
+    )
+    return results
+
+
+
+
+def _run_upstream_cli_individual_compat(
+    specs: list[tuple[int, str, int, int, str]], python: Path, source_dir: Path, *,
+    cancel_check=None, log_callback=None,
+) -> dict[str, tuple[dict | None, str | None]]:
+    """Compatibility path for minimal/legacy upstream trees.
+
+    This path is intentionally limited to runtimes that cannot start the
+    persistent worker contract. It preserves partial success: one bad ROI must
+    not discard JSON already produced by another ROI. Production-ready upstream
+    trees use :class:`FindtextCenterNetSession` and never enter this path.
+    """
+    results: dict[str, tuple[dict | None, str | None]] = {}
+    for _page_no, staged_path, _offset_x, _offset_y, display_name in specs:
+        if callable(cancel_check) and cancel_check():
+            raise InterruptedError("Ruby 识别已停止")
+        result_path = Path(staged_path + ".json")
+        result_path.unlink(missing_ok=True)
+        command = [str(python), "run_ocr.py", str(Path(staged_path).resolve())]
+        code, stdout, stderr = _run_process(
+            command, cwd=source_dir, cancel_check=cancel_check
+        )
+        key = str(Path(staged_path).resolve())
+        try:
+            if result_path.is_file():
+                try:
+                    payload = json.loads(result_path.read_text(encoding="utf-8"))
+                except Exception as exc:
+                    results[key] = (None, f"上游 JSON 无法解析：{exc}")
+                else:
+                    results[key] = (payload, None) if isinstance(payload, dict) else (None, "上游 JSON 顶层不是对象")
+            else:
+                detail = " | ".join((stderr or stdout or "上游 CLI 未返回输出").strip().splitlines()[-4:])
+                results[key] = (None, detail if code else "上游 CLI 未生成该 ROI 的 JSON")
+        finally:
+            result_path.unlink(missing_ok=True)
+        _emit(log_callback, f"↪️ findtext 兼容 CLI · {display_name} · {'ok' if isinstance(results[key][0], dict) else 'failed'}")
+    return results
+
+
+class FindtextWorkerStartupError(RuntimeError):
+    """The upstream model process failed before it could accept ROI requests."""
 
 
 class FindtextCenterNetSession:
@@ -1921,15 +2056,93 @@ class FindtextCenterNetSession:
         self._request_id = 0
         self.backend = ""
         self._last_heartbeat = 0.0
+        self._started_at = 0.0
+        self._stage = "worker starting"
+        stamp = time.strftime("%Y%m%d-%H%M%S")
+        self.diagnostic_path = ROOT / "debug" / "findtext-centernet" / f"session-{stamp}-{os.getpid()}-{time.time_ns() % 1_000_000:06d}.log"
 
-    def _drain_upstream_log(self) -> None:
+    def _log(self, message: str) -> None:
+        line = str(message)
+        try:
+            self.diagnostic_path.parent.mkdir(parents=True, exist_ok=True)
+            timestamp = datetime.now().astimezone().isoformat(timespec="seconds")
+            safe_line = line.replace(str(Path.home()), "~")[:2000]
+            with self.diagnostic_path.open("a", encoding="utf-8") as stream:
+                stream.write(f"{timestamp} {safe_line}\n")
+        except OSError:
+            pass
+        _emit(self.log_callback, line)
+
+    def _handle_progress(self, data: dict) -> None:
+        stage = str(data.get("stage") or "unknown")
+        self._stage = stage
+        if stage == "upstream_import":
+            self._log(
+                "findtext · worker started · "
+                f"Python {data.get('python', '?')} · Torch {data.get('torch', '?')} · "
+                f"CoreML Tools {data.get('coremltools', '?')}"
+            )
+            self._log("findtext · importing pinned upstream; CoreML models initialize during this step")
+        elif stage == "roi_started":
+            self._log(
+                f"🔎 findtext ROI {data.get('index', '?')}/{data.get('total', '?')} · inference started"
+            )
+        elif stage == "roi_finished":
+            outcome = "ok" if data.get("ok") else "failed"
+            error_type = str(data.get("error_type") or "")
+            error_suffix = f" · {error_type}" if error_type else ""
+            self._log(
+                f"🔎 findtext ROI {data.get('index', '?')}/{data.get('total', '?')} · "
+                f"{outcome}{error_suffix} · {float(data.get('elapsed_seconds') or 0):.2f}s"
+            )
+        elif stage in {"coreml_model_started", "coreml_model_finished", "coreml_model_failed"}:
+            model = Path(str(data.get("model") or "unknown model")).name
+            if stage == "coreml_model_started":
+                self._log(f"🧠 CoreML loading {model}…")
+            else:
+                outcome = "loaded" if stage == "coreml_model_finished" else "failed"
+                elapsed = float(data.get("elapsed_seconds") or 0)
+                self._log(f"🧠 CoreML {outcome} {model} · {elapsed:.1f}s")
+        elif stage == "coreml_compiled_cache_hit":
+            model = Path(str(data.get("model") or "unknown model")).name
+            self._log(f"⚡ CoreML compiled cache hit · {model}")
+        elif stage in {"coreml_compile_started", "coreml_compile_finished", "coreml_compile_failed"}:
+            model = Path(str(data.get("model") or "unknown model")).name
+            if stage == "coreml_compile_started":
+                self._log(f"🧩 CoreML first-use compile · {model}…")
+            elif stage == "coreml_compile_finished":
+                elapsed = float(data.get("elapsed_seconds") or 0)
+                self._log(f"✅ CoreML compiled cache ready · {model} · {elapsed:.1f}s")
+            else:
+                self._log(
+                    f"⚠️ CoreML compiled cache unavailable · {model} · "
+                    f"{str(data.get('error') or 'fallback to package load')}"
+                )
+        else:
+            self._log(f"findtext · worker progress · stage={stage}")
+
+    def _drain_upstream_log(self, *, settle_seconds: float = 0.0) -> None:
         pump = self._stderr_pump
         if pump is None:
             return
-        for line in pump.get_nowait_lines(limit=100):
-            line = str(line).strip()
-            if line:
-                _emit(self.log_callback, "findtext · " + line)
+        deadline = time.monotonic() + max(0.0, float(settle_seconds or 0.0))
+        while True:
+            lines = pump.get_nowait_lines(limit=100)
+            for line in lines:
+                line = str(line).strip()
+                if line:
+                    # Upstream may print recognized book text; keep its existing UI
+                    # visibility, but never persist raw stderr into diagnostics.
+                    _emit(self.log_callback, "findtext · " + line)
+            if time.monotonic() >= deadline:
+                return
+            # stderr and protocol stdout are pumped by independent reader threads.
+            # Give a just-completed upstream print a tiny chance to reach the queue
+            # so UI diagnostics are not lost merely because the JSON result won
+            # the scheduling race.  This never touches the persistent diagnostic
+            # file and is intentionally bounded to a few milliseconds.
+            if not lines:
+                time.sleep(0.005)
 
     def _read_protocol(self, *, timeout: float, label: str) -> dict:
         assert self.proc is not None
@@ -1938,9 +2151,13 @@ class FindtextCenterNetSession:
         def on_wait() -> None:
             self._drain_upstream_log()
             now = time.monotonic()
-            if now - self._last_heartbeat >= 12.0:
+            if now - self._last_heartbeat >= 30.0:
                 self._last_heartbeat = now
-                _emit(self.log_callback, f"⏳ {label}仍在运行；上游模型/ROI 进程保持响应…")
+                elapsed = max(0.0, now - (self._started_at or now))
+                self._log(
+                    f"⏳ {label} · {elapsed:.0f}s · 子进程仍存活，当前阶段={self._stage}；"
+                    "尚无新的内部进度信号，不能据此判断仍在计算"
+                )
 
         while True:
             line = self._stdout_pump.readline(
@@ -1961,9 +2178,12 @@ class FindtextCenterNetSession:
             except json.JSONDecodeError:
                 # Protocol stdout should contain only JSON, but keep fail-open
                 # tolerance in case an upstream dependency writes to fd=1.
-                _emit(self.log_callback, "findtext · " + line)
+                self._log("findtext · " + line)
                 continue
             if isinstance(data, dict):
+                if data.get("type") == "progress":
+                    self._handle_progress(data)
+                    continue
                 return data
 
     def start(self) -> "FindtextCenterNetSession":
@@ -1971,6 +2191,10 @@ class FindtextCenterNetSession:
             return self
         self.close()
         from adapters.subprocess_watchdog import LinePump, isolated_process_kwargs, env_seconds
+        self._started_at = time.monotonic()
+        self._last_heartbeat = self._started_at
+        self._stage = "worker startup"
+        self._log(f"▶ findtext worker startup · diagnostics={self.diagnostic_path}")
         command = [
             str(self.python), str(WORKER_SCRIPT),
             "--source-root", str(self.source_dir),
@@ -1989,17 +2213,33 @@ class FindtextCenterNetSession:
         )
         self._stdout_pump = LinePump(self.proc.stdout, name="findtext-upstream-stdout")
         self._stderr_pump = LinePump(self.proc.stderr, name="findtext-upstream-stderr")
-        ready = self._read_protocol(
-            timeout=env_seconds("NOVEL_FORMATTER_OCR_STARTUP_TIMEOUT", 900.0, minimum=60.0),
-            label="findtextCenterNet 上游模型初始化",
-        )
+        try:
+            startup_timeout = env_seconds(
+                "NOVEL_FORMATTER_FINDTEXT_STARTUP_TIMEOUT",
+                env_seconds("NOVEL_FORMATTER_OCR_STARTUP_TIMEOUT", 300.0, minimum=60.0),
+                minimum=60.0,
+            )
+            ready = self._read_protocol(
+                timeout=startup_timeout,
+                label="findtextCenterNet 上游模型初始化",
+            )
+        except InterruptedError:
+            self._log("■ findtext worker startup cancelled")
+            self.close()
+            raise
+        except Exception as exc:
+            self._log(f"✕ findtext worker startup failed · {type(exc).__name__}: {exc}")
+            self.close()
+            raise FindtextWorkerStartupError(str(exc)) from exc
+        self._drain_upstream_log()
         if not ready.get("ready"):
             error = str(ready.get("error") or "上游 worker 未就绪")
+            self._log(f"✕ findtext upstream not ready · {error}")
             self.close()
-            raise RuntimeError(error)
+            raise FindtextWorkerStartupError(error)
         self.backend = str(ready.get("backend") or "")
-        _emit(
-            self.log_callback,
+        self._stage = "ready"
+        self._log(
             f"✅ findtextCenterNet 上游原生 worker 已就绪 · backend={self.backend or 'unknown'} · 模型仅加载一次",
         )
         return self
@@ -2019,6 +2259,9 @@ class FindtextCenterNetSession:
         }
         self.proc.stdin.write(json.dumps(request, ensure_ascii=False) + "\n")
         self.proc.stdin.flush()
+        self._started_at = time.monotonic()
+        self._last_heartbeat = self._started_at
+        self._stage = f"ROI request {request_id}"
         data = self._read_protocol(
             timeout=(
                 float(timeout) if timeout is not None else
@@ -2035,13 +2278,14 @@ class FindtextCenterNetSession:
                 out[path] = (dict(item["payload"]), None)
             else:
                 out[path] = (None, str(item.get("error") or "上游未返回有效 JSON"))
-        self._drain_upstream_log()
+        self._drain_upstream_log(settle_seconds=0.03)
         return out
 
     def close(self) -> None:
         proc = self.proc
         self.proc = None
         if proc is not None:
+            self._log("■ findtext worker stopped")
             try:
                 if proc.poll() is None and proc.stdin is not None:
                     proc.stdin.write(json.dumps({"command": "close"}) + "\n")
@@ -2076,6 +2320,207 @@ class FindtextCenterNetSession:
 
     def __exit__(self, exc_type, exc, tb) -> None:
         self.close()
+
+
+_SHARED_FINDTEXT_LOCK = threading.RLock()
+# State changes (job holds/session pointer) must stay non-blocking even while
+# CoreML is loading.  Protocol operations use a separate lock so cancel/end can
+# revoke a job and close an in-flight prewarm immediately.
+_SHARED_FINDTEXT_PROTOCOL_LOCK = threading.RLock()
+_SHARED_FINDTEXT_SESSION: FindtextCenterNetSession | None = None
+_SHARED_FINDTEXT_SESSION_KEY: tuple[str, str, str] | None = None
+_SHARED_FINDTEXT_JOB_HOLDS: set[str] = set()
+_SHARED_FINDTEXT_PREWARM_THREADS: dict[str, threading.Thread] = {}
+
+
+def _findtext_job_is_active(job_id: str) -> bool:
+    with _SHARED_FINDTEXT_LOCK:
+        return str(job_id) in _SHARED_FINDTEXT_JOB_HOLDS
+
+
+def _close_shared_findtext_session() -> None:
+    global _SHARED_FINDTEXT_SESSION, _SHARED_FINDTEXT_SESSION_KEY
+    with _SHARED_FINDTEXT_LOCK:
+        session = _SHARED_FINDTEXT_SESSION
+        _SHARED_FINDTEXT_SESSION = None
+        _SHARED_FINDTEXT_SESSION_KEY = None
+    if session is not None:
+        try:
+            session.close()
+        except Exception:
+            pass
+
+
+def begin_findtext_ocr_job(
+    job_id: str, *, cancel_check=None, log_callback=None, background: bool = True,
+) -> str:
+    """Hold and prewarm findtext for one OCR job.
+
+    There is deliberately no idle TTL.  The worker lifetime follows the OCR
+    task lifetime exactly: start warming as soon as the job begins, remain
+    resident while the job is active, then release immediately when the job
+    ends/cancels.  Prewarming normally runs on a daemon thread so CoreML/ONNX
+    model construction overlaps ordinary OCR instead of blocking it first.
+    """
+    token = str(job_id or f"ocr-{os.getpid()}-{time.time_ns()}")
+    with _SHARED_FINDTEXT_LOCK:
+        _SHARED_FINDTEXT_JOB_HOLDS.add(token)
+        existing = _SHARED_FINDTEXT_PREWARM_THREADS.get(token)
+        if existing is not None and existing.is_alive():
+            return token
+
+    def job_cancelled() -> bool:
+        if not _findtext_job_is_active(token):
+            return True
+        return bool(callable(cancel_check) and cancel_check())
+
+    def prewarm() -> None:
+        try:
+            if job_cancelled():
+                return
+            _emit(
+                log_callback,
+                "🔥 findtextCenterNet Ruby worker 开始后台预热；与正文 OCR 并行，生命周期跟随当前 OCR 任务。",
+            )
+            started = time.monotonic()
+            source_dir, python = prepare_runtime(log_callback=log_callback)
+            if job_cancelled():
+                return
+            # The shared-session lock serializes worker startup and later JSONL
+            # requests.  If Ruby becomes ready before ordinary OCR finishes,
+            # the later Ruby pass simply reuses this already-loaded process.
+            with _shared_findtext_session(
+                source_dir,
+                python,
+                cancel_check=job_cancelled,
+                log_callback=log_callback,
+            ) as session:
+                backend = session.backend or "unknown"
+            if not job_cancelled():
+                _emit(
+                    log_callback,
+                    f"✅ findtextCenterNet Ruby worker 预热完成 · backend={backend} · "
+                    f"{time.monotonic() - started:.1f}s；本 OCR 任务结束前保持常驻。",
+                )
+        except InterruptedError:
+            _emit(log_callback, "■ findtextCenterNet Ruby worker 预热已随 OCR 任务停止。")
+        except Exception as exc:
+            # Ruby remains optional.  The normal Ruby pass keeps its existing
+            # fail-open diagnostics and may retry/fallback when actually used.
+            _emit(log_callback, f"⚠️ findtextCenterNet Ruby worker 后台预热失败：{exc}")
+        finally:
+            with _SHARED_FINDTEXT_LOCK:
+                current = _SHARED_FINDTEXT_PREWARM_THREADS.get(token)
+                if current is threading.current_thread():
+                    _SHARED_FINDTEXT_PREWARM_THREADS.pop(token, None)
+
+    if background:
+        thread = threading.Thread(
+            target=prewarm,
+            daemon=True,
+            name=f"findtext-prewarm-{token[-24:]}",
+        )
+        with _SHARED_FINDTEXT_LOCK:
+            _SHARED_FINDTEXT_PREWARM_THREADS[token] = thread
+        thread.start()
+    else:
+        prewarm()
+    return token
+
+
+def end_findtext_ocr_job(job_id: str | None, *, log_callback=None) -> None:
+    """Release a findtext job hold and close the worker when the last job ends."""
+    if not job_id:
+        return
+    token = str(job_id)
+    with _SHARED_FINDTEXT_LOCK:
+        _SHARED_FINDTEXT_JOB_HOLDS.discard(token)
+        should_close = not _SHARED_FINDTEXT_JOB_HOLDS
+    if should_close:
+        _close_shared_findtext_session()
+        _emit(log_callback, "🧹 findtextCenterNet Ruby worker 已随 OCR 任务结束立即释放。")
+
+
+@contextmanager
+def _shared_findtext_session(
+    source_dir: Path, python: Path, *, cancel_check=None, log_callback=None,
+):
+    """Reuse the heavyweight findtext worker for the active OCR task.
+
+    CoreML model construction can dominate a short Ruby pass by two orders of
+    magnitude.  An OCR job hold keeps the process resident for exactly that job
+    lifetime; there is no arbitrary idle timer. Calls outside an OCR job remain
+    ephemeral and close the worker as soon as their context exits.
+
+    The protocol lock serializes startup/JSONL requests, while the state lock is
+    intentionally *not* held during model loading or inference.  This lets a
+    cancel/end request revoke the job and terminate an in-flight prewarm without
+    waiting for a long CoreML cold start to finish first.
+    """
+    global _SHARED_FINDTEXT_SESSION, _SHARED_FINDTEXT_SESSION_KEY
+    source_dir = Path(source_dir).resolve()
+    # Do not resolve this path.  A venv's bin/python is commonly a symlink to
+    # the base interpreter; resolving it makes the child skip the venv.
+    python = Path(os.path.abspath(Path(python).expanduser()))
+    fingerprint = runtime_fingerprint(source_dir, upstream_commit=UPSTREAM_COMMIT)
+    key = (str(source_dir), str(python), fingerprint)
+
+    with _SHARED_FINDTEXT_PROTOCOL_LOCK:
+        with _SHARED_FINDTEXT_LOCK:
+            session = _SHARED_FINDTEXT_SESSION
+            if (
+                session is None
+                or _SHARED_FINDTEXT_SESSION_KEY != key
+                or session.proc is None
+                or session.proc.poll() is not None
+            ):
+                stale = session
+                session = FindtextCenterNetSession(
+                    source_dir, python, cancel_check=cancel_check, log_callback=log_callback
+                )
+                _SHARED_FINDTEXT_SESSION = session
+                _SHARED_FINDTEXT_SESSION_KEY = key
+            else:
+                stale = None
+                session.cancel_check = cancel_check
+                session.log_callback = log_callback
+                _emit(log_callback, "⚡ findtextCenterNet 复用已加载 Ruby 模型，跳过本轮 CoreML/ONNX 冷启动。")
+        if stale is not None:
+            try:
+                stale.close()
+            except Exception:
+                pass
+        try:
+            yield session.start()
+        except BaseException:
+            # Protocol/model errors can leave stdout state ambiguous. Never
+            # reuse a worker after a failed request.
+            try:
+                session.close()
+            finally:
+                with _SHARED_FINDTEXT_LOCK:
+                    if _SHARED_FINDTEXT_SESSION is session:
+                        _SHARED_FINDTEXT_SESSION = None
+                        _SHARED_FINDTEXT_SESSION_KEY = None
+            raise
+        finally:
+            with _SHARED_FINDTEXT_LOCK:
+                close_ephemeral = bool(
+                    _SHARED_FINDTEXT_SESSION is session
+                    and not _SHARED_FINDTEXT_JOB_HOLDS
+                )
+                if close_ephemeral:
+                    _SHARED_FINDTEXT_SESSION = None
+                    _SHARED_FINDTEXT_SESSION_KEY = None
+            if close_ephemeral:
+                # Non-OCR callers do not receive a hidden grace period. The
+                # worker is either held by a live job or released immediately.
+                try:
+                    session.close()
+                except Exception:
+                    pass
+
+atexit.register(_close_shared_findtext_session)
 
 
 def _merge_ruby_candidate_payloads(documents: Iterable[UnifiedDocument]) -> dict[str, dict]:
@@ -2499,13 +2944,16 @@ def detect_ruby_lines(
                 batch_size = max(1, min(64, int(batch_size or 16)))
                 completed = cache_hits
 
-                def consume_payload(spec, payload: dict | None, error: str | None = None) -> bool:
+                def consume_payload(
+                    spec, payload: dict | None, error: str | None = None, *, log_error: bool = True
+                ) -> bool:
                     nonlocal completed, failed_rois
                     page_no, staged_path, offset_x, offset_y, display_name = spec
                     if not isinstance(payload, dict):
                         failed_rois += 1
                         completed += 1
-                        _emit(log_callback, f"⚠️ 跳过失败 Ruby ROI：{display_name}：{error or '上游未返回有效 JSON'}")
+                        if log_error:
+                            _emit(log_callback, f"⚠️ 跳过失败 Ruby ROI：{display_name}：{error or '上游未返回有效 JSON'}")
                         if progress_callback:
                             progress_callback(completed, len(staged_specs), display_name + " · skipped")
                         return False
@@ -2524,12 +2972,15 @@ def detect_ruby_lines(
                     return True
 
                 worker_failed = False
+                worker_error: Exception | None = None
                 try:
-                    with FindtextCenterNetSession(
+                    with _shared_findtext_session(
                         source_dir, python,
                         cancel_check=cancel_check,
                         log_callback=log_callback,
                     ) as session:
+                        if diagnostics is not None:
+                            diagnostics["backend"] = session.backend or "unknown"
                         for start in range(0, len(pending_specs), batch_size):
                             if callable(cancel_check) and cancel_check():
                                 raise InterruptedError("Ruby 识别已停止")
@@ -2546,44 +2997,67 @@ def detect_ruby_lines(
                     raise
                 except Exception as exc:
                     worker_failed = True
+                    worker_error = exc
                     _emit(
                         log_callback,
-                        "⚠️ findtextCenterNet 长驻上游 worker 异常；仅对尚未完成 ROI 回退原项目 run_ocr.py 单图调用："
+                        "⚠️ findtextCenterNet 长驻上游 worker 异常："
                         + str(exc),
                     )
 
                 if worker_failed:
-                    # Compatibility fallback uses the upstream CLI exactly as
-                    # documented.  It is intentionally slower because each call
-                    # reloads the model, but Ruby is optional and must fail open.
                     already_done = completed - cache_hits
                     remaining = pending_specs[max(0, already_done):]
-                    for spec in remaining:
-                        if callable(cancel_check) and cancel_check():
-                            raise InterruptedError("Ruby 识别已停止")
-                        page_no, staged_path, _ox, _oy, display_name = spec
-                        result_path = Path(staged_path + ".json")
-                        result_path.unlink(missing_ok=True)
-                        one = [str(python), "run_ocr.py", staged_path]
-                        one_code, one_stdout, one_stderr = _run_process(
-                            one, cwd=source_dir, cancel_check=cancel_check
+                    worker_startup_failed = isinstance(worker_error, FindtextWorkerStartupError)
+                    upstream_entry_exists = (Path(source_dir) / "run_ocr.py").is_file()
+                    if worker_startup_failed and upstream_entry_exists:
+                        # A real prepared runtime that cannot initialize its model
+                        # should not be cold-started once per ROI. Preserve the
+                        # body OCR and report Ruby as unavailable for this pass.
+                        _emit(
+                            log_callback,
+                            f"⏭️ findtext worker 未完成模型初始化；跳过 {len(remaining)} 个 Ruby ROI，避免重复冷启动。正文 OCR 不受影响。",
                         )
-                        if one_code == 0 and result_path.is_file():
-                            try:
-                                payload = json.loads(result_path.read_text(encoding="utf-8"))
-                            except Exception as json_exc:
-                                payload = None
-                                error = f"上游 JSON 无法解析：{json_exc}"
-                            else:
-                                error = None
-                            finally:
-                                result_path.unlink(missing_ok=True)
-                            consume_payload(spec, payload, error)
-                            continue
-                        detail = " | ".join(
-                            (one_stderr or one_stdout or "无输出").strip().splitlines()[-4:]
-                        )
-                        consume_payload(spec, None, detail or "上游单图调用失败")
+                        failed_rois += len(remaining)
+                        completed += len(remaining)
+                        if progress_callback:
+                            progress_callback(
+                                completed, len(staged_specs), "findtext model startup failed · Ruby skipped"
+                            )
+                    else:
+                        # Compatibility fallback.  A minimal/legacy tree that
+                        # cannot expose the persistent worker is retried one ROI
+                        # at a time so partial success survives a bad crop.  For a
+                        # real runtime failure after worker startup, retain the
+                        # faster one-process batch fallback.
+                        if not upstream_entry_exists:
+                            returned = _run_upstream_cli_individual_compat(
+                                remaining, python, source_dir,
+                                cancel_check=cancel_check, log_callback=log_callback,
+                            )
+                        else:
+                            returned = _run_upstream_cli_batch(
+                                remaining, python, source_dir,
+                                cancel_check=cancel_check, log_callback=log_callback,
+                            )
+                        logged_errors = 0
+                        suppressed_errors = 0
+                        for spec in remaining:
+                            staged_path = str(Path(spec[1]).resolve())
+                            payload, error = returned.get(
+                                staged_path, (None, "上游 CLI 未返回该 ROI"),
+                            )
+                            log_error = isinstance(payload, dict) or logged_errors < 5
+                            if not isinstance(payload, dict):
+                                if log_error:
+                                    logged_errors += 1
+                                else:
+                                    suppressed_errors += 1
+                            consume_payload(spec, payload, error, log_error=log_error)
+                        if suppressed_errors:
+                            _emit(
+                                log_callback,
+                                f"ℹ️ 另有 {suppressed_errors} 个失败 ROI 的相同错误已合并显示，避免重复刷屏。",
+                            )
 
                 try:
                     cache.prune()
@@ -2634,6 +3108,48 @@ def _block_score(block_text: str, line: RubyLine) -> float:
     return SequenceMatcher(None, block_norm, plain_norm, autojunk=False).ratio() * 0.80
 
 
+def _short_ruby_base_evidence(block_text: str, line: RubyLine, spatial_score: float) -> float:
+    """Score *Ruby bases*, not the surrounding findtext line.
+
+    Real findtextCenterNet output commonly returns a normal-length sentence that
+    merely contains a two-character Ruby base.  r5 incorrectly gated this rescue
+    on ``len(line.plain) < 4``; that worked for synthetic standalone-base tests but
+    rejected the real GUI/CoreML shape.  Upstream already marks Ruby parent/text
+    characters structurally, so the safety question is the actual base span plus
+    its original-page geometry, never the length of the containing sentence.
+
+    Pure geometry is still insufficient: every pair must have one unique exact
+    base in the local text, or (for 2..12 character bases) one unique same-length
+    one-glyph OCR variant.
+    """
+    pairs = tuple((str(base or ""), str(reading or "")) for base, reading in line.pairs)
+    if not line.pair_boxes or not pairs:
+        return 0.0
+    if float(spatial_score or 0.0) < 0.70:
+        return 0.0
+    text = str(block_text or "")
+    if not text:
+        return 0.0
+    pair_scores: list[float] = []
+    for base, _reading in pairs:
+        if not base:
+            return 0.0
+        exact_count = text.count(base)
+        if exact_count == 1:
+            pair_scores.append(0.96)
+            continue
+        if exact_count > 1:
+            return 0.0
+        # Never guess a missing one-character base: any nearby character would
+        # be a one-substitution candidate.  Multi-character bases can use the
+        # deliberately narrow unique one-glyph recovery helper.
+        candidate = _unique_local_base_substitution(text, base)
+        if candidate is None:
+            return 0.0
+        pair_scores.append(0.78)
+    return min(pair_scores) if pair_scores else 0.0
+
+
 def _page_pixel_size(document: UnifiedDocument, page_no: int) -> tuple[int, int]:
     for page in document.pages:
         if int(page.page_no or 0) != int(page_no):
@@ -2680,19 +3196,23 @@ def _block_pixel_box(document: UnifiedDocument, block) -> tuple[float, float, fl
     return None
 
 
-def _spatial_alignment_score(
-    line: RubyLine, block_box: tuple[float, float, float, float] | None,
+def _box_spatial_alignment_score(
+    source_box: tuple[float, float, float, float] | None,
+    target_box: tuple[float, float, float, float] | None,
 ) -> float:
-    """Score how well a findtext vertical line overlaps one OCR block.
+    """Score original-page overlap for two vertical-text boxes.
 
-    Text remains the primary criterion.  Geometry is a tie-break/guard that
-    prevents a Ruby reading from being attached to an identical word in another
-    physical column on the same page.
+    X is intentionally dominant for Japanese vertical layout.  This helper is
+    also used with the *Ruby base* geometry returned by findtextCenterNet, so
+    physical-column ownership is decided from immutable pixels rather than from
+    the fused text that the GUI later projects back onto those columns.
     """
-    if block_box is None or line.x2 <= line.x1 or line.y2 <= line.y1:
+    if source_box is None or target_box is None:
         return 0.0
-    lx1, ly1, lx2, ly2 = line.x1, line.y1, line.x2, line.y2
-    bx1, by1, bx2, by2 = block_box
+    lx1, ly1, lx2, ly2 = source_box
+    bx1, by1, bx2, by2 = target_box
+    if lx2 <= lx1 or ly2 <= ly1 or bx2 <= bx1 or by2 <= by1:
+        return 0.0
     lw, lh = max(1.0, lx2 - lx1), max(1.0, ly2 - ly1)
     bw, bh = max(1.0, bx2 - bx1), max(1.0, by2 - by1)
     overlap_x = max(0.0, min(lx2, bx2) - max(lx1, bx1))
@@ -2702,13 +3222,243 @@ def _spatial_alignment_score(
     lcx, bcx = (lx1 + lx2) / 2.0, (bx1 + bx2) / 2.0
     centre_dx = abs(lcx - bcx)
     x_near = max(0.0, 1.0 - centre_dx / max(24.0, 2.5 * max(lw, bw)))
-    # Vertical Japanese lines are narrow in X and long in Y: X correspondence
-    # is more discriminative than exact line height.
     return min(1.0, 0.58 * max(x_ratio, x_near) + 0.42 * y_ratio)
+
+
+def _ruby_structural_box(line: RubyLine) -> tuple[float, float, float, float] | None:
+    """Prefer findtext's Ruby-base boxes over its surrounding sentence box."""
+    if line.pair_boxes:
+        return _union_pixel_boxes(line.pair_boxes)
+    if line.x2 > line.x1 and line.y2 > line.y1:
+        return (line.x1, line.y1, line.x2, line.y2)
+    return None
+
+
+def _spatial_alignment_score(
+    line: RubyLine, block_box: tuple[float, float, float, float] | None,
+) -> float:
+    """Score how well a findtext vertical line overlaps one OCR block."""
+    line_box = (line.x1, line.y1, line.x2, line.y2)
+    return _box_spatial_alignment_score(line_box, block_box)
+
+
+def _structural_review_column(
+    contexts: Iterable[_RubyMatchContext], line: RubyLine,
+) -> tuple[_RubyMatchContext | None, float]:
+    """Return one unambiguous physical-column owner for a Ruby line.
+
+    findtextCenterNet exposes Ruby-base geometry before GUI fusion.  The GUI's
+    ``column_texts`` are reconstructed from the final fused sentence and can
+    drift by one column around OCR insertions/deletions.  They are therefore
+    useful only as local *text* evidence; they must never decide which physical
+    column owns a Ruby pair.
+
+    Fail closed unless the base geometry strongly selects one immutable review
+    region and is clearly separated from the runner-up.
+    """
+    source_box = _ruby_structural_box(line)
+    if source_box is None:
+        return None, 0.0
+    by_column: dict[str, tuple[float, _RubyMatchContext]] = {}
+    for context in contexts:
+        column_id = str(context.column_id or "")
+        if context.scope != "review_column" or not column_id or context.bbox is None:
+            continue
+        score = _box_spatial_alignment_score(source_box, context.bbox)
+        current = by_column.get(column_id)
+        if current is None or score > current[0]:
+            by_column[column_id] = (score, context)
+    ranked = sorted(by_column.values(), key=lambda item: item[0], reverse=True)
+    if not ranked or ranked[0][0] < 0.72:
+        return None, 0.0
+    top_score, top_context = ranked[0]
+    second_score = ranked[1][0] if len(ranked) > 1 else 0.0
+    if second_score >= 0.60 and (top_score - second_score) < 0.16:
+        return None, 0.0
+    return top_context, top_score
+
+
+def _region_pixel_box(
+    document: UnifiedDocument, page_no: int, region: dict,
+) -> tuple[float, float, float, float] | None:
+    """Convert an OCR-review normalized region to original-page pixels."""
+    if not isinstance(region, dict):
+        return None
+    try:
+        region_page = int(region.get("page", 0) or 0)
+    except (TypeError, ValueError):
+        return None
+    if region_page not in {0, int(page_no)}:
+        return None
+    bbox = region.get("bbox") or ()
+    if not isinstance(bbox, (list, tuple)) or len(bbox) < 4:
+        return None
+    width, height = _page_pixel_size(document, page_no)
+    if width <= 0 or height <= 0:
+        return None
+    try:
+        x, y, w, h = (float(value) for value in bbox[:4])
+    except (TypeError, ValueError, OverflowError):
+        return None
+    if not all(map(math.isfinite, (x, y, w, h))):
+        return None
+    x1 = max(0.0, min(1.0, x)) * width
+    y1 = max(0.0, min(1.0, y)) * height
+    x2 = max(0.0, min(1.0, x + w)) * width
+    y2 = max(0.0, min(1.0, y + h)) * height
+    return (x1, y1, x2, y2) if x2 > x1 and y2 > y1 else None
+
+
+def _union_pixel_boxes(
+    boxes: Iterable[tuple[float, float, float, float] | None],
+) -> tuple[float, float, float, float] | None:
+    values = [box for box in boxes if box is not None]
+    if not values:
+        return None
+    return (
+        min(box[0] for box in values), min(box[1] for box in values),
+        max(box[2] for box in values), max(box[3] for box in values),
+    )
+
+
+def _block_match_contexts(
+    document: UnifiedDocument, block, page_no: int,
+) -> list[_RubyMatchContext]:
+    """Expose the smallest trustworthy GUI-fusion contexts for one block.
+
+    ``build_fused_document`` deliberately retains per-sentence *and* per-physical
+    column lineage in ``ocr_review_sentence_groups``.  findtextCenterNet likewise
+    returns structural Ruby geometry.  Matching those two local structures avoids
+    forcing a short Ruby-bearing source line to resemble a long fused paragraph.
+    The whole block remains as a fallback for legacy/non-fused documents.
+    """
+    block_text = str(getattr(block, "text", "") or "")
+    block_box = _block_pixel_box(document, block)
+    contexts: list[_RubyMatchContext] = [
+        _RubyMatchContext(block_text, block_box, "block")
+    ]
+    metadata = block.metadata if isinstance(getattr(block, "metadata", None), dict) else {}
+    groups = metadata.get("ocr_review_sentence_groups") or []
+    if isinstance(groups, dict):
+        groups = [groups]
+    if not isinstance(groups, list):
+        groups = []
+
+    for group in groups:
+        if not isinstance(group, dict):
+            continue
+        try:
+            raw_row_index = group.get("row_index", -1)
+            row_index = int(raw_row_index) if raw_row_index is not None else -1
+        except (TypeError, ValueError):
+            row_index = -1
+        regions = group.get("regions") or []
+        if isinstance(regions, dict):
+            regions = [regions]
+        regions = [item for item in regions if isinstance(item, dict)]
+        pixel_regions = [_region_pixel_box(document, page_no, item) for item in regions]
+        group_box = _union_pixel_boxes(pixel_regions)
+        group_text = str(group.get("text", "") or "")
+        if group_text:
+            contexts.append(_RubyMatchContext(
+                group_text, group_box, "review_sentence", row_index=row_index,
+            ))
+
+        column_ids = group.get("column_ids") or []
+        if isinstance(column_ids, str):
+            column_ids = [column_ids]
+        elif not isinstance(column_ids, (list, tuple)):
+            column_ids = []
+        column_ids = [str(value or "") for value in column_ids]
+        column_texts = group.get("column_texts") or []
+        if isinstance(column_texts, str):
+            column_texts = [column_texts]
+        elif not isinstance(column_texts, (list, tuple)):
+            column_texts = []
+        column_texts = [str(value or "") for value in column_texts]
+
+        region_by_column = {
+            str(region.get("column_id", "") or ""): pixel_box
+            for region, pixel_box in zip(regions, pixel_regions)
+            if str(region.get("column_id", "") or "") and pixel_box is not None
+        }
+        # Geometry is authoritative even when fused-text projection happens to
+        # assign zero characters to a physical column.  Keep such empty-text
+        # column contexts so Ruby ownership can still be recovered from the
+        # immutable original-page region.
+        column_count = max(len(column_ids), len(column_texts), len(pixel_regions))
+        for index in range(column_count):
+            text_value = column_texts[index] if index < len(column_texts) else ""
+            column_id = column_ids[index] if index < len(column_ids) else ""
+            bbox = region_by_column.get(column_id)
+            if bbox is None and index < len(pixel_regions):
+                bbox = pixel_regions[index]
+            if not text_value and bbox is None:
+                continue
+            contexts.append(_RubyMatchContext(
+                text_value, bbox, "review_column", row_index=row_index, column_id=column_id,
+            ))
+
+    # Preserve order while dropping exact duplicates.  ``scope`` is part of the
+    # key because the same text with tighter column geometry is stronger evidence.
+    unique: list[_RubyMatchContext] = []
+    seen: set[tuple] = set()
+    for context in contexts:
+        rounded_box = tuple(round(float(v), 3) for v in context.bbox) if context.bbox else ()
+        key = (context.scope, context.text, rounded_box, context.row_index, context.column_id)
+        if key in seen:
+            continue
+        seen.add(key)
+        unique.append(context)
+    return unique
+
+
+def _unique_local_base_substitution(source_plain: str, detected_base: str) -> str | None:
+    """Return one unique same-length one-glyph OCR variant of a Ruby base.
+
+    This is deliberately much narrower than generic fuzzy matching.  It is used
+    only after ``apply_ruby_lines`` has already established a strong text +
+    original-page geometry match for the findtext line.  The authoritative OCR
+    spelling is *not* corrected here; we merely locate the one span on which the
+    immutable reading can safely be attached.
+
+    Short Japanese Ruby bases are common (for example 緻密/ちみつ).  Requiring
+    an edit-span from the tiny findtext base to an entire fused paragraph can
+    fail even when the physical line is unambiguous.  A unique one-substitution
+    window fixes that gap while failing closed on repeated/ambiguous words.
+    """
+    text = str(source_plain or "")
+    base = str(detected_base or "")
+    if len(base) < 2 or len(base) > 12 or len(text) < len(base):
+        return None
+    if text.count(base) > 0:
+        return None
+
+    def text_char(ch: str) -> bool:
+        category = unicodedata.category(ch) if ch else ""
+        return bool(category and category[0] in {"L", "N"})
+
+    if not all(text_char(ch) for ch in base):
+        return None
+
+    matches: list[str] = []
+    width = len(base)
+    for start in range(0, len(text) - width + 1):
+        candidate = text[start:start + width]
+        if not all(text_char(ch) for ch in candidate):
+            continue
+        mismatches = sum(1 for left, right in zip(base, candidate) if left != right)
+        if mismatches != 1:
+            continue
+        matches.append(candidate)
+        if len(matches) > 1:
+            return None
+    return matches[0] if len(matches) == 1 else None
 
 
 def _safe_inject(
     source: str, line: RubyLine, *, allow_base_correction: bool = False,
+    authoritative_plain: str | None = None,
 ) -> tuple[str, int]:
     """Inject markers without changing prose characters.
 
@@ -2769,10 +3519,27 @@ def _safe_inject(
             continue
         # Never guess between repeated kanji occurrences.  This is the guard
         # that prevents the optional Ruby pass from corrupting main OCR prose.
-        if out.count(base) != 1:
+        if out.count(base) == 1:
+            out = out.replace(base, marked, 1)
+            inserted += 1
             continue
-        out = out.replace(base, marked, 1)
-        inserted += 1
+
+        # The exact findtext base can be absent because ordinary OCR got one
+        # glyph wrong (e.g. 緻密 -> 縦密).  At this point the caller has already
+        # verified the same physical line/column.  Permit only a *unique*,
+        # same-length, one-glyph substitution in the authoritative plain text.
+        # The OCR character itself is preserved; only the Ruby reading is
+        # attached.  ``_merge_findtext_annotation_evidence`` then records the
+        # detected base so a later Paddle/AI correction can migrate the anchor.
+        if allow_base_correction:
+            plain_source = str(authoritative_plain or RUBY_RE.sub(lambda m: m.group(1), source))
+            candidate = _unique_local_base_substitution(plain_source, base)
+            candidate_marked = f"｜{candidate}《{reading}》" if candidate else ""
+            if candidate and out.count(candidate) == 1 and candidate_marked not in out:
+                out = out.replace(candidate, candidate_marked, 1)
+                inserted += 1
+                continue
+        continue
     return out, inserted
 
 def _annotations_from_marked(marked: str, plain: str, *, context_chars: int = 18) -> list[dict]:
@@ -2900,6 +3667,30 @@ def _merge_findtext_annotation_evidence(
         item["findtext_page"] = int(line.page or 0)
         if chosen < len(line.pair_boxes):
             item["findtext_pair_bbox"] = [round(float(v), 3) for v in line.pair_boxes[chosen]]
+        if chosen < len(line.pair_reading_boxes):
+            item["findtext_reading_bbox"] = [
+                round(float(v), 3) for v in line.pair_reading_boxes[chosen]
+            ]
+
+        # Explicitly record Japanese Ruby layout semantics without changing the
+        # immutable Aozora overlay.  One-base-character annotations are mono
+        # Ruby; multi-character bases are group Ruby.  Overhang is measured from
+        # findtext geometry and may extend before/after the base by design.
+        item["ruby_layout_kind"] = "mono" if len(detected_base) == 1 else "group"
+        item["ruby_base_char_count"] = len(detected_base)
+        item["ruby_reading_char_count"] = len(reading)
+        base_box = item.get("findtext_pair_bbox") or []
+        reading_box = item.get("findtext_reading_bbox") or []
+        if len(base_box) == 4 and len(reading_box) == 4:
+            before = max(0.0, float(base_box[1]) - float(reading_box[1]))
+            after = max(0.0, float(reading_box[3]) - float(base_box[3]))
+            base_extent = max(1.0, float(base_box[3]) - float(base_box[1]))
+            item["ruby_overhang"] = {
+                "before_px": round(before, 3),
+                "after_px": round(after, 3),
+                "max_ratio": round(max(before, after) / base_extent, 4),
+                "detected": bool(before >= 1.0 or after >= 1.0),
+            }
         if detected_base != base_now:
             item["base_correction_candidates"] = [detected_base]
             evidence = ["findtextCenterNet"]
@@ -2975,31 +3766,109 @@ def apply_ruby_lines(document: UnifiedDocument, lines: Iterable[RubyLine]) -> Ru
         for line in page_lines:
             ranked = []
             for index, block in enumerate(candidates):
-                text_score = _block_score(str(block.text or ""), line)
-                spatial_score = _spatial_alignment_score(
-                    line, _block_pixel_box(document, block)
+                contexts = _block_match_contexts(document, block, page_no)
+                has_physical_context = any(
+                    context.scope == "review_column" and context.bbox is not None
+                    for context in contexts
                 )
-                # Text is authoritative; page geometry only resolves physically
-                # distinct candidates and must never rescue unrelated prose.
-                combined = text_score + (0.18 * spatial_score if text_score >= 0.55 else 0.0)
-                ranked.append((combined, text_score, spatial_score, index, block))
-            ranked.sort(key=lambda item: (-item[0], -item[1], -item[2], item[3]))
+                structural_context, structural_geometry_score = _structural_review_column(
+                    contexts, line
+                )
+                # Pair geometry is stronger than reconstructed GUI text.  If
+                # findtext supplied base boxes and physical review regions exist
+                # but they do not select one column unambiguously, fail closed
+                # rather than letting projected text choose a neighbouring strip.
+                if line.pair_boxes and has_physical_context and structural_context is None:
+                    continue
+                # When findtext Ruby-base geometry uniquely identifies a physical
+                # GUI review column, that immutable region owns the Ruby pair.
+                # ``column_texts`` are only a projected view of the fused prose
+                # and may drift across an OCR insertion/deletion boundary, so a
+                # neighbouring projected fragment must never steal ownership.
+                evaluation_contexts = (
+                    [structural_context] if structural_context is not None else contexts
+                )
+                best = None
+                for context_order, context in enumerate(evaluation_contexts):
+                    raw_text_score = _block_score(context.text, line)
+                    spatial_score = (
+                        structural_geometry_score
+                        if structural_context is not None and context is structural_context
+                        else _spatial_alignment_score(line, context.bbox)
+                    )
+                    permit_pair_rescue = bool(
+                        context.scope == "review_column" or not has_physical_context
+                    )
+                    short_base_score = (
+                        _short_ruby_base_evidence(context.text, line, spatial_score)
+                        if permit_pair_rescue else 0.0
+                    )
+                    short_base_source = "review_column" if short_base_score > 0.0 else ""
+                    # A real GUI fusion can project the final sentence boundary
+                    # one column away even though the immutable region geometry
+                    # is correct.  Once geometry uniquely owns the Ruby pair,
+                    # fall back to the authoritative fused block text only for a
+                    # *unique* exact/one-glyph base.  This cannot change prose; it
+                    # merely locates the span to annotate.
+                    if (
+                        structural_context is not None
+                        and context is structural_context
+                        and short_base_score <= 0.0
+                    ):
+                        block_short_score = _short_ruby_base_evidence(
+                            str(getattr(block, "text", "") or ""),
+                            line, structural_geometry_score,
+                        )
+                        if block_short_score > 0.0:
+                            short_base_score = block_short_score
+                            short_base_source = "authoritative_block_after_geometry"
+                    text_score = max(raw_text_score, short_base_score)
+                    structure_bonus = (
+                        0.04 if structural_context is not None and context is structural_context and short_base_score > 0.0
+                        else 0.025 if context.scope == "review_column" and short_base_score > 0.0
+                        else 0.0
+                    )
+                    combined = (
+                        text_score
+                        + (0.18 * spatial_score if text_score >= 0.55 else 0.0)
+                        + structure_bonus
+                    )
+                    scored = (
+                        combined, text_score, spatial_score, short_base_score,
+                        -context_order, context, short_base_source,
+                    )
+                    if best is None or scored[:5] > best[:5]:
+                        best = scored
+                if best is None:
+                    continue
+                (
+                    combined, text_score, spatial_score, short_base_score,
+                    _order, context, short_base_source,
+                ) = best
+                ranked.append((
+                    combined, text_score, spatial_score, short_base_score,
+                    index, block, context, short_base_source,
+                ))
+            ranked.sort(key=lambda item: (-item[0], -item[1], -item[2], item[4]))
             if not ranked or ranked[0][1] < 0.55:
                 continue
-            _combined_score, text_score, spatial_score, _index, block = ranked[0]
+            (
+                _combined_score, text_score, spatial_score, short_base_score,
+                _index, block, match_context, short_base_source,
+            ) = ranked[0]
             metadata = block.metadata if isinstance(block.metadata, dict) else {}
             # Ruby is a metadata overlay only.  Never consume/replace ``ocr_raw``:
             # that field remains evidence from the ordinary OCR/fusion channel.
             existing = str(metadata.get("ruby_aozora") or block.text or "")
             # Base-spelling recovery is permitted only after the ordinary OCR
-            # block has already won a strong text match.  Original-page geometry
-            # strengthens the decision when char/pair boxes are available.
+            # local context has already won a strong text/structure match.
             allow_base_correction = bool(
                 text_score >= 0.70
                 and (spatial_score >= 0.35 or not line.pair_boxes)
             )
             marked, inserted = _safe_inject(
                 existing, line, allow_base_correction=allow_base_correction,
+                authoritative_plain=str(block.text or ""),
             )
             if inserted <= 0 or marked == existing:
                 # Existing markers still count as matched, but don't increment
@@ -3032,13 +3901,35 @@ def apply_ruby_lines(document: UnifiedDocument, lines: Iterable[RubyLine]) -> Ru
             metadata["ruby_original_block_type"] = str(getattr(block.type, "value", block.type))
             evidence = list(metadata.get("ruby_alignment_evidence") or [])
             block_box = _block_pixel_box(document, block)
+            method = (
+                "findtext_pair_geometry_plus_review_column_text"
+                if match_context.scope == "review_column"
+                else "text_plus_original_page_geometry" if match_context.bbox
+                else "text_only"
+            )
             evidence.append({
-                "method": "text_plus_original_page_geometry" if block_box else "text_only",
+                "method": method,
                 "line_bbox": [round(line.x1, 2), round(line.y1, 2), round(line.x2, 2), round(line.y2, 2)],
                 "pair_bboxes": [[round(v, 2) for v in box] for box in line.pair_boxes],
+                "pair_reading_bboxes": [[round(v, 2) for v in box] for box in line.pair_reading_boxes],
                 "block_bbox": [round(v, 2) for v in block_box] if block_box else [],
+                "match_context_bbox": [round(v, 2) for v in match_context.bbox] if match_context.bbox else [],
+                "match_scope": match_context.scope,
+                "match_row_index": int(match_context.row_index),
+                "match_column_id": str(match_context.column_id or ""),
                 "text_score": round(float(text_score), 6),
                 "spatial_score": round(float(spatial_score), 6),
+                "short_base_match_score": round(float(short_base_score), 6),
+                "short_base_geometry_rescue": bool(short_base_score > 0.0),
+                "short_base_text_source": str(short_base_source or ""),
+                "physical_column_owned_by_geometry": bool(
+                    match_context.scope == "review_column" and line.pair_boxes
+                ),
+                "ruby_base_lengths": [len(str(base or "")) for base, _reading in line.pairs],
+                "detected_ruby_pairs": [
+                    {"base": str(base or ""), "reading": str(reading or "")}
+                    for base, reading in line.pairs
+                ],
             })
             metadata["ruby_alignment_evidence"] = evidence
             block.metadata = metadata
@@ -3774,6 +4665,7 @@ def preserve_ruby_in_documents(
             cache_hits=int(diagnostics.get("cache_hits", 0) or 0),
             cache_misses=int(diagnostics.get("cache_misses", 0) or 0),
             failed_rois=int(diagnostics.get("failed_rois", 0) or 0),
+            backend=str(diagnostics.get("backend") or "cache_or_runner"),
         )
         for doc in target_docs:
             doc.metadata.__dict__["ruby_preservation_enabled"] = True
@@ -3812,7 +4704,7 @@ def preserve_ruby_in_documents(
         for doc in geometry_docs:
             # Ordinary OCR evidence is never allowed to retain Ruby result metadata.
             strip_ruby_overlay(doc, strip_candidate_geometry=False, strip_logs=False)
-        message = str(exc)
+        message = str(exc).strip() or type(exc).__name__
         if prose_mutations and "Ruby 隔离保护触发" not in message:
             message = f"{message}；Ruby 隔离保护另恢复 {prose_mutations} 个正文块"
         _emit(log_callback, f"⚠️ Ruby 保留失败，正文 OCR 保持原样：{message}")
@@ -3830,6 +4722,7 @@ def preserve_ruby_in_documents(
             cache_misses=int(diagnostics.get("cache_misses", 0) or 0),
             failed_rois=int(diagnostics.get("failed_rois", 0) or 0),
             error=message,
+            backend=str(diagnostics.get("backend") or "unknown"),
         )
         for doc in target_docs:
             doc.metadata.__dict__["ruby_preservation_enabled"] = True

@@ -25,7 +25,7 @@ from pathlib import Path, PurePosixPath
 from typing import Any, Iterable, Sequence
 import xml.etree.ElementTree as ET
 
-from engine.text_compare import looks_like_chapter_title
+from engine.document_alignment import looks_like_chapter_title
 from models.document import BlockType, UnifiedDocument
 from utils.publication_preflight import inspect_document_for_publication
 
@@ -3309,15 +3309,15 @@ def build_compact_rebuild_source(
 def estimate_export_size(package: dict, *, package_mode: str = "compact") -> dict:
     """Fast conservative prediction used by the GUI before writing files."""
     requested = str(package_mode or "compact").strip().lower()
-    if requested in {"disagreement_v4", "v4", "adjudication", "conflict_only"}:
-        from engine.ai_disagreement_package_v4 import build_disagreement_records
+    if requested in {"disagreement_v5", "v5", "adjudication", "conflict_only"}:
+        from engine.ai_disagreement_package_v5 import build_disagreement_records
         records, summary = build_disagreement_records(package)
         conflict_count = int(summary.get("model_action_required_count", 0) or 0)
         pages = {int(record.get("page", 0) or 0) for record in records if record.get("model_action_required")}
         raw_json = len(_json_bytes(_redact_absolute_paths(package)))
         estimated_zip = int(raw_json * 0.10 + conflict_count * 14_000 + 7_000_000)
         return {
-            "package_mode": "disagreement_v4",
+            "package_mode": "disagreement_v5",
             "estimated_zip_size_mb": round(estimated_zip / (1024 * 1024), 1),
             "estimated_file_count": int(12 + conflict_count),
             "visual_page_count": len({page for page in pages if page > 0}),
@@ -3326,6 +3326,10 @@ def estimate_export_size(package: dict, *, package_mode: str = "compact") -> dic
             "publication_image_bytes": 0,
             "prediction_is_conservative": True,
         }
+    if requested in {"disagreement_v4", "v4"}:
+        raise ValueError(
+            "当前开发版不再支持 V4 裁决包；请使用当前 V5 裁决流程。"
+        )
     mode = "forensic" if requested == "forensic" else "compact"
     editable = len(package.get("editable_items") or [])
     raw_json = len(_json_bytes(_redact_absolute_paths(package)))

@@ -50,6 +50,50 @@ _SENSITIVE_RE = re.compile(
     re.I,
 )
 
+_STRUCTURAL_PAIRS = (
+    ("「", "」"), ("『", "』"), ("（", "）"), ("【", "】"),
+    ("〈", "〉"), ("《", "》"), ("［", "］"), ("｛", "｝"),
+)
+_STRUCTURAL_OPENERS = frozenset(pair[0] for pair in _STRUCTURAL_PAIRS)
+_STRUCTURAL_CLOSERS = frozenset(pair[1] for pair in _STRUCTURAL_PAIRS)
+
+
+def _structural_balance_penalty(text: str) -> int:
+    """Return a small structural imbalance score for paired Japanese marks."""
+    value = canonical_japanese(text)
+    return sum(abs(value.count(left) - value.count(right)) for left, right in _STRUCTURAL_PAIRS)
+
+
+def _minority_completes_majority_structure(
+    winner_text: str,
+    dissenting_texts: Sequence[str],
+) -> bool:
+    """Detect a conservative missing-edge-quote/bracket majority.
+
+    A 2:1 OCR vote must not auto-finalize merely because two recognizers both
+    dropped the same leading/trailing structural mark. Only the narrow case
+    where a dissenting candidate is otherwise identical and adds at most three
+    balancing edge marks is guarded here. Ordinary lexical disagreements are
+    unaffected.
+    """
+    winner = canonical_japanese(winner_text)
+    winner_penalty = _structural_balance_penalty(winner)
+    if not winner or winner_penalty <= 0:
+        return False
+    for raw in dissenting_texts:
+        dissent = canonical_japanese(raw)
+        if not dissent or _structural_balance_penalty(dissent) >= winner_penalty:
+            continue
+        if dissent.startswith(winner):
+            extra = dissent[len(winner):]
+            if 0 < len(extra) <= 3 and all(ch in _STRUCTURAL_CLOSERS for ch in extra):
+                return True
+        if dissent.endswith(winner):
+            extra = dissent[:len(dissent) - len(winner)]
+            if 0 < len(extra) <= 3 and all(ch in _STRUCTURAL_OPENERS for ch in extra):
+                return True
+    return False
+
 
 @dataclass(slots=True)
 class ModelReliability:
@@ -104,12 +148,8 @@ def model_family(label: str) -> str:
     value = str(label or "").strip().casefold()
     if "ndl" in value:
         return "ndl_layout_recognizer"
-    if "yomi" in value:
-        return "yomitoku_document_ai"
     if "48px" in value or "manga_48" in value or "48 px" in value:
         return "manga48_ar"
-    if "manga" in value:
-        return "manga_transformer"
     if "apple" in value or "vision" in value or "macocr" in value or "macos" in value:
         return "apple_vision"
     if "paddle" in value:
@@ -396,22 +436,42 @@ def decide_ensemble(
         # With a dissenting candidate, keep the majority as provisional.  High-
         # risk numbers/status fields remain reviewable even after a 2:1 vote.
         critical_dissent = sensitive and len(candidates) >= 3
+        dissenting_texts = [
+            candidate["text"] for candidate in candidates
+            if candidate["key"] != winner_key
+        ]
+        structural_dissent = _minority_completes_majority_structure(
+            best["canonical"], dissenting_texts,
+        )
         confidence = 0.93 if support >= 3 else 0.89
         confidence += min(0.04, max(0.0, margin) * 0.03)
         if critical_dissent:
             confidence = min(confidence, 0.84)
             warnings.append("数字、等级或结构化字段存在少数模型异议")
+        if structural_dissent:
+            confidence = min(confidence, 0.82)
+            warnings.append("多数候选疑似共同漏掉句首/句尾引号或括号；少数候选结构更完整")
+        # 924 Stable Core rule: disagreement is evidence, not truth. A 2:1/3:1
+        # majority may choose the best provisional display candidate, but it can
+        # never close the row by itself. Only exact/normalised consensus or the
+        # separately verified targeted-retry path may become a local final lock.
+        warnings.append("存在独立 OCR 模型异议；多数候选仅作暂定，2:1 不等于正确")
         return EnsembleDecision(
             status="majority_consensus",
             chosen_index=best["index"], chosen_text=best["canonical"],
             chosen_key=winner_key, confidence=max(0.0, min(0.99, confidence)),
             support_count=support, family_support_count=winner_families,
             score_margin=margin, requires_more_models=False,
-            requires_review=critical_dissent,
-            sensitive=sensitive,
-            reason=f"{support} 个候选、{winner_families} 个独立OCR家族形成多数",
+            requires_review=True,
+            sensitive=bool(sensitive or structural_dissent),
+            reason=f"{support} 个候选、{winner_families} 个独立OCR家族形成暂定多数；仍需裁决",
             warnings=tuple(dict.fromkeys(warnings)),
-            evidence={"winner_score": winner_score, "runner_score": runner_score},
+            evidence={
+                "winner_score": winner_score,
+                "runner_score": runner_score,
+                "structural_dissent": bool(structural_dissent),
+                "stable_core_majority_is_provisional": True,
+            },
         )
 
     # A weighted single-model winner is never auto accepted.  It is useful only

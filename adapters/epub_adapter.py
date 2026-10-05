@@ -66,6 +66,7 @@ class _ChapterHTMLParser(HTMLParser):
         self._has_ruby = False
         self._in_ruby = False
         self._in_rt = False
+        self._in_rp = False
         self._ruby_base: list[str] = []
         self._ruby_reading: list[str] = []
         self._img_count = 0
@@ -161,6 +162,12 @@ class _ChapterHTMLParser(HTMLParser):
             self._ruby_reading = []
             return
 
+        # <rp> is only a visual fallback for user agents without native Ruby.
+        # It must never become part of the authoritative Ruby base/readback.
+        if tag == "rp" and self._in_ruby:
+            self._in_rp = True
+            return
+
         if tag == "br" and self._leaf_tag is not None:
             self._buf.append("\n")
             self._source_buf.append("\n")
@@ -176,6 +183,10 @@ class _ChapterHTMLParser(HTMLParser):
             self._in_rt = False
             return
 
+        if tag == "rp":
+            self._in_rp = False
+            return
+
         if tag == "ruby":
             self._in_ruby = False
             self._has_ruby = True
@@ -189,6 +200,8 @@ class _ChapterHTMLParser(HTMLParser):
             self._flush_leaf()
 
     def handle_data(self, data):
+        if self._in_rp:
+            return
         if self._in_rt:
             self._ruby_reading.append(data)
         elif self._in_ruby:

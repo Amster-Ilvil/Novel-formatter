@@ -11,6 +11,12 @@ import sys
 import traceback
 from pathlib import Path
 
+# Direct worker execution uses adapters/ as sys.path[0]; pin the project root
+# first so the local utils package cannot be shadowed by another installed package.
+ROOT = Path(__file__).resolve().parents[1]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
 import numpy as np
 from PIL import Image, ImageOps
 
@@ -19,31 +25,27 @@ try:
 except ModuleNotFoundError:  # direct worker execution adds adapters/ to sys.path
     from manga_48px_runtime import load_ocr_class
 
+from utils.apple_silicon_runtime import recommended_manga_batch, configure_torch_memory_safety, probe_torch_mps
+from utils.hardware_runtime import current_available_memory_gb, memory_budget_gb
 
-def _device(torch):
+
+def _device(torch, *, mps_probe: tuple[bool, str] | None = None):
     requested = os.environ.get(
         "NOVEL_FORMATTER_MANGA_48PX_DEVICE", "auto"
     ).strip().lower()
     if requested not in {"auto", "cpu", "mps", "cuda"}:
         requested = "auto"
+    mps_ok, _mps_detail = mps_probe if mps_probe is not None else probe_torch_mps(torch)
     if requested == "auto":
         if torch.cuda.is_available():
             return torch.device("cuda")
-        if os.environ.get("NOVEL_FORMATTER_MANGA_48PX_MPS", "1") != "0":
-            try:
-                if torch.backends.mps.is_available() and torch.backends.mps.is_built():
-                    return torch.device("mps")
-            except Exception:
-                pass
+        if os.environ.get("NOVEL_FORMATTER_MANGA_48PX_MPS", "1") != "0" and mps_ok:
+            return torch.device("mps")
         return torch.device("cpu")
     if requested == "cuda" and not torch.cuda.is_available():
         return torch.device("cpu")
-    if requested == "mps":
-        try:
-            if not (torch.backends.mps.is_available() and torch.backends.mps.is_built()):
-                return torch.device("cpu")
-        except Exception:
-            return torch.device("cpu")
+    if requested == "mps" and not mps_ok:
+        return torch.device("cpu")
     return torch.device(requested)
 
 
@@ -178,6 +180,7 @@ class Recognizer:
         except ValueError:
             threads = 0
         torch.set_num_threads(threads or min(8, max(1, os.cpu_count() or 4)))
+        configure_torch_memory_safety(torch)
 
         OCR, model_path, dict_path = load_ocr_class(cache_dir)
         with dict_path.open("r", encoding="utf-8-sig") as fh:
@@ -195,6 +198,7 @@ class Recognizer:
             )
 
         self.model = OCR(self.dictionary, 768)
+        self._learned_batch_cap = 0
         state = _load_official_state_dict(torch, model_path)
         try:
             self.model.load_state_dict(state, strict=True)
@@ -209,8 +213,19 @@ class Recognizer:
             ) from exc
 
         self.model.eval()
-        self.device = _device(torch)
+        requested_device = os.environ.get("NOVEL_FORMATTER_MANGA_48PX_DEVICE", "auto").strip().lower()
+        self.mps_probe_ok, self.mps_probe_detail = probe_torch_mps(torch)
+        self.device = _device(torch, mps_probe=(self.mps_probe_ok, self.mps_probe_detail))
         self.device_fallback_reason = ""
+        if self.device.type == "cpu" and requested_device in {"auto", "mps"}:
+            try:
+                if torch.backends.mps.is_built() and not self.mps_probe_ok:
+                    self.device_fallback_reason = (
+                        "MPS 实测不可用，已使用 CPU：" + self.mps_probe_detail
+                        + "。请在设置中运行设备检测；Apple Silicon 上旧 x86_64/Rosetta venv 会自动重建。"
+                    )
+            except Exception:
+                pass
         try:
             self.model.to(self.device)
         except Exception as exc:
@@ -237,6 +252,90 @@ class Recognizer:
         except Exception:
             pass
 
+    def _batch_groups(self, prepared: list[tuple[str, np.ndarray, int, str]]) -> list[list[tuple[str, np.ndarray, int, str]]]:
+        """Bucket 48px strips by width so padding waste does not dominate M6 GPU time."""
+        if not prepared:
+            return []
+        target = max(1, recommended_manga_batch()) if self.device.type != "cpu" else min(8, max(2, recommended_manga_batch()))
+        learned_cap = int(getattr(self, "_learned_batch_cap", 0) or 0)
+        if learned_cap:
+            target = min(target, learned_cap)
+        budget = max(1.5, float(memory_budget_gb()))
+        # Pixel budget follows live OCR memory headroom.  The coefficient is a
+        # conservative tensor-size envelope, not a fixed RAM tier.
+        pixel_budget = int(max(260_000, min(1_200_000, budget * 180_000)))
+        available = current_available_memory_gb()
+        if available and available < 2.5:
+            target = min(target, 2)
+            pixel_budget = min(pixel_budget, 320_000)
+        # Very wide rotated vertical columns create large padded tensors. Keep the
+        # batch count high for ordinary novel columns, but shrink it automatically
+        # before a single extreme column forces a large unified-memory allocation.
+        ordered = sorted(prepared, key=lambda item: (int(item[2]), str(item[0])))
+        groups: list[list[tuple[str, np.ndarray, int, str]]] = []
+        current: list[tuple[str, np.ndarray, int, str]] = []
+        current_max_width = 0
+        for item in ordered:
+            width = max(4, int(item[2]))
+            next_max = max(current_max_width, width)
+            next_count = len(current) + 1
+            estimated_pixels = next_count * 48 * next_max
+            if current and (next_count > target or estimated_pixels > pixel_budget):
+                groups.append(current)
+                current = []
+                current_max_width = 0
+            current.append(item)
+            current_max_width = max(current_max_width, width)
+        if current:
+            groups.append(current)
+        return groups
+
+    def _recognize_prepared_part(self, batch, kwargs):
+        widths = [item[2] for item in batch]
+        max_width = 4 * (max(widths) + 7) // 4
+        region = np.zeros((len(batch), 48, max_width, 3), dtype=np.uint8)
+        for index, (_, array, width, _) in enumerate(batch):
+            region[index, :, :width, :] = array
+        tensor = (self.torch.from_numpy(region).float() - 127.5) / 127.5
+        tensor = tensor.permute(0, 3, 1, 2).to(self.device)
+        try:
+            with self.torch.inference_mode():
+                recognized = self.model.infer_beam_batch_tensor(tensor, widths, **kwargs)
+            self._learned_batch_cap = max(self._learned_batch_cap, len(batch))
+            return recognized
+        except RuntimeError as exc:
+            self._release_memory()
+            if len(batch) > 1:
+                self._learned_batch_cap = max(1, len(batch) // 2)
+                try:
+                    from utils.ocr_runtime_calibration import record
+                    record("48px", batch_size=len(batch), elapsed_seconds=0.001, items=len(batch), available_memory_gb=current_available_memory_gb(), success=False, resource_error=True)
+                except Exception:
+                    pass
+                mid = max(1, len(batch) // 2)
+                result = []
+                result.extend(self._recognize_prepared_part(batch[:mid], kwargs))
+                result.extend(self._recognize_prepared_part(batch[mid:], kwargs))
+                return result
+            if self.device.type != "cpu":
+                self._fallback_to_cpu(exc)
+                return self._recognize_prepared_part(batch, kwargs)
+            raise
+
+    def _release_memory(self):
+        try:
+            import gc
+            gc.collect()
+        except Exception:
+            pass
+        try:
+            if self.device.type == "mps" and hasattr(self.torch, "mps") and hasattr(self.torch.mps, "empty_cache"):
+                self.torch.mps.empty_cache()
+            elif self.device.type == "cuda" and hasattr(self.torch, "cuda"):
+                self.torch.cuda.empty_cache()
+        except Exception:
+            pass
+
     def recognize(
         self,
         paths: list[str],
@@ -247,52 +346,61 @@ class Recognizer:
         for path in paths:
             array, width, orientation = _prepare_image(path)
             prepared.append((path, array, width, orientation))
-        output: list[dict] = []
-        for offset in range(0, len(prepared), 16):
-            batch = prepared[offset:offset + 16]
+        recognized_by_path: dict[str, dict] = {}
+        kwargs = {
+            "beams_k": max(1, min(8, int(beams_k))),
+            "max_seq_length": max(8, min(384, int(max_seq_length))),
+        }
+        for batch in self._batch_groups(prepared):
             widths = [item[2] for item in batch]
-            max_width = 4 * (max(widths) + 7) // 4
-            region = np.zeros((len(batch), 48, max_width, 3), dtype=np.uint8)
-            for index, (_, array, width, _) in enumerate(batch):
-                region[index, :, :width, :] = array
-            tensor = (self.torch.from_numpy(region).float() - 127.5) / 127.5
-            tensor = tensor.permute(0, 3, 1, 2).to(self.device)
-            kwargs = {
-                "beams_k": max(1, min(8, int(beams_k))),
-                "max_seq_length": max(8, min(384, int(max_seq_length))),
-            }
+            def _run_current(batch_items, batch_widths):
+                region_local = np.zeros((len(batch_items), 48, 4 * ((max(batch_widths) + 7) // 4), 3), dtype=np.uint8)
+                for local_index, (_, local_array, local_width, _) in enumerate(batch_items):
+                    region_local[local_index, :, :local_width, :] = local_array
+                tensor_local = (self.torch.from_numpy(region_local).float() - 127.5) / 127.5
+                tensor_local = tensor_local.permute(0, 3, 1, 2).to(self.device)
+                with self.torch.inference_mode():
+                    result_local = self.model.infer_beam_batch_tensor(tensor_local, batch_widths, **kwargs)
+                return result_local
+
             try:
-                with self.torch.inference_mode():
-                    recognized = self.model.infer_beam_batch_tensor(
-                        tensor, widths, **kwargs
-                    )
+                recognized = _run_current(batch, widths)
+                self._learned_batch_cap = max(self._learned_batch_cap, len(batch))
             except RuntimeError as exc:
-                if self.device.type == "cpu":
-                    raise
-                self._fallback_to_cpu(exc)
-                tensor = tensor.to(self.device)
-                with self.torch.inference_mode():
-                    recognized = self.model.infer_beam_batch_tensor(
-                        tensor, widths, **kwargs
-                    )
+                if len(batch) > 1:
+                    self._learned_batch_cap = max(1, len(batch) // 2)
+                    self._release_memory()
+                    mid = max(1, len(batch) // 2)
+                    split_recognized = []
+                    for part in (batch[:mid], batch[mid:]):
+                        if not part:
+                            continue
+                        split_recognized.extend(self._recognize_prepared_part(part, kwargs))
+                    recognized = split_recognized
+                else:
+                    if self.device.type == "cpu":
+                        raise
+                    self._fallback_to_cpu(exc)
+                    self._release_memory()
+                    recognized = _run_current(batch, widths)
             if len(recognized) != len(batch):
                 raise RuntimeError(
                     f"48px OCR 批量返回数量异常：输入 {len(batch)}，返回 {len(recognized)}"
                 )
             for (path, _, width, orientation), item in zip(batch, recognized):
                 text, probability, fg, bg = _decode(self.dictionary, item)
-                output.append(
-                    {
-                        "path": path,
-                        "text": text,
-                        "confidence": probability,
-                        "foreground": fg,
-                        "background": bg,
-                        "input_width": width,
-                        "orientation": orientation,
-                    }
-                )
-        return output
+                recognized_by_path[str(path)] = {
+                    "path": path,
+                    "text": text,
+                    "confidence": probability,
+                    "foreground": fg,
+                    "background": bg,
+                    "input_width": width,
+                    "orientation": orientation,
+                }
+        # Restore physical-column input order exactly; bucketing is invisible to
+        # the caller and therefore cannot reorder Japanese reading flow.
+        return [recognized_by_path[str(path)] for path in paths if str(path) in recognized_by_path]
 
 
 def main() -> None:
@@ -325,6 +433,9 @@ def main() -> None:
                 "model": "Manga Image Translator 48px AR",
                 "input_contract": "48px-horizontal-strip; vertical crops auto-rotated",
                 "fallback": recognizer.device_fallback_reason,
+                "torch_version": str(getattr(recognizer.torch, "__version__", "")),
+                "mps_probe_ok": bool(getattr(recognizer, "mps_probe_ok", False)),
+                "mps_probe_detail": str(getattr(recognizer, "mps_probe_detail", "")),
             },
             ensure_ascii=False,
         ),

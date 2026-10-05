@@ -18,7 +18,6 @@ from PySide6.QtWidgets import (
     QGroupBox,
     QHBoxLayout,
     QLabel,
-    QMessageBox,
     QPushButton,
     QScrollArea,
     QSizePolicy,
@@ -26,6 +25,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from ui.localized_dialogs import LocalizedMessageBox as QMessageBox
 from adapters.scan_preprocess import ScanPreprocessOptions, process_scan_page
 from utils.session_temp import session_temp_registry
 
@@ -38,20 +38,20 @@ class _PreviewPane(QFrame):
         super().__init__(parent)
         self.setFrameShape(QFrame.StyledPanel)
         self.setStyleSheet(
-            "QFrame { background: #F8FAFD; border: 1px solid #CFE2F8; border-radius: 8px; }"
+            "QFrame { background: #F7F8FA; border: 1px solid #E2E5E9; border-radius: 8px; }"
         )
         layout = QVBoxLayout(self)
         layout.setContentsMargins(8, 8, 8, 8)
         layout.setSpacing(6)
         heading = QLabel(title)
-        heading.setStyleSheet("font-weight: 700; color: #202733; border: none;")
+        heading.setStyleSheet("font-weight: 700; color: #14202E; border: none;")
         layout.addWidget(heading)
         self.image_label = QLabel("尚未生成预览")
         self.image_label.setAlignment(Qt.AlignCenter)
         self.image_label.setMinimumSize(250, 320)
         self.image_label.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
         self.image_label.setStyleSheet(
-            "background: #FFFFFF; color: #667085; border: 1px solid #D7E7F8; border-radius: 6px;"
+            "background: #FFFFFF; color: #5B6B80; border: 1px solid #E2E5E9; border-radius: 6px;"
         )
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
@@ -60,7 +60,7 @@ class _PreviewPane(QFrame):
         layout.addWidget(scroll, 1)
         self.caption = QLabel("")
         self.caption.setWordWrap(True)
-        self.caption.setStyleSheet("color: #667085; font-size: 10px; border: none;")
+        self.caption.setStyleSheet("color: #5B6B80; font-size: 10px; border: none;")
         layout.addWidget(self.caption)
 
     def set_path(self, path: str, caption: str = "") -> None:
@@ -115,7 +115,7 @@ class ScanPreprocessDialog(QDialog):
             "只生成会话临时副本，不修改原图。处理完成后，页面管理、OCR预览、分列和多模型会统一读取同一批优化页面。"
         )
         intro.setWordWrap(True)
-        intro.setStyleSheet("color: #475467; font-size: 11px;")
+        intro.setStyleSheet("color: #5B6B80; font-size: 11px;")
         root.addWidget(intro)
 
         body = QHBoxLayout()
@@ -174,7 +174,7 @@ class ScanPreprocessDialog(QDialog):
         self.scope_label = QLabel(scope_text)
         self.scope_label.setWordWrap(True)
         self.scope_label.setStyleSheet(
-            "background: #EAF3FF; color: #174A7E; border: 1px solid #CFE2F8; "
+            "background: #E4EEFF; color: #1C47B8; border: 1px solid #E2E5E9; "
             "border-radius: 7px; padding: 8px; font-size: 11px;"
         )
         settings_layout.addWidget(self.scope_label)
@@ -183,7 +183,7 @@ class ScanPreprocessDialog(QDialog):
             "双页拆分会改变页面数量，但每个新页面会继承原页的正文/封面/插图分类。"
         )
         warning.setWordWrap(True)
-        warning.setStyleSheet("color: #667085; font-size: 10px;")
+        warning.setStyleSheet("color: #5B6B80; font-size: 10px;")
         settings_layout.addWidget(warning)
 
         self.preview_button = QPushButton("更新当前页预览")
@@ -215,9 +215,9 @@ class ScanPreprocessDialog(QDialog):
         )
         self.apply_button.setDefault(True)
         self.apply_button.setStyleSheet(
-            "QPushButton { background: #1677FF; color: white; border: none; "
+            "QPushButton { background: #2F6BFF; color: white; border: none; "
             "border-radius: 7px; padding: 8px 16px; font-weight: 700; }"
-            "QPushButton:hover { background: #0F6CE8; }"
+            "QPushButton:hover { background: #2559E0; }"
         )
         self.apply_button.clicked.connect(self._accept_and_save)
         footer.addWidget(self.apply_button)

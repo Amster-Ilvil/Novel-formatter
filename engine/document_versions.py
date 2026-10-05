@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import Optional
 from models.document import UnifiedDocument, Block, BlockType
 from utils.atomic_io import atomic_write_text, atomic_write_bytes
+from engine.version_delta_store import VersionDeltaStore
 
 
 
@@ -113,16 +114,107 @@ class VersionInfo:
     changes: list[dict] = field(default_factory=list)
 
 class DocumentVersionStore:
-    """Keeps three independent complete UnifiedDocument snapshots on disk or in memory."""
-    FILES = {"ocr": "ocr_document.json", "replacement": "replacement_result.json", "ai": "ai_result.json"}
+    """Keeps independent OCR and AI UnifiedDocument snapshots on disk or in memory."""
+    FILES = {"ocr": "ocr_document.json", "ai": "ai_result.json"}
     def __init__(self, project_dir: str | None = None):
         self.project_dir = Path(project_dir) if project_dir else None
         self.documents: dict[str, UnifiedDocument] = {}
         self.info: dict[str, VersionInfo] = {}
         if self.project_dir:
-            for d in ("documents", "revisions/ocr_history", "revisions/replacement_history",
-                      "revisions/ai_history", "assets/cover", "assets/images", "logs", "exports"):
+            for d in ("documents", "revisions/ocr_history",
+                      "revisions/ai_history", "revisions/objects", "assets/cover", "assets/images", "logs", "exports"):
                 (self.project_dir / d).mkdir(parents=True, exist_ok=True)
+
+    def _delta_store(self) -> VersionDeltaStore:
+        if not self.project_dir:
+            raise RuntimeError("当前版本库没有项目目录")
+        return VersionDeltaStore(self.project_dir / "revisions")
+
+    def history(self, kind: str) -> list[Path]:
+        if kind not in self.FILES:
+            raise ValueError(f"Unknown document version: {kind}")
+        if not self.project_dir:
+            return []
+        return self._delta_store().list_history(self.project_dir / "revisions" / f"{kind}_history")
+
+    def restore_history(self, kind: str, snapshot_path: str | Path, *, autosave: bool = True) -> UnifiedDocument:
+        """Restore one old snapshot as a new revision, never rewriting history in place."""
+        if kind not in self.FILES:
+            raise ValueError(f"Unknown document version: {kind}")
+        if not self.project_dir:
+            raise RuntimeError("当前版本库没有项目目录")
+        source = Path(snapshot_path)
+        history_root = (self.project_dir / "revisions" / f"{kind}_history").resolve()
+        resolved = source.expanduser().resolve()
+        if history_root not in resolved.parents:
+            raise ValueError("历史快照不属于当前项目/版本类型")
+        payload = self._delta_store().load_snapshot(resolved)
+        version_raw = dict(payload.pop("version", {}) or {})
+        doc = UnifiedDocument.from_dict(payload)
+        parent = str(version_raw.get("parent", "") or "")
+        restored = self.set(
+            kind, doc, parent=parent,
+            changes=[{"type": "history_restore", "snapshot": resolved.name}],
+            autosave=autosave,
+        )
+        return restored
+
+    def restore_history_block(
+        self, kind: str, snapshot_path: str | Path, *,
+        block_id: str = "", block_index: int | None = None, autosave: bool = True,
+    ) -> UnifiedDocument:
+        """Restore exactly one historical block into the current document.
+
+        Stable block IDs are preferred. Index restore is only used when the caller
+        explicitly supplies ``block_index``; no fuzzy positional guessing occurs.
+        """
+        if kind not in self.FILES:
+            raise ValueError(f"Unknown document version: {kind}")
+        current = self.get(kind)
+        if current is None:
+            raise RuntimeError(f"当前没有 {kind} 文档")
+        if not self.project_dir:
+            raise RuntimeError("当前版本库没有项目目录")
+        resolved = Path(snapshot_path).expanduser().resolve()
+        history_root = (self.project_dir / "revisions" / f"{kind}_history").resolve()
+        if history_root not in resolved.parents:
+            raise ValueError("历史快照不属于当前项目/版本类型")
+        payload = self._delta_store().load_snapshot(resolved)
+        payload.pop("version", None)
+        historical = UnifiedDocument.from_dict(payload)
+
+        old_index = new_index = None
+        stable_id = str(block_id or "").strip()
+        if stable_id:
+            old_index = next((i for i, block in enumerate(historical.blocks) if str(block.id) == stable_id), None)
+            new_index = next((i for i, block in enumerate(current.blocks) if str(block.id) == stable_id), None)
+            if old_index is None or new_index is None:
+                raise KeyError(f"无法在历史/当前文档同时找到 block_id={stable_id}")
+        elif block_index is not None:
+            index = int(block_index)
+            if not (0 <= index < len(historical.blocks) and 0 <= index < len(current.blocks)):
+                raise IndexError("block_index 超出历史或当前文档范围")
+            old_index = new_index = index
+        else:
+            raise ValueError("必须提供 block_id 或明确 block_index")
+
+        before_id = str(current.blocks[new_index].id or "")
+        current.blocks[new_index] = copy.deepcopy(historical.blocks[old_index])
+        return self.set(
+            kind, current, parent=self.info.get(kind, VersionInfo()).parent,
+            changes=[{
+                "type": "history_block_restore", "snapshot": resolved.name,
+                "block_id": stable_id or before_id, "block_index": new_index,
+            }],
+            autosave=autosave,
+        )
+
+    def gc_history_objects(self, *, dry_run: bool = True) -> dict:
+        """Dry-run or prune immutable history objects not reachable from any manifest."""
+        if not self.project_dir:
+            return {"dry_run": bool(dry_run), "reachable": 0, "unreachable": 0, "deleted": 0,
+                    "reclaimable_bytes": 0, "reclaimed_bytes": 0, "object_ids": []}
+        return self._delta_store().collect_garbage(dry_run=dry_run)
 
     def set(self, kind: str, doc: UnifiedDocument, parent: str = "", changes=None, autosave=True):
         if kind not in self.FILES: raise ValueError(f"Unknown document version: {kind}")
@@ -141,7 +233,7 @@ class DocumentVersionStore:
         return copy.deepcopy(doc) if doc else None
 
     def clear(self, kind: str, delete_disk: bool = True):
-        """Clear one version without affecting the other two versions."""
+        """Clear one version without affecting the other document version."""
         if kind not in self.FILES:
             raise ValueError(f"Unknown document version: {kind}")
         self.documents.pop(kind, None)
@@ -159,8 +251,16 @@ class DocumentVersionStore:
         payload = self.documents[kind].to_dict()
         payload["version"] = self.info[kind].__dict__
         if target.exists():
-            h = self.project_dir / "revisions" / f"{kind}_history" / f"{int(time.time())}_{target.name}"
-            atomic_write_bytes(h, target.read_bytes())
+            history_dir = self.project_dir / "revisions" / f"{kind}_history"
+            previous_bytes = target.read_bytes()
+            try:
+                previous_payload = json.loads(previous_bytes.decode("utf-8"))
+                self._delta_store().snapshot_payload(previous_payload, history_dir, kind=kind)
+            except Exception:
+                # Fail closed for history optimisation: never block saving the current
+                # document merely because an old/hand-edited JSON cannot be chunked.
+                h = history_dir / f"{time.time_ns()}_{target.name}"
+                atomic_write_bytes(h, previous_bytes)
         atomic_write_text(target, json.dumps(payload, ensure_ascii=False, indent=2) + "\n")
         if kind == "ai":
             atomic_write_text(

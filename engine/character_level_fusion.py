@@ -7,8 +7,8 @@ IDs.  This module operates only inside one aligned row, so it cannot pull text
 from a neighbouring printed column.  Three OCR strings are globally aligned at
 character level and voted position by position with role-aware reliability:
 
-* NDLOCR/YomiToku are favoured for continuous skeleton/completeness;
-* 48px AR and YomiToku are favoured for substitutions;
+* NDLOCR is favoured for continuous skeleton/completeness;
+* 48px AR is favoured for substitutions;
 * Apple Vision is useful for omissions but single-model insertions are penalised
   because duplicated text is its most common failure mode.
 
@@ -26,7 +26,7 @@ import unicodedata
 from typing import Sequence
 
 from engine.external_ocr import line_quality
-from engine.text_compare import normalise_for_alignment
+from engine.document_alignment import normalise_for_alignment
 from engine.adaptive_ocr_ensemble import is_sensitive_text, standard_japanese_key
 
 _GAP = None
@@ -53,34 +53,24 @@ def model_role(label: str) -> str:
         return "manga48"
     if "apple" in value or "vision" in value or "macocr" in value or "macos" in value:
         return "apple"
-    if "yomi" in value or "parseq" in value:
-        return "yomitoku"
-    if "manga" in value:
-        return "manga"
     return "generic"
 
 
 _ROLE_BACKBONE_WEIGHT = {
     "ndlocr": 1.10,
-    "yomitoku": 1.07,
     "generic": 1.00,
-    "manga": 0.99,
     "apple": 0.98,
     "manga48": 0.96,
 }
 _ROLE_SUBSTITUTION_WEIGHT = {
-    "yomitoku": 1.10,
     "manga48": 1.08,
     "apple": 1.04,
     "ndlocr": 1.00,
-    "manga": 1.00,
     "generic": 1.00,
 }
 _ROLE_SINGLE_INSERTION_WEIGHT = {
-    "yomitoku": 0.96,
     "ndlocr": 0.91,
     "generic": 0.86,
-    "manga": 0.80,
     "manga48": 0.76,
     "apple": 0.52,
 }
@@ -424,7 +414,7 @@ def build_character_fusion(
             review_required=True,
             local_reocr_recommended=True,
             reason="字符级对齐没有得到可靠文字",
-            warnings=("三模型字符对齐失败，建议局部重识别",),
+            warnings=("多模型字符对齐失败，建议局部重识别",),
         )
 
     # If voting merely reproduces one source, keep the original source card; no
@@ -468,7 +458,7 @@ def build_character_fusion(
     for model_index in duplicate_models:
         warnings.append(f"{visible_labels[model_index]}疑似包含重复片段")
     if all_different:
-        warnings.append(f"有 {all_different} 个字符位置三模型均不同")
+        warnings.append(f"有 {all_different} 个字符位置所有模型均不同")
     if unique_insertions:
         warnings.append(
             f"有 {unique_insertions} 处仅单模型插入，已保守过滤 {omitted_unique_chars} 字"
@@ -507,7 +497,7 @@ def build_character_fusion(
     if strong:
         reason += "；高置信字符融合自动采用"
     elif differs_from_all:
-        reason += "；生成字符融合建议，保留三份原始 OCR 供人工选择"
+        reason += "；生成字符融合建议，保留原始 OCR 候选供人工选择"
     else:
         reason += "；融合结果等同现有模型，不新增候选"
 

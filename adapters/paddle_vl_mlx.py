@@ -24,13 +24,17 @@ import time
 from pathlib import Path
 
 from adapters.runtime_env import ensure_venv, venv_python
+from utils.apple_silicon_runtime import mlx_worker_env
 
 ROOT = Path(__file__).parent.parent
 VENV_DIR = ROOT / ".venv-mlx-vlm"
 VENV_PYTHON = venv_python(VENV_DIR)
 MLX_VLM_PACKAGE_SPEC = os.environ.get(
-    "NOVEL_FORMATTER_MLX_VLM_PACKAGE", "mlx-vlm>=0.3.11"
-).strip() or "mlx-vlm>=0.3.11"
+    "NOVEL_FORMATTER_MLX_VLM_PACKAGE", "mlx-vlm>=0.7.2,<0.8"
+).strip() or "mlx-vlm>=0.7.2,<0.8"
+MLX_PACKAGE_SPEC = os.environ.get(
+    "NOVEL_FORMATTER_MLX_PACKAGE", "mlx>=0.32.2,<0.33"
+).strip() or "mlx>=0.32.2,<0.33"
 DEFAULT_MODEL = os.environ.get(
     "NOVEL_FORMATTER_PADDLE_VL_MLX_MODEL", "PaddlePaddle/PaddleOCR-VL-1.6"
 ).strip() or "PaddlePaddle/PaddleOCR-VL-1.6"
@@ -65,7 +69,10 @@ def _marker_code() -> str:
         "from importlib.metadata import version; "
         "parts=version('mlx-vlm').split('+',1)[0].split('.'); "
         "nums=tuple(int(''.join(c for c in p if c.isdigit()) or 0) for p in parts[:3]); "
-        "assert nums >= (0,3,11), 'mlx-vlm>=0.3.11 required'; "
+        "assert nums >= (0,7,2), 'mlx-vlm>=0.7.2 required'; "
+        "mlx_parts=version('mlx').split('+',1)[0].split('.'); "
+        "mlx_nums=tuple(int(''.join(c for c in p if c.isdigit()) or 0) for p in mlx_parts[:3]); "
+        "assert mlx_nums >= (0,32,2), 'mlx>=0.32.2 required'; "
         "assert sys.platform=='darwin' and platform.machine().lower() in ('arm64','aarch64'), "
         "'MLX-VLM requires Apple Silicon macOS'"
     )
@@ -78,7 +85,7 @@ def setup_mlx_venv(*, verbose: bool = True) -> Path:
         VENV_DIR,
         label="PaddleOCR-VL · MLX-VLM",
         marker_code=_marker_code(),
-        packages=[MLX_VLM_PACKAGE_SPEC],
+        packages=[MLX_PACKAGE_SPEC, MLX_VLM_PACKAGE_SPEC],
         verbose=verbose,
         min_minor=10,
         max_minor=13,
@@ -114,7 +121,29 @@ def probe_mlx_runtime(*, deep: bool = False) -> tuple[bool, str]:
         version_text = version_proc.stdout.strip() if version_proc.returncode == 0 else ""
     except Exception:
         version_text = ""
-    return True, f"MLX-VLM {version_text or '>=0.3.11'} 可用"
+    return True, f"MLX-VLM {version_text or '>=0.7.2'} 可用"
+
+
+def _truthy_env(name: str, default: str = "0") -> bool:
+    return str(os.environ.get(name, default) or default).strip().lower() in {"1", "true", "yes", "on"}
+
+def _apply_mlx_vlm_performance_env(env: dict[str, str]) -> dict[str, str]:
+    """Apply conservative opt-in MLX-VLM acceleration knobs.
+
+    Upstream mlx-vlm supports APC prefix caching, continuous batching and
+    speculative decoding.  Continuous batching is server-managed.  APC is
+    exposed here as an opt-in because its resident cache competes with OCR
+    models in unified memory; speculative decoding remains upstream/manual until
+    a compatible drafter is explicitly selected and parity-tested.
+    """
+    if _truthy_env("NOVEL_FORMATTER_MLX_VLM_APC"):
+        env["APC_ENABLED"] = "1"
+        # Avoid surprise disk persistence unless the user opts into it.
+        env["APC_DISK_ENABLED"] = "1" if _truthy_env("NOVEL_FORMATTER_MLX_VLM_APC_DISK") else "0"
+        memory_gb = str(os.environ.get("NOVEL_FORMATTER_MLX_VLM_APC_MEMORY_GB", "") or "").strip()
+        if memory_gb:
+            env["APC_MEMORY_MAX_GB"] = memory_gb
+    return env
 
 
 def _free_local_port() -> int:
@@ -179,9 +208,8 @@ class _MlxVlmServer:
                 "--host", "127.0.0.1",
                 "--port", str(port),
             ]
-            env = dict(os.environ)
+            env = _apply_mlx_vlm_performance_env(mlx_worker_env(os.environ.copy()))
             env.setdefault("HF_HUB_DISABLE_PROGRESS_BARS", "1")
-            env.setdefault("TOKENIZERS_PARALLELISM", "false")
             env["NOVEL_FORMATTER_MLX_PARENT_PID"] = str(os.getpid())
             from adapters.subprocess_watchdog import isolated_process_kwargs
             self._proc = subprocess.Popen(

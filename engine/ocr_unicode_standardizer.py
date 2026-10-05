@@ -51,16 +51,39 @@ _KANA_SPACING_DAKUTEN = re.compile(
 )
 
 # Compare-only aliases.  These are never written back to the OCR text.
-_COMPARE_PUNCTUATION_ALIASES = str.maketrans({
+_COMPARE_PUNCTUATION_ALIAS_MAP = {
     "\uFF5E": "\u301C",  # FULLWIDTH TILDE -> WAVE DASH
+    "\u3030": "\u301C",  # WAVY DASH -> WAVE DASH
     "\u00B7": "\u30FB",  # MIDDLE DOT -> KATAKANA MIDDLE DOT
+    "\uFF65": "\u30FB",  # HALFWIDTH KATAKANA MIDDLE DOT
+    "\u2022": "\u30FB",  # BULLET -> KATAKANA MIDDLE DOT (compare only)
+    "\u22EF": "\u2026",  # MIDLINE HORIZONTAL ELLIPSIS -> HORIZONTAL ELLIPSIS
+    "\u2025": "\u2026",  # TWO DOT LEADER -> HORIZONTAL ELLIPSIS (compare only)
+    # Dash-like OCR presentation variants.  Do NOT fold Japanese prolonged
+    # sound mark U+30FC or ideograph 一: those are substantive characters.
+    "\u2010": "\u2015",  # HYPHEN -> HORIZONTAL BAR
+    "\u2011": "\u2015",  # NON-BREAKING HYPHEN -> HORIZONTAL BAR
+    "\u2012": "\u2015",  # FIGURE DASH -> HORIZONTAL BAR
+    "\u2014": "\u2015",  # EM DASH -> HORIZONTAL BAR
+    "\u2013": "\u2015",  # EN DASH -> HORIZONTAL BAR
+    "\u2500": "\u2015",  # BOX DRAWINGS LIGHT HORIZONTAL -> HORIZONTAL BAR
+    "\u2501": "\u2015",  # BOX DRAWINGS HEAVY HORIZONTAL -> HORIZONTAL BAR
+    "\u254C": "\u2015",  # BOX DRAWINGS LIGHT DOUBLE DASH HORIZONTAL
+    "\u254D": "\u2015",  # BOX DRAWINGS HEAVY DOUBLE DASH HORIZONTAL
+    "\u2574": "\u2015",  # BOX DRAWINGS LIGHT LEFT
+    "\u2576": "\u2015",  # BOX DRAWINGS LIGHT RIGHT
+    "\u2578": "\u2015",  # BOX DRAWINGS HEAVY LEFT
+    "\u257A": "\u2015",  # BOX DRAWINGS HEAVY RIGHT
+    "\uFF0D": "\u2015",  # FULLWIDTH HYPHEN-MINUS -> HORIZONTAL BAR
     # Compare-only ASCII/fullwidth forms.  Authoritative OCR text remains
     # untouched; these mappings only prevent visually identical punctuation
     # from appearing as a false conflict in OCR Compare.
     "？": "?", "！": "!", "：": ":", "；": ";",
     "（": "(", "）": ")", "［": "[", "］": "]",
     "｛": "{", "｝": "}", "，": ",", "．": ".",
-})
+    "＂": "\"", "＇": "'",
+}
+_COMPARE_PUNCTUATION_ALIASES = str.maketrans(_COMPARE_PUNCTUATION_ALIAS_MAP)
 
 _CATEGORY_LABELS = {
     "nfc": "组合浊音/合成字符",
@@ -313,6 +336,28 @@ def japanese_ocr_comparison_key(
     value = unicodedata.normalize("NFC", value)
     report.comparison_keys_changed = int(value != source)
     return value, report
+
+
+def comparison_key_alias_trace(text: str) -> list[dict[str, str]]:
+    """Return compare-only punctuation folds without changing source text.
+
+    This is a debug/audit helper for visually-identical Unicode conflicts.  It
+    intentionally reports only the explicit punctuation alias table; deletion
+    of whitespace/IVS/control characters remains available through the normal
+    normalization report counts.
+    """
+    output: list[dict[str, str]] = []
+    for char in str(text or ""):
+        target = _COMPARE_PUNCTUATION_ALIAS_MAP.get(char)
+        if target is None or target == char:
+            continue
+        output.append({
+            "source": char,
+            "source_codepoint": f"U+{ord(char):04X}",
+            "target": target,
+            "target_codepoint": f"U+{ord(target):04X}",
+        })
+    return output
 
 
 def normalize_text_collection(

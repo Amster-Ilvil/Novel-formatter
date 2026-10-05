@@ -2,14 +2,14 @@
 # -*- coding: utf-8 -*-
 """外部 OCR 引擎的共享运行框架。
 
-PaddleOCR / Manga-OCR / NDLOCR-Lite 等引擎的流程完全一致：
+PaddleOCR / NDLOCR-Lite 等引擎的流程完全一致：
     展开输入（图片/PDF）→ 可选裁剪 → 跳过非正文页 → worker 子进程逐页识别
     → 可选页眉过滤 → 页面自动分类 → 组装 UnifiedDocument
 唯一不同的是 worker 怎么起。这里把公共流程收拢成 run_ocr_engine()，
 各适配器只提供 worker_fn(ocr_paths, cancel_check) -> (path, blocks, error) 迭代器。
 
 blocks 协议：[{"text": str, "confidence": float, "box": [[x,y]×4] | None}, ...]
-box 为 None 时不生成 bbox。Manga OCR 页面入口会先进入物理分列适配器，不再直接识别整页。
+box 为 None 时不生成 bbox。
 """
 
 from __future__ import annotations
@@ -19,6 +19,7 @@ import os
 import re
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
@@ -93,7 +94,7 @@ def iter_worker_jsonl(cmd: list[str], cancel_check=None, engine_label: str = "OC
     """Run a JSONL worker with drained stderr, cancellation and an idle timeout."""
     from adapters.subprocess_watchdog import (
         LinePump, ProcessCancelled, env_seconds, isolated_process_kwargs,
-        terminate_process,
+        terminate_process, workload_timeout,
     )
 
     proc = subprocess.Popen(
@@ -170,7 +171,7 @@ def iter_server_worker_jsonl(
     """Run a persistent JSONL OCR worker with bounded requests and a watchdog."""
     from adapters.subprocess_watchdog import (
         LinePump, ProcessCancelled, env_seconds, isolated_process_kwargs,
-        terminate_process,
+        terminate_process, workload_timeout,
     )
 
     paths = [str(path) for path in image_paths]
@@ -186,7 +187,12 @@ def iter_server_worker_jsonl(
     stdout_pump = LinePump(proc.stdout, name=f"{engine_label}-stdout")
     stderr_pump = LinePump(proc.stderr, name=f"{engine_label}-stderr")
     stderr_lines: list[str] = []
-    request_timeout = env_seconds("NOVEL_FORMATTER_OCR_REQUEST_TIMEOUT", 300.0, minimum=30.0)
+    base_request_timeout = env_seconds(
+        "NOVEL_FORMATTER_OCR_REQUEST_TIMEOUT", 300.0, minimum=30.0
+    )
+    timeout_per_megapixel = env_seconds(
+        "NOVEL_FORMATTER_OCR_TIMEOUT_PER_MEGAPIXEL", 2.0, minimum=0.1, maximum=60.0
+    )
     terminated = False
 
     def drain_stderr() -> None:
@@ -204,6 +210,22 @@ def iter_server_worker_jsonl(
                 break
             request_id += 1
             chunk = paths[start:start + size]
+            max_megapixels = 0.0
+            for image_path in chunk:
+                try:
+                    width, height = page_size(image_path)
+                    max_megapixels = max(
+                        max_megapixels, (float(width) * float(height)) / 1_000_000.0
+                    )
+                except Exception:
+                    # A worker may accept a non-raster source that Pillow cannot
+                    # probe.  In that case retain the configured base timeout.
+                    pass
+            request_timeout = workload_timeout(
+                base_request_timeout,
+                megapixels=max_megapixels,
+                seconds_per_megapixel=timeout_per_megapixel,
+            )
             request = {"request_id": request_id, "images": chunk}
             proc.stdin.write(json.dumps(request, ensure_ascii=False) + "\n")
             proc.stdin.flush()
@@ -288,6 +310,8 @@ def run_ocr_engine(
     strict_column_audit: bool = False,
     ocr_mode: str = "ja_vertical",
     merge_horizontal_fragments: bool = True,
+    performance_callback=None,
+    worker_timing_name: str = "recognition",
 ) -> UnifiedDocument:
     """通用引擎流程；参数语义与 apple_vision_adapter.run() 一致。"""
     ocr_mode = normalize_ocr_mode(ocr_mode)
@@ -313,61 +337,111 @@ def run_ocr_engine(
     # setup.  Classified asset pages must not pay preprocessing cost or leak
     # cover/TOC/colophon text into cross-page header statistics.
     source_pages_to_ocr, skipped_asset_pages = split_ocr_pages(image_paths, overrides)
+    def report_timing(stage: str, seconds: float, details: dict | None = None) -> None:
+        if not callable(performance_callback):
+            return
+        try:
+            performance_callback(stage, max(0.0, float(seconds)), details or {})
+        except Exception:
+            pass
+
+    report_timing("input_pages", 0.0, {
+        "total": len(image_paths),
+        "ocr": len(source_pages_to_ocr),
+        "skipped": len(skipped_asset_pages),
+    })
     ocr_inputs_by_page: dict[int, str] = {}
     cancelled_before_recognition = False
+    preparation_started = time.perf_counter()
     if crop_rect is not None or crop_top > 0 or crop_bottom > 0:
         from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeout
         from adapters.apple_vision_adapter import crop_for_ocr
-        source_paths = [path for _, path in source_pages_to_ocr]
+
+        # In multi-model column mode the fixed-region page is immutable and shared
+        # by every recognizer.  Older code still created one Future per page for
+        # every later model merely so ``crop_for_ocr`` could acquire a lock and
+        # rediscover that the finished file already existed.  Skip that entire
+        # scheduling/lock path for completed atomic outputs; only genuinely
+        # missing pages enter the worker pool.  This does not change crop pixels
+        # or names, and a concurrent writer remains safe because it exposes the
+        # destination only after os.replace().
+        direct_reused = 0
+        pending_entries: list[tuple[tuple[int, str], str]] = []
+        crop_dir = Path(temp_crop_dir) if temp_crop_dir else None
+        for source_entry in source_pages_to_ocr:
+            source_path = source_entry[1]
+            reused_path: str | None = None
+            if reuse_existing_crops and crop_dir is not None:
+                candidate = crop_dir / Path(source_path).name
+                try:
+                    if candidate.exists() and candidate.stat().st_size > 0:
+                        reused_path = str(candidate)
+                except OSError:
+                    reused_path = None
+            if reused_path is not None:
+                ocr_inputs_by_page[source_entry[0]] = reused_path
+                direct_reused += 1
+            else:
+                pending_entries.append((source_entry, source_path))
+
         # Crop only admitted body/unknown pages. Cancellation must also stop the
         # preprocessing queue: the former pool.map/list construct waited for all
         # queued pages even after the GUI Stop button had been pressed.
-        executor = ThreadPoolExecutor(max_workers=min(8, os.cpu_count() or 4))
-        futures = [
-            executor.submit(
-                crop_for_ocr,
-                source_path,
-                crop_top=crop_top,
-                crop_bottom=crop_bottom,
-                crop_rect=crop_rect,
-                out_dir=temp_crop_dir,
-                reuse_existing=bool(reuse_existing_crops),
-            )
-            for source_path in source_paths
-        ]
         crop_cancelled = False
-        try:
-            for source_entry, future in zip(source_pages_to_ocr, futures):
-                if callable(cancel_check) and cancel_check():
-                    crop_cancelled = True
-                    break
-                while True:
+        futures = []
+        executor = None
+        if pending_entries:
+            executor = ThreadPoolExecutor(max_workers=min(4, os.cpu_count() or 4))
+            futures = [
+                executor.submit(
+                    crop_for_ocr,
+                    source_path,
+                    crop_top=crop_top,
+                    crop_bottom=crop_bottom,
+                    crop_rect=crop_rect,
+                    out_dir=temp_crop_dir,
+                    reuse_existing=bool(reuse_existing_crops),
+                )
+                for _source_entry, source_path in pending_entries
+            ]
+            try:
+                for (source_entry, _source_path), future in zip(pending_entries, futures):
                     if callable(cancel_check) and cancel_check():
                         crop_cancelled = True
                         break
-                    try:
-                        cropped = future.result(timeout=0.10)
+                    while True:
+                        if callable(cancel_check) and cancel_check():
+                            crop_cancelled = True
+                            break
+                        try:
+                            cropped = future.result(timeout=0.10)
+                            break
+                        except FutureTimeout:
+                            continue
+                    if crop_cancelled:
                         break
-                    except FutureTimeout:
-                        continue
+                    if callable(cancel_check) and cancel_check():
+                        crop_cancelled = True
+                        break
+                    ocr_inputs_by_page[source_entry[0]] = cropped
+            finally:
                 if crop_cancelled:
-                    break
-                if callable(cancel_check) and cancel_check():
-                    crop_cancelled = True
-                    break
-                ocr_inputs_by_page[source_entry[0]] = cropped
-        finally:
-            if crop_cancelled:
-                cancelled_before_recognition = True
-                for future in futures:
-                    future.cancel()
-                executor.shutdown(wait=False, cancel_futures=True)
-            else:
-                executor.shutdown(wait=True)
+                    cancelled_before_recognition = True
+                    for future in futures:
+                        future.cancel()
+                    executor.shutdown(wait=False, cancel_futures=True)
+                else:
+                    executor.shutdown(wait=True)
     else:
         ocr_inputs_by_page = {
             page_no: path for page_no, path in source_pages_to_ocr
         }
+    if crop_rect is not None or crop_top > 0 or crop_bottom > 0:
+        report_timing("image_preparation", time.perf_counter() - preparation_started, {
+            "pages": len(ocr_inputs_by_page),
+            "reused_crops": bool(reuse_existing_crops),
+            "direct_reused_crops": direct_reused if reuse_existing_crops else 0,
+        })
 
     pages_to_ocr = [
         (page_no, ocr_inputs_by_page[page_no])
@@ -394,7 +468,18 @@ def run_ocr_engine(
     processed = 0
     if pages_to_ocr:
         ocr_paths = [p for _, p in pages_to_ocr]
-        for path, blocks, error in worker_fn(ocr_paths, cancel_check):
+        def timed_worker():
+            started = time.perf_counter()
+            try:
+                yield from worker_fn(ocr_paths, cancel_check)
+            finally:
+                report_timing(worker_timing_name, time.perf_counter() - started, {
+                    "pages_requested": len(ocr_paths),
+                    "pages_returned": processed,
+                    "source_engine": source_engine,
+                })
+
+        for path, blocks, error in timed_worker():
             i = page_idx_by_path.get(path)
             if i is None:
                 continue
@@ -641,6 +726,8 @@ def run_ocr_engine(
                     "column_left", "column_top", "column_right", "column_bottom",
                     "column_hard_left", "column_hard_right",
                     "ruby_candidate_boxes", "ruby_candidate_confidence",
+                    "column_supplemental_boxes", "column_excluded_boxes",
+                    "column_ruby_guard_boxes", "column_full_height_slot",
                     "column_ocr_empty", "column_requires_handwriting",
                     "preserve_empty_ocr_column", "preserve_ocr_item",
                     "column_manual_placeholder", "column_ocr_attempts",
@@ -654,7 +741,15 @@ def run_ocr_engine(
                     "column_ocr_rescue_policy", "column_ocr_rescue_budget",
                     "column_ocr_rescue_used", "column_ocr_rescue_method",
                     "column_ocr_rescue_reason",
-                    "column_ocr_transport", "column_ndlocr_page_mode",
+                    "column_ocr_transport", "column_ocr_transport_version",
+                    "column_ocr_input_contract", "column_ocr_input_profile",
+                    "column_isolation_mode", "column_ocr_input_profile_sha256",
+                    "column_ocr_input_image_path", "column_ocr_transport_profile",
+                    "column_preserve_body_pixels",
+                    "column_ocr_input_sha256", "column_ocr_actual_input_sha256",
+                    "column_ocr_actual_input_sha256s", "column_ocr_actual_input_scope",
+                    "column_ndlocr_page_input_sha256",
+                    "column_ndlocr_page_mode",
                     "sentence_context_reocr_group",
                     "sentence_context_reocr_column_ids",
                     "sentence_context_reocr_column_count",
@@ -670,6 +765,7 @@ def run_ocr_engine(
                     "sentence_context_reocr_owner_column_id",
                     "sentence_context_reocr_position",
                     "sentence_context_reocr_owner",
+                    "sentence_context_reocr_input_sha256",
                     "ocr_review_sentence_image_path",
                     "black_ink_layout_only", "black_ink_estimated_chars",
                     "black_ink_content_spans",
@@ -698,6 +794,42 @@ def run_ocr_engine(
                 doc.toc.append(TocEntry(title=text, chapter_index=chapter_index, block_index=len(doc.blocks)))
 
             doc.blocks.append(block)
+            # Persist OCR-input provenance independently of later block reflow /
+            # page->sentence projection.  The stable physical column id is the
+            # join key used by V5 adjudication input audits.
+            column_id = str(item_metadata.get("column_id", "") or "")
+            if column_id:
+                record = {
+                    "column_id": column_id,
+                    "prepared_column_sha256": str(item_metadata.get("column_ocr_input_sha256", "") or ""),
+                    "actual_input_sha256": str(item_metadata.get("column_ocr_actual_input_sha256", "") or ""),
+                    "actual_input_sha256s": [
+                        str(value) for value in (item_metadata.get("column_ocr_actual_input_sha256s", []) or [])
+                        if str(value)
+                    ],
+                    "input_hash_scope": str(item_metadata.get("column_ocr_actual_input_scope", "") or "unavailable"),
+                    "page_input_sha256": str(item_metadata.get("column_ndlocr_page_input_sha256", "") or ""),
+                    "sentence_input_sha256": str(item_metadata.get("sentence_context_reocr_input_sha256", "") or ""),
+                    "input_profile": str(item_metadata.get("column_ocr_input_profile", "") or ""),
+                    "input_profile_sha256": str(item_metadata.get("column_ocr_input_profile_sha256", "") or ""),
+                    "input_contract": str(item_metadata.get("column_ocr_input_contract", "") or ""),
+                    "transport": str(item_metadata.get("column_ocr_transport", "") or ""),
+                    "transport_version": str(item_metadata.get("column_ocr_transport_version", "") or ""),
+                    "isolation_mode": str(item_metadata.get("column_isolation_mode", "") or ""),
+                    "selected_variant": str(item_metadata.get("column_ocr_selected_variant", "") or ""),
+                    "seeded_reuse": bool(item_metadata.get("column_consensus_seeded", False)),
+                    "attempts": list(item_metadata.get("column_ocr_attempts", []) or []),
+                }
+                existing = dict(doc.metadata.column_ocr_input_records.get(column_id, {}) or {})
+                # A non-empty later value may add sentence/page provenance, but
+                # contradictory non-empty hashes are retained as an explicit
+                # conflict rather than silently overwritten.
+                if existing:
+                    old_actual = str(existing.get("actual_input_sha256", "") or "")
+                    new_actual = str(record.get("actual_input_sha256", "") or "")
+                    if old_actual and new_actual and old_actual != new_actual:
+                        record["metadata_conflict"] = True
+                doc.metadata.column_ocr_input_records[column_id] = {**existing, **record}
             order_counter += 1
 
         text_page_count += 1

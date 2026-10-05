@@ -50,8 +50,15 @@ class OCRPreviewTempStore:
                 self._closing = True
             roots = tuple(sorted(self._roots))
             self._roots.clear()
-        for root in roots:
-            shutil.rmtree(root, ignore_errors=True)
+        # Explicit workspace Clear still deletes immediately because the same
+        # process continues running and may reuse disk space.  On application
+        # close every OCR crop root is a child of SessionTempRegistry; deleting
+        # thousands of files here would block Qt before the registry gets a
+        # chance to perform its detached cleanup.  MainWindow.closeEvent owns
+        # that one asynchronous session-root deletion.
+        if not closing:
+            for root in roots:
+                shutil.rmtree(root, ignore_errors=True)
         return roots
 
     def finish_run(self, path: str, epoch: int) -> bool:

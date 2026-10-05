@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Paragraph —— Text Replacement Engine 用的轻量文本单元。
+Paragraph —— 文本导入/对齐使用的轻量文本单元。
 
 比 UnifiedDocument.Block 更简单：只关心"这段文字属于哪一章、在原文里第几个、
 是不是标题"，不携带 bbox/图片/页面这些结构信息——那些结构永远来自 OCR 那一份
-UnifiedDocument，Paragraph 只代表"用来替换正文的高质量文本"，两者角色不同，
+UnifiedDocument，Paragraph 只代表"用于文本导入/对齐的正文片段"，两者角色不同，
 不该共用同一个数据结构。
 """
 

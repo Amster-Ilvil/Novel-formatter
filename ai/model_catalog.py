@@ -47,7 +47,7 @@ def _request_json(url: str, headers: dict[str, str], timeout: int) -> dict[str, 
         url,
         headers={
             "Accept": "application/json",
-            "User-Agent": "NovelFormatter/1.0 model-catalog",
+            "User-Agent": "NovelFormatter/2.0 model-catalog",
             **headers,
         },
         method="GET",

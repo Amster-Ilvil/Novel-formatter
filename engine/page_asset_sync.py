@@ -68,7 +68,13 @@ def _page_for_existing_ref(block: Block, images: list[str]) -> int:
     return 0
 
 
-def _overlay_is_satisfied(doc: UnifiedDocument, images: list[str], managed_types: dict[int, BlockType]) -> bool:
+def _overlay_is_satisfied(
+    doc: UnifiedDocument,
+    images: list[str],
+    managed_types: dict[int, BlockType],
+    text_page_numbers: set[int] | None = None,
+) -> bool:
+    text_pages = set(text_page_numbers or set())
     found: dict[int, int] = {}
     for block in doc.blocks:
         if block.type != BlockType.IMAGE_REF:
@@ -77,7 +83,7 @@ def _overlay_is_satisfied(doc: UnifiedDocument, images: list[str], managed_types
         if page_no in managed_types:
             found[page_no] = found.get(page_no, 0) + 1
     for page_no, page_type in managed_types.items():
-        expected = 1 if _is_image_page(page_type) else 0
+        expected = 1 if page_no not in text_pages and _is_image_page(page_type) else 0
         if found.get(page_no, 0) != expected:
             return False
     return True
@@ -90,6 +96,7 @@ def sync_page_manager_assets(
     *,
     preserve_unmanaged_pages: bool = True,
     copy_document: bool = True,
+    text_page_numbers: Iterable[int] | None = None,
 ) -> tuple[UnifiedDocument, PageAssetSyncReport]:
     """Return a document synchronized with the current Page Manager overlay.
 
@@ -103,12 +110,28 @@ def sync_page_manager_assets(
     if not images:
         return (copy.deepcopy(doc) if copy_document else doc), PageAssetSyncReport()
 
+    # Some workflows intentionally extract text from a page whose Page Manager
+    # type is still semantic rather than ``paragraph`` (for example AFTERWORD).
+    # The default remains byte-for-byte compatible with the old overlay policy;
+    # callers must explicitly name the page numbers that already have
+    # authoritative text.  Those pages keep their semantic PageInfo type while
+    # avoiding an IMAGE_REF replacement that would otherwise discard the text.
+    text_pages: set[int] = set()
+    for raw_page_no in (text_page_numbers or []):
+        try:
+            page_no = int(raw_page_no)
+        except (TypeError, ValueError):
+            continue
+        if page_no > 0:
+            text_pages.add(page_no)
+
     out = copy.deepcopy(doc) if copy_document else doc
     overrides = {int(k): v for k, v in (confirmed_overrides or {}).items()}
     signature = repr((
         tuple(images),
         tuple(sorted((int(k), str(getattr(v, "value", v))) for k, v in overrides.items())),
         bool(preserve_unmanaged_pages),
+        tuple(sorted(text_pages)),
     ))
     existing_pages = {int(p.page_no): p for p in out.pages}
 
@@ -137,9 +160,12 @@ def sync_page_manager_assets(
 
     if (
         getattr(out.metadata, "page_asset_sync_signature", None) == signature
-        and _overlay_is_satisfied(out, images, managed_types)
+        and _overlay_is_satisfied(out, images, managed_types, text_pages)
     ):
-        image_pages = sum(1 for p in managed_types.values() if _is_image_page(p))
+        image_pages = sum(
+            1 for page_no, page_type in managed_types.items()
+            if page_no not in text_pages and _is_image_page(page_type)
+        )
         unplaced = sum(
             1 for b in out.blocks
             if b.type == BlockType.IMAGE_REF and (b.metadata or {}).get("placement_required")
@@ -168,7 +194,7 @@ def sync_page_manager_assets(
                     changed = True
                 continue
             page_type = managed_types[ref_page]
-            if not _is_image_page(page_type) or ref_page in preserved_pages:
+            if ref_page in text_pages or not _is_image_page(page_type) or ref_page in preserved_pages:
                 removed += 1
                 changed = True
                 continue
@@ -191,7 +217,7 @@ def sync_page_manager_assets(
             kept.append(block)
             continue
         page_type = managed_types[page_no]
-        if page_type != BlockType.PARAGRAPH and not strict_authoritative:
+        if page_no not in text_pages and page_type != BlockType.PARAGRAPH and not strict_authoritative:
             removed += 1
             changed = True
             continue
@@ -207,7 +233,7 @@ def sync_page_manager_assets(
 
     for page_no in range(1, len(images) + 1):
         page_type = managed_types[page_no]
-        if not _is_image_page(page_type) or page_no in preserved_pages:
+        if page_no in text_pages or not _is_image_page(page_type) or page_no in preserved_pages:
             continue
         image_path = images[page_no - 1]
         placement_required = False
@@ -272,7 +298,10 @@ def sync_page_manager_assets(
     if rebuilt_toc or out.toc:
         out.toc = rebuilt_toc
 
-    image_pages = sum(1 for p in managed_types.values() if _is_image_page(p))
+    image_pages = sum(
+        1 for page_no, page_type in managed_types.items()
+        if page_no not in text_pages and _is_image_page(page_type)
+    )
     if changed or removed or inserted:
         out.add_log(
             "page_manager_assets",

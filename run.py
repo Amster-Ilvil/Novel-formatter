@@ -150,6 +150,21 @@ def main(argv=None) -> int:
     if args.batch:
         if args.from_json or args.from_epub or args.text_layer:
             parser.error("--batch 不能与 --from-json、--from-epub 或 --text-layer 同时使用")
+        unsupported = []
+        for flag, value in (
+            ("--overrides", args.overrides), ("--preserve-ruby", args.preserve_ruby),
+            ("--title", args.title), ("--author", args.author), ("--publisher", args.publisher),
+            ("--isbn", args.isbn), ("--volume", args.volume), ("--repo", args.repo),
+            ("--output-word", args.output_word), ("--save-json", args.save_json),
+            ("--save-formatted-json", args.save_formatted_json),
+        ):
+            if value:
+                unsupported.append(flag)
+        if unsupported:
+            parser.error(
+                "批量模式目前不支持以下单本参数（过去会被静默忽略）："
+                + "、".join(unsupported)
+            )
         if not input_path.is_dir():
             parser.error("批量模式的 input 必须是包含书籍子目录的文件夹")
         from core.batch_processor import BatchProcessor
@@ -157,6 +172,13 @@ def main(argv=None) -> int:
             input_dir=args.input,
             output_dir=args.output_dir,
             preview_enabled=not args.no_preview,
+            vertical=args.vertical,
+            css_template=args.template,
+            shortcut_name=args.shortcut,
+            crop_top=args.crop_top,
+            crop_bottom=args.crop_bottom,
+            steps=args.steps,
+            verbose=not args.quiet,
         ).run()
         return 0
 

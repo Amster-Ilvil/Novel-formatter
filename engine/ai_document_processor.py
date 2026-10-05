@@ -17,15 +17,17 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Iterable
 
-from ai.request_limiter import RequestLimiter
+from ai.request_limiter import RequestLimiter, retry_delay_seconds
+from ai.redaction import redact_secrets
 from ai.token_counter import estimate_tokens
 from engine.document_versions import ai_request_payload, build_ai_document, cleanup_ai_covered_fragments
+from engine.ai_glossary import glossary_fingerprint, load_glossary, select_relevant_glossary
 
 # Protocol v3 follows the same efficiency principle as AiNiee: ordered numbered text,
 # minimal repeated metadata, token-aware batching, and local reuse of unchanged content.
 TYPESET_PROMPT = """Correct and typeset Japanese light-novel OCR without changing its style or facts.
-Input is one ordered chapter part: {"b":[[id,type,text],...],"g":0|1}. Types: p=paragraph,d=dialogue,c=chapter,s=section,r=ruby,f=footnote,t=toc,u=other.
-Fix clear OCR errors, missing characters, punctuation and grammar. Merge/split blocks when needed, repair cross-page sentences, put each dialogue turn in its own block, and separate dialogue from narration. Preserve chapter/section order and apply consistent light-novel formatting across batches.
+Input is one ordered chapter part: {"b":[[id,type,text],...],"g":0|1,"k":[[source,preferred],...]?}. Types: p=paragraph,d=dialogue,c=chapter,s=section,r=ruby,f=footnote,t=toc,u=other.
+Fix clear OCR errors, missing characters, punctuation and grammar. Merge/split blocks when needed, repair cross-page sentences, put each dialogue turn in its own block, and separate dialogue from narration. Preserve chapter/section order and apply consistent light-novel formatting across batches. If optional k is present, it is a protected glossary: preserve the spelling used in the source text, or use its preferred form only when correcting an actual OCR/normalization error; never rename a coined term to a more common word.
 Return ONLY changed contiguous ranges as compact JSON: {"o":[[[source_ids...],[[type,text],...]],...]}. Each operation replaces exactly those contiguous input ids; operations must not overlap. Omit every unchanged range.
 When g=1, also return one complete EPUB stylesheet in top-level key "s". The CSS must be plain CSS (no Markdown), suitable for Japanese light novels, and style body, h1, h2, p.normal, p.dialogue, ruby, rt, .cover-page, .illus-page and img. It must preserve readable spacing in both vertical and horizontal export; writing-mode may be included because the exporter removes it for horizontal mode. When g=0, omit "s".
 If nothing changes return {"o":[],"s":"..."} when g=1, otherwise {"o":[]}.
@@ -33,7 +35,7 @@ Never invent, summarize, translate, rename, delete content, or return explanatio
 INPUT:\n{{INPUT}}"""
 
 CORRECTION_PROMPT = """Proofread Japanese light-novel OCR while preserving wording, style, block order, block count and block type.
-Input: {"b":[[id,type,text],...]}. Correct only clear OCR character errors, obvious missing characters, punctuation and grammar. Do not merge, split or reformat.
+Input: {"b":[[id,type,text],...],"k":[[source,preferred],...]?}. Correct only clear OCR character errors, obvious missing characters, punctuation and grammar. Do not merge, split or reformat. If optional k is present, treat it as a protected glossary: preserve the spelling used in the source text, or use its preferred form only for an actual OCR/normalization error; never normalize coined names into common words.
 Return ONLY changed blocks as compact JSON: {"c":[[id,corrected_text],...]}. Omit unchanged blocks. If nothing changes return {"c":[]}.
 No explanations, unchanged text or Markdown.
 INPUT:\n{{INPUT}}"""
@@ -41,6 +43,8 @@ INPUT:\n{{INPUT}}"""
 _RETRY_SUFFIX = """
 Your response was not valid JSON. Return exactly one compact JSON object matching the schema, with no Markdown or commentary.
 """
+
+_GLOSSARY_PROMPT_GUARD = """Optional input key k is a protected glossary of [source, preferred] pairs. Treat coined names, character names, skills, items and place names as immutable terminology. Preserve the spelling already valid for the current language; use preferred only to repair an actual OCR/normalization error. Never replace a protected coined term with a more common synonym."""
 
 AI_TYPESET_FALLBACK_CSS = """html {
     writing-mode: vertical-rl;
@@ -365,6 +369,9 @@ def _wire_batch(batch: dict) -> tuple[dict, dict[str, str]]:
     payload = {"b": rows}
     if batch.get("request_css"):
         payload["g"] = 1
+    glossary = batch.get("glossary") or []
+    if glossary:
+        payload["k"] = glossary
     return payload, aliases
 
 
@@ -406,20 +413,19 @@ def _is_transient_api_error(exc: Exception) -> bool:
 
 
 def _retry_delay(exc: Exception, attempt: int) -> float:
-    """Respect provider Retry-After headers, otherwise use bounded backoff."""
-    response = getattr(exc, "response", None)
-    headers = getattr(response, "headers", None) or getattr(exc, "headers", None) or {}
-    retry_after = None
-    try:
-        retry_after = headers.get("retry-after") or headers.get("Retry-After")
-    except Exception:
-        retry_after = None
-    if retry_after is not None:
-        try:
-            return max(0.25, min(float(retry_after), 30.0))
-        except (TypeError, ValueError):
-            pass
-    return min(0.75 * (2 ** max(0, attempt)), 6.0)
+    """Respect Retry-After and use jittered exponential backoff otherwise."""
+    return retry_delay_seconds(exc, attempt, base=0.75, cap=30.0, jitter=0.25)
+
+
+def _sleep_with_cancel(seconds: float, cancel_check=None) -> None:
+    deadline = time.monotonic() + max(0.0, float(seconds))
+    while True:
+        if cancel_check and cancel_check():
+            raise RuntimeError("AI任务已停止")
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return
+        time.sleep(min(0.20, remaining))
 
 
 def _call_and_parse(
@@ -464,9 +470,12 @@ def _call_and_parse(
                 ) from exc
             last_error = exc
             if attempt < api_retries and _is_transient_api_error(exc):
-                time.sleep(_retry_delay(exc, attempt))
+                _sleep_with_cancel(_retry_delay(exc, attempt), cancel_check)
                 continue
-            raise AIRequestError(f"AI API 请求失败：{exc}") from exc
+            safe_error = redact_secrets(
+                exc, secrets=[str(getattr(provider, "api_key", "") or "")]
+            )
+            raise AIRequestError(f"AI API 请求失败：{safe_error}") from exc
         if cancel_check and cancel_check():
             raise RuntimeError("AI任务已停止")
         if usage:
@@ -480,7 +489,10 @@ def _call_and_parse(
             # immediately lets the caller split once instead of paying for the same large
             # prompt and output a second time.
             raise
-    raise AIRequestError(f"AI API 请求失败：{last_error}") from last_error
+    safe_error = redact_secrets(
+        last_error, secrets=[str(getattr(provider, "api_key", "") or "")]
+    )
+    raise AIRequestError(f"AI API 请求失败：{safe_error}") from last_error
 
 
 def _unwrap_compact_payload(parsed: dict) -> dict:
@@ -606,6 +618,43 @@ def _dynamic_member_coverage_minimum(length: int) -> float:
     return 0.0
 
 
+def _bounded_levenshtein(a: str, b: str, max_distance: int) -> int:
+    """Exact Levenshtein distance, stopping once the configured band is exceeded."""
+    if a == b:
+        return 0
+    if len(a) > len(b):
+        a, b = b, a
+    limit = max(0, int(max_distance))
+    if len(b) - len(a) > limit:
+        return limit + 1
+    inf = limit + 1
+    previous = {j: j for j in range(0, min(len(b), limit) + 1)}
+    for i, ca in enumerate(a, 1):
+        lo = max(1, i - limit)
+        hi = min(len(b), i + limit)
+        current = {i - 1: i} if lo == 1 else {}
+        row_min = inf
+        for j in range(lo, hi + 1):
+            insert = current.get(j - 1, inf) + 1
+            delete = previous.get(j, inf) + 1
+            subst = previous.get(j - 1, inf) + (0 if ca == b[j - 1] else 1)
+            value = min(insert, delete, subst)
+            current[j] = value
+            row_min = min(row_min, value)
+        if row_min > limit:
+            return inf
+        previous = current
+    return previous.get(len(b), inf)
+
+
+def _correction_edit_ratio_limit() -> float:
+    try:
+        value = float(os.environ.get("NOVEL_FORMATTER_AI_CORRECTION_MAX_EDIT_RATIO", "0.15"))
+    except (TypeError, ValueError):
+        value = 0.15
+    return max(0.02, min(0.50, value))
+
+
 def _correction_replacement_is_safe(source_text: str, output_text: str, aliases: dict[str, str] | None = None) -> tuple[bool, str]:
     """Accept only genuinely local OCR corrections.
 
@@ -640,6 +689,18 @@ def _correction_replacement_is_safe(source_text: str, output_text: str, aliases:
         return False, "length"
     if source_len < 4 and output_len > max(6, source_len * 3):
         return False, "length"
+
+    # Hard execution-layer anti-rewrite guard. Prompts are advisory; this
+    # bounded exact Levenshtein check makes a large model rewrite a no-op even
+    # when the provider ignores instructions. Very short captions keep the
+    # historical permissive path because one OCR glyph can exceed 15%.
+    if source_len >= 20:
+        edit_limit = _correction_edit_ratio_limit()
+        denominator = max(source_len, output_len, 1)
+        allowed = max(1, int(math.ceil(denominator * edit_limit)))
+        distance = _bounded_levenshtein(source, output, allowed)
+        if distance > allowed:
+            return False, "edit_distance"
 
     if source_len >= 4:
         matcher = difflib.SequenceMatcher(None, source, output, autojunk=False)
@@ -1061,20 +1122,12 @@ def run_ai_document(
     *,
     request_css: bool = True,
     layout_lock: bool | None = None,
-    cleanup_replacement_fragments: bool = True,
     checkpoint_dir: str | os.PathLike | None = None,
     resume: bool = True,
+    glossary_path: str | os.PathLike | None = None,
 ):
     """Run token-light, bounded, concurrent and order-preserving AI processing."""
-    # Replacement documents created by older versions may still contain tiny OCR
-    # continuation columns after a complete replaced sentence. Clean a private copy
-    # before batching so the model never sees and "corrects" those fragments into
-    # more convincing duplicates.
     doc = copy.deepcopy(doc)
-    pre_ai_fragment_cleanup = 0
-    if cleanup_replacement_fragments:
-        from engine.replacement_engine import cleanup_covered_replacement_fragments
-        pre_ai_fragment_cleanup = cleanup_covered_replacement_fragments(doc)
     payload = ai_request_payload(doc)
     mode = "correction" if mode == "correction" else "typeset"
     template = prompt_template or (CORRECTION_PROMPT if mode == "correction" else TYPESET_PROMPT)
@@ -1092,10 +1145,17 @@ def run_ai_document(
     else:
         default_tokens = 24000 if mode == "correction" else 16000
     batch_tokens = configured_tokens if configured_tokens > 0 else default_tokens
+    glossary = load_glossary(glossary_path)
+    glossary_hash = glossary_fingerprint(glossary_path, glossary)
+    if glossary and "protected glossary" not in template.lower():
+        template = template.replace("{{INPUT}}", _GLOSSARY_PROMPT_GUARD + "\n{{INPUT}}")
+    # Reserve a small bounded budget so per-batch glossary injection cannot push an
+    # otherwise full prompt beyond the configured input window.
+    effective_batch_tokens = max(1000, batch_tokens - (2048 if glossary else 0))
     batches = _chapter_batches(
         payload,
         max_chars=configured_chars,
-        max_tokens=batch_tokens,
+        max_tokens=effective_batch_tokens,
         prompt_template=template,
         model=str(getattr(provider, "model", "") or ""),
     )
@@ -1103,6 +1163,13 @@ def run_ai_document(
         # Only one batch requests the global stylesheet. Formatter-workspace AI
         # disables this because its output is a document revision, not an EPUB theme.
         batches[0]["request_css"] = True
+
+    if glossary:
+        for batch in batches:
+            batch["glossary"] = select_relevant_glossary(
+                glossary,
+                (str(block.get("text", "") or "") for block in batch.get("blocks", [])),
+            )
 
     checkpoint_job_dir: Path | None = None
     checkpoint_signature = ""
@@ -1112,12 +1179,14 @@ def run_ai_document(
             "chapter_part": b.get("chapter_part"),
             "blocks": [{"type": x.get("type"), "text": x.get("text")} for x in b.get("blocks", [])],
             "request_css": bool(b.get("request_css", False)),
+            "glossary": list(b.get("glossary") or []),
         } for b in batches]
         signature_payload = {
-            "version": 2,
+            "version": 3,
             "mode": mode,
             "model": str(getattr(provider, "model", "") or ""),
             "prompt_sha256": hashlib.sha256(template.encode("utf-8")).hexdigest(),
+            "glossary_sha256": glossary_hash,
             "batches": canonical_batches,
         }
         checkpoint_signature = hashlib.sha256(
@@ -1397,6 +1466,8 @@ def run_ai_document(
     post_ai_fragment_cleanup = cleanup_ai_covered_fragments(doc, result) if mode == "typeset" else 0
     result.metadata.ai_processing_mode = mode
     result.metadata.ai_layout_locked = (mode == "typeset") if layout_lock is None else bool(layout_lock)
+    result.metadata.__dict__["ai_glossary_sha256"] = glossary_hash
+    result.metadata.__dict__["ai_glossary_entries"] = len(glossary)
     if mode == "typeset" and request_css:
         css = generated_css["value"] or AI_TYPESET_FALLBACK_CSS
         result.metadata.ai_epub_css = css
@@ -1420,12 +1491,13 @@ def run_ai_document(
             f"cached_tokens={usage['cached_tokens']}; cache_miss_tokens={usage['cache_miss_tokens']}; "
             f"reasoning_tokens={usage['reasoning_tokens']}; provider_requests={usage['provider_requests']}; "
             f"deepseek_thinking={deepseek_thinking if provider_name == 'deepseek' else 'n/a'}; "
-            f"recovery={recovery_stats}; pre_ai_fragment_cleanup={pre_ai_fragment_cleanup}; "
+            f"recovery={recovery_stats}; "
             f"post_ai_fragment_cleanup={post_ai_fragment_cleanup}; "
+            f"glossary_entries={len(glossary)}; glossary_sha256={glossary_hash[:12] if glossary_hash else 'none'}; "
             f"checkpoint={str(checkpoint_job_dir) if checkpoint_job_dir is not None else 'off'}; "
             f"resumed_batches={resumed_batches}"
         ),
-        sum(recovery_stats.values()) + pre_ai_fragment_cleanup + post_ai_fragment_cleanup,
+        sum(recovery_stats.values()) + post_ai_fragment_cleanup,
     )
     emit("完成")
     return result, changes

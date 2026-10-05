@@ -27,10 +27,53 @@ class PersistentRecognitionSession:
         self._request_id = 0
         self._lock = threading.Lock()
         self._paddle_source_index = 0
+        self._idle_timer: threading.Timer | None = None
+        self._idle_timer_lock = threading.Lock()
 
     @property
     def supported(self) -> bool:
         return self.engine in {"ndlocr_lite", "paddle_ocr"}
+
+    def _cancel_idle_unload(self) -> None:
+        with self._idle_timer_lock:
+            timer = self._idle_timer
+            self._idle_timer = None
+        if timer is not None:
+            try:
+                timer.cancel()
+            except Exception:
+                pass
+
+    def _schedule_idle_unload(self) -> None:
+        """Release heavyweight worker models after a configurable idle period."""
+        self._cancel_idle_unload()
+        try:
+            seconds = float(os.environ.get("NOVEL_FORMATTER_OCR_IDLE_UNLOAD_SECONDS", "300") or 300)
+        except (TypeError, ValueError):
+            seconds = 300.0
+        if seconds <= 0:
+            return
+        seconds = max(0.05, min(seconds, 86400.0))
+
+        def unload() -> None:
+            # Never kill a worker while recognize() owns the session lock.  If a
+            # new request started just before the timer fired, reschedule.
+            acquired = self._lock.acquire(blocking=False)
+            if not acquired:
+                self._schedule_idle_unload()
+                return
+            try:
+                self._close_process_only()
+            finally:
+                self._lock.release()
+                with self._idle_timer_lock:
+                    self._idle_timer = None
+
+        timer = threading.Timer(seconds, unload)
+        timer.daemon = True
+        with self._idle_timer_lock:
+            self._idle_timer = timer
+        timer.start()
 
     def _command(self) -> list[str]:
         if self.engine == "ndlocr_lite":
@@ -42,7 +85,8 @@ class PersistentRecognitionSession:
             ]
         if self.engine == "paddle_ocr":
             from adapters.paddle_ocr_adapter import (
-                setup_venv, VENV_PYTHON, WORKER_SCRIPT, _prepare_vl_runtime
+                setup_venv, VENV_PYTHON, WORKER_SCRIPT, _prepare_vl_runtime,
+                recommended_paddle_batch, _paddle_worker_env,
             )
             pipeline = str(self.options.get("pipeline") or "ocr")
             if pipeline not in {"ocr", "structure", "vl"}:
@@ -57,6 +101,7 @@ class PersistentRecognitionSession:
                 str(VENV_PYTHON), str(WORKER_SCRIPT),
                 "--lang", str(self.options.get("lang") or "japan"),
                 "--pipeline", pipeline,
+                "--batch-size", str(recommended_paddle_batch(pipeline)),
             ]
             if pipeline == "vl":
                 command.extend([
@@ -79,9 +124,10 @@ class PersistentRecognitionSession:
         )
         sources = paddle_model_source_attempts(str(self.options.get("model_source") or "auto"))
         source = sources[min(self._paddle_source_index, len(sources) - 1)]
-        return paddle_source_environment(source, os.environ)
+        return _paddle_worker_env(source)
 
     def _ensure_started(self) -> None:
+        self._cancel_idle_unload()
         if self._proc is not None and self._proc.poll() is None:
             return
         if not self.supported:
@@ -117,7 +163,9 @@ class PersistentRecognitionSession:
                     try:
                         self._ensure_started()
                         assert self._proc is not None and self._proc.stdin is not None and self._proc.stdout is not None
-                        from adapters.subprocess_watchdog import LinePump, env_seconds
+                        from adapters.subprocess_watchdog import (
+                            LinePump, env_seconds, workload_timeout,
+                        )
                         if self._stdout_pump is None:
                             self._stdout_pump = LinePump(
                                 self._proc.stdout, name=f"{self.engine}-persistent-stdout"
@@ -139,8 +187,25 @@ class PersistentRecognitionSession:
                                 "NOVEL_FORMATTER_OCR_STARTUP_TIMEOUT", 900.0, minimum=60.0
                             )
                         else:
-                            request_timeout = env_seconds(
+                            base_timeout = env_seconds(
                                 "NOVEL_FORMATTER_OCR_REQUEST_TIMEOUT", 300.0, minimum=30.0
+                            )
+                            per_mp = env_seconds(
+                                "NOVEL_FORMATTER_OCR_TIMEOUT_PER_MEGAPIXEL",
+                                2.0, minimum=0.1, maximum=60.0,
+                            )
+                            max_mp = 0.0
+                            try:
+                                from adapters.ocr_engine_common import page_size
+                                for image_path in image_paths:
+                                    width, height = page_size(image_path)
+                                    max_mp = max(max_mp, width * height / 1_000_000.0)
+                            except Exception:
+                                pass
+                            request_timeout = workload_timeout(
+                                base_timeout,
+                                megapixels=max_mp,
+                                seconds_per_megapixel=per_mp,
                             )
                         while True:
                             line = self._stdout_pump.readline(
@@ -166,6 +231,7 @@ class PersistentRecognitionSession:
                             if int(data.get("request_id", request_id) or request_id) != request_id:
                                 continue
                             if data.get("batch_done") or data.get("type") == "request_done":
+                                self._schedule_idle_unload()
                                 return
                             emitted = True
                             path = str(data.get("path") or "")
@@ -195,7 +261,7 @@ class PersistentRecognitionSession:
         except Exception:
             return ""
 
-    def close(self) -> None:
+    def _close_process_only(self) -> None:
         proc = self._proc
         self._proc = None
         if proc is not None:
@@ -225,6 +291,10 @@ class PersistentRecognitionSession:
             except Exception:
                 pass
             self._stderr_file = None
+
+    def close(self) -> None:
+        self._cancel_idle_unload()
+        self._close_process_only()
 
     def __enter__(self):
         return self

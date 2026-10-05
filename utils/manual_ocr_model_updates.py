@@ -71,23 +71,17 @@ _MODEL_ORDER = (
     "ndlocr_lite",
     "manga_48px",
     "hayai_ocr",
-    "manga_ocr",
-    "yomitoku",
     "paddle_ocr",
-    "pdf_craft",
-    "google_vision",
+    "paddle_aistudio",
 )
 
 _LABELS = {
-    "apple_vision": "Apple Vision / Live Text",
+    "apple_vision": "Apple OCR",
     "ndlocr_lite": "NDLOCR-Lite",
     "manga_48px": "48px AR OCR",
-    "hayai_ocr": "Hayai OCR v2.1",
-    "manga_ocr": "Manga OCR",
-    "yomitoku": "YomiToku OCR",
+    "hayai_ocr": "Hayai OCR",
     "paddle_ocr": "PaddleOCR / PP-OCR",
-    "pdf_craft": "PDF Craft / DeepSeek-OCR",
-    "google_vision": "Google Vision API",
+    "paddle_aistudio": "PaddleOCR · AI Studio API",
 }
 
 _SOURCE_URLS = {
@@ -95,11 +89,8 @@ _SOURCE_URLS = {
     "ndlocr_lite": "https://github.com/ndl-lab/ndlocr-lite/releases",
     "manga_48px": "https://github.com/zyddnys/manga-image-translator/releases",
     "hayai_ocr": "https://github.com/NopeNopeGuy/hayai-ocr",
-    "manga_ocr": "https://huggingface.co/kha-white/manga-ocr-base",
-    "yomitoku": "https://pypi.org/project/yomitoku/",
     "paddle_ocr": "https://github.com/PaddlePaddle/PaddleOCR/releases",
-    "pdf_craft": "https://pypi.org/project/pdf-craft/",
-    "google_vision": "https://cloud.google.com/vision/docs",
+    "paddle_aistudio": "https://aistudio.baidu.com/paddleocr",
 }
 
 _GITHUB_LATEST = {
@@ -109,13 +100,10 @@ _GITHUB_LATEST = {
 }
 
 _HF_MODEL_API = {
-    "manga_ocr": "https://huggingface.co/api/models/kha-white/manga-ocr-base",
 }
 
 _PYPI_API = {
     "hayai_ocr": "https://pypi.org/pypi/hayai-ocr/json",
-    "yomitoku": "https://pypi.org/pypi/yomitoku/json",
-    "pdf_craft": "https://pypi.org/pypi/pdf-craft/json",
 }
 
 
@@ -300,24 +288,6 @@ def _read_json_marker(path: Path, key: str = "revision") -> str:
         return ""
 
 
-def _manga_ocr_local_revision() -> str:
-    marker = STATE_DIR / "manga_ocr.json"
-    revision = _read_json_marker(marker)
-    if revision:
-        return revision
-    roots = (
-        ROOT / ".model-cache" / "manga-ocr" / "hub" / "models--kha-white--manga-ocr-base" / "refs" / "main",
-        ROOT / ".model-cache" / "manga-ocr" / "models--kha-white--manga-ocr-base" / "refs" / "main",
-        Path.home() / ".cache" / "huggingface" / "hub" / "models--kha-white--manga-ocr-base" / "refs" / "main",
-    )
-    for ref in roots:
-        try:
-            value = ref.read_text(encoding="utf-8").strip()
-        except OSError:
-            continue
-        if value:
-            return value
-    return "未安装"
 
 
 def _ndlocr_local_revision() -> str:
@@ -427,43 +397,10 @@ def local_statuses() -> list[ModelUpdateStatus]:
             hayai_local,
             "未检查",
             "compatibility_locked" if hayai_local != "未安装" else "not_installed",
-            f"当前适配器固定兼容 Hayai OCR {hayai_pinned or '2.1.0'}；Torch/LiteRT 与模型接口共同构成运行合同，不盲目升级。",
+            f"当前适配器固定兼容 Hayai OCR {hayai_pinned or '2.3.0'}；Torch/LiteRT 与模型接口共同构成运行合同，不盲目升级。",
             False,
             "首次使用自动安装" if hayai_local == "未安装" else "不可单独更新",
             _SOURCE_URLS["hayai_ocr"],
-        )
-    )
-
-    manga_local = _manga_ocr_local_revision()
-    statuses.append(
-        ModelUpdateStatus(
-            "manga_ocr",
-            _LABELS["manga_ocr"],
-            "可手动更新",
-            manga_local,
-            "未检查",
-            "not_checked" if manga_local != "未安装" else "not_installed",
-            "点击“检查更新”后读取 Hugging Face 官方模型仓库提交版本。",
-            manga_local == "未安装",
-            "安装/修复" if manga_local == "未安装" else "更新所选模型",
-            _SOURCE_URLS["manga_ocr"],
-        )
-    )
-
-    yomi_local = _dist_version(ROOT / ".venv-yomitoku", "yomitoku")
-    yomi_pinned = _read_assignment(ROOT / "adapters" / "yomitoku_adapter.py", "YOMITOKU_VERSION")
-    statuses.append(
-        ModelUpdateStatus(
-            "yomitoku",
-            _LABELS["yomitoku"],
-            "与 OCR 代码绑定",
-            yomi_local,
-            "未检查",
-            "compatibility_locked",
-            f"当前 OCR 代码固定兼容 YomiToku {yomi_pinned or '指定版本'}；只显示上游版本，不盲目升级。",
-            False,
-            "不可单独更新",
-            _SOURCE_URLS["yomitoku"],
         )
     )
 
@@ -483,36 +420,21 @@ def local_statuses() -> list[ModelUpdateStatus]:
         )
     )
 
-    pdf_local = _dist_version(ROOT / ".venv-pdf-craft", "pdf-craft")
     statuses.append(
         ModelUpdateStatus(
-            "pdf_craft",
-            _LABELS["pdf_craft"],
-            "与运行时绑定",
-            pdf_local,
-            "未检查",
-            "compatibility_locked",
-            "DeepSeek-OCR 权重与 PDF Craft/CUDA 运行时绑定；只显示上游版本，避免单独替换权重。",
+            "paddle_aistudio",
+            _LABELS["paddle_aistudio"],
+            "云端托管",
+            "无本地模型",
+            "AI Studio 云端服务",
+            "cloud_managed",
+            "AI Studio PaddleOCR 模型由百度云端维护；本机仅保存非敏感接口设置，Token 可使用系统凭据库。",
             False,
-            "不可单独更新",
-            _SOURCE_URLS["pdf_craft"],
+            "无需更新",
+            _SOURCE_URLS["paddle_aistudio"],
         )
     )
 
-    statuses.append(
-        ModelUpdateStatus(
-            "google_vision",
-            _LABELS["google_vision"],
-            "云端托管",
-            "无本地模型",
-            "Google 云端服务",
-            "cloud_managed",
-            "Google Vision API 模型由云端服务维护，本机没有可更新的权重。",
-            False,
-            "无需更新",
-            _SOURCE_URLS["google_vision"],
-        )
-    )
     return statuses
 
 
@@ -548,7 +470,7 @@ def check_updates(
             raise ModelUpdateCancelled("用户取消检查 OCR 模型更新")
         item = current[component_id]
         _emit(progress_callback, "check", index - 1, total, f"检查 {item.label}")
-        if component_id in {"apple_vision", "google_vision"}:
+        if component_id in {"apple_vision", "paddle_aistudio"}:
             result.append(item)
             _emit(progress_callback, "check", index, total, item.detail)
             continue
@@ -571,7 +493,7 @@ def check_updates(
                     can_update=True,
                     action_label="重装兼容模型" if state == "current_compatible" else "安装/修复",
                 )
-            elif component_id in {"hayai_ocr", "yomitoku", "paddle_ocr", "pdf_craft"}:
+            elif component_id in {"hayai_ocr", "paddle_ocr"}:
                 pinned_detail = item.detail
                 if local != "未安装" and local == remote:
                     state = "current_compatible"
@@ -836,89 +758,8 @@ def _update_manga_48px(
                     shutil.rmtree(temporary, ignore_errors=True)
 
 
-def _find_hf_snapshot_python() -> Path:
-    venv = ROOT / ".venv-manga-ocr"
-    for path in (venv / "bin" / "python", venv / "Scripts" / "python.exe"):
-        if path.exists():
-            return path
-    # This call is user-initiated and only prepares the already pinned Manga OCR
-    # runtime when it does not yet exist.
-    from adapters.manga_ocr_adapter import setup_venv
-
-    return Path(setup_venv(verbose=False))
 
 
-def _update_manga_ocr(
-    target_revision: str | None,
-    *,
-    progress_callback: ProgressCallback | None,
-    cancel_check: CancelCheck | None,
-) -> str:
-    if _cancelled(cancel_check):
-        raise ModelUpdateCancelled("用户取消 Manga OCR 模型更新")
-    revision = str(target_revision or "").strip()
-    if not revision:
-        revision = _remote_version("manga_ocr", 20.0)
-    if not revision:
-        raise ModelUpdateError("Hugging Face 未返回 Manga OCR 提交版本")
-    python = _find_hf_snapshot_python()
-    cache = ROOT / ".model-cache" / "manga-ocr"
-    cache.mkdir(parents=True, exist_ok=True)
-    script = (
-        "from huggingface_hub import snapshot_download; "
-        "from pathlib import Path; import os,sys; "
-        "cache=Path(sys.argv[2]); local=cache/'manual-snapshots'/sys.argv[1]; "
-        "local.mkdir(parents=True, exist_ok=True); "
-        "kwargs=dict(repo_id='kha-white/manga-ocr-base', revision=sys.argv[1], "
-        "cache_dir=str(cache), local_dir=str(local), resume_download=True); "
-        "kwargs.update({'local_dir_use_symlinks': False}) if os.name=='nt' else None; "
-        "path=snapshot_download(**kwargs); print(path)"
-    )
-    _emit(progress_callback, "download", 0, 0, f"下载 Manga OCR {revision[:12]}")
-    env = os.environ.copy()
-    env.setdefault("HF_HUB_DISABLE_XET", "1")
-    env.setdefault("HF_HUB_DISABLE_SYMLINKS_WARNING", "1")
-    if os.name == "nt":
-        env.setdefault("HF_HUB_DISABLE_XET", "1")
-        env.setdefault("HF_HUB_ENABLE_HF_TRANSFER", "0")
-    try:
-        process = subprocess.Popen(
-            [str(python), "-c", script, revision, str(cache)],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            text=True,
-            env=env,
-        )
-    except OSError as exc:
-        raise ModelUpdateError(f"无法启动 Manga OCR 更新环境：{exc}") from exc
-    output: list[str] = []
-    assert process.stdout is not None
-    while True:
-        if _cancelled(cancel_check):
-            process.terminate()
-            try:
-                process.wait(timeout=5)
-            except subprocess.TimeoutExpired:
-                process.kill()
-            raise ModelUpdateCancelled("用户取消 Manga OCR 模型更新")
-        line = process.stdout.readline()
-        if line:
-            output.append(line.rstrip())
-            _emit(progress_callback, "download", 0, 0, line.rstrip())
-        elif process.poll() is not None:
-            break
-        else:
-            time.sleep(0.1)
-    code = process.wait()
-    if code != 0:
-        raise ModelUpdateError("Manga OCR 下载失败：\n" + "\n".join(output[-20:]))
-    atomic_write_json(
-        STATE_DIR / "manga_ocr.json",
-        {"revision": revision, "updated_at": _utc_now(), "mode": "manual"},
-    )
-    _invalidate_runtime_state("manga_ocr")
-    _emit(progress_callback, "done", 1, 1, f"Manga OCR 已更新到 {revision[:12]}")
-    return revision
 
 
 def _ndlocr_model_names(source_dir: Path) -> list[str]:
@@ -1099,7 +940,7 @@ def update_component(
 ) -> ModelUpdateStatus:
     """Manually install/update one supported model with rollback boundaries."""
     component_id = str(component_id or "").strip()
-    if component_id not in {"ndlocr_lite", "manga_48px", "manga_ocr"}:
+    if component_id not in {"ndlocr_lite", "manga_48px"}:
         raise ModelUpdateError("该模型由系统、云端或当前 OCR 运行合同管理，不能单独替换")
     before_map = {item.component_id: item for item in local_statuses()}
     before = before_map[component_id]
@@ -1111,14 +952,8 @@ def update_component(
                     progress_callback=progress_callback,
                     cancel_check=cancel_check,
                 )
-            elif component_id == "manga_48px":
+            else:  # manga_48px
                 revision = _update_manga_48px(
-                    progress_callback=progress_callback,
-                    cancel_check=cancel_check,
-                )
-            else:
-                revision = _update_manga_ocr(
-                    target_revision,
                     progress_callback=progress_callback,
                     cancel_check=cancel_check,
                 )

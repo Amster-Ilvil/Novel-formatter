@@ -17,10 +17,22 @@ class BatchProcessor:
     root is now always removed—even when iteration or setup fails midway.
     """
 
-    def __init__(self, input_dir, output_dir, preview_enabled=True):
+    def __init__(
+        self, input_dir, output_dir, preview_enabled=True, *,
+        vertical: bool = False, css_template: str = "denki",
+        shortcut_name: str = "ExtractText", crop_top: float = 0.0,
+        crop_bottom: float = 0.0, steps=None, verbose: bool = True,
+    ):
         self.input_dir = Path(input_dir).expanduser()
         self.output_dir = Path(output_dir).expanduser()
         self.preview_enabled = bool(preview_enabled)
+        self.vertical = bool(vertical)
+        self.css_template = str(css_template or "denki")
+        self.shortcut_name = str(shortcut_name or "ExtractText")
+        self.crop_top = float(crop_top or 0.0)
+        self.crop_bottom = float(crop_bottom or 0.0)
+        self.steps = None if steps is None else list(steps)
+        self.verbose = bool(verbose)
         self.temp_root = Path(tempfile.mkdtemp(prefix="novel_ocr_batch_"))
 
     def run(self) -> dict[str, object]:
@@ -38,7 +50,8 @@ class BatchProcessor:
                 key=lambda path: path.name.casefold(),
             )
             if not books:
-                print(f"[BATCH] 未找到书籍子目录: {self.input_dir}")
+                if self.verbose:
+                    print(f"[BATCH] 未找到书籍子目录: {self.input_dir}")
 
             for book in books:
                 try:
@@ -46,10 +59,12 @@ class BatchProcessor:
                     processed.append(book.name)
                 except Exception:
                     failed.append(book.name)
-                    print(f"[FAILED] {book.name}")
-                    traceback.print_exc()
+                    if self.verbose:
+                        print(f"[FAILED] {book.name}")
+                        traceback.print_exc()
 
-            print(f"[BATCH] 完成 {len(processed)} 本，失败 {len(failed)} 本")
+            if self.verbose:
+                print(f"[BATCH] 完成 {len(processed)} 本，失败 {len(failed)} 本")
             return {"processed": processed, "failed": failed}
         finally:
             self.cleanup()
@@ -64,15 +79,20 @@ class BatchProcessor:
         with crop_manager.managed(book_dir.name) as crop_path:
             doc = ocr_run(
                 image_folder=str(book_dir),
-                verbose=True,
+                verbose=self.verbose,
                 preview_enabled=self.preview_enabled,
                 temp_crop_dir=str(crop_path),
+                shortcut_name=self.shortcut_name,
+                crop_top=self.crop_top,
+                crop_bottom=self.crop_bottom,
             )
-            formatted = run_pipeline(doc, verbose=True)
+            formatted = run_pipeline(doc, steps=self.steps, verbose=self.verbose)
             build_epub(
                 formatted,
                 output_path=str(self.output_dir / f"{book_dir.name}.epub"),
-                verbose=True,
+                css_template=self.css_template,
+                vertical=self.vertical,
+                verbose=self.verbose,
             )
 
     def cleanup(self) -> None:

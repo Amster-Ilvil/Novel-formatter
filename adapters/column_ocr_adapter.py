@@ -4,15 +4,19 @@
 
 This adapter intentionally does *not* ask a layout model to discover text boxes.
 The common OCR layer first applies the user's fixed normalized crop rectangle to
-all pages.  We then detect complete physical vertical columns with deterministic connected-component geometry, isolate every column with a white mask at the original pixel size, and pass
-those masked page images directly to one selected OCR engine.
+all pages.  We then detect complete physical vertical columns with deterministic
+connected-component geometry and build one canonical *visibility layer* per
+column: target body pixels stay at native resolution while all other page pixels,
+including side Ruby, are replaced by paper white.  Each recognizer receives a
+viewport derived from that same layer: wider paper context for layout OCR and a
+more compact crop for line/crop recognizers.
 
 The design goal is omission safety:
 
 * fixed body region removes headers, page numbers, and illustrations before OCR;
 * connected-component splitting works without optional OpenCV/SciPy packages and
   preserves every detected physical column as a masked recognition target;
-* target glyph pixels are never stretched or resampled; other columns are white-masked;
+* target glyph pixels are never stretched or resampled; other columns and Ruby are white-masked;
 * failed/empty column recognition is retried with a wider masked target;
 * strict mode preserves every detected column; an unresolved OCR column becomes a visible manual-review placeholder instead of aborting the whole book.
 """
@@ -26,14 +30,16 @@ import re
 import hashlib
 import tempfile
 import threading
+import time
 from collections import OrderedDict
+from bisect import bisect_left, bisect_right
 from difflib import SequenceMatcher
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Callable, Iterator, Sequence
 from concurrent.futures import ThreadPoolExecutor
 
-from PIL import Image, ImageOps
+from PIL import Image, ImageChops, ImageOps
 
 from adapters.ocr_engine_common import is_spurious_ocr_item, run_ocr_engine
 from adapters.ocr_recognition_bridge import (
@@ -51,6 +57,10 @@ from engine.column_sentence_reflow import (
     normalize_column_text,
     starts_post_quote_continuation,
 )
+from core.ocr_segment_cache import OcrSegmentCache
+from core.ocr_engine_profiles import (
+    get_ocr_engine_profile, get_ocr_transport_profile, transport_profile_id,
+)
 
 # Compatibility hook for tests/plugins that monkeypatch the recognizer.
 _recognizer_iterator = recognizer_iterator
@@ -61,7 +71,29 @@ SUPPORTED_RECOGNIZERS = {
     key: value for key, value in RECOGNITION_ENGINES.items() if key != "native"
 }
 
-COLUMN_DETECTOR_VERSION = "component-geometry-v14-ruby-roi-tile-packing"
+# Physical geometry is shared across OCR engines, but the recognizer input
+# transport is model-specific.  The profile registry is the single authority
+# for viewport/padding/resource choices; slot order never changes a model's
+# pixels.
+# Compatibility exports retained for older tests/plugins.  They are derived
+# from the profile registry instead of being the production source of truth.
+_COMPACT_VIEWPORT_ENGINES = frozenset({
+    key for key in ("hayai_ocr", "manga_48px")
+    if get_ocr_engine_profile(key).viewport_mode in {"compact", "line", "short_block"}
+})
+_CONTEXT_VIEWPORT_ENGINES = frozenset({
+    key for key in ("apple_vision", "macocr", "mac_ocr", "macos_ocr", "ndlocr_lite",
+                    "paddle_ocr", "google_vision")
+    if get_ocr_engine_profile(key).viewport_mode == "context"
+})
+
+def _recognizer_viewport_mode(recognition_engine: str) -> str:
+    mode = get_ocr_engine_profile(recognition_engine).viewport_mode
+    return "compact" if mode in {"compact", "line", "short_block"} else "context"
+
+COLUMN_DETECTOR_VERSION = "component-geometry-v25-complete-body-envelope"
+CANONICAL_COLUMN_TRANSPORT_VERSION = "shared-geometry-model-transport-v2-ruby-edge-speck"
+CANONICAL_SENTENCE_TRANSPORT_VERSION = "canonical-multicolumn-sentence-v53-role2"
 LEGACY_PROJECTION_DETECTOR_VERSION = "review-only-projection-v5-periodic-grid"
 
 _SHARED_PREPARE_LOCK_GUARD = threading.Lock()
@@ -133,6 +165,21 @@ def _normalise_column_input_profile(value: object) -> str:
     return "v8_legacy"
 
 
+def _normalise_column_isolation_mode(value: object) -> str:
+    """Normalize the user-facing physical-column transport choice.
+
+    ``mask`` keeps the canonical Ruby-free visibility layer but crops a
+    recognizer-appropriate white viewport around the visible body column.
+    ``display`` keeps the full source-page canvas: every pixel outside the
+    current body column is opaque paper white, so the recognizer still sees
+    only one column while retaining the original page coordinate scale.
+    """
+    mode = str(value or "mask").strip().lower().replace("-", "_")
+    if mode in {"display", "full_page", "fullpage", "page_display", "visible_page"}:
+        return "display"
+    return "mask"
+
+
 def _column_input_contract_descriptor(
     *,
     recognition_engine: str,
@@ -148,22 +195,28 @@ def _column_input_contract_descriptor(
     ruby_strength: str,
     preserve_body_pixels: bool,
     capture_ruby_candidates: bool,
+    apple_context_padding: bool = False,
+    apple_ink_framing: bool = False,
+    full_height_context: bool = False,
+    isolation_mode: str = "mask",
     input_profile: str,
 ) -> tuple[dict[str, object], str]:
     payload: dict[str, object] = {
-        "cache_schema": "column-input-contract-v4-engine-independent",
-        # The recognizer never participates in physical-column detection or
-        # pixel generation.  Excluding it from the namespace lets models with
-        # the same *effective* image contract reuse byte-identical run-local
-        # crops, while compact/smart/ruby differences still receive isolated
-        # directories through the remaining fields below.
+        "cache_schema": "column-input-contract-v8-canonical-single-column",
+        "canonical_transport_version": CANONICAL_COLUMN_TRANSPORT_VERSION,
+        "transport_profile": transport_profile_id(recognition_engine),
+        # Geometry remains recognizer-independent, but the final model input is
+        # deliberately namespaced by transport_profile above.  Two models share
+        # final PNG bytes only when their explicit transport profiles match.
         "detector_version": column_detector_version(detector_mode),
         "detector_mode": _normalise_column_detector_mode(detector_mode),
         "sensitivity": int(sensitivity),
         "padding_percent": int(padding_percent),
         "max_columns": int(max_columns),
         "fixed_region_rect": [float(v) for v in (fixed_region_rect or [])],
-        "compact_transport": bool(compact_transport),
+        # All ordinary single-column recognizers now share the same tight native-pixel
+        # transport.  These historical UI/engine knobs no longer change pixels.
+        "compact_transport": False if full_height_context else True,
         "auto_filter_ruby": bool(auto_filter_ruby),
         "filter_fragments": bool(filter_fragments),
         "smart_crop": bool(smart_crop),
@@ -174,10 +227,99 @@ def _column_input_contract_descriptor(
         # OFF run can never leak candidate sidecars into a later ON run (or vice
         # versa).
         "capture_ruby_candidates": bool(capture_ruby_candidates),
+        "apple_context_padding": False,
+        "apple_ink_framing": False,
+        "full_height_context": bool(full_height_context),
+        "single_column_model_transport": True,
+        "isolation_mode": _normalise_column_isolation_mode(isolation_mode),
         "input_profile": _normalise_column_input_profile(input_profile),
     }
     encoded = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
     return payload, hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+
+
+def _column_geometry_contract_descriptor(
+    *,
+    detector_mode: str,
+    sensitivity: int,
+    padding_percent: int,
+    max_columns: int,
+    fixed_region_rect: Sequence[float] | None,
+    capture_ruby_candidates: bool,
+) -> tuple[dict[str, object], str]:
+    """Describe only the physical-column detection contract.
+
+    Recognition transports (tight/context/compact framing, cleanup, recognizer
+    choice) are deliberately excluded.  Those options can change the pixels
+    sent to a model, but they cannot change the authoritative physical-column
+    geometry.  Keeping geometry in its own run-local namespace lets every OCR
+    model reuse the same connected-component analysis without weakening the
+    stricter per-transport crop cache.
+    """
+    payload: dict[str, object] = {
+        "cache_schema": "column-geometry-contract-v1",
+        "detector_version": column_detector_version(detector_mode),
+        "detector_mode": _normalise_column_detector_mode(detector_mode),
+        "sensitivity": int(sensitivity),
+        "padding_percent": int(padding_percent),
+        "max_columns": int(max_columns),
+        "fixed_region_rect": [float(v) for v in (fixed_region_rect or [])],
+        # Candidate capture changes DetectedColumn metadata, so ON/OFF geometry
+        # must never share a sidecar even though body boxes are usually equal.
+        "capture_ruby_candidates": bool(capture_ruby_candidates),
+    }
+    encoded = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    return payload, hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+
+
+def _shared_geometry_profile_dir(
+    base_dir: Path,
+    *,
+    detector_mode: str,
+    sensitivity: int,
+    padding_percent: int,
+    max_columns: int,
+    fixed_region_rect: Sequence[float] | None,
+    capture_ruby_candidates: bool,
+) -> tuple[Path, str]:
+    """Return the shared run-local geometry namespace for all OCR models."""
+    payload, fingerprint = _column_geometry_contract_descriptor(
+        detector_mode=detector_mode,
+        sensitivity=sensitivity,
+        padding_percent=padding_percent,
+        max_columns=max_columns,
+        fixed_region_rect=fixed_region_rect,
+        capture_ruby_candidates=capture_ruby_candidates,
+    )
+    target = base_dir / f"geometry_{fingerprint}"
+    target.mkdir(parents=True, exist_ok=True)
+    contract_path = target / "geometry_contract.json"
+    contract_lock = _shared_prepare_lock(target, 0)
+    with contract_lock:
+        expected_contract = {**payload, "fingerprint": fingerprint}
+        if contract_path.exists():
+            try:
+                current = json.loads(contract_path.read_text(encoding="utf-8"))
+            except Exception as exc:
+                raise RuntimeError(f"OCR 分列几何缓存损坏: {contract_path}") from exc
+            if current != expected_contract:
+                raise RuntimeError(f"OCR 分列几何缓存内容与目录指纹不一致: {contract_path}")
+        else:
+            tmp = contract_path.with_name(
+                f".{contract_path.name}.{os.getpid()}.{threading.get_ident()}.tmp"
+            )
+            try:
+                tmp.write_text(
+                    json.dumps(expected_contract, ensure_ascii=False, sort_keys=True),
+                    encoding="utf-8",
+                )
+                os.replace(tmp, contract_path)
+            finally:
+                try:
+                    tmp.unlink(missing_ok=True)
+                except OSError:
+                    pass
+    return target, fingerprint
 
 
 def _shared_prepare_profile_dir(
@@ -196,6 +338,10 @@ def _shared_prepare_profile_dir(
     ruby_strength: str,
     preserve_body_pixels: bool,
     capture_ruby_candidates: bool,
+    apple_context_padding: bool,
+    apple_ink_framing: bool,
+    full_height_context: bool = False,
+    isolation_mode: str,
     input_profile: str,
 ) -> tuple[Path, str]:
     """Return an immutable cache namespace for one effective OCR input contract.
@@ -221,6 +367,10 @@ def _shared_prepare_profile_dir(
         ruby_strength=ruby_strength,
         preserve_body_pixels=preserve_body_pixels,
         capture_ruby_candidates=capture_ruby_candidates,
+        apple_context_padding=apple_context_padding,
+        apple_ink_framing=apple_ink_framing,
+        full_height_context=full_height_context,
+        isolation_mode=isolation_mode,
         input_profile=input_profile,
     )
     target = base_dir / f"input_{fingerprint}"
@@ -270,6 +420,10 @@ class DetectedColumn:
     full_height_slot: bool = False
     supplemental_boxes: tuple[tuple[int, int, int, int], ...] = ()
     excluded_boxes: tuple[tuple[int, int, int, int], ...] = ()
+    # Internal geometry-only Ruby isolation guard.  Unlike telemetry, this is
+    # always populated when the detector can identify a side-ruby run so that
+    # toggling Ruby candidate collection can never change ordinary OCR pixels.
+    ruby_guard_boxes: tuple[tuple[int, int, int, int], ...] = ()
     # Geometry-only Ruby candidate telemetry. These boxes never enter normal
     # OCR text/voting; findtextCenterNet consumes them later for smart ROI.
     ruby_candidate_boxes: tuple[tuple[int, int, int, int], ...] = ()
@@ -1168,6 +1322,60 @@ def _vertical_ink_bounds(mask: Image.Image, left: int, right: int) -> tuple[int,
     return active[0], active[-1] + 1
 
 
+def _vertical_ink_envelope_from_edges(
+    mask: Image.Image,
+    left: int,
+    right: int,
+    *,
+    top_limit: int = 0,
+    bottom_limit: int | None = None,
+) -> tuple[int, int] | None:
+    """Find the outer vertical ink envelope inside one trusted column band.
+
+    The OCR UI has already limited the image to the body area. Collapse only
+    this column band to a 1px-wide vertical projection (Pillow performs the
+    expensive averaging in C), then scan from the top and bottom inward for the
+    first supported ink row. This implements the user's edge-inward rule without
+    the very high Python cost of inspecting every pixel in every column.
+
+    The caller uses this result only to expand the existing component detector
+    box, never to shrink it.
+    """
+    width, height = mask.size
+    if width <= 0 or height <= 0:
+        return None
+    left = max(0, min(width - 1, int(left)))
+    right = max(left + 1, min(width, int(right)))
+    top_limit = max(0, min(height - 1, int(top_limit)))
+    if bottom_limit is None:
+        bottom_limit = height
+    bottom_limit = max(top_limit + 1, min(height, int(bottom_limit)))
+
+    crop = mask.crop((left, top_limit, right, bottom_limit))
+    try:
+        collapsed = crop.resize((1, crop.height), Image.Resampling.BOX)
+        try:
+            raw_values = (
+                collapsed.get_flattened_data()
+                if hasattr(collapsed, "get_flattened_data")
+                else collapsed.getdata()
+            )
+            # Convert the averaged 0..255 value back to an approximate number
+            # of black-mask pixels in the source row. A threshold below one
+            # pixel preserves tiny punctuation/quote tips while still ignoring
+            # pure-white rows.
+            rows = [float(value) * crop.width / 255.0 for value in raw_values]
+        finally:
+            collapsed.close()
+    finally:
+        crop.close()
+
+    active = [index for index, value in enumerate(rows) if value >= 0.75]
+    if not active:
+        return None
+    return top_limit + active[0], top_limit + active[-1] + 1
+
+
 def _vertical_content_spans(mask: Image.Image, left: int, right: int) -> tuple[list[tuple[int, int]], int]:
     """Return vertically separated ink blocks and a conservative glyph estimate.
 
@@ -1307,12 +1515,40 @@ def _detached_punctuation_boxes(
                     max_y + 1,
                     area,
                 ))
-        # One or two hanging marks are plausible punctuation.  Repeated side
-        # components are furigana/notes and must stay excluded at source.
-        if 0 < len(components) <= 2:
-            vertical_extent = max(item[3] for item in components) - min(item[1] for item in components)
-            if vertical_extent <= max(body_width * 2.6, 18):
-                accepted.extend((x0, y0, x1, y1) for x0, y0, x1, y1, _area in components)
+        # Detached punctuation can be a single hanging mark, a quote/comma
+        # pair, or a small cluster such as a vertical ellipsis.  Furigana by
+        # contrast appears as many side components distributed alongside many
+        # body rows.  Group the components by near-contiguous vertical extent:
+        # one or two compact clusters are accepted, while widely distributed
+        # side components remain excluded as Ruby/notes.
+        if components:
+            components.sort(key=lambda item: (item[1], item[0]))
+            clusters: list[list[tuple[int, int, int, int, int]]] = []
+            cluster_gap = max(6, round(body_width * 1.20))
+            for item in components:
+                if not clusters:
+                    clusters.append([item])
+                    continue
+                last = clusters[-1][-1]
+                if item[1] - last[3] <= cluster_gap:
+                    clusters[-1].append(item)
+                else:
+                    clusters.append([item])
+            if 0 < len(clusters) <= 2:
+                accepted_clusters: list[tuple[int, int, int, int]] = []
+                max_cluster_extent = max(22, round(body_width * 4.8))
+                max_cluster_components = max(4, round(body_width * 0.25))
+                for cluster in clusters:
+                    top = min(item[1] for item in cluster)
+                    bottom = max(item[3] for item in cluster)
+                    vertical_extent = bottom - top
+                    if len(cluster) <= max_cluster_components and vertical_extent <= max_cluster_extent:
+                        accepted_clusters.extend((x0, y0, x1, y1) for x0, y0, x1, y1, _area in cluster)
+                    else:
+                        accepted_clusters = []
+                        break
+                if accepted_clusters:
+                    accepted.extend(accepted_clusters)
     return accepted
 
 
@@ -2129,6 +2365,10 @@ def _cluster_component_columns(
             cluster = {
                 "components": nearby,
                 "center": expected,
+                "observed_center": (
+                    sum(component.center_x * component.area for component in nearby)
+                    / max(1, sum(component.area for component in nearby))
+                ),
                 "grid_center": expected,
                 "grid_slot": int(slot),
                 "weight": float(sum(component.area for component in nearby)),
@@ -2144,21 +2384,34 @@ def _cluster_component_columns(
     # cannot establish its own OCR slot.
     strong.sort(key=lambda value: float(value.get("grid_center", value["center"])))
     kept: list[dict] = []
+
+    def actual_center(candidate: dict) -> float:
+        return float(candidate.get("observed_center", candidate["center"]))
+
     for cluster in strong:
-        neighbours = [candidate for candidate in strong if candidate is not cluster]
+        recovered_short = bool(cluster.get("recovered_short"))
+        neighbours = [
+            candidate for candidate in strong
+            if candidate is not cluster
+            and (not recovered_short or not candidate.get("recovered_short"))
+        ]
+        cluster_center = (
+            actual_center(cluster) if recovered_short
+            else float(cluster.get("grid_center", cluster["center"]))
+        )
         nearest = min(
             neighbours,
             key=lambda candidate: abs(
-                float(candidate.get("grid_center", candidate["center"]))
-                - float(cluster.get("grid_center", cluster["center"]))
+                (actual_center(candidate) if recovered_short else float(candidate.get("grid_center", candidate["center"])))
+                - cluster_center
             ),
             default=None,
         )
         ruby_like = False
-        if nearest is not None and not cluster.get("recovered_short"):
+        if nearest is not None:
             distance = abs(
-                float(nearest.get("grid_center", nearest["center"]))
-                - float(cluster.get("grid_center", cluster["center"]))
+                (actual_center(nearest) if recovered_short else float(nearest.get("grid_center", nearest["center"])))
+                - cluster_center
             )
             normal_slot = bool(pitch > 0 and distance >= pitch * 0.60)
             smaller = (
@@ -2173,6 +2426,103 @@ def _cluster_component_columns(
     if len(kept) < max(1, round(len(strong) * 0.50)):
         kept = strong
 
+    # Some light novels print the next Arabic chapter number as a tiny detached
+    # horizontal marker far to the *left* of the final vertical body column. It
+    # is part of reading order (after the current page body, before the next
+    # page), but the regular body grid intentionally rejects it as off-grid.
+    # Recover exactly one glyph-sized margin group only when a stable body grid
+    # already exists. This is geometry-only; OCR still decides whether the crop
+    # actually contains a chapter number, and downstream structure recovery only
+    # promotes numeric text after a book-level sequential-pattern guard.
+    if grid_reliable and pitch > 0 and 4 <= len(kept) <= 18:
+        body_left_center = min(
+            float(value.get("grid_center", value["center"])) for value in kept
+        )
+        margin_limit = body_left_center - max(pitch * 1.20, typical_width * 2.4)
+        margin_usable = [
+            component for component in usable
+            if component.center_x < margin_limit
+            and page_height * 0.065 <= component.center_y <= page_height * 0.34
+            and component.height >= typical_height * 0.55
+            and component.height <= typical_height * 1.55
+            and component.width >= max(2.0, typical_width * 0.24)
+            and component.width <= typical_width * 1.35
+            and component.area >= max(8.0, typical_area * 0.16)
+            and component.area <= max(32.0, typical_area * 2.2)
+        ]
+        # Illustration/noise pages can leave hundreds of tiny components in the
+        # detached margin.  The grouping pass below is intentionally tiny: a
+        # chapter number is only 1–3 glyph components, so retaining the best 24
+        # glyph-like candidates is both safer and prevents an accidental O(n²)
+        # scan from becoming a full-book performance cliff.
+        if len(margin_usable) > 24:
+            margin_usable = sorted(
+                margin_usable,
+                key=lambda component: (
+                    abs(component.height - typical_height) / max(1.0, typical_height),
+                    abs(component.area - typical_area) / max(1.0, typical_area),
+                    abs(component.center_y - page_height * 0.14) / max(1.0, page_height),
+                ),
+            )[:24]
+        # Form compact same-baseline groups (one to three Arabic digits).  Body
+        # Japanese columns cannot satisfy the far-left + short horizontal-group
+        # constraints, while dust/running folios fail the glyph-size/y guards.
+        candidate_groups: list[list[_InkComponent]] = []
+        unused = set(range(len(margin_usable)))
+        while unused:
+            seed_index = min(unused)
+            unused.remove(seed_index)
+            group = [margin_usable[seed_index]]
+            changed = True
+            while changed:
+                changed = False
+                for idx in list(unused):
+                    item = margin_usable[idx]
+                    if any(
+                        abs(item.center_y - other.center_y) <= typical_height * 0.48
+                        and abs(item.center_x - other.center_x) <= max(typical_width * 1.35, pitch * 0.48)
+                        for other in group
+                    ):
+                        group.append(item)
+                        unused.remove(idx)
+                        changed = True
+            candidate_groups.append(group)
+
+        viable_groups: list[list[_InkComponent]] = []
+        for group in candidate_groups:
+            if not (1 <= len(group) <= 3):
+                continue
+            left = min(item.left for item in group)
+            right = max(item.right for item in group)
+            top = min(item.top for item in group)
+            bottom = max(item.bottom for item in group)
+            if right - left > max(typical_width * 3.2, pitch * 0.82):
+                continue
+            if bottom - top > typical_height * 1.85:
+                continue
+            viable_groups.append(group)
+
+        if viable_groups:
+            # Prefer the strongest compact group; a true chapter marker normally
+            # consists of one/two full-size digit glyphs with no other margin ink.
+            title_group = max(
+                viable_groups,
+                key=lambda group: (
+                    sum(item.area for item in group),
+                    -abs((sum(item.center_y for item in group) / len(group)) - page_height * 0.14),
+                ),
+            )
+            total_area = max(1, sum(item.area for item in title_group))
+            title_cluster = {
+                "components": list(title_group),
+                "center": sum(item.center_x * item.area for item in title_group) / total_area,
+                "observed_center": sum(item.center_x * item.area for item in title_group) / total_area,
+                "weight": float(total_area),
+                "detached_title_candidate": True,
+            }
+            _refresh_component_cluster_stats(title_cluster)
+            kept.append(title_cluster)
+
     kept.sort(key=lambda value: float(value.get("grid_center", value["center"])))
     return kept, {
         "typical_height": typical_height,
@@ -2184,6 +2534,88 @@ def _cluster_component_columns(
         "component_count": len(components),
         "anchor_count": len(body_anchors),
     }
+
+
+def _assumed_single_column_component_model(
+    components: Sequence[_InkComponent],
+    *,
+    page_width: int,
+    page_height: int,
+) -> tuple[list[dict], dict]:
+    """Build one physical-column model for an already-cropped narrow source.
+
+    The normal multi-column component detector intentionally rejects components
+    wider than a small fraction of the *page* width.  On a 100px-wide manual
+    single-column crop, normal 30--40px Japanese glyphs therefore look
+    "too wide" and only radical fragments survive, which falsely creates several
+    columns.  This path changes the reference frame: remove only structural page
+    rules/frames, estimate glyph scale from the remaining ink, and keep one
+    dominant vertical x-band as one physical column.
+    """
+    if not components:
+        return [], {"reason": "no_components"}
+
+    structural_free: list[_InkComponent] = []
+    for component in components:
+        if component.area < 2:
+            continue
+        very_tall = component.height >= max(80, round(page_height * 0.45))
+        frame_like = very_tall and (
+            component.width <= max(6, round(page_width * 0.08))
+            or component.width >= max(18, round(page_width * 0.55))
+        )
+        edge_rule = (
+            (component.left <= 2 or component.right >= page_width - 2)
+            and component.width <= max(3, round(page_width * 0.035))
+            and component.height >= max(18, round(page_height * 0.045))
+        )
+        if frame_like or edge_rule:
+            continue
+        structural_free.append(component)
+    if not structural_free:
+        return [], {"reason": "only_structural_components"}
+
+    rough_height = max(4.0, _percentile([item.height for item in structural_free], 0.72))
+    total_weight = sum(max(1.0, float(item.area)) for item in structural_free)
+    weighted_center = sum(
+        item.center_x * max(1.0, float(item.area)) for item in structural_free
+    ) / max(1.0, total_weight)
+    dominant_radius = max(float(page_width) * 0.30, rough_height * 1.35, 12.0)
+    body = [
+        item for item in structural_free
+        if abs(item.center_x - weighted_center) <= dominant_radius
+    ]
+    if not body:
+        body = structural_free
+
+    typical_height = max(4.0, _percentile([item.height for item in body], 0.72))
+    typical_width = max(3.0, _percentile([item.width for item in body], 0.72))
+    typical_area = max(5.0, _percentile([item.area for item in body], 0.66))
+    total_weight = sum(max(1.0, float(item.area)) for item in body)
+    center = sum(
+        item.center_x * max(1.0, float(item.area)) for item in body
+    ) / max(1.0, total_weight)
+    cluster = {
+        "components": list(body),
+        "center": center,
+        "observed_center": center,
+        "grid_center": center,
+        "weight": total_weight,
+        "assumed_single_column": True,
+    }
+    _refresh_component_cluster_stats(cluster)
+    return [cluster], {
+        "typical_height": typical_height,
+        "typical_width": typical_width,
+        "typical_area": typical_area,
+        "pitch": 0.0,
+        "grid_phase": None,
+        "grid_reliable": False,
+        "component_count": len(components),
+        "anchor_count": len(body),
+        "assumed_single_column": True,
+    }
+
 
 def _component_content_spans(
     components: Sequence[_InkComponent],
@@ -2201,6 +2633,71 @@ def _component_content_spans(
         else:
             merged.append([int(top), int(bottom)])
     return tuple((top, bottom) for top, bottom in merged if bottom > top)
+
+
+def _recover_leading_punctuation_chain(
+    columns: Sequence[DetectedColumn],
+    components: Sequence[_InkComponent],
+    *,
+    scale: float,
+    typical_width: float,
+    typical_height: float,
+    typical_area: float,
+) -> list[DetectedColumn]:
+    """Attach a compact, aligned punctuation run above a column's first glyph."""
+    if not columns or not components or scale <= 0:
+        return list(columns)
+    recovered: list[DetectedColumn] = []
+    for column in columns:
+        center_x = (column.left + column.right) * 0.5 * scale
+        first_content_top = min(
+            (start for start, end in column.content_spans if end > start),
+            default=column.top,
+        )
+        cursor = first_content_top * scale
+        max_gap = max(5.0, typical_height * 0.52)
+        max_lead = max(typical_height * 4.0, column.width * scale * 3.2)
+        x_tolerance = max(3.0, min(typical_width * 0.36, column.width * scale * 0.28))
+        candidates = [
+            component for component in components
+            if component.bottom <= cursor + 2
+            and component.top >= max(cursor - max_lead, column.top * scale if column.full_height_slot else 0)
+            and abs(component.center_x - center_x) <= x_tolerance
+            and component.width <= max(typical_width * 1.4, column.width * scale * 0.85)
+            and component.height <= typical_height * 0.48
+            and component.area <= typical_area * 1.6
+        ]
+        chain: list[_InkComponent] = []
+        while candidates:
+            adjacent = [
+                component for component in candidates
+                if component.bottom <= cursor + 2
+                and component.bottom >= cursor - max_gap
+            ]
+            if not adjacent:
+                break
+            selected = max(adjacent, key=lambda component: component.bottom)
+            chain.append(selected)
+            candidates.remove(selected)
+            cursor = float(selected.top)
+        if len(chain) < 3:
+            recovered.append(column)
+            continue
+
+        leading_top = max(0, math.floor(min(item.top for item in chain) / scale))
+        leading_bottom = math.ceil(max(item.bottom for item in chain) / scale)
+        spans = list(column.content_spans)
+        if spans and spans[0][0] - leading_bottom <= max(4, round(typical_height / scale * 0.95)):
+            spans[0] = (leading_top, spans[0][1])
+        else:
+            spans.insert(0, (leading_top, leading_bottom))
+        recovered.append(replace(
+            column,
+            top=min(column.top, leading_top),
+            content_spans=tuple(spans),
+            estimated_chars=column.estimated_chars + len(chain),
+        ))
+    return recovered
 
 
 
@@ -2313,13 +2810,22 @@ def _component_full_glyph_bounds(
     row_tolerance = max(2.0, typical_height * 0.46)
     side_band_tolerance = max(1.5, typical_width * 0.28)
 
+    # ``repeated_band_count`` is queried repeatedly for components inside the
+    # same physical column.  Indexing the eligible x-centres once preserves the
+    # exact inclusive ``abs(dx) <= tolerance`` predicate while avoiding a full
+    # Python scan of every page component on every query.
+    repeat_band_centres = sorted(
+        other.center_x
+        for other in components
+        if hard_left <= other.center_x < hard_right and other.area >= 2
+    )
+
     def repeated_band_count(component: _InkComponent) -> int:
-        return sum(
-            1
-            for other in components
-            if hard_left <= other.center_x < hard_right
-            and abs(other.center_x - component.center_x) <= side_band_tolerance
-            and other.area >= 2
+        center_x = component.center_x
+        return bisect_right(
+            repeat_band_centres, center_x + side_band_tolerance
+        ) - bisect_left(
+            repeat_band_centres, center_x - side_band_tolerance
         )
 
     # The initial x-cluster can still contain a small ruby strip when its centre
@@ -2370,12 +2876,20 @@ def _component_full_glyph_bounds(
         and component.height <= max(typical_height * 1.85, 10.0)
     ]
 
+    body_row_overlap_cache: dict[int, bool] = {}
+
     def overlaps_body_row(component: _InkComponent) -> bool:
-        return any(
+        component_id = id(component)
+        cached = body_row_overlap_cache.get(component_id)
+        if cached is not None:
+            return cached
+        result = any(
             max(0, min(component.bottom, bottom) - max(component.top, top))
             >= max(1, round(component.height * 0.20))
             for top, bottom in body_intervals
         )
+        body_row_overlap_cache[component_id] = result
+        return result
 
     # Start with the components that established the physical body column.  Add
     # detached radicals only when their x-band repeats through a substantial
@@ -2624,6 +3138,19 @@ def _component_full_glyph_bounds(
     side_extension_floor = max(2, round(typical_width * 0.12))
     effective_lefts: list[int] = []
     effective_rights: list[int] = []
+    tail_x_tolerance = max(2.0, typical_width * 0.24)
+    tail_repeat_candidates = [
+        other
+        for other in components
+        if hard_left <= other.center_x < hard_right
+        and other.height <= typical_height * 0.72
+        and other.width <= max(6.0, typical_width * 0.78)
+        and other.area <= max(14.0, typical_area * 0.56)
+        and overlaps_body_row(other)
+    ]
+    tail_repeat_centres = sorted(other.center_x for other in tail_repeat_candidates)
+    tail_repeat_ids = {id(other) for other in tail_repeat_candidates}
+
     def _tail_band_repetition(
         component: _InkComponent,
         tail_left: int,
@@ -2632,18 +3159,19 @@ def _component_full_glyph_bounds(
         if tail_right <= tail_left:
             return 0
         tail_center = (float(tail_left) + float(tail_right)) / 2.0
-        x_tolerance = max(2.0, typical_width * 0.24)
-        return sum(
-            1
-            for other in components
-            if other is not component
-            and hard_left <= other.center_x < hard_right
-            and abs(other.center_x - tail_center) <= x_tolerance
-            and other.height <= typical_height * 0.72
-            and other.width <= max(6.0, typical_width * 0.78)
-            and other.area <= max(14.0, typical_area * 0.56)
-            and overlaps_body_row(other)
+        count = bisect_right(
+            tail_repeat_centres, tail_center + tail_x_tolerance
+        ) - bisect_left(
+            tail_repeat_centres, tail_center - tail_x_tolerance
         )
+        # The historical generator excluded ``other is component``.  Preserve
+        # that identity rule exactly after the prefilter/bisect fast path.
+        if (
+            id(component) in tail_repeat_ids
+            and abs(component.center_x - tail_center) <= tail_x_tolerance
+        ):
+            count -= 1
+        return max(0, count)
 
     # Touching ruby often merges into the base component on *every* annotated
     # row.  In that case there are no separate side components for the function
@@ -2828,6 +3356,7 @@ def _detect_vertical_columns_components(
     fixed_region_rect: Sequence[float] | None = None,
     fixed_region_already_masked: bool = False,
     capture_ruby_candidates: bool = True,
+    assume_single_column: bool = False,
 ) -> list[DetectedColumn]:
     """Detect physical columns from connected printed-glyph components.
 
@@ -2847,11 +3376,16 @@ def _detect_vertical_columns_components(
         mask, scale, _threshold = _make_ink_mask(image)
         try:
             components = _connected_ink_components(mask)
-            clusters, metrics = _cluster_component_columns(
-                components,
-                page_width=mask.width,
-                page_height=mask.height,
-            )
+            if assume_single_column:
+                clusters, metrics = _assumed_single_column_component_model(
+                    components, page_width=mask.width, page_height=mask.height
+                )
+            else:
+                clusters, metrics = _cluster_component_columns(
+                    components,
+                    page_width=mask.width,
+                    page_height=mask.height,
+                )
             if not clusters:
                 return []
             if len(clusters) > max_columns:
@@ -2894,10 +3428,17 @@ def _detect_vertical_columns_components(
                 # components centred on this physical column establish its body
                 # strip; recovered short columns still retain their tiny marks.
                 centre_tolerance = max(2.0, typical_width * 0.70)
-                body_components = [
-                    component for component in cluster_components
-                    if abs(component.center_x - center) <= centre_tolerance
-                ] or cluster_components
+                if bool(cluster.get("assumed_single_column") or cluster.get("detached_title_candidate")):
+                    # The source is already one physical column.  Its printed
+                    # glyphs can fragment into several x-bands (radicals, kana
+                    # side strokes, punctuation), so do not re-apply the normal
+                    # centre-only filter after explicitly merging those bands.
+                    body_components = cluster_components
+                else:
+                    body_components = [
+                        component for component in cluster_components
+                        if abs(component.center_x - center) <= centre_tolerance
+                    ] or cluster_components
                 left, right, excluded = _component_full_glyph_bounds(
                     components,
                     body_components,
@@ -2909,7 +3450,11 @@ def _detect_vertical_columns_components(
                     typical_area=typical_area,
                     pitch=float(metrics.get("pitch", 0.0) or 0.0),
                     mask=mask,
-                    force_full_envelope=bool(cluster.get("recovered_short")),
+                    force_full_envelope=bool(
+                        cluster.get("recovered_short")
+                        or cluster.get("assumed_single_column")
+                        or cluster.get("detached_title_candidate")
+                    ),
                 )
 
                 supplemental = _component_punctuation_boxes(
@@ -2924,22 +3469,29 @@ def _detect_vertical_columns_components(
                     typical_area=typical_area,
                 )
 
-                # Record possible Ruby while connected components are already in
-                # Candidate telemetry is strictly opt-in with Ruby preservation.
-                # When Ruby is OFF we skip this branch entirely, restoring the
-                # pre-Ruby column-detection cost and leaving no candidate sidecar.
+                # Ruby telemetry remains opt-in, but the *body isolation guard* is
+                # not. A tiny furigana fragment can otherwise look exactly like
+                # detached hanging punctuation and get copied back through a
+                # supplemental box even though the strict body rectangle excludes
+                # the rest of the ruby run. To keep normal OCR Ruby-free even when
+                # the Ruby side-channel is disabled, run the geometry-only ruby
+                # classifier whenever telemetry is requested OR a supplemental
+                # punctuation candidate needs validation. This never invokes OCR.
                 ruby_candidate_mask_boxes: list[tuple[int, int, int, int]] = []
                 ruby_candidate_confidence = 0.0
-                if capture_ruby_candidates:
-                    # Connected components are already in memory for ordinary OCR
-                    # column splitting; this branch performs geometry only, never OCR.
+                ruby_guard_boxes: list[tuple[int, int, int, int]] = []
+                # The isolation guard is part of canonical column geometry, not
+                # Ruby telemetry.  Run the lightweight geometry classifier for
+                # every physical column so capture_ruby_candidates can only
+                # control side-channel exposure, never OCR crop pixels.
+                if True:
                     candidate_core_half = max(typical_width * 0.62, typical_height * 0.52)
                     candidate_body_x0 = max(hard_left, int(round(center - candidate_core_half)))
                     candidate_body_x1 = min(hard_right, int(round(center + candidate_core_half)))
                     # Ruby often sits just outside the midpoint-based hard slot of
                     # its base column (especially vertical text, where furigana is
                     # printed in the gutter to the right). Observe a narrow halo
-                    # for telemetry only; it never widens pixels fed to normal OCR.
+                    # for masking/telemetry only; it never widens normal OCR pixels.
                     candidate_scan_margin = max(2.0, typical_width * 0.72)
                     local_component_dicts = [
                         {
@@ -2960,32 +3512,52 @@ def _detect_vertical_columns_components(
                         target_width=typical_width,
                         target_height=typical_height,
                     )
-                    ruby_candidate_mask_boxes = list(dict.fromkeys(
-                        ruby_candidate_geometry.ruby_boxes
-                    ))
-                    if not ruby_candidate_mask_boxes and excluded:
-                        plausible_excluded = []
-                        for box in excluded:
-                            bw = max(1, int(box[2]) - int(box[0]))
-                            bh = max(1, int(box[3]) - int(box[1]))
-                            aspect = max(bw / max(1, bh), bh / max(1, bw))
-                            if (
-                                bw <= max(3.0, typical_width * 0.72)
-                                and bh <= max(4.0, typical_height * 0.82)
-                                and aspect <= 3.0
-                            ):
-                                plausible_excluded.append(box)
-                        if len(plausible_excluded) >= 2:
-                            ruby_candidate_mask_boxes.extend(plausible_excluded)
-                    ruby_candidate_mask_boxes = list(dict.fromkeys(
+                    ruby_guard_boxes = list(dict.fromkeys(
                         tuple(int(value) for value in box[:4])
-                        for box in ruby_candidate_mask_boxes
+                        for box in ruby_candidate_geometry.ruby_boxes
                         if len(box) >= 4 and box[2] > box[0] and box[3] > box[1]
                     ))
-                    ruby_candidate_confidence = (
-                        max(0.65, float(ruby_candidate_geometry.confidence or 0.0))
-                        if ruby_candidate_mask_boxes else 0.0
-                    )
+
+                    # Reject any supplemental mark that the local ruby run detector
+                    # also classified as furigana. Exact equality is common, but use
+                    # rectangle overlap so scale rounding cannot reopen a 1px sliver.
+                    if supplemental and ruby_guard_boxes:
+                        def _overlaps_ruby_guard(box: tuple[int, int, int, int]) -> bool:
+                            return any(
+                                min(box[2], ruby_box[2]) > max(box[0], ruby_box[0])
+                                and min(box[3], ruby_box[3]) > max(box[1], ruby_box[1])
+                                for ruby_box in ruby_guard_boxes
+                            )
+
+                        supplemental = tuple(
+                            box for box in supplemental if not _overlaps_ruby_guard(box)
+                        )
+
+                    if capture_ruby_candidates:
+                        ruby_candidate_mask_boxes = list(ruby_guard_boxes)
+                        if not ruby_candidate_mask_boxes and excluded:
+                            plausible_excluded = []
+                            for box in excluded:
+                                bw = max(1, int(box[2]) - int(box[0]))
+                                bh = max(1, int(box[3]) - int(box[1]))
+                                aspect = max(bw / max(1, bh), bh / max(1, bw))
+                                if (
+                                    bw <= max(3.0, typical_width * 0.72)
+                                    and bh <= max(4.0, typical_height * 0.82)
+                                    and aspect <= 3.0
+                                ):
+                                    plausible_excluded.append(box)
+                            if len(plausible_excluded) >= 2:
+                                ruby_candidate_mask_boxes.extend(plausible_excluded)
+                        ruby_candidate_mask_boxes = list(dict.fromkeys(
+                            tuple(int(value) for value in box[:4])
+                            for box in ruby_candidate_mask_boxes
+                            if len(box) >= 4 and box[2] > box[0] and box[3] > box[1]
+                        ))
+                        ruby_candidate_confidence = (
+                            max(0.65, float(ruby_candidate_geometry.confidence or 0.0))
+                            if ruby_candidate_mask_boxes else 0.0
+                        )
 
                 supplemental_components = [
                     component for component in components
@@ -3002,6 +3574,22 @@ def _detect_vertical_columns_components(
                     span_components,
                     typical_height=typical_height,
                 )
+                # The fixed slot already retains all native pixels in the body
+                # band. Include detached first/last kana and punctuation in the
+                # diagnostic envelope too, even when component clustering did
+                # not use them as anchors. Never scan the adjacent ruby band.
+                ink_envelope = _vertical_ink_envelope_from_edges(
+                    mask, left, right,
+                    top_limit=max(0, math.floor(body_top_px * scale)),
+                    bottom_limit=min(mask.height, math.ceil(body_bottom_px * scale)),
+                )
+                if ink_envelope is not None:
+                    if spans:
+                        spans = list(spans)
+                        spans[0] = (min(spans[0][0], ink_envelope[0]), spans[0][1])
+                        spans[-1] = (spans[-1][0], max(spans[-1][1], ink_envelope[1]))
+                    else:
+                        spans = [ink_envelope]
                 estimated_chars = max(
                     1,
                     _component_row_count(body_components, typical_height=typical_height)
@@ -3024,6 +3612,36 @@ def _detect_vertical_columns_components(
                         image.height,
                         math.ceil(min(mask.height, span_bottom + vertical_pad) * inv_scale),
                     )
+
+                    # Final omission-safety pass: the component classifier can
+                    # miss detached opening/closing punctuation or a tiny first/
+                    # last glyph fragment.  The GUI has already removed headers
+                    # and page margins, so scan this physical column band from
+                    # the body top and bottom toward the centre and use the
+                    # outermost supported ink only to EXPAND the existing box.
+                    scan_pad = max(2, round(typical_width * 0.18))
+                    scan_left = max(hard_left, left - scan_pad)
+                    scan_right = min(hard_right, right + scan_pad)
+                    edge_envelope = _vertical_ink_envelope_from_edges(
+                        mask,
+                        scan_left,
+                        scan_right,
+                        top_limit=0,
+                        bottom_limit=mask.height,
+                    )
+                    if edge_envelope is not None:
+                        edge_top, edge_bottom = edge_envelope
+                        edge_pad = max(4, round(typical_height * 0.22))
+                        edge_top_px = max(
+                            0,
+                            math.floor(max(0, edge_top - edge_pad) * inv_scale),
+                        )
+                        edge_bottom_px = min(
+                            image.height,
+                            math.ceil(min(mask.height, edge_bottom + edge_pad) * inv_scale),
+                        )
+                        top_px = min(top_px, edge_top_px)
+                        bottom_px = max(bottom_px, edge_bottom_px)
                 if right_px - left_px < 3 or bottom_px - top_px < 3:
                     continue
                 content_spans = tuple(
@@ -3066,6 +3684,16 @@ def _detect_vertical_columns_components(
                         for box in excluded
                         if box[2] > box[0] and box[3] > box[1]
                     ),
+                    ruby_guard_boxes=tuple(
+                        (
+                            max(body_left_px, math.floor(box[0] * inv_scale)),
+                            max(body_top_px, math.floor(box[1] * inv_scale)),
+                            min(body_right_px, math.ceil(box[2] * inv_scale)),
+                            min(body_bottom_px, math.ceil(box[3] * inv_scale)),
+                        )
+                        for box in ruby_guard_boxes
+                        if box[2] > box[0] and box[3] > box[1]
+                    ),
                     ruby_candidate_boxes=tuple(
                         (
                             max(body_left_px, math.floor(box[0] * inv_scale)),
@@ -3084,11 +3712,51 @@ def _detect_vertical_columns_components(
                     page_width=image.width,
                     page_height=image.height,
                 )
+            columns = _recover_leading_punctuation_chain(
+                columns,
+                components,
+                scale=scale,
+                typical_width=typical_width,
+                typical_height=typical_height,
+                typical_area=typical_area,
+            )
+            columns = _remove_extreme_ruby_width_outliers(columns)
             return sorted(columns, key=lambda column: (-(column.left + column.right), column.top))
         finally:
             mask.close()
     finally:
         image.close()
+
+def _remove_extreme_ruby_width_outliers(
+    columns: Sequence[DetectedColumn],
+) -> list[DetectedColumn]:
+    """Drop only extreme narrow auxiliary/ruby columns on multi-column pages.
+
+    A real one/two-glyph body column is often short, but its *glyph width* still
+    stays close to the page's body-column width.  Ruby-only fragments are much
+    narrower.  The threshold is intentionally conservative: it requires at
+    least five detected columns, <=3 estimated glyphs, and a width below 30%
+    of the page median.  This keeps ordinary numeric/terminal columns while
+    preventing a tiny furigana run from becoming authoritative OCR evidence.
+    """
+    items = list(columns or ())
+    if len(items) < 5:
+        return items
+    widths = sorted(column.width for column in items if column.width > 0)
+    if not widths:
+        return items
+    median_width = float(widths[len(widths) // 2])
+    if median_width < 8.0:
+        return items
+    threshold = median_width * 0.30
+    return [
+        column for column in items
+        if not (
+            column.width < threshold
+            and int(column.estimated_chars or 0) <= 3
+        )
+    ]
+
 
 def _normalise_column_detector_mode(value: str | None) -> str:
     token = str(value or "components").strip().lower().replace("-", "_")
@@ -3115,6 +3783,7 @@ def detect_vertical_columns(
     fixed_region_already_masked: bool = False,
     detector_mode: str = "components",
     capture_ruby_candidates: bool = True,
+    assume_single_column: bool = False,
 ) -> list[DetectedColumn]:
     """Detect vertical columns using the ordinary no-projection component path.
 
@@ -3140,6 +3809,7 @@ def detect_vertical_columns(
         fixed_region_rect=fixed_region_rect,
         fixed_region_already_masked=fixed_region_already_masked,
         capture_ruby_candidates=bool(capture_ruby_candidates),
+        assume_single_column=bool(assume_single_column),
     )
 
 _OCR_PLACEHOLDER_CHARS = frozenset("□■◻◼�")
@@ -3609,12 +4279,121 @@ def _open_page_image(
 
 
 def _column_source_boxes(column: DetectedColumn) -> list[tuple[int, int, int, int]]:
-    boxes = [(int(column.left), int(column.top), int(column.right), int(column.bottom))]
+    """Return the native-pixel reveal boxes for one physical column.
+
+    Detection boxes intentionally stay tight for stable column separation, but
+    OCR must not expose *only* that tight detector rectangle: punctuation,
+    quotation marks and edge strokes often sit a few pixels outside it.  Reveal
+    a modest amount of real source image on all four sides *before* the white
+    context canvas is built.  Horizontal growth is hard-clamped to the logical
+    non-overlapping column slot (``hard_left``/``hard_right``), so neighbouring
+    columns can never enter.  Ruby boxes are blanked afterwards by
+    ``_paste_column_source``.
+    """
+    body_left = int(column.left)
+    body_right = int(column.right)
+    body_top = int(column.top)
+    body_bottom = int(column.bottom)
+    body_width = max(1, body_right - body_left)
+
+    # A 15--25% horizontal reveal margin is enough to recover hanging Japanese
+    # punctuation without turning the source window into the whole inter-column
+    # gap.  Keep at least 4 px for small/high-resolution columns.
+    x_pad = max(4, round(body_width * 0.22))
+    left = max(int(column.hard_left), body_left - x_pad)
+    right = min(int(column.hard_right), body_right + x_pad)
+
+    # A strong run of geometry-only Ruby candidates on one side is a hard
+    # obstacle for *native-pixel expansion*.  Do not reveal source pixels all
+    # the way into that band and then hope exact candidate boxes erase every
+    # anti-aliased edge.  Instead stop the reveal a small safety distance before
+    # the nearest Ruby candidate.  The opposite side and vertical expansion are
+    # unaffected, so punctuation recovery is preserved wherever Ruby is absent.
+    ruby_candidates = [
+        tuple(int(value) for value in box[:4])
+        for box in (
+            getattr(column, "ruby_guard_boxes", ())
+            or getattr(column, "ruby_candidate_boxes", ())
+            or ()
+        )
+        if len(box) >= 4 and int(box[2]) > int(box[0]) and int(box[3]) > int(box[1])
+    ]
+    if ruby_candidates:
+        barrier_gap = max(2, round(body_width * 0.05))
+        min_cluster_items = 3
+        min_vertical_span = max(18, round(body_width * 1.20))
+
+        left_side = [box for box in ruby_candidates if box[2] <= body_left]
+        if len(left_side) >= min_cluster_items:
+            y0 = min(box[1] for box in left_side)
+            y1 = max(box[3] for box in left_side)
+            if y1 - y0 >= min_vertical_span:
+                nearest = max(box[2] for box in left_side)
+                left = max(left, min(body_left, nearest + barrier_gap))
+
+        right_side = [box for box in ruby_candidates if box[0] >= body_right]
+        if len(right_side) >= min_cluster_items:
+            y0 = min(box[1] for box in right_side)
+            y1 = max(box[3] for box in right_side)
+            if y1 - y0 >= min_vertical_span:
+                nearest = min(box[0] for box in right_side)
+                right = min(right, max(body_right, nearest - barrier_gap))
+
+    if column.full_height_slot:
+        # A trusted fixed body rectangle already defines the intended vertical
+        # page span, so do not leak outside it.
+        top, bottom = body_top, body_bottom
+    else:
+        # Vertical punctuation / detached quote marks are frequently just above
+        # or below the component union.  Give them a slightly larger native-
+        # pixel safety margin than the old 20% rule, but keep it proportional to
+        # the column width rather than to page height.
+        y_pad = max(8, round(body_width * 0.45))
+        top = max(0, body_top - y_pad)
+        bottom = body_bottom + y_pad
+
+    boxes = [(left, top, right, bottom)]
+    if not column.full_height_slot:
+        # Detached opening/closing quotes can sit more than half a glyph above
+        # or below the detected body. Reveal that extra height only within the
+        # trusted body x-band, so side Ruby cannot enter through the cap.
+        end_pad = max(8, round(body_width * 1.4))
+        head_top = max(0, body_top - end_pad)
+        if head_top < top:
+            boxes.append((body_left, head_top, body_right, top))
+        tail_bottom = body_bottom + end_pad
+        if tail_bottom > bottom:
+            boxes.append((body_left, bottom, body_right, tail_bottom))
     boxes.extend(
         tuple(int(value) for value in box[:4])
         for box in (getattr(column, "supplemental_boxes", ()) or ())
     )
     return [box for box in boxes if box[2] > box[0] and box[3] > box[1]]
+
+
+def _column_detector_preview_bounds(column: DetectedColumn) -> tuple[int, int, int, int]:
+    """Return the tight detector envelope used only for UI diagnostics.
+
+    Physical column slots intentionally span the complete fixed body height so
+    masking stays stable across models.  Painting that slot as the green
+    "detector box" is misleading: it makes every column look full-height even
+    when the detector actually found only a short title/terminal column.  Keep
+    OCR geometry unchanged and derive the visible detector envelope from the
+    immutable ink ``content_spans`` instead.
+    """
+    spans = [
+        (int(top), int(bottom))
+        for top, bottom in (getattr(column, "content_spans", ()) or ())
+        if int(bottom) > int(top)
+    ]
+    if spans:
+        return (
+            min([int(column.left), *(int(box[0]) for box in column.supplemental_boxes)]),
+            min([min(top for top, _bottom in spans), *(int(box[1]) for box in column.supplemental_boxes)]),
+            max([int(column.right), *(int(box[2]) for box in column.supplemental_boxes)]),
+            max([max(bottom for _top, bottom in spans), *(int(box[3]) for box in column.supplemental_boxes)]),
+        )
+    return (int(column.left), int(column.top), int(column.right), int(column.bottom))
 
 
 def _column_source_union(column: DetectedColumn) -> tuple[int, int, int, int]:
@@ -3648,11 +4427,177 @@ def _paste_source_boxes(
 
 
 def _column_exclusion_boxes(column: DetectedColumn) -> list[tuple[int, int, int, int]]:
-    return [
-        tuple(int(value) for value in box[:4])
-        for box in (getattr(column, "excluded_boxes", ()) or ())
-        if len(box) >= 4 and int(box[2]) > int(box[0]) and int(box[3]) > int(box[1])
+    # Component classification can mistake a detached stroke or dakuten for
+    # side Ruby. The detector's body x-band is authoritative for native pixels;
+    # only erase portions of an exclusion that lie outside that band.
+    body_left, body_right = int(column.left), int(column.right)
+    masks: list[tuple[int, int, int, int]] = []
+    for raw in (getattr(column, "excluded_boxes", ()) or ()):
+        if len(raw) < 4:
+            continue
+        x0, y0, x1, y1 = (int(raw[0]), int(raw[1]), int(raw[2]), int(raw[3]))
+        if x1 <= x0 or y1 <= y0:
+            continue
+        if x0 < body_left:
+            masks.append((x0, y0, min(x1, body_left), y1))
+        if x1 > body_right:
+            masks.append((max(x0, body_right), y0, x1, y1))
+    return [box for box in masks if box[2] > box[0] and box[3] > box[1]]
+
+
+def _column_expansion_ruby_boxes(column: DetectedColumn) -> list[tuple[int, int, int, int]]:
+    """Return side-Ruby pixels that must be blanked from canonical OCR input.
+
+    The normal four-side reveal expands a tight body box by a few native pixels,
+    so Ruby in that *expansion fringe* is always blanked.  A rarer failure mode
+    occurs when one tiny glyph of a real vertical Ruby run crosses a few pixels
+    inside ``column.left/right``.  The old body-band safety rule preserved that
+    fragment and every OCR engine then saw the same black edge speck.
+
+    Do not solve this by deleting every tiny edge component: dakuten,
+    handakuten, punctuation and detached kanji strokes can look identical in a
+    single row.  An inward candidate is blanked only when it is supported by a
+    compact vertical Ruby run on the same side containing at least three
+    distinct, sequential small-glyph rows.  Widely separated side fragments and
+    one/two-row marks therefore remain untouched.
+    """
+    body_left = int(column.left)
+    body_right = int(column.right)
+    body_width = max(1, body_right - body_left)
+    raw_boxes = [
+        tuple(int(value) for value in raw[:4])
+        for raw in (
+            getattr(column, "ruby_guard_boxes", ())
+            or getattr(column, "ruby_candidate_boxes", ())
+            or ()
+        )
+        if len(raw) >= 4
+        and int(raw[2]) > int(raw[0])
+        and int(raw[3]) > int(raw[1])
     ]
+
+    masks: list[tuple[int, int, int, int]] = []
+    # Historical four-side source expansion: Ruby exposed only in the reveal
+    # fringe can always be removed without touching trusted body pixels.
+    for x0, y0, x1, y1 in raw_boxes:
+        if x0 < body_left:
+            masks.append((x0, y0, min(x1, body_left), y1))
+        if x1 > body_right:
+            masks.append((max(x0, body_right), y0, x1, y1))
+
+    left_outside = [box for box in raw_boxes if box[2] <= body_left]
+    right_outside = [box for box in raw_boxes if box[0] >= body_right]
+    edge_depth = max(4, round(body_width * 0.20))
+    tiny_width = max(4, round(body_width * 0.25))
+    tiny_height = max(7, round(body_width * 0.42))
+    row_sequence_gap = max(7, round(body_width * 0.35))
+    x_support_gap = max(6, round(body_width * 0.30))
+
+    def _ruby_runs(
+        boxes: Sequence[tuple[int, int, int, int]], *, side: str,
+    ) -> list[tuple[int, int, tuple[tuple[int, int, int, int], ...]]]:
+        """Collapse side boxes into compact 3+-row vertical Ruby sequences."""
+        if not boxes:
+            return []
+        # First merge only boxes that occupy the same printed mini-glyph row.
+        rows: list[dict[str, object]] = []
+        for box in sorted(boxes, key=lambda item: (item[1], item[3], item[0])):
+            if rows and box[1] <= int(rows[-1]["bottom"]) + 1:
+                rows[-1]["top"] = min(int(rows[-1]["top"]), box[1])
+                rows[-1]["bottom"] = max(int(rows[-1]["bottom"]), box[3])
+                cast_boxes = rows[-1]["boxes"]
+                assert isinstance(cast_boxes, list)
+                cast_boxes.append(box)
+            else:
+                rows.append({"top": box[1], "bottom": box[3], "boxes": [box]})
+
+        sequences: list[list[dict[str, object]]] = []
+        for row in rows:
+            if (
+                sequences
+                and int(row["top"]) - int(sequences[-1][-1]["bottom"]) <= row_sequence_gap
+            ):
+                sequences[-1].append(row)
+            else:
+                sequences.append([row])
+
+        result: list[tuple[int, int, tuple[tuple[int, int, int, int], ...]]] = []
+        for sequence in sequences:
+            if len(sequence) < 3:
+                continue
+            flat: list[tuple[int, int, int, int]] = []
+            for row in sequence:
+                row_boxes = row["boxes"]
+                assert isinstance(row_boxes, list)
+                flat.extend(row_boxes)
+            top = min(box[1] for box in flat)
+            bottom = max(box[3] for box in flat)
+            if bottom - top < max(18, round(body_width * 0.90)):
+                continue
+            # The run must actually hug this column edge.  This rejects distant
+            # annotations belonging to another physical column.
+            if side == "left":
+                nearest_gap = body_left - max(box[2] for box in flat)
+            else:
+                nearest_gap = min(box[0] for box in flat) - body_right
+            if nearest_gap > max(6, round(body_width * 0.35)):
+                continue
+            result.append((top, bottom, tuple(flat)))
+        return result
+
+    left_runs = _ruby_runs(left_outside, side="left")
+    right_runs = _ruby_runs(right_outside, side="right")
+
+    def _horizontal_gap(a, b) -> int:
+        if a[2] < b[0]:
+            return b[0] - a[2]
+        if b[2] < a[0]:
+            return a[0] - b[2]
+        return 0
+
+    for box in raw_boxes:
+        x0, y0, x1, y1 = box
+        if x1 <= body_left or x0 >= body_right:
+            continue
+        if x1 - x0 > tiny_width or y1 - y0 > tiny_height:
+            continue
+
+        candidate_runs: list[tuple[
+            str, int, int, tuple[tuple[int, int, int, int], ...]
+        ]] = []
+        if x0 < body_left + edge_depth and x1 - body_left <= edge_depth:
+            candidate_runs.extend(("left", top, bottom, boxes) for top, bottom, boxes in left_runs)
+        if body_right - x0 <= edge_depth and x1 > body_right - edge_depth:
+            candidate_runs.extend(("right", top, bottom, boxes) for top, bottom, boxes in right_runs)
+        if not candidate_runs:
+            continue
+
+        centre_y = (y0 + y1) / 2.0
+        for side, run_top, run_bottom, support_boxes in candidate_runs:
+            if centre_y < run_top - row_sequence_gap or centre_y > run_bottom + row_sequence_gap:
+                continue
+            local_support = sum(
+                1
+                for support in support_boxes
+                if _horizontal_gap(box, support) <= x_support_gap
+                and not (support[3] < y0 - row_sequence_gap or support[1] > y1 + row_sequence_gap)
+            )
+            if local_support >= 1:
+                # The 3+-row run is the strong evidence; one nearby member merely
+                # binds this inward fragment to that run.  Extend by one pixel only
+                # *toward the Ruby side* to absorb antialiasing without shaving the
+                # inner edge of the base glyph.
+                if side == "left":
+                    masks.append((max(int(column.hard_left), x0 - 1), y0, x1, y1))
+                else:
+                    masks.append((x0, y0, min(int(column.hard_right), x1 + 1), y1))
+                break
+
+    deduped: list[tuple[int, int, int, int]] = []
+    for box in masks:
+        if box[2] > box[0] and box[3] > box[1] and box not in deduped:
+            deduped.append(box)
+    return deduped
 
 
 def _blank_destination_boxes(
@@ -3684,9 +4629,10 @@ def _paste_column_source(
 ) -> None:
     """Paste one detected column into ``destination``.
 
-    ``erase_exclusions`` keeps the old review/debug Ruby-removal behaviour.
-    Production OCR passes ``False`` (or uses the raw hard-slot path) so no
-    component inside a physical column can be painted over before recognition.
+    ``erase_exclusions=True`` is the standard Ruby-free body transport: the
+    detector-approved body/source boxes are copied first and side-Ruby boxes are
+    then painted back to paper white.  ``False`` is retained for explicit
+    lossless/debug paths that intentionally preserve every source component.
     """
     _paste_source_boxes(
         destination,
@@ -3696,9 +4642,15 @@ def _paste_column_source(
         offset_y=offset_y,
     )
     if erase_exclusions:
+        exclusion_boxes = _column_exclusion_boxes(column)
+        # Four-side native source expansion may expose the first few pixels of a
+        # side Ruby run that was deliberately outside the tight body rectangle.
+        # Blank those candidate pixels only in the expansion fringe; never erase
+        # candidate pixels inside the trusted body x-band.
+        exclusion_boxes.extend(_column_expansion_ruby_boxes(column))
         _blank_destination_boxes(
             destination,
-            _column_exclusion_boxes(column),
+            exclusion_boxes,
             offset_x=offset_x,
             offset_y=offset_y,
             background=background or _paper_background(source),
@@ -3715,11 +4667,11 @@ def _masked_column_image(
 ) -> Image.Image:
     """Keep one physical column on a full-size paper-colour canvas.
 
-    The production default copies the complete logical hard slot directly from
-    the fixed-region source page.  It never applies ``excluded_boxes`` or a
-    density-derived body-core cut, so detached dakuten/handakuten and thin
-    printed strokes remain available to every OCR model.  The old filtered body
-    band is retained only for explicit review/debug calls.
+    ``preserve_body_pixels=False`` is the standard Japanese-novel production
+    contract: copy the detector-approved body/source boxes at native resolution
+    and blank geometrically classified Ruby exclusions.  ``True`` exposes the
+    complete hard slot for explicit compatibility/debug calls.  Neither path
+    resizes, sharpens, or re-rasterizes the printed glyphs.
     """
     paper = background or _paper_background(image)
     canvas = Image.new("RGB", image.size, paper)
@@ -3751,14 +4703,97 @@ def _masked_column_image(
         finally:
             region.close()
     else:
-        _paste_column_source(
-            canvas,
-            image,
-            column,
-            background=paper,
-            erase_exclusions=True,
-        )
+        # Production Ruby-free transport normally exposes the whole detected
+        # body column.  Span recovery is the one exception: it must reveal only
+        # the requested vertical fragment, otherwise the "short-span" rescue
+        # silently re-runs the complete column and cannot recover a detached
+        # block independently.  Keep supplemental punctuation boxes, but clip
+        # every source box to the span's y-range before pasting.
+        source_boxes = _column_source_boxes(column)
+        if span is not None and not retry:
+            clipped_boxes: list[tuple[int, int, int, int]] = []
+            for box_left, box_top, box_right, box_bottom in source_boxes:
+                clipped_top = max(int(box_top), int(top))
+                clipped_bottom = min(int(box_bottom), int(bottom))
+                if box_right > box_left and clipped_bottom > clipped_top:
+                    clipped_boxes.append((
+                        int(box_left), clipped_top, int(box_right), clipped_bottom,
+                    ))
+            _paste_source_boxes(canvas, image, clipped_boxes)
+            span_exclusions = _column_exclusion_boxes(column)
+            span_exclusions.extend(_column_expansion_ruby_boxes(column))
+            _blank_destination_boxes(
+                canvas,
+                span_exclusions,
+                background=paper,
+            )
+        else:
+            _paste_column_source(
+                canvas,
+                image,
+                column,
+                background=paper,
+                erase_exclusions=True,
+            )
     return canvas
+
+
+def _column_visibility_viewport(
+    image: Image.Image,
+    column: DetectedColumn,
+    *,
+    mode: str,
+    background: tuple[int, int, int] | None = None,
+    preserve_body_pixels: bool = True,
+    transport_profile: str = "",
+) -> Image.Image:
+    """Return the canonical single-column OCR transport.
+
+    Physical ``hard_left/hard_right`` slots remain authoritative geometry but are
+    never used as the model viewport: page-edge slots can be hundreds of pixels
+    wide and full-height slots can waste most of a recognizer's receptive field.
+    Every ordinary recognizer instead receives the same native-pixel body window:
+    detector-approved pixels only, Ruby/neighbours whitened, and modest white
+    breathing room around the actual printed column.  No glyph is rescaled.
+    ``mode`` is retained only for API compatibility; it does not change pixels.
+    """
+    paper = background or _paper_background(image)
+    layer = _masked_column_image(
+        image, column, retry=False, background=paper,
+        preserve_body_pixels=preserve_body_pixels,
+    )
+    try:
+        # Start from the logical printed-body envelope, not the hard slot.
+        body_left = max(0, min(layer.width - 1, int(column.left)))
+        body_right = max(body_left + 1, min(layer.width, int(column.right)))
+        body_top = max(0, min(layer.height - 1, int(column.top)))
+        body_bottom = max(body_top + 1, min(layer.height, int(column.bottom)))
+        ref = max(1, int(column.width))
+        # The physical column is shared, but each recognizer may need a
+        # different amount of white breathing room.  Resolve the explicit
+        # transport profile back to its stable engine capability profile.
+        profile = get_ocr_transport_profile(transport_profile)
+        if profile is None:
+            # Backward-compatible callers that do not provide a profile retain
+            # the old canonical 0.50/0.30 framing.
+            pad_x = max(12, round(ref * 0.50))
+            pad_y = max(10, round(ref * 0.30))
+        else:
+            pad_x = max(int(profile.min_pad_x), round(ref * float(profile.pad_x_ratio)))
+            pad_y = max(int(profile.min_pad_y), round(ref * float(profile.pad_y_ratio)))
+        left = max(0, body_left - pad_x)
+        right = min(layer.width, body_right + pad_x)
+        top = max(0, body_top - pad_y)
+        bottom = min(layer.height, body_bottom + pad_y)
+        viewport = layer.crop((left, top, right, bottom)).convert("RGB")
+    finally:
+        layer.close()
+    # One final ink-aware framing pass absorbs tiny detector variance while
+    # preserving enough white paper for OCR.  This also makes all engines reuse
+    # nearly identical 70--90 px column widths on ordinary 1200px novel pages.
+    framed = _tighten_ink_framing(viewport, max(1, int(column.width)), transport_profile)
+    viewport.close()
+    return framed
 
 class _SentencePageCache:
     """Small LRU of fixed-region page images for ordered sentence rendering."""
@@ -3808,7 +4843,8 @@ def _sentence_group_image(
     fixed_region_rect: Sequence[float] | None = None,
     shared_page_cache: _SentencePageCache | None = None,
     preserve_body_pixels: bool = True,
-) -> Image.Image:
+    return_layout: bool = False,
+) -> Image.Image | tuple[Image.Image, tuple[tuple[int, int, int, int], ...]]:
     """Assemble original-pixel columns into one context image."""
     if not targets:
         raise ValueError("句组不能为空")
@@ -3834,33 +4870,14 @@ def _sentence_group_image(
                     else _paper_background(image)
                 )
             column = page_columns[page_path][column_index]
-            if preserve_body_pixels:
-                left = max(0, min(image.width - 1, int(column.hard_left)))
-                right = max(left + 1, min(image.width, int(column.hard_right)))
-                if column.full_height_slot:
-                    top = max(0, int(column.top))
-                    bottom = min(image.height, int(column.bottom))
-                else:
-                    vertical_context = max(14, round(max(1, column.width) * 1.35))
-                    top = max(0, int(column.top) - vertical_context)
-                    bottom = min(image.height, int(column.bottom) + vertical_context)
-                strip = image.crop((left, top, right, bottom)).convert("RGB")
-            else:
-                union_left, union_top, union_right, union_bottom = _column_source_union(column)
-                left = max(0, min(image.width - 1, union_left))
-                right = max(left + 1, min(image.width, union_right))
-                if column.full_height_slot:
-                    top = max(0, min(int(column.top), union_top))
-                    bottom = min(image.height, max(int(column.bottom), union_bottom))
-                else:
-                    vertical_context = max(14, round(max(1, column.width) * 1.35))
-                    top = max(0, min(int(column.top), union_top) - vertical_context)
-                    bottom = min(image.height, max(int(column.bottom), union_bottom) + vertical_context)
-                strip = Image.new("RGB", (right - left, bottom - top), background)
-                _paste_column_source(
-                    strip, image, column, offset_x=left, offset_y=top,
-                    background=background, erase_exclusions=True,
-                )
+            # Reuse the exact canonical single-column transport as the building
+            # block of sentence OCR.  This guarantees the same body pixels, Ruby
+            # masking and scale across Hayai/Apple/48px/NDL fallback and V5 AI
+            # evidence, while sentence OCR only adds clean inter-column context.
+            strip = _column_visibility_viewport(
+                image, column, mode="compact", background=background,
+                preserve_body_pixels=preserve_body_pixels,
+            )
             strips.append(strip)
             widths.append(strip.width)
             max_height = max(max_height, strip.height)
@@ -3873,16 +4890,70 @@ def _sentence_group_image(
         canvas_height = max_height + margin_y * 2
         canvas = Image.new("RGB", (canvas_width, canvas_height), background)
         cursor = canvas_width - margin_x
+        boxes = []
         for strip in strips:
             cursor -= strip.width
             canvas.paste(strip, (cursor, margin_y))
+            boxes.append((cursor, margin_y, cursor + strip.width, margin_y + strip.height))
             cursor -= gap
+        if return_layout:
+            return canvas, tuple(boxes)
         return canvas
     finally:
         for strip in strips:
             strip.close()
         for image in local_page_cache.values():
             image.close()
+
+def _sentence_group_horizontal_reflow_image(
+    page_columns: dict[str, list[DetectedColumn]],
+    targets: Sequence[tuple[str, int]],
+    *,
+    fixed_region_rect: Sequence[float] | None = None,
+    shared_page_cache: _SentencePageCache | None = None,
+    preserve_body_pixels: bool = True,
+):
+    """Build a geometry-only left-to-right sentence strip for 48px AR OCR.
+
+    Every source is the same authoritative canonical physical-column viewport
+    used by the ordinary OCR models.  The transform only rearranges fixed-grid
+    glyph cells in reading order; it never uses recognized text to place glyphs.
+    """
+    if not targets:
+        raise ValueError("句组不能为空")
+    from engine.horizontal_reflow_retry import build_horizontal_sentence_reflow
+
+    column_images: list[Image.Image] = []
+    nominal_pitches: list[int] = []
+    local_page_cache: dict[str, Image.Image] = {}
+    try:
+        for position, (page_path, column_index) in enumerate(targets):
+            if shared_page_cache is not None:
+                image = shared_page_cache.get(page_path)
+                background = shared_page_cache.background(page_path, image)
+            else:
+                image = local_page_cache.get(page_path)
+                if image is None:
+                    image = _open_page_image(page_path, fixed_region_rect)
+                    local_page_cache[page_path] = image
+                background = _paper_background(image)
+            column = page_columns[page_path][column_index]
+            strip = _column_visibility_viewport(
+                image, column, mode="compact", background=background,
+                preserve_body_pixels=preserve_body_pixels,
+            )
+            column_images.append(strip)
+            nominal_pitches.append(max(10, int(getattr(column, "width", 0) or strip.width)))
+
+        return build_horizontal_sentence_reflow(
+            column_images, nominal_pitches=nominal_pitches, max_glyphs=255,
+        )
+    finally:
+        for image in column_images:
+            image.close()
+        for image in local_page_cache.values():
+            image.close()
+
 
 def _sentence_group_page_runs(
     targets: Sequence[tuple[str, int]],
@@ -3932,29 +5003,15 @@ def _sentence_group_merged_box_image(
                     else _paper_background(image)
                 )
             columns = [page_columns[page_path][index] for index in indices]
-            if preserve_body_pixels:
-                run_widths = [max(1, column.hard_right - column.hard_left) for column in columns]
-                typical_column_widths.extend(run_widths)
-                typical_width = sorted(run_widths)[len(run_widths) // 2]
-                exact_slots = bool(columns and all(column.full_height_slot for column in columns))
-                extra_x = 0 if exact_slots else max(3, round(typical_width * 0.16))
-                extra_y = 0 if exact_slots else max(8, round(typical_width * 0.55))
-                left = max(0, min(column.hard_left for column in columns) - extra_x)
-                right = min(image.width, max(column.hard_right for column in columns) + extra_x)
-                top = max(0, min(column.top for column in columns) - extra_y)
-                bottom = min(image.height, max(column.bottom for column in columns) + extra_y)
-            else:
-                run_widths = [max(1, column.right - column.left) for column in columns]
-                typical_column_widths.extend(run_widths)
-                typical_width = sorted(run_widths)[len(run_widths) // 2]
-                exact_slots = bool(columns and all(column.full_height_slot for column in columns))
-                extra_x = 0 if exact_slots else max(3, round(typical_width * 0.16))
-                extra_y = 0 if exact_slots else max(8, round(typical_width * 0.55))
-                unions = [_column_source_union(column) for column in columns]
-                left = max(0, min(box[0] for box in unions) - extra_x)
-                right = min(image.width, max(box[2] for box in unions) + extra_x)
-                top = max(0, min(box[1] for box in unions) - extra_y)
-                bottom = min(image.height, max(box[3] for box in unions) + extra_y)
+            run_widths = [max(1, column.right - column.left) for column in columns]
+            typical_column_widths.extend(run_widths)
+            typical_width = sorted(run_widths)[len(run_widths) // 2]
+            extra_x = max(10, round(typical_width * 0.50))
+            extra_y = max(8, round(typical_width * 0.30))
+            left = max(0, min(column.left for column in columns) - extra_x)
+            right = min(image.width, max(column.right for column in columns) + extra_x)
+            top = max(0, min(column.top for column in columns) - extra_y)
+            bottom = min(image.height, max(column.bottom for column in columns) + extra_y)
             body_bounds = _normalized_body_bounds(image, fixed_region_rect)
             if body_bounds is not None:
                 body_left, body_top, body_right, body_bottom = body_bounds
@@ -4002,18 +5059,58 @@ def _sentence_group_cache_key(
     page_number_by_path: dict[str, int],
     *,
     global_merged: bool,
+    preserve_body_pixels: bool,
     fixed_region_rect: Sequence[float] | None,
 ) -> str:
     payload = {
+        "transport_version": CANONICAL_SENTENCE_TRANSPORT_VERSION,
         "targets": [
             [int(page_number_by_path.get(page_path, 0)), int(column_index)]
             for page_path, column_index in targets
         ],
         "global_merged": bool(global_merged),
+        "preserve_body_pixels": bool(preserve_body_pixels),
         "fixed_region_rect": [round(float(value), 7) for value in (fixed_region_rect or [])],
     }
     raw = json.dumps(payload, ensure_ascii=True, sort_keys=True, separators=(",", ":"))
     return hashlib.sha1(raw.encode("utf-8")).hexdigest()[:20]
+
+
+def _sentence_reflow_sidecar(path: Path) -> Path:
+    return path.with_suffix(path.suffix + ".meta.json")
+
+
+def _load_sentence_reflow_glyph_count(path: Path) -> int:
+    """Return the audited glyph count for a cached 48px sentence strip.
+
+    The horizontal image itself cannot recover how many fixed-grid cells were
+    concatenated.  Never fall back to detector ``estimated_chars`` because that
+    value is intentionally approximate and can make a valid cached OCR result
+    fail the recognizer length gate on a second run.
+    """
+    sidecar = _sentence_reflow_sidecar(path)
+    try:
+        payload = json.loads(sidecar.read_text(encoding="utf-8"))
+        if str(payload.get("transport_version") or "") != "48px-horizontal-sentence-reflow-v1":
+            return 0
+        count = int(payload.get("glyph_count") or 0)
+        return count if 0 < count <= 255 else 0
+    except Exception:
+        return 0
+
+
+def _write_sentence_reflow_sidecar(path: Path, glyph_count: int) -> None:
+    sidecar = _sentence_reflow_sidecar(path)
+    payload = {
+        "transport_version": "48px-horizontal-sentence-reflow-v1",
+        "glyph_count": int(glyph_count),
+    }
+    temporary = sidecar.with_suffix(sidecar.suffix + ".tmp")
+    temporary.write_text(
+        json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")),
+        encoding="utf-8",
+    )
+    temporary.replace(sidecar)
 
 
 _SENTENCE_GROUP_TITLE_RE = re.compile(
@@ -4027,6 +5124,31 @@ _SENTENCE_GROUP_TITLE_RE = re.compile(
 def _looks_sentence_group_title(text: str) -> bool:
     value = normalize_column_text(text)
     return bool(value and len(value) <= 100 and _SENTENCE_GROUP_TITLE_RE.match(value))
+
+
+def _resolve_explicit_sentence_target_groups(
+    by_column_id: dict[str, tuple[str, int]],
+    groups: Sequence[Sequence[str]],
+    *,
+    max_columns: int,
+) -> list[list[tuple[str, int]]]:
+    """Resolve exact smart-router sentence groups without re-segmenting text.
+
+    Missing IDs and overlong groups fail closed.  A one-column sentence is
+    deliberately valid: sentence-role OCR is about the complete sentence unit,
+    not about requiring a multi-column canvas.
+    """
+    resolved: list[list[tuple[str, int]]] = []
+    limit = max(1, int(max_columns or 1))
+    for raw_group in groups or ():
+        ids = tuple(str(value or "") for value in raw_group if str(value or ""))
+        if not ids or len(ids) > limit:
+            continue
+        targets = [by_column_id.get(column_id) for column_id in ids]
+        if any(target is None for target in targets):
+            continue
+        resolved.append([target for target in targets if target is not None])
+    return resolved
 
 
 def _sentence_reocr_groups(
@@ -4144,12 +5266,11 @@ def _affix_matches_baseline(candidate_affix: str, baseline_affix: str) -> bool:
     return SequenceMatcher(None, candidate_key, baseline_key, autojunk=False).ratio() >= 0.84
 
 
-def _new_ndlocr_kana_annotation(baseline: str, candidate: str) -> str:
+def _new_sentence_kana_annotation(baseline: str, candidate: str) -> str:
     """Find candidate-only short kana runs that resemble misplaced ruby text.
 
-    This guard is deliberately limited to NDLOCR sentence re-OCR.  The first-pass
-    per-column result is kept when the second pass inserts a compact kana reading
-    while the surrounding sentence otherwise closely matches the baseline.
+    Keep the first-pass text when a sentence pass inserts a compact kana reading
+    while the surrounding text otherwise closely matches the baseline.
     """
     base = normalize_column_text(baseline)
     value = normalize_column_text(candidate)
@@ -4186,6 +5307,7 @@ def _validate_sentence_reocr_candidate(
     confidence: float,
     *,
     recognition_engine: str = "",
+    primary_stable: bool = False,
 ) -> tuple[bool, str, str, str]:
     """Conservative quality gate for replacing joined per-column OCR text."""
     baseline = join_column_parts(primary_parts)
@@ -4208,10 +5330,14 @@ def _validate_sentence_reocr_candidate(
     if candidate_suffix and not _affix_matches_baseline(candidate_suffix, baseline_suffix):
         return False, "句组 OCR 新增疑似页码/数字/英文页边伪文字后缀", baseline, value
 
-    if str(recognition_engine or "").strip().lower() == "ndlocr_lite":
-        kana_annotation = _new_ndlocr_kana_annotation(baseline, value)
+    engine = str(recognition_engine or "").strip().lower()
+    if engine in {"ndlocr_lite", "apple_vision", "macocr", "mac_ocr", "macos_ocr"}:
+        kana_annotation = _new_sentence_kana_annotation(baseline, value)
         if kana_annotation:
-            return False, "NDLOCR 句组 OCR 新增疑似错位注音文字", baseline, value
+            label = "NDLOCR" if engine == "ndlocr_lite" else "Apple Vision"
+            return False, f"{label} 句组 OCR 新增疑似错位注音文字", baseline, value
+    if primary_stable and engine in {"apple_vision", "macocr", "mac_ocr", "macos_ocr"}:
+        return False, "Apple Vision 逐列底稿稳定完整，句组结果仅作参考", baseline, value
 
     baseline_clean = baseline.replace("□", "")
     if baseline_clean:
@@ -4228,6 +5354,20 @@ def _validate_sentence_reocr_candidate(
         return False, "句组 OCR 引号失衡加重", baseline, value
     if value.count("□") > baseline.count("□"):
         return False, "句组 OCR 增加了未识别占位符", baseline, value
+    baseline_has_verifiable_defect = bool(
+        any(marker in baseline for marker in ("□", "�"))
+        or is_spurious_ocr_item(baseline)
+        or not has_sentence_terminal(baseline)
+        or _quote_balance_penalty(value) < _quote_balance_penalty(baseline)
+        or _japanese_character_ratio(baseline) < 0.42
+    )
+    if value != baseline and not baseline_has_verifiable_defect:
+        return (
+            False,
+            "句组 OCR 改写了完整逐列文本，但未修复可验证缺陷；保留逐列底稿",
+            baseline,
+            value,
+        )
     return True, "通过句末、长度、相似度与符号安全校验", baseline, value
 
 
@@ -4257,7 +5397,7 @@ def _trim_region_to_primary_ink(region: Image.Image) -> Image.Image:
     """Conservatively trim side debris from a compact column crop.
 
     Column slots can be slightly wider than the true printed text band.  For
-    Manga OCR this may expose punctuation or thin strokes from a neighbour
+    A recognizer may expose punctuation or thin strokes from a neighbour
     column, which the decoder then treats as extra characters.  Keep only the
     dominant vertical ink run and a tiny safety pad; never rescale glyphs.
     """
@@ -4548,11 +5688,9 @@ def _choose_adaptive_column_rescue(
     very_low_conf = 0.0 < float(confidence or 0.0) < 0.25
 
     engine = str(recognition_engine or "").strip().lower()
-    # Manga OCR's worker always removes page-sized whitespace and rotates a
-    # vertical text strip before inference.  Retrying the full-size masked page
-    # therefore produces the same prepared model input, wastes one inference,
-    # and can reintroduce the very page-mask hallucination this adapter avoids.
-    if compact_primary and engine not in {"manga_ocr", "hayai_ocr", "manga_48px", "yomitoku"} and (
+    # Compact crop recognizers should not immediately repeat the same prepared
+    # pixels through an equivalent full-size retry.
+    if compact_primary and engine not in {"hayai_ocr", "manga_48px"} and (
         not valid or severe_short or very_low_conf
     ):
         return _ColumnRescueDecision(
@@ -4695,6 +5833,33 @@ def _sentence_group_smart_reocr_decision(
     if min(confidences) < min_floor or sum(confidences) / len(confidences) < average_floor:
         return True, "逐列置信度不足以安全跳过"
     return False, "逐列底稿稳定完整，智能跳过重复整句 OCR"
+
+
+def _apple_sentence_primary_stable(
+    targets: Sequence[tuple[str, int]],
+    recognized: dict[tuple[str, int], tuple[str, float, str | None]],
+    selection_meta: dict[tuple[str, int], dict],
+) -> bool:
+    """Only explicit first-pass uncertainty permits Apple sentence replacement."""
+    parts: list[str] = []
+    for target in targets:
+        result = recognized.get(target)
+        if not result or result[2] or float(result[1] or 0.0) < 0.90:
+            return False
+        text = normalize_column_text(result[0])
+        if not text or "□" in text or "�" in text or is_spurious_ocr_item(text):
+            return False
+        meta = selection_meta.get(target) or {}
+        if meta.get("conflict") or meta.get("rescue_used"):
+            return False
+        if str(meta.get("selected_method") or "primary") not in {"primary", "page_primary"}:
+            return False
+        parts.append(text)
+    baseline = join_column_parts(parts)
+    return bool(
+        has_sentence_terminal(baseline)
+        and _quote_balance_penalty(baseline) == 0
+    )
 
 
 def _repetition_penalty(text: str) -> float:
@@ -4851,10 +6016,11 @@ def _recognize_batch(
 
 
 class _RecognizerSession:
-    """Share Manga OCR's model across all adaptive passes."""
+    """Share one selected recognizer runtime across adaptive passes."""
 
     def __init__(self, engine: str, *, shortcut_name: str, cancel_check, verbose: bool, temp: Path,
-                 engine_options: dict | None = None, load_progress_callback=None):
+                 engine_options: dict | None = None, load_progress_callback=None,
+                 retained_session_holder: dict | None = None):
         self.engine = engine
         self.shortcut_name = shortcut_name
         self.cancel_check = cancel_check
@@ -4862,45 +6028,49 @@ class _RecognizerSession:
         self.temp = temp
         self.engine_options = dict(engine_options or {})
         self.load_progress_callback = load_progress_callback
-        self._manga = None
+        self.retained_session_holder = retained_session_holder if isinstance(retained_session_holder, dict) else None
+        self._retained_session = False
         self._hayai = None
         self._manga48 = None
-        self._yomitoku = None
+        self._mangaocr = None
         self._persistent = None
         self._jsonl_persistent = None
         self._serial = 0
 
     def __enter__(self):
-        if self.engine == "manga_ocr":
-            from adapters.manga_ocr_adapter import MangaOcrSession
-            self._manga = MangaOcrSession(cancel_check=self.cancel_check, verbose=self.verbose)
-            self._manga.__enter__()
-        elif self.engine == "hayai_ocr":
-            from adapters.hayai_ocr_adapter import HayaiOcrSession
-            self._hayai = HayaiOcrSession(
-                engine_options=self.engine_options, cancel_check=self.cancel_check, verbose=self.verbose
-            )
-            self._hayai.__enter__()
+        if self.engine == "hayai_ocr":
+            holder = self.retained_session_holder
+            existing = holder.get("session") if holder is not None else None
+            if existing is not None:
+                self._hayai = existing
+                self._retained_session = True
+            else:
+                from adapters.hayai_ocr_adapter import HayaiOcrSession
+                self._hayai = HayaiOcrSession(
+                    engine_options=self.engine_options, cancel_check=self.cancel_check, verbose=self.verbose,
+                    load_progress_callback=self.load_progress_callback,
+                )
+                self._hayai.__enter__()
+                if holder is not None:
+                    holder["session"] = self._hayai
+                    self._retained_session = True
         elif self.engine == "manga_48px":
             from adapters.manga_48px_adapter import Manga48pxSession
             self._manga48 = Manga48pxSession(
                 cancel_check=self.cancel_check,
                 verbose=self.verbose,
                 load_progress_callback=self.load_progress_callback,
+                engine_options=self.engine_options,
             )
             self._manga48.__enter__()
-        elif self.engine == "yomitoku":
-            from adapters.yomitoku_adapter import YomiTokuSession
-            self._yomitoku = YomiTokuSession(
-                mode=str(self.engine_options.get("mode") or "fast"),
-                device=str(self.engine_options.get("device") or "auto"),
-                detector_onnx=bool(self.engine_options.get("detector_onnx", True)),
-                large_review=bool(self.engine_options.get("large_review", True)),
-                review_threshold=float(self.engine_options.get("review_threshold", 0.82) or 0.82),
+        elif self.engine == "manga_ocr":
+            from adapters.manga_ocr_adapter import MangaOcrSession
+            self._mangaocr = MangaOcrSession(
                 cancel_check=self.cancel_check,
                 verbose=self.verbose,
+                load_progress_callback=self.load_progress_callback,
             )
-            self._yomitoku.__enter__()
+            self._mangaocr.__enter__()
         # Preserve the monkeypatch hook used by tests/plugins.  Persistent native
         # sessions are enabled only when the stock bridge is active.
         elif _recognizer_iterator is recognizer_iterator and self.engine == "apple_vision":
@@ -4913,7 +6083,9 @@ class _RecognizerSession:
         elif _recognizer_iterator is recognizer_iterator and self.engine == "ndlocr_lite":
             from adapters.ndlocr_lite_adapter import NDLOcrLiteSession
             self._persistent = NDLOcrLiteSession(
-                cancel_check=self.cancel_check, verbose=self.verbose
+                cancel_check=self.cancel_check,
+                verbose=self.verbose,
+                engine_options=self.engine_options,
             )
             self._persistent.__enter__()
         elif _recognizer_iterator is recognizer_iterator and self.engine == "paddle_ocr":
@@ -4944,11 +6116,18 @@ class _RecognizerSession:
             return None
         results: dict[str, tuple[list[dict] | None, str | None]] = {}
         total = max(1, len(paths))
+        completed = 0
+
+        def on_wait(current: int, _total: int) -> None:
+            if callable(progress_callback):
+                progress_callback(current, total, "__worker_waiting__")
+
         for current, (image_path, blocks, error) in enumerate(
-            self._persistent.iter_recognize(paths), start=1
+            self._persistent.iter_recognize(paths, on_wait=on_wait), start=1
         ):
             key = str(image_path)
             results[key] = (None, str(error)) if error else (list(blocks or []), None)
+            completed = current
             if callable(progress_callback):
                 progress_callback(current, total, key)
         return results
@@ -4959,22 +6138,36 @@ class _RecognizerSession:
         label: str,
         *,
         progress_callback=None,
+        input_metadata: dict[str, dict] | None = None,
     ) -> dict[str, tuple[str, float, str | None]]:
         if not paths:
             return {}
-        if self._manga is not None:
-            return self._manga.recognize(paths, progress_callback=progress_callback)
+        metadata = {str(key): dict(value or {}) for key, value in (input_metadata or {}).items()}
         if self._hayai is not None:
-            return self._hayai.recognize(paths, progress_callback=progress_callback)
+            return self._hayai.recognize(
+                paths,
+                progress_callback=progress_callback,
+                input_metadata=metadata,
+            )
         if self._manga48 is not None:
-            return self._manga48.recognize(paths, progress_callback=progress_callback)
-        if self._yomitoku is not None:
-            return self._yomitoku.recognize(paths, progress_callback=progress_callback)
+            return self._manga48.recognize(
+                paths, progress_callback=progress_callback, input_metadata=metadata
+            )
+        if self._mangaocr is not None:
+            return self._mangaocr.recognize(
+                paths, progress_callback=progress_callback, input_metadata=metadata
+            )
         if self._persistent is not None:
             results: dict[str, tuple[str, float, str | None]] = {}
             total = max(1, len(paths))
             for current, (crop_path, blocks, error) in enumerate(
-                self._persistent.iter_recognize(paths), start=1
+                self._persistent.iter_recognize(
+                    paths,
+                    on_wait=lambda done, all_items: (
+                        progress_callback(done, total, "__worker_waiting__")
+                        if callable(progress_callback) else None
+                    ),
+                ), start=1
             ):
                 key = str(crop_path)
                 if error:
@@ -5023,12 +6216,10 @@ class _RecognizerSession:
         )
 
     def __exit__(self, exc_type, exc, tb):
-        if self._manga is not None:
-            try:
-                return self._manga.__exit__(exc_type, exc, tb)
-            finally:
-                self._manga = None
         if self._hayai is not None:
+            if self._retained_session:
+                self._hayai = None
+                return False
             try:
                 return self._hayai.__exit__(exc_type, exc, tb)
             finally:
@@ -5038,11 +6229,11 @@ class _RecognizerSession:
                 return self._manga48.__exit__(exc_type, exc, tb)
             finally:
                 self._manga48 = None
-        if self._yomitoku is not None:
+        if self._mangaocr is not None:
             try:
-                return self._yomitoku.__exit__(exc_type, exc, tb)
+                return self._mangaocr.__exit__(exc_type, exc, tb)
             finally:
-                self._yomitoku = None
+                self._mangaocr = None
         if self._persistent is not None:
             try:
                 return self._persistent.__exit__(exc_type, exc, tb)
@@ -5062,6 +6253,7 @@ def _session_recognize(
     label: str,
     *,
     progress_callback=None,
+    input_metadata: dict[str, dict] | None = None,
 ) -> dict[str, tuple[str, float, str | None]]:
     """Call a session with live progress while preserving old plugin APIs."""
 
@@ -5078,7 +6270,18 @@ def _session_recognize(
         supports_callback = False
 
     if supports_callback:
-        return method(paths, label, progress_callback=progress_callback)
+        try:
+            return method(
+                paths, label, progress_callback=progress_callback,
+                input_metadata=input_metadata or {},
+            )
+        except TypeError as exc:
+            # Third-party/legacy sessions may accept progress_callback but not
+            # the new prepared-input metadata contract.  Preserve compatibility
+            # while stock 48px sessions receive the layout hint.
+            if "input_metadata" not in str(exc):
+                raise
+            return method(paths, label, progress_callback=progress_callback)
 
     result = method(paths, label)
     if callable(progress_callback):
@@ -5113,6 +6316,140 @@ def _apply_column_cleanup(
     return result.image
 
 
+def _tighten_ink_framing(image: Image.Image, reference_width: int, transport_profile: str = "") -> Image.Image:
+    """Build the final single-column model input without resampling glyphs.
+
+    The canonical Ruby-free visibility layer may still be page-sized for UI/
+    debugging semantics.  Models must never receive that mostly-empty page.
+    Detect the actual visible ink envelope, then keep a modest native-pixel
+    margin on all four sides.  No glyph is scaled, sharpened, rotated or moved.
+    """
+    rgb = image.convert("RGB")
+    background = _paper_background(rgb)
+    paper = Image.new("RGB", rgb.size, background)
+    try:
+        difference = ImageChops.difference(rgb, paper).convert("L")
+        ink = difference.point(lambda value: 255 if value >= 12 else 0)
+        try:
+            bounds = ink.getbbox()
+        finally:
+            ink.close()
+    finally:
+        paper.close()
+    if not bounds:
+        rgb.close()
+        return image.copy()
+    left, top, right, bottom = bounds
+    # Half a body-glyph width was validated locally on the short-column cases
+    # (e.g. 「魔王。」): enough white breathing room for Live Text without
+    # recreating the old full-page white canvas.
+    ref = max(1, int(reference_width))
+    profile = get_ocr_transport_profile(transport_profile)
+    if profile is None:
+        pad_x = max(10, round(ref * 0.50))
+        pad_y = max(10, round(ref * 0.50))
+    else:
+        pad_x = max(int(profile.min_pad_x), round(ref * float(profile.pad_x_ratio)))
+        pad_y = max(int(profile.min_pad_y), round(ref * float(profile.pad_y_ratio)))
+    bounds = (
+        max(0, left - pad_x),
+        max(0, top - pad_y),
+        min(rgb.width, right + pad_x),
+        min(rgb.height, bottom + pad_y),
+    )
+    if bounds == (0, 0, rgb.width, rgb.height):
+        copy = image.copy()
+        rgb.close()
+        return _pad_blank_context_for_profile(copy, ref, transport_profile)
+    result = rgb.crop(bounds)
+    rgb.close()
+    return _pad_blank_context_for_profile(result, ref, transport_profile)
+
+
+def _pad_blank_context_for_profile(
+    image: Image.Image,
+    reference_width: int,
+    transport_profile: str = "",
+) -> Image.Image:
+    """Pad an already isolated crop with blank paper only.
+
+    The user's full-book M6 run showed that Hayai empty outputs cluster on very
+    short clean crops.  Reopening a wider source crop can reintroduce neighbour
+    ink or Ruby, so this adds context only after isolation.
+    """
+    profile = get_ocr_transport_profile(transport_profile)
+    if profile is None:
+        return image
+    ref = max(1, int(reference_width))
+    target_width = max(
+        int(image.width),
+        round(ref * float(profile.min_canvas_width_ratio)),
+    )
+    target_height = max(
+        int(image.height),
+        round(ref * float(profile.min_canvas_height_ratio)),
+    )
+    if target_width == image.width and target_height == image.height:
+        return image
+    background = _paper_background(image)
+    canvas = Image.new("RGB", (target_width, target_height), background)
+    canvas.paste(
+        image,
+        ((target_width - image.width) // 2, (target_height - image.height) // 2),
+    )
+    image.close()
+    return canvas
+
+
+def _center_wide_column_viewport(image: Image.Image, reference_width: int) -> Image.Image:
+    """Center a column in an oversized slot without changing glyphs or page height."""
+    if image.width <= max(1, int(reference_width)) * 3:
+        return image
+    background = _paper_background(image)
+    paper = Image.new("RGB", image.size, background)
+    try:
+        difference = ImageChops.difference(image.convert("RGB"), paper).convert("L")
+        ink = difference.point(lambda value: 255 if value >= 12 else 0)
+        try:
+            bounds = ink.getbbox()
+        finally:
+            ink.close()
+    finally:
+        paper.close()
+    if not bounds:
+        return image
+    left, _, right, _ = bounds
+    padding = max(16, round(max(1, int(reference_width)) * 0.75))
+    result = Image.new("RGB", (right - left + 2 * padding, image.height), background)
+    strip = image.crop((left, 0, right, image.height))
+    try:
+        result.paste(strip, (padding, 0))
+    finally:
+        strip.close()
+    return result
+
+
+def _should_assume_single_column_source(
+    image: Image.Image,
+    fixed_region_rect: Sequence[float] | None = None,
+) -> bool:
+    """Conservatively identify an already-cropped single-column source image.
+
+    This is intentionally restricted to very tall/narrow inputs.  Normal book
+    pages and ordinary fixed-body regions never trigger it, so multi-column page
+    segmentation remains unchanged.  The explicit adapter option can still force
+    or disable the assumption when needed.
+    """
+    width = max(1, int(image.width))
+    height = max(1, int(image.height))
+    if fixed_region_rect:
+        bounds = _normalized_body_bounds(image, fixed_region_rect)
+        if bounds is not None:
+            width = max(1, int(bounds[2] - bounds[0]))
+            height = max(1, int(bounds[3] - bounds[1]))
+    return bool(height >= 360 and width / max(1.0, float(height)) <= 0.20)
+
+
 def _prepare_page_crops(
     page_index: int,
     page_path: str,
@@ -5130,49 +6467,122 @@ def _prepare_page_crops(
     detector_mode: str = "components",
     preserve_body_pixels: bool = True,
     capture_ruby_candidates: bool = True,
+    apple_context_padding: bool = False,
+    apple_ink_framing: bool = False,
+    full_height_context: bool = False,
+    isolation_mode: str = "mask",
+    transport_profile: str = "",
+    precomputed_columns: Sequence[DetectedColumn] | None = None,
+    assume_single_column: bool | None = None,
 ) -> tuple[str, list[DetectedColumn], list[tuple[str, int]], str | None]:
     try:
         image = _open_page_image(page_path, fixed_region_rect)
         try:
-            columns = detect_vertical_columns(
-                image,
-                sensitivity=sensitivity,
-                padding_percent=padding_percent,
-                max_columns=max_columns,
-                fixed_region_rect=fixed_region_rect,
-                fixed_region_already_masked=bool(fixed_region_rect),
-                detector_mode=detector_mode,
-                capture_ruby_candidates=bool(capture_ruby_candidates),
+            effective_assume_single_column = (
+                _should_assume_single_column_source(image, fixed_region_rect)
+                if assume_single_column is None
+                else bool(assume_single_column)
             )
+            if precomputed_columns is None:
+                columns = detect_vertical_columns(
+                    image,
+                    sensitivity=sensitivity,
+                    padding_percent=padding_percent,
+                    max_columns=max_columns,
+                    fixed_region_rect=fixed_region_rect,
+                    fixed_region_already_masked=bool(fixed_region_rect),
+                    detector_mode=detector_mode,
+                    capture_ruby_candidates=bool(capture_ruby_candidates),
+                    assume_single_column=effective_assume_single_column,
+                )
+            else:
+                columns = list(precomputed_columns)
             if not columns:
                 raise RuntimeError("固定正文区域内没有检测到可识别的竖列")
             generated: list[tuple[str, int]] = []
             background = _paper_background(image)
+            isolation_mode = _normalise_column_isolation_mode(isolation_mode)
             for column_index, column in enumerate(columns, start=1):
-                # The compact transport removes only guaranteed blank canvas.
-                # Glyph pixels remain at their original resolution and are never
-                # resampled.  If recognition returns empty, the caller retries
-                # this column with the original full-size masked page.
-                crop = (
-                    _isolated_column_image(
+                # One authoritative visibility layer feeds every OCR model.
+                # Standard production mode (preserve_body_pixels=False) pastes
+                # only detector-approved body boxes and blanks Ruby exclusions.
+                # Model-specific transports are then merely different white
+                # viewports over those exact same original pixels.
+                # ``display`` now changes only the UI preview semantics.  The
+                # recognition model must never receive a page-sized white canvas
+                # containing one tiny column, so both display and mask derive the
+                # *same* model transport from the canonical Ruby-free layer.
+                if full_height_context:
+                    # Explicit legacy compatibility opt-in: keep a full-height
+                    # single-column viewport.  Normal production never enters
+                    # this path.
+                    layer = _masked_column_image(
                         image, column, retry=False, background=background,
                         preserve_body_pixels=preserve_body_pixels,
                     )
-                    if (compact_transport or smart_crop)
-                    else _crop_column(
-                        image, column, retry=False, background=background,
+                    try:
+                        left = max(0, min(layer.width - 1, int(column.hard_left)))
+                        right = max(left + 1, min(layer.width, int(column.hard_right)))
+                        crop = layer.crop((left, 0, right, layer.height)).convert("RGB")
+                    finally:
+                        layer.close()
+                elif apple_context_padding:
+                    crop = _column_visibility_viewport(
+                        image,
+                        column,
+                        mode="context",
+                        background=background,
+                        preserve_body_pixels=preserve_body_pixels,
+                        transport_profile=transport_profile,
+                    )
+                elif compact_transport or smart_crop:
+                    crop = _column_visibility_viewport(
+                        image,
+                        column,
+                        mode="compact",
+                        background=background,
+                        preserve_body_pixels=preserve_body_pixels,
+                        transport_profile=transport_profile,
+                    )
+                else:
+                    crop = _column_visibility_viewport(
+                        image, column, mode="compact", background=background,
+                        preserve_body_pixels=preserve_body_pixels,
+                        transport_profile=transport_profile,
+                    )
+
+                # Ruby has already been removed geometrically from the
+                # visibility layer in production mode.  Do not run another
+                # density-based smart crop afterwards: that was the source of
+                # overly narrow 40--50 px transports and could shave legitimate
+                # punctuation/strokes.  Fragment filtering remains opt-in.
+                if filter_fragments:
+                    crop = _apply_column_cleanup(
+                        crop,
+                        auto_filter_ruby=False,
+                        filter_fragments=True,
+                        smart_crop=False,
+                        ruby_strength=ruby_strength,
+                        background=background,
                         preserve_body_pixels=preserve_body_pixels,
                     )
-                )
-                crop = _apply_column_cleanup(
-                    crop,
-                    auto_filter_ruby=auto_filter_ruby,
-                    filter_fragments=filter_fragments,
-                    smart_crop=smart_crop,
-                    ruby_strength=ruby_strength,
-                    background=background,
-                    preserve_body_pixels=preserve_body_pixels,
-                )
+                # Recognition transport is always one physical column.  "display"
+                # remains a full-page *preview* choice, but the OCR model must not
+                # receive a 1200x1600 mostly-white page containing one tiny column.
+                # Apple Live Text also uses this framing in mask mode because short
+                # isolated columns are especially sensitive to ink/page ratio.
+                if full_height_context:
+                    framed = _center_wide_column_viewport(crop, column.width)
+                    if framed is not crop:
+                        crop.close()
+                        crop = framed
+                else:
+                    # Canonical single-column transport is recognizer-agnostic.
+                    # A second pass is intentionally idempotent and removes any
+                    # legacy/context white canvas that reached this point.
+                    framed = _tighten_ink_framing(crop, column.width, transport_profile)
+                    crop.close()
+                    crop = framed
                 crop_path = temp / f"p{page_index:05d}_c{column_index:03d}.png"
                 crop.save(crop_path, format="PNG", compress_level=1)
                 crop.close()
@@ -5194,6 +6604,7 @@ def _column_to_json(column: DetectedColumn) -> dict:
         "full_height_slot": bool(column.full_height_slot),
         "supplemental_boxes": [list(box) for box in column.supplemental_boxes],
         "excluded_boxes": [list(box) for box in column.excluded_boxes],
+        "ruby_guard_boxes": [list(box) for box in column.ruby_guard_boxes],
         "ruby_candidate_boxes": [list(box) for box in column.ruby_candidate_boxes],
         "ruby_candidate_confidence": float(column.ruby_candidate_confidence),
     }
@@ -5221,12 +6632,241 @@ def _column_from_json(data: dict) -> DetectedColumn:
             for box in data.get("excluded_boxes", [])
             if isinstance(box, (list, tuple)) and len(box) >= 4
         ),
+        ruby_guard_boxes=tuple(
+            (int(box[0]), int(box[1]), int(box[2]), int(box[3]))
+            for box in data.get("ruby_guard_boxes", data.get("ruby_candidate_boxes", []))
+            if isinstance(box, (list, tuple)) and len(box) >= 4
+        ),
         ruby_candidate_boxes=tuple(
             (int(box[0]), int(box[1]), int(box[2]), int(box[3]))
             for box in data.get("ruby_candidate_boxes", [])
             if isinstance(box, (list, tuple)) and len(box) >= 4
         ),
         ruby_candidate_confidence=float(data.get("ruby_candidate_confidence", 0.0) or 0.0),
+    )
+
+
+def _prepare_page_columns_cached(
+    page_index: int,
+    page_path: str,
+    cache_dir: Path,
+    *,
+    sensitivity: int,
+    padding_percent: int,
+    max_columns: int,
+    fixed_region_rect: Sequence[float] | None = None,
+    detector_mode: str = "components",
+    capture_ruby_candidates: bool = True,
+    assume_single_column: bool | None = None,
+) -> tuple[list[DetectedColumn], str | None]:
+    """Detect authoritative physical columns once per page and OCR run.
+
+    This cache contains geometry only.  No recognizer-specific crop pixels are
+    stored here, so Apple/NDL/Hayai/48px can share detection while still using
+    independent image-transport contracts where required.
+    """
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    sidecar = cache_dir / f"p{page_index:05d}_geometry.json"
+    lock = _shared_prepare_lock(cache_dir, page_index)
+    with lock:
+        expected = {
+            "detector_version": column_detector_version(detector_mode),
+            "detector_mode": _normalise_column_detector_mode(detector_mode),
+            "page_path": str(page_path),
+            "sensitivity": int(sensitivity),
+            "padding_percent": int(padding_percent),
+            "max_columns": int(max_columns),
+            "fixed_region_rect": list(fixed_region_rect or []),
+            "capture_ruby_candidates": bool(capture_ruby_candidates),
+            "assume_single_column": assume_single_column,
+        }
+        if sidecar.exists():
+            try:
+                payload = json.loads(sidecar.read_text(encoding="utf-8"))
+                if all(payload.get(key) == value for key, value in expected.items()):
+                    columns = [_column_from_json(item) for item in payload.get("columns", [])]
+                    if columns:
+                        return columns, None
+            except Exception:
+                pass
+
+        try:
+            image = _open_page_image(page_path, fixed_region_rect)
+            try:
+                effective_assume_single_column = (
+                    _should_assume_single_column_source(image, fixed_region_rect)
+                    if assume_single_column is None
+                    else bool(assume_single_column)
+                )
+                columns = detect_vertical_columns(
+                    image,
+                    sensitivity=sensitivity,
+                    padding_percent=padding_percent,
+                    max_columns=max_columns,
+                    fixed_region_rect=fixed_region_rect,
+                    fixed_region_already_masked=bool(fixed_region_rect),
+                    detector_mode=detector_mode,
+                    capture_ruby_candidates=bool(capture_ruby_candidates),
+                    assume_single_column=effective_assume_single_column,
+                )
+            finally:
+                image.close()
+            if not columns:
+                return [], "固定正文区域内没有检测到可识别的竖列"
+        except Exception as exc:
+            return [], str(exc)
+
+        payload = {
+            **expected,
+            "columns": [_column_to_json(column) for column in columns],
+            "ruby_candidate_summary": {
+                "columns": sum(1 for column in columns if column.ruby_candidate_boxes),
+                "boxes": sum(len(column.ruby_candidate_boxes) for column in columns),
+                "max_confidence": max(
+                    (float(column.ruby_candidate_confidence) for column in columns),
+                    default=0.0,
+                ),
+            },
+        }
+        tmp = sidecar.with_suffix(".json.tmp")
+        tmp.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+        tmp.replace(sidecar)
+        return columns, None
+
+
+def _prepare_page_crops_with_geometry_cache(
+    page_index: int,
+    page_path: str,
+    output_dir: Path,
+    geometry_cache_dir: Path,
+    *,
+    sensitivity: int,
+    padding_percent: int,
+    max_columns: int,
+    fixed_region_rect: Sequence[float] | None = None,
+    compact_transport: bool = False,
+    auto_filter_ruby: bool = False,
+    filter_fragments: bool = False,
+    smart_crop: bool = False,
+    ruby_strength: str = "standard",
+    detector_mode: str = "components",
+    preserve_body_pixels: bool = True,
+    capture_ruby_candidates: bool = True,
+    apple_context_padding: bool = False,
+    apple_ink_framing: bool = False,
+    full_height_context: bool = False,
+    isolation_mode: str = "mask",
+    transport_profile: str = "",
+    assume_single_column: bool | None = None,
+) -> tuple[str, list[DetectedColumn], list[tuple[str, int]], str | None]:
+    """Render one transport while seeding/reusing the shared geometry cache.
+
+    On the first transport for a page, detection and crop rendering happen from
+    the same decoded image, exactly like the historical path.  The resulting
+    geometry is then published atomically for every other recognizer.  This
+    avoids the tempting but expensive detect-open + render-open double decode.
+    """
+    geometry_cache_dir.mkdir(parents=True, exist_ok=True)
+    sidecar = geometry_cache_dir / f"p{page_index:05d}_geometry.json"
+    expected = {
+        "detector_version": column_detector_version(detector_mode),
+        "detector_mode": _normalise_column_detector_mode(detector_mode),
+        "page_path": str(page_path),
+        "sensitivity": int(sensitivity),
+        "padding_percent": int(padding_percent),
+        "max_columns": int(max_columns),
+        "fixed_region_rect": list(fixed_region_rect or []),
+        "capture_ruby_candidates": bool(capture_ruby_candidates),
+        "assume_single_column": assume_single_column,
+    }
+
+    def load_cached() -> list[DetectedColumn] | None:
+        if not sidecar.exists():
+            return None
+        try:
+            payload = json.loads(sidecar.read_text(encoding="utf-8"))
+            if not all(payload.get(key) == value for key, value in expected.items()):
+                return None
+            columns = [_column_from_json(item) for item in payload.get("columns", [])]
+            return columns or None
+        except Exception:
+            return None
+
+    def save_cached(columns: Sequence[DetectedColumn]) -> None:
+        payload = {
+            **expected,
+            "columns": [_column_to_json(column) for column in columns],
+            "ruby_candidate_summary": {
+                "columns": sum(1 for column in columns if column.ruby_candidate_boxes),
+                "boxes": sum(len(column.ruby_candidate_boxes) for column in columns),
+                "max_confidence": max(
+                    (float(column.ruby_candidate_confidence) for column in columns),
+                    default=0.0,
+                ),
+            },
+        }
+        tmp = sidecar.with_name(
+            f".{sidecar.name}.{os.getpid()}.{threading.get_ident()}.tmp"
+        )
+        try:
+            tmp.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+            os.replace(tmp, sidecar)
+        finally:
+            try:
+                tmp.unlink(missing_ok=True)
+            except OSError:
+                pass
+
+    geometry_lock = _shared_prepare_lock(geometry_cache_dir, page_index)
+    with geometry_lock:
+        columns = load_cached()
+        if columns is None:
+            # First transport owns geometry creation.  Keep detection + crop
+            # generation in one image-open pass, then publish only metadata.
+            result = _prepare_page_crops(
+                page_index, page_path, output_dir,
+                sensitivity=sensitivity, padding_percent=padding_percent,
+                max_columns=max_columns, fixed_region_rect=fixed_region_rect,
+                compact_transport=compact_transport,
+                auto_filter_ruby=auto_filter_ruby,
+                filter_fragments=filter_fragments,
+                smart_crop=smart_crop,
+                ruby_strength=ruby_strength,
+                detector_mode=detector_mode,
+                preserve_body_pixels=preserve_body_pixels,
+                capture_ruby_candidates=capture_ruby_candidates,
+                apple_context_padding=apple_context_padding,
+                apple_ink_framing=apple_ink_framing,
+                full_height_context=full_height_context,
+                isolation_mode=isolation_mode,
+                transport_profile=transport_profile,
+                assume_single_column=assume_single_column,
+            )
+            if result[3] is None and result[1]:
+                save_cached(result[1])
+            return result
+
+    # Geometry was already available.  Rendering remains transport-specific,
+    # but expensive connected-component detection is skipped.
+    return _prepare_page_crops(
+        page_index, page_path, output_dir,
+        sensitivity=sensitivity, padding_percent=padding_percent,
+        max_columns=max_columns, fixed_region_rect=fixed_region_rect,
+        compact_transport=compact_transport,
+        auto_filter_ruby=auto_filter_ruby,
+        filter_fragments=filter_fragments,
+        smart_crop=smart_crop,
+        ruby_strength=ruby_strength,
+        detector_mode=detector_mode,
+        preserve_body_pixels=preserve_body_pixels,
+        capture_ruby_candidates=capture_ruby_candidates,
+        apple_context_padding=apple_context_padding,
+        apple_ink_framing=apple_ink_framing,
+        full_height_context=full_height_context,
+        isolation_mode=isolation_mode,
+        transport_profile=transport_profile,
+        precomputed_columns=columns,
+        assume_single_column=assume_single_column,
     )
 
 
@@ -5247,6 +6887,13 @@ def _prepare_page_crops_cached_unlocked(
     detector_mode: str = "components",
     preserve_body_pixels: bool = True,
     capture_ruby_candidates: bool = True,
+    apple_context_padding: bool = False,
+    apple_ink_framing: bool = False,
+    full_height_context: bool = False,
+    isolation_mode: str = "mask",
+    transport_profile: str = "",
+    geometry_cache_dir: Path | None = None,
+    assume_single_column: bool | None = None,
 ) -> tuple[str, list[DetectedColumn], list[tuple[str, int]], str | None]:
     """Prepare deterministic column masks once and reuse them across OCR models.
 
@@ -5266,13 +6913,26 @@ def _prepare_page_crops_cached_unlocked(
                 "padding_percent": int(padding_percent),
                 "max_columns": int(max_columns),
                 "fixed_region_rect": list(fixed_region_rect or []),
-                "compact_transport": bool(compact_transport),
+                # All ordinary single-column recognizers now share the same tight native-pixel
+        # transport.  These historical UI/engine knobs no longer change pixels.
+        "compact_transport": False if full_height_context else True,
                 "auto_filter_ruby": bool(auto_filter_ruby),
                 "filter_fragments": bool(filter_fragments),
                 "smart_crop": bool(smart_crop),
                 "ruby_strength": normalise_ruby_strength(ruby_strength),
                 "preserve_body_pixels": bool(preserve_body_pixels),
                 "capture_ruby_candidates": bool(capture_ruby_candidates),
+                # Canonical v52 transport tightens every ordinary single-column
+                # viewport to the same native-pixel ink envelope.  These legacy
+                # Apple/context toggles therefore no longer affect final PNG
+                # bytes and must not force a redundant rebuild of the shared
+                # crop namespace.
+                "apple_context_padding": False,
+                "apple_ink_framing": False,
+                "full_height_context": bool(full_height_context),
+                "isolation_mode": _normalise_column_isolation_mode(isolation_mode),
+                "transport_profile": str(transport_profile or ""),
+                "assume_single_column": assume_single_column,
             }
             if all(payload.get(key) == value for key, value in expected.items()):
                 columns = [_column_from_json(item) for item in payload.get("columns", [])]
@@ -5294,19 +6954,46 @@ def _prepare_page_crops_cached_unlocked(
             # Incomplete cache: rebuild this page only.
             pass
 
-    result = _prepare_page_crops(
-        page_index, page_path, cache_dir,
-        sensitivity=sensitivity, padding_percent=padding_percent,
-        max_columns=max_columns, fixed_region_rect=fixed_region_rect,
-        compact_transport=compact_transport,
-        auto_filter_ruby=auto_filter_ruby,
-        filter_fragments=filter_fragments,
-        smart_crop=smart_crop,
-        ruby_strength=ruby_strength,
-        detector_mode=detector_mode,
-        preserve_body_pixels=preserve_body_pixels,
-        capture_ruby_candidates=capture_ruby_candidates,
-    )
+    if geometry_cache_dir is not None:
+        result = _prepare_page_crops_with_geometry_cache(
+            page_index, page_path, cache_dir, geometry_cache_dir,
+            sensitivity=sensitivity, padding_percent=padding_percent,
+            max_columns=max_columns, fixed_region_rect=fixed_region_rect,
+            compact_transport=compact_transport,
+            auto_filter_ruby=auto_filter_ruby,
+            filter_fragments=filter_fragments,
+            smart_crop=smart_crop,
+            ruby_strength=ruby_strength,
+            detector_mode=detector_mode,
+            preserve_body_pixels=preserve_body_pixels,
+            capture_ruby_candidates=capture_ruby_candidates,
+            apple_context_padding=apple_context_padding,
+            apple_ink_framing=apple_ink_framing,
+            full_height_context=full_height_context,
+            isolation_mode=isolation_mode,
+            transport_profile=transport_profile,
+            assume_single_column=assume_single_column,
+        )
+    else:
+        result = _prepare_page_crops(
+            page_index, page_path, cache_dir,
+            sensitivity=sensitivity, padding_percent=padding_percent,
+            max_columns=max_columns, fixed_region_rect=fixed_region_rect,
+            compact_transport=compact_transport,
+            auto_filter_ruby=auto_filter_ruby,
+            filter_fragments=filter_fragments,
+            smart_crop=smart_crop,
+            ruby_strength=ruby_strength,
+            detector_mode=detector_mode,
+            preserve_body_pixels=preserve_body_pixels,
+            capture_ruby_candidates=capture_ruby_candidates,
+            apple_context_padding=apple_context_padding,
+            apple_ink_framing=apple_ink_framing,
+            full_height_context=full_height_context,
+            isolation_mode=isolation_mode,
+            transport_profile=transport_profile,
+            assume_single_column=assume_single_column,
+        )
     returned_path, columns, generated, error = result
     if error or not columns:
         return result
@@ -5318,13 +7005,21 @@ def _prepare_page_crops_cached_unlocked(
         "padding_percent": int(padding_percent),
         "max_columns": int(max_columns),
         "fixed_region_rect": list(fixed_region_rect or []),
-        "compact_transport": bool(compact_transport),
+        # All ordinary single-column recognizers now share the same tight native-pixel
+        # transport.  These historical UI/engine knobs no longer change pixels.
+        "compact_transport": False if full_height_context else True,
         "auto_filter_ruby": bool(auto_filter_ruby),
         "filter_fragments": bool(filter_fragments),
         "smart_crop": bool(smart_crop),
         "ruby_strength": normalise_ruby_strength(ruby_strength),
         "preserve_body_pixels": bool(preserve_body_pixels),
         "capture_ruby_candidates": bool(capture_ruby_candidates),
+        "apple_context_padding": False,
+        "apple_ink_framing": False,
+        "full_height_context": bool(full_height_context),
+        "isolation_mode": _normalise_column_isolation_mode(isolation_mode),
+        "transport_profile": str(transport_profile or ""),
+        "assume_single_column": assume_single_column,
         "columns": [_column_to_json(column) for column in columns],
         # Run-local Ruby geometry telemetry is produced as a free by-product of
         # ordinary column detection. It is never OCR text and never enters
@@ -5363,6 +7058,13 @@ def _prepare_page_crops_cached(
     detector_mode: str = "components",
     preserve_body_pixels: bool = True,
     capture_ruby_candidates: bool = True,
+    apple_context_padding: bool = False,
+    apple_ink_framing: bool = False,
+    full_height_context: bool = False,
+    isolation_mode: str = "mask",
+    transport_profile: str = "",
+    geometry_cache_dir: Path | None = None,
+    assume_single_column: bool | None = None,
 ) -> tuple[str, list[DetectedColumn], list[tuple[str, int]], str | None]:
     """Thread-safe wrapper for two OCR engines sharing one crop cache."""
     lock = _shared_prepare_lock(cache_dir, page_index)
@@ -5383,6 +7085,13 @@ def _prepare_page_crops_cached(
             detector_mode=detector_mode,
             preserve_body_pixels=preserve_body_pixels,
             capture_ruby_candidates=capture_ruby_candidates,
+            apple_context_padding=apple_context_padding,
+            apple_ink_framing=apple_ink_framing,
+            full_height_context=full_height_context,
+            isolation_mode=isolation_mode,
+            transport_profile=transport_profile,
+            geometry_cache_dir=geometry_cache_dir,
+            assume_single_column=assume_single_column,
         )
 
 
@@ -5449,6 +7158,31 @@ def _iter_column_pages(
     with tempfile.TemporaryDirectory(prefix="novel_formatter_column_ocr_") as temp_dir:
         temp = Path(temp_dir)
         runtime_options = dict(engine_options or {})
+        performance_callback = runtime_options.pop("column_performance_callback", None)
+        retained_session_holder = runtime_options.pop("column_retained_recognizer_holder", None)
+
+        # V5.7 persistent segment cache.  These options belong to the orchestration
+        # layer, not to an OCR engine process, so remove them before constructing
+        # the recognizer session.  Cache keys are content-addressed and include a
+        # caller-supplied runtime fingerprint covering implementation + options.
+        segment_cache_dir = str(runtime_options.pop("column_segment_cache_dir", "") or "")
+        segment_cache_runtime_id = str(
+            runtime_options.pop("column_segment_cache_runtime_id", "") or ""
+        )
+        segment_cache = OcrSegmentCache(
+            segment_cache_dir,
+            engine=str(recognition_engine or ""),
+            runtime_id=segment_cache_runtime_id,
+        )
+
+        def report_performance(stage: str, seconds: float, details: dict | None = None) -> None:
+            if not callable(performance_callback):
+                return
+            try:
+                performance_callback(stage, max(0.0, float(seconds)), details or {})
+            except Exception:
+                pass
+
         column_preview_callback = runtime_options.pop("column_preview_callback", None)
         fixed_region_rect_raw = runtime_options.pop("column_fixed_region_rect", None)
         fixed_region_rect = None
@@ -5463,6 +7197,7 @@ def _iter_column_pages(
         shared_prepare_value = str(runtime_options.get("column_shared_prepare_dir", "") or "")
         shared_prepare_base = Path(shared_prepare_value) if shared_prepare_value else None
         shared_prepare: Path | None = None
+        shared_geometry: Path | None = None
         input_profile_fingerprint = ""
         shared_variant_value = str(runtime_options.get("column_shared_variant_dir", "") or "")
         shared_variants = Path(shared_variant_value) if shared_variant_value else None
@@ -5475,6 +7210,9 @@ def _iter_column_pages(
         compact_primary_transport = bool(
             runtime_options.pop("column_compact_primary_transport", False)
         )
+        isolation_mode = _normalise_column_isolation_mode(
+            runtime_options.pop("column_isolation_mode", "mask")
+        )
         detector_mode = _normalise_column_detector_mode(
             runtime_options.pop("column_detector_mode", "components")
         )
@@ -5483,6 +7221,19 @@ def _iter_column_pages(
         # projection remains isolated in the review module.
         if detector_mode != "components":
             detector_mode = "components"
+        raw_assume_single_column = runtime_options.pop("column_assume_single_column", "auto")
+        if isinstance(raw_assume_single_column, str):
+            token = raw_assume_single_column.strip().lower()
+            if token in {"", "auto", "detect", "automatic"}:
+                assume_single_column: bool | None = None
+            elif token in {"1", "true", "yes", "on", "always"}:
+                assume_single_column = True
+            else:
+                assume_single_column = False
+        elif raw_assume_single_column is None:
+            assume_single_column = None
+        else:
+            assume_single_column = bool(raw_assume_single_column)
         # The caller selects between two exact-pixel transports.  The standard
         # Japanese-novel path uses ``False``: copy only detector-approved body
         # source boxes (plus punctuation supplements) so side Ruby never reaches
@@ -5513,6 +7264,26 @@ def _iter_column_pages(
         # * v8_legacy: the original v8 direct-call/plugin semantics;
         # * custom: the user-selected interactive cleanup values.
         engine_key = str(recognition_engine or "").strip().lower()
+        # Layout-aware recognizers benefit from a wider paper-context viewport;
+        # crop/line recognizers receive the compact derivative instead.  The
+        # legacy parameter name is retained in cache/API plumbing for backward
+        # compatibility, but it now means "contextual visibility viewport".
+        viewport_mode = _recognizer_viewport_mode(engine_key)
+        apple_context_padding = viewport_mode == "context"
+        # Apple and NDLOCR default to the same tight native-pixel framing.
+        # This matches the manually cropped NDLOCR path, avoids feeding short
+        # columns thousands of rows of pure white paper, and lets both engines
+        # reuse byte-identical run-local PNGs.  A hidden compatibility option
+        # can still restore the former NDLOCR full-height transport.
+        ndlocr_full_height_context = bool(
+            runtime_options.pop("column_ndlocr_full_height_context", False)
+        )
+        full_height_context = bool(
+            engine_key == "ndlocr_lite" and ndlocr_full_height_context
+        )
+        single_column_ink_framing = engine_key in {
+            "apple_vision", "macocr", "mac_ocr", "macos_ocr"
+        } or bool(engine_key == "ndlocr_lite" and not full_height_context)
         if input_profile == "v8_exact":
             auto_filter_ruby = True
             filter_fragments = False
@@ -5529,25 +7300,16 @@ def _iter_column_pages(
             }
         else:
             smart_crop = requested_smart_crop
-        if str(recognition_engine or "").strip().lower() == "manga_ocr":
-            # Manga OCR's ViT processor resizes the whole input.  A page-sized
-            # mask containing one 40-60 px column makes the glyphs effectively
-            # disappear and the decoder hallucinates fluent unrelated Japanese.
-            # It must always receive a compact physical text region.
-            compact_primary_transport = True
-        elif str(recognition_engine or "").strip().lower() == "hayai_ocr":
-            # Hayai v2.1 is also a crop recognizer. NaFlex preserves aspect ratio,
-            # but full-page masks still waste patches and can trigger decoder hallucination.
-            compact_primary_transport = True
-        elif str(recognition_engine or "").strip().lower() == "manga_48px":
-            # The 48px AR network is also a line recognizer, not a page-layout
-            # model. It receives compact physical columns and rotates them in
-            # its worker before resizing to the trained 48-pixel height.
-            compact_primary_transport = True
-        elif str(recognition_engine or "").strip().lower() == "yomitoku":
-            # YomiToku receives the authoritative compact physical column and
-            # bypasses its page-level DBNet detector.  This keeps detached
-            # radicals and punctuation in the same recognition polygon.
+        if isolation_mode == "display":
+            # Full-page visibility is an explicit user choice.  Do not let a
+            # recognizer's usual compact-viewport preference silently turn it
+            # back into the cropped-mask transport.
+            compact_primary_transport = False
+        elif viewport_mode == "compact":
+            # Crop/line recognizers must not see a mostly-white full page.  They
+            # receive a compact viewport cut from the same canonical visibility
+            # layer, so changing recognizers never changes which pixels are
+            # considered body text or Ruby.
             compact_primary_transport = True
         _input_contract_payload, input_profile_fingerprint = (
             _column_input_contract_descriptor(
@@ -5564,10 +7326,23 @@ def _iter_column_pages(
                 ruby_strength=ruby_strength,
                 preserve_body_pixels=preserve_body_pixels,
                 capture_ruby_candidates=capture_ruby_candidates,
+                apple_context_padding=apple_context_padding,
+                apple_ink_framing=single_column_ink_framing,
+                full_height_context=full_height_context,
+                isolation_mode=isolation_mode,
                 input_profile=input_profile,
             )
         )
         if shared_prepare_base is not None:
+            shared_geometry, _geometry_fingerprint = _shared_geometry_profile_dir(
+                shared_prepare_base,
+                detector_mode=detector_mode,
+                sensitivity=sensitivity,
+                padding_percent=padding_percent,
+                max_columns=max_columns,
+                fixed_region_rect=fixed_region_rect,
+                capture_ruby_candidates=capture_ruby_candidates,
+            )
             shared_prepare, namespaced_fingerprint = _shared_prepare_profile_dir(
                 shared_prepare_base,
                 recognition_engine=recognition_engine,
@@ -5583,6 +7358,10 @@ def _iter_column_pages(
                 ruby_strength=ruby_strength,
                 preserve_body_pixels=preserve_body_pixels,
                 capture_ruby_candidates=capture_ruby_candidates,
+                apple_context_padding=apple_context_padding,
+                apple_ink_framing=single_column_ink_framing,
+                full_height_context=full_height_context,
+                isolation_mode=isolation_mode,
                 input_profile=input_profile,
             )
             if namespaced_fingerprint != input_profile_fingerprint:
@@ -5594,6 +7373,15 @@ def _iter_column_pages(
             runtime_options.pop("column_ndlocr_page_mode", None),
             legacy_page_batch=legacy_ndlocr_page_batch,
         )
+        if recognition_engine == "ndlocr_lite":
+            # NDLOCR is allowed to use its native page-layout strength for speed.
+            # Crucially, this no longer gives it an independent segmentation:
+            # the full-page result is routed back into the same authoritative
+            # shared DetectedColumn geometry used by every other OCR engine, and
+            # hybrid fallbacks reuse those exact column IDs/bounds.
+            ndlocr_page_mode = _normalise_ndlocr_page_mode(
+                ndlocr_page_mode, legacy_page_batch=legacy_ndlocr_page_batch
+            )
         sentence_reocr_strategy = str(
             runtime_options.pop("column_sentence_context_strategy", "full") or "full"
         ).strip().lower()
@@ -5610,6 +7398,14 @@ def _iter_column_pages(
             target_column_ids = {
                 str(value) for value in raw_target_column_ids if str(value)
             }
+        # Preserve the execution intent after consuming ``column_target_ids``.
+        # Model adapters do not need the actual immutable target-id set, but they
+        # do need to know that this is a sparse disagreement-review pass so they
+        # can use item-isolated request sizing/watchdogs instead of whole-book
+        # throughput batching.
+        if target_column_ids is not None:
+            runtime_options["disagreement_review"] = True
+
         raw_seed_results = runtime_options.pop("column_seed_results", {}) or {}
         seed_results = raw_seed_results if isinstance(raw_seed_results, dict) else {}
         seed_mark_selective = bool(
@@ -5625,20 +7421,43 @@ def _iter_column_pages(
             sentence_target_ids = {
                 str(value) for value in raw_sentence_target_ids if str(value)
             }
+        raw_sentence_target_groups = runtime_options.pop("column_sentence_target_groups", None)
+        sentence_target_groups: tuple[tuple[str, ...], ...] | None = None
+        if raw_sentence_target_groups is not None:
+            parsed_groups: list[tuple[str, ...]] = []
+            seen_groups: set[tuple[str, ...]] = set()
+            for raw_group in raw_sentence_target_groups or ():
+                if isinstance(raw_group, str):
+                    group = (raw_group,) if raw_group else ()
+                else:
+                    try:
+                        group = tuple(str(value) for value in raw_group if str(value))
+                    except TypeError:
+                        group = ()
+                if group and group not in seen_groups:
+                    seen_groups.add(group)
+                    parsed_groups.append(group)
+            sentence_target_groups = tuple(parsed_groups)
 
         column_rescue_policy = _normalise_column_rescue_policy(
             runtime_options.pop("column_rescue_policy", "adaptive")
         )
         page_columns: dict[str, list[DetectedColumn]] = {}
         crop_to_target: dict[str, tuple[str, int]] = {}
+        crop_input_path: dict[tuple[str, int], str] = {}
         crop_input_sha256: dict[tuple[str, int], str] = {}
         ndlocr_page_input_sha256: dict[str, str] = {}
         crop_paths: list[str] = []
         detection_errors: dict[str, str] = {}
 
         jobs = [(index, path) for index, path in enumerate(page_paths, start=1)]
-        prepare_cap = 6 if compact_primary_transport else 4
-        worker_count = min(prepare_cap, max(1, os.cpu_count() or 2), len(jobs))
+        try:
+            from utils.apple_silicon_runtime import recommended_prepare_workers
+            prepare_limit = recommended_prepare_workers()
+        except Exception:
+            prepare_limit = 4
+        worker_count = min(max(1, int(prepare_limit)), max(1, os.cpu_count() or 2), len(jobs))
+        preparation_started = time.perf_counter()
         def prepare_job(job):
             return (
                 _prepare_page_crops_cached(
@@ -5655,6 +7474,13 @@ def _iter_column_pages(
                     detector_mode=detector_mode,
                     preserve_body_pixels=preserve_body_pixels,
                     capture_ruby_candidates=capture_ruby_candidates,
+                    apple_context_padding=apple_context_padding,
+                    apple_ink_framing=single_column_ink_framing,
+                    full_height_context=full_height_context,
+                    isolation_mode=isolation_mode,
+                    transport_profile=transport_profile_id(recognition_engine),
+                    geometry_cache_dir=shared_geometry,
+                    assume_single_column=assume_single_column,
                 )
                 if shared_prepare is not None
                 else _prepare_page_crops(
@@ -5671,6 +7497,12 @@ def _iter_column_pages(
                     detector_mode=detector_mode,
                     preserve_body_pixels=preserve_body_pixels,
                     capture_ruby_candidates=capture_ruby_candidates,
+                    apple_context_padding=apple_context_padding,
+                    apple_ink_framing=single_column_ink_framing,
+                    full_height_context=full_height_context,
+                    isolation_mode=isolation_mode,
+                    transport_profile=transport_profile_id(recognition_engine),
+                    assume_single_column=assume_single_column,
                 )
             )
 
@@ -5701,6 +7533,7 @@ def _iter_column_pages(
                         crop_paths.append(crop_path)
                         target = (page_path, zero_index)
                         crop_to_target[crop_path] = target
+                        crop_input_path[target] = str(crop_path)
                         crop_input_sha256[target] = _file_sha256(crop_path)
                 if phase_callback is not None:
                     label = os.path.basename(page_path)
@@ -5716,6 +7549,15 @@ def _iter_column_pages(
             split_cancelled = True
         finally:
             pool.shutdown(wait=not split_cancelled, cancel_futures=split_cancelled)
+
+        prepared_column_count = sum(len(columns) for columns in page_columns.values())
+        report_performance("image_preparation", time.perf_counter() - preparation_started, {
+            "pages": len(page_paths),
+            "pages_with_columns": sum(bool(columns) for columns in page_columns.values()),
+            "columns": prepared_column_count,
+            "crop_images": len(crop_paths),
+            "workers": worker_count,
+        })
 
         if split_cancelled:
             return
@@ -5740,6 +7582,10 @@ def _iter_column_pages(
         recognized: dict[tuple[str, int], tuple[str, float, str | None]] = {}
         candidate_map: dict[tuple[str, int], list[_TextCandidate]] = {}
         attempt_map: dict[tuple[str, int], list[str]] = {}
+        # Exact recognizer-input hashes for non-primary rescue routes.  A route
+        # may consume more than one image (for example ``short_blocks``), so
+        # preserve the ordered list instead of inventing a single synthetic hash.
+        rescue_input_hashes: dict[tuple[str, int], dict[str, list[str]]] = {}
         selection_meta: dict[tuple[str, int], dict] = {}
         sentence_reocr_meta: dict[tuple[str, int], dict] = {}
         rescue_decisions: dict[tuple[str, int], _ColumnRescueDecision] = {}
@@ -5754,6 +7600,15 @@ def _iter_column_pages(
         sentence_reocr_enabled = bool(
             runtime_options.pop("column_sentence_context_reocr", False)
         )
+        # Hard gate: multi-column sentence images/re-recognition are strictly
+        # opt-in.  When the UI switch is OFF, discard any stale/selective
+        # sentence target ids that may have been supplied by a multi-model
+        # recovery path.  This keeps the default OCR path byte-for-byte at the
+        # physical-column/page level and prevents an internal rescue request
+        # from silently enabling multi-column merging.
+        if not sentence_reocr_enabled:
+            sentence_target_ids = None
+            sentence_target_groups = None
         sentence_reocr_max = max(
             2,
             int(runtime_options.pop("column_sentence_context_max_columns", 10) or 10),
@@ -5788,6 +7643,13 @@ def _iter_column_pages(
             max(0.08, primary_end - 0.08)
             if compact_primary_transport else primary_end
         )
+        recognition_metrics = {
+            "seconds": 0.0,
+            "calls": 0,
+            "items": 0,
+            "cache_hits": 0,
+            "cache_misses": 0,
+        }
 
         def emit_recognition_work(fraction: float, detail: str) -> None:
             if phase_callback is None:
@@ -5820,16 +7682,114 @@ def _iter_column_pages(
                 target = target_lookup(str(path)) if callable(target_lookup) else None
                 location = target_description(target)
                 detail = f"{stage_name} {current_i} / {total_i}"
+                if str(path) == "__worker_waiting__":
+                    detail += " · OCR 子进程仍在运行，当前页面/批次推理中"
                 if location:
                     detail += f" · {location}"
                 emit_recognition_work(start + (end - start) * ratio, detail)
 
             return callback
 
+        def recognize_batch(
+            session, paths, label, *, progress_callback=None,
+            input_metadata: dict[str, dict] | None = None,
+        ):
+            """Recognize a deterministic image batch with per-segment reuse.
+
+            The cache deliberately wraps the *real* session call instead of only
+            caching crop construction.  A cache hit therefore guarantees that the
+            model/helper is not invoked for that image.  Transient OCR errors are
+            never saved by :class:`OcrSegmentCache`.
+            """
+            ordered_paths = [str(path) for path in paths]
+            if not ordered_paths:
+                return {}
+
+            if segment_cache.enabled:
+                # Reuse the adapter's run-local SHA memo.  Primary column PNGs
+                # have already been hashed for audit metadata, so this normally
+                # costs zero extra file reads; sentence/retry images are hashed
+                # once here and the digest is reused for cache writes below.
+                digest_by_path = {path: _file_sha256(path) for path in ordered_paths}
+                cached, misses = segment_cache.load_many(
+                    ordered_paths, str(label), image_sha256_by_path=digest_by_path
+                )
+                hit_count = len(cached)
+                miss_count = len(misses)
+                recognition_metrics["cache_hits"] += hit_count
+                recognition_metrics["cache_misses"] += miss_count
+            else:
+                digest_by_path = {}
+                cached, misses = {}, ordered_paths
+                hit_count = 0
+                miss_count = len(misses)
+
+            results = dict(cached)
+            total = len(ordered_paths)
+            if hit_count and callable(progress_callback):
+                # Keep progress monotonic while still exposing that cached work was
+                # completed instantly.  Live misses continue from this baseline.
+                last_hit = next((p for p in reversed(ordered_paths) if p in cached), ordered_paths[0])
+                progress_callback(hit_count, total, last_hit)
+
+            if misses:
+                started = time.perf_counter()
+
+                def live_progress(current: int, _live_total: int, path: str) -> None:
+                    if callable(progress_callback):
+                        if str(path) == "__worker_waiting__":
+                            progress_callback(hit_count + max(0, int(current or 0)), total, str(path))
+                        else:
+                            progress_callback(
+                                min(total, hit_count + max(0, int(current or 0))),
+                                total,
+                                str(path),
+                            )
+
+                try:
+                    miss_metadata = {
+                        str(path): dict((input_metadata or {}).get(str(path), {}) or {})
+                        for path in misses
+                    }
+                    live = _session_recognize(
+                        session, misses, str(label), progress_callback=live_progress,
+                        input_metadata=miss_metadata,
+                    )
+                finally:
+                    recognition_metrics["seconds"] += time.perf_counter() - started
+                    recognition_metrics["calls"] += 1
+                    recognition_metrics["items"] += miss_count
+
+                for path in misses:
+                    result = live.get(path, ("", 0.0, "识字进程未返回该图像"))
+                    results[path] = result
+                    segment_cache.save(
+                        path, str(label), result,
+                        image_sha256=digest_by_path.get(path),
+                    )
+            elif callable(progress_callback):
+                # All-cache-hit batches still finish the stage at 100%.
+                progress_callback(total, total, ordered_paths[-1])
+
+            return results
+
         def mark_attempt(target: tuple[str, int], method: str) -> None:
             methods = attempt_map.setdefault(target, [])
             if method not in methods:
                 methods.append(method)
+
+        def record_recognizer_input(
+            target: tuple[str, int], method: str, path: str | Path
+        ) -> str:
+            try:
+                digest = _file_sha256(Path(path))
+            except Exception:
+                return ""
+            per_method = rescue_input_hashes.setdefault(target, {})
+            values = per_method.setdefault(str(method), [])
+            if digest and digest not in values:
+                values.append(digest)
+            return digest
 
         def add_candidate(
             target: tuple[str, int],
@@ -5846,6 +7806,15 @@ def _iter_column_pages(
 
         def immutable_column_id(target: tuple[str, int]) -> str:
             return f"p{page_number_by_path[target[0]]:05d}:c{target[1] + 1:03d}"
+
+        def is_selected_target(target: tuple[str, int]) -> bool:
+            """Restrict targeted review runs to the requested immutable columns.
+
+            Production review normally seeds non-target columns from the primary
+            models, but the hard gate here prevents plugins/tests with no seed
+            from accidentally OCRing the whole book.
+            """
+            return target_column_ids is None or immutable_column_id(target) in target_column_ids
 
         consensus_seed_targets: set[tuple[str, int]] = set()
         if target_column_ids is not None:
@@ -5905,6 +7874,7 @@ def _iter_column_pages(
                 str(detail or "正在准备识字模型"),
             )
 
+        session_load_started = time.perf_counter()
         with _RecognizerSession(
             recognition_engine,
             shortcut_name=shortcut_name,
@@ -5913,7 +7883,27 @@ def _iter_column_pages(
             temp=temp,
             engine_options=runtime_options,
             load_progress_callback=model_load_progress,
+            retained_session_holder=retained_session_holder,
         ) as session:
+            report_performance("model_loading", time.perf_counter() - session_load_started, {
+                "engine": recognition_engine,
+            })
+            session_parts = [
+                getattr(session, name, None)
+                for name in ("_hayai", "_manga48", "_mangaocr", "_persistent", "_jsonl_persistent")
+            ]
+            active_session = next((part for part in session_parts if part is not None), None)
+            if active_session is not None:
+                runtime_details = {
+                    "engine": recognition_engine,
+                    "device": str(getattr(active_session, "device", "") or "unknown"),
+                    "backend": str(
+                        getattr(active_session, "detector_backend", "")
+                        or getattr(active_session, "backend", "")
+                        or type(active_session).__name__
+                    ),
+                }
+                report_performance("runtime", 0.0, runtime_details)
             page_batch_requested = bool(
                 target_column_ids is None
                 and ndlocr_page_mode in {"page", "hybrid"}
@@ -5957,7 +7947,13 @@ def _iter_column_pages(
                         else "NDLOCR智能混合 · 整页识别后只补疑难列"
                     ),
                 )
-                raw_results = raw_method(page_inputs, progress_callback=page_progress)
+                page_batch_started = time.perf_counter()
+                try:
+                    raw_results = raw_method(page_inputs, progress_callback=page_progress)
+                finally:
+                    recognition_metrics["seconds"] += time.perf_counter() - page_batch_started
+                    recognition_metrics["calls"] += 1
+                    recognition_metrics["items"] += len(page_inputs)
                 if raw_results is not None:
                     page_batch_used = True
                     for input_path in page_inputs:
@@ -6017,13 +8013,13 @@ def _iter_column_pages(
                 primary_paths = [
                     crop_path
                     for crop_path, target in crop_to_target.items()
-                    if target[0] in page_batch_failed_pages
+                    if target[0] in page_batch_failed_pages and is_selected_target(target)
                 ]
             else:
                 primary_paths = [
                     crop_path
                     for crop_path, target in crop_to_target.items()
-                    if target not in recognized
+                    if target not in recognized and is_selected_target(target)
                 ]
             primary_start = page_batch_end if page_batch_used else 0.02
             if primary_paths:
@@ -6039,7 +8035,7 @@ def _iter_column_pages(
                         else "识字模型已就绪 · 开始逐列识别"
                     ),
                 )
-                primary = _session_recognize(
+                primary = recognize_batch(
                     session,
                     primary_paths,
                     "primary",
@@ -6089,6 +8085,8 @@ def _iter_column_pages(
                 for page_path, columns in page_columns.items():
                     for column_index, column in enumerate(columns):
                         target = (page_path, column_index)
+                        if not is_selected_target(target):
+                            continue
                         if target in page_stable_targets or target in page_only_locked_targets:
                             continue
                         attempts = attempt_map.get(target, [])
@@ -6112,6 +8110,25 @@ def _iter_column_pages(
                         if decision is not None:
                             rescue_decisions[target] = decision
 
+                def _allow_single_pass_placeholder_rescue(
+                    target: tuple[str, int], decision: _ColumnRescueDecision,
+                ) -> bool:
+                    """Allow one cheap model-specific retry only for a failed main column.
+
+                    The M6 full-book run produced 56 Hayai □ placeholders out of
+                    5849 columns.  Re-enabling the old broad rescue ladder would
+                    destroy throughput, but retrying only those explicit failures
+                    is <1% of the book and prevents avoidable silent evidence loss.
+                    """
+                    if str(recognition_engine or "").strip().lower() != "hayai_ocr":
+                        return False
+                    current = recognized.get(target)
+                    value = normalize_column_text(current[0] if current else "")
+                    return (
+                        (not _valid_column_text(value) or "□" in value or "�" in value)
+                        and decision.method in {"balanced_crop_2x", "short_blocks", "wide"}
+                    )
+
                 planned = {
                     target: decision
                     for target, decision in rescue_decisions.items()
@@ -6119,6 +8136,7 @@ def _iter_column_pages(
                     and (
                         not single_pass
                         or decision.method == "primary_fullsize_fallback"
+                        or _allow_single_pass_placeholder_rescue(target, decision)
                     )
                 }
                 if planned:
@@ -6148,11 +8166,13 @@ def _iter_column_pages(
                             mark_attempt(target, method)
                             if method == "primary_fullsize_fallback":
                                 rescue_image = _crop_column(
-                                    image, column, retry=False, background=background
+                                    image, column, retry=False, background=background,
+                                    preserve_body_pixels=preserve_body_pixels,
                                 )
                             elif method == "wide":
                                 rescue_image = _crop_column(
-                                    image, column, retry=True, background=background
+                                    image, column, retry=True, background=background,
+                                    preserve_body_pixels=preserve_body_pixels,
                                 )
                             elif method in {
                                 "balanced_full",
@@ -6160,10 +8180,12 @@ def _iter_column_pages(
                                 "adaptive_binary_crop_2x",
                             }:
                                 masked = _crop_column(
-                                    image, column, retry=True, background=background
+                                    image, column, retry=True, background=background,
+                                    preserve_body_pixels=preserve_body_pixels,
                                 )
                                 isolated = _isolated_column_image(
-                                    image, column, retry=True, background=background
+                                    image, column, retry=True, background=background,
+                                    preserve_body_pixels=preserve_body_pixels,
                                 )
                                 try:
                                     variant = build_fallback_variant(
@@ -6179,11 +8201,12 @@ def _iter_column_pages(
                                 continue
                             rescue_image = _apply_column_cleanup(
                                 rescue_image,
-                                auto_filter_ruby=auto_filter_ruby,
+                                auto_filter_ruby=(auto_filter_ruby if preserve_body_pixels else False),
                                 filter_fragments=filter_fragments,
-                                smart_crop=smart_crop,
+                                smart_crop=(smart_crop if preserve_body_pixels else False),
                                 ruby_strength=ruby_strength,
                                 background=background,
+                                preserve_body_pixels=preserve_body_pixels,
                             )
                             path = temp / (
                                 (
@@ -6199,6 +8222,7 @@ def _iter_column_pages(
                             key = str(path)
                             rescue_paths_by_method.setdefault(method, []).append(key)
                             rescue_path_to_target[key] = target
+                            record_recognizer_input(target, method, key)
                     finally:
                         image.close()
 
@@ -6214,7 +8238,7 @@ def _iter_column_pages(
                 for method, paths in rescue_paths_by_method.items():
                     if cancel_check is not None and cancel_check():
                         break
-                    results = _session_recognize(
+                    results = recognize_batch(
                         session,
                         paths,
                         method,
@@ -6264,15 +8288,17 @@ def _iter_column_pages(
                             column = page_columns[page_path][column_index]
                             for span_index, span in enumerate(column.content_spans):
                                 crop = _crop_content_span(
-                                    image, column, span, background=background
+                                    image, column, span, background=background,
+                                    preserve_body_pixels=preserve_body_pixels,
                                 )
                                 crop = _apply_column_cleanup(
                                     crop,
-                                    auto_filter_ruby=auto_filter_ruby,
+                                    auto_filter_ruby=(auto_filter_ruby if preserve_body_pixels else False),
                                     filter_fragments=filter_fragments,
-                                    smart_crop=smart_crop,
+                                    smart_crop=(smart_crop if preserve_body_pixels else False),
                                     ruby_strength=ruby_strength,
                                     background=background,
+                                    preserve_body_pixels=preserve_body_pixels,
                                 )
                                 path = temp / (
                                     f"adaptive_short_p{page_number_by_path[page_path]:05d}_"
@@ -6285,10 +8311,11 @@ def _iter_column_pages(
                                 key = str(path)
                                 short_paths.append(key)
                                 short_path_to_target[key] = (target, span_index)
+                                record_recognizer_input(target, "short_blocks", key)
                     finally:
                         image.close()
                 if short_paths and not (cancel_check is not None and cancel_check()):
-                    results = _session_recognize(
+                    results = recognize_batch(
                         session,
                         short_paths,
                         "short_blocks",
@@ -6361,15 +8388,17 @@ def _iter_column_pages(
                         _page_path, column_index = target
                         column = page_columns[page_path][column_index]
                         masked = _crop_column(
-                            image, column, retry=False, background=background
+                            image, column, retry=False, background=background,
+                            preserve_body_pixels=preserve_body_pixels,
                         )
                         masked = _apply_column_cleanup(
                             masked,
-                            auto_filter_ruby=auto_filter_ruby,
+                            auto_filter_ruby=(auto_filter_ruby if preserve_body_pixels else False),
                             filter_fragments=filter_fragments,
-                            smart_crop=smart_crop,
+                            smart_crop=(smart_crop if preserve_body_pixels else False),
                             ruby_strength=ruby_strength,
                             background=background,
+                            preserve_body_pixels=preserve_body_pixels,
                         )
                         path = temp / (
                             f"primary_full_p{page_number_by_path[page_path]:05d}_"
@@ -6382,10 +8411,11 @@ def _iter_column_pages(
                         key = str(path)
                         compact_fallback_paths.append(key)
                         compact_fallback_to_target[key] = target
+                        record_recognizer_input(target, "primary_fullsize_fallback", key)
                 finally:
                     image.close()
             if compact_fallback_paths and not (cancel_check is not None and cancel_check()):
-                fallback_results = _session_recognize(
+                fallback_results = recognize_batch(
                     session,
                     compact_fallback_paths,
                     "primary_fullsize_fallback",
@@ -6426,7 +8456,8 @@ def _iter_column_pages(
                 (page_path, column_index)
                 for page_path, columns in page_columns.items()
                 for column_index, column in enumerate(columns)
-                if (page_path, column_index) not in page_stable_targets
+                if is_selected_target((page_path, column_index))
+                and (page_path, column_index) not in page_stable_targets
                 and (page_path, column_index) not in page_only_locked_targets
                 and len(column.content_spans) >= 2
                 and (
@@ -6449,15 +8480,17 @@ def _iter_column_pages(
                         column = page_columns[page_path][column_index]
                         for span_index, span in enumerate(column.content_spans):
                             crop = _crop_content_span(
-                                image, column, span, background=background
+                                image, column, span, background=background,
+                                preserve_body_pixels=preserve_body_pixels,
                             )
                             crop = _apply_column_cleanup(
                                 crop,
-                                auto_filter_ruby=auto_filter_ruby,
+                                auto_filter_ruby=(auto_filter_ruby if preserve_body_pixels else False),
                                 filter_fragments=filter_fragments,
-                                smart_crop=smart_crop,
+                                smart_crop=(smart_crop if preserve_body_pixels else False),
                                 ruby_strength=ruby_strength,
                                 background=background,
+                                preserve_body_pixels=preserve_body_pixels,
                             )
                             path = temp / (
                                 f"recover_p{page_number_by_path[page_path]:05d}_"
@@ -6468,11 +8501,12 @@ def _iter_column_pages(
                             key = str(path)
                             recovery_paths.append(key)
                             recovery_to_target[key] = (target, span_index)
+                            record_recognizer_input(target, "short_blocks", key)
                 finally:
                     image.close()
 
             if recovery_paths and not (cancel_check is not None and cancel_check()):
-                recovery_results = _session_recognize(
+                recovery_results = recognize_batch(
                     session,
                     recovery_paths,
                     "short_blocks",
@@ -6512,6 +8546,8 @@ def _iter_column_pages(
                 for page_path, columns in page_columns.items():
                     for column_index, column in enumerate(columns):
                         target = (page_path, column_index)
+                        if not is_selected_target(target):
+                            continue
                         if target in page_stable_targets or target in page_only_locked_targets:
                             continue
                         result = recognized.get(target)
@@ -6541,14 +8577,16 @@ def _iter_column_pages(
                         crop = _crop_column(
                             image, page_columns[page_path][column_index],
                             retry=True, background=background,
+                            preserve_body_pixels=preserve_body_pixels,
                         )
                         crop = _apply_column_cleanup(
                             crop,
-                            auto_filter_ruby=auto_filter_ruby,
+                            auto_filter_ruby=(auto_filter_ruby if preserve_body_pixels else False),
                             filter_fragments=filter_fragments,
-                            smart_crop=smart_crop,
+                            smart_crop=(smart_crop if preserve_body_pixels else False),
                             ruby_strength=ruby_strength,
                             background=background,
+                            preserve_body_pixels=preserve_body_pixels,
                         )
                         retry_path = temp / f"retry_{retry_serial:06d}.png"
                         crop.save(retry_path, format="PNG", compress_level=1)
@@ -6556,11 +8594,12 @@ def _iter_column_pages(
                         key = str(retry_path)
                         retry_paths.append(key)
                         retry_to_target[key] = target
+                        record_recognizer_input(target, "wide", key)
                 finally:
                     image.close()
 
             if retry_paths and not (cancel_check is not None and cancel_check()):
-                retry_results = _session_recognize(
+                retry_results = recognize_batch(
                     session,
                     retry_paths,
                     "wide",
@@ -6595,6 +8634,8 @@ def _iter_column_pages(
                 for page_path, columns in page_columns.items():
                     for column_index, column in enumerate(columns):
                         target = (page_path, column_index)
+                        if not is_selected_target(target):
+                            continue
                         if target in page_stable_targets or target in page_only_locked_targets:
                             continue
                         result = recognized.get(target)
@@ -6640,26 +8681,30 @@ def _iter_column_pages(
                         _page_path, column_index = target
                         column = page_columns[page_path][column_index]
                         masked = _crop_column(
-                            image, column, retry=True, background=background
+                            image, column, retry=True, background=background,
+                            preserve_body_pixels=preserve_body_pixels,
                         )
                         isolated = _isolated_column_image(
-                            image, column, retry=True, background=background
+                            image, column, retry=True, background=background,
+                            preserve_body_pixels=preserve_body_pixels,
                         )
                         masked = _apply_column_cleanup(
                             masked,
-                            auto_filter_ruby=auto_filter_ruby,
+                            auto_filter_ruby=(auto_filter_ruby if preserve_body_pixels else False),
                             filter_fragments=filter_fragments,
-                            smart_crop=smart_crop,
+                            smart_crop=(smart_crop if preserve_body_pixels else False),
                             ruby_strength=ruby_strength,
                             background=background,
+                            preserve_body_pixels=preserve_body_pixels,
                         )
                         isolated = _apply_column_cleanup(
                             isolated,
-                            auto_filter_ruby=auto_filter_ruby,
+                            auto_filter_ruby=(auto_filter_ruby if preserve_body_pixels else False),
                             filter_fragments=filter_fragments,
-                            smart_crop=smart_crop,
+                            smart_crop=(smart_crop if preserve_body_pixels else False),
                             ruby_strength=ruby_strength,
                             background=background,
+                            preserve_body_pixels=preserve_body_pixels,
                         )
                         variants = []
                         try:
@@ -6685,6 +8730,7 @@ def _iter_column_pages(
                     key = str(cached_paths[method])
                     variant_paths.setdefault(method, []).append(key)
                     variant_to_target[key] = (target, method)
+                    record_recognizer_input(target, method, key)
 
             total_variant_paths = sum(len(paths) for paths in variant_paths.values())
             completed_variant_paths = 0
@@ -6696,7 +8742,7 @@ def _iter_column_pages(
                     "balanced_crop_2x": "局部放大增强",
                     "adaptive_binary_crop_2x": "二值化增强",
                 }
-                results = _session_recognize(
+                results = recognize_batch(
                     session,
                     paths,
                     method,
@@ -6728,9 +8774,8 @@ def _iter_column_pages(
             for page_path, columns in page_columns.items():
                 for column_index, column in enumerate(columns):
                     target = (page_path, column_index)
-                    selected, conflict, ranked = _select_text_candidate(
-                        candidate_map.get(target, []), column
-                    )
+                    candidates = candidate_map.get(target, [])
+                    selected, conflict, ranked = _select_text_candidate(candidates, column)
                     if selected is None:
                         continue
                     recognized[target] = (selected.text, selected.confidence, None)
@@ -6787,11 +8832,26 @@ def _iter_column_pages(
                     for page_path in page_paths
                     for column_index in range(len(page_columns.get(page_path, [])))
                 ]
-                groups = _sentence_reocr_groups(
-                    ordered_targets,
-                    recognized,
-                    max_columns=sentence_reocr_max,
-                )
+                if sentence_target_groups is not None:
+                    # Smart role routing already knows the exact sentence rows
+                    # from the page+column bootstrap comparison.  Reuse those
+                    # groups verbatim instead of guessing boundaries again from
+                    # seeded OCR tails.  One-column complete sentences are valid
+                    # targets too: 48px can rotate/reflow a single isolated
+                    # column, and a sentence recognizer can review that exact residual crop.
+                    by_column_id = {
+                        immutable_column_id(target): target for target in ordered_targets
+                    }
+                    groups = _resolve_explicit_sentence_target_groups(
+                        by_column_id, sentence_target_groups,
+                        max_columns=sentence_reocr_max,
+                    )
+                else:
+                    groups = _sentence_reocr_groups(
+                        ordered_targets,
+                        recognized,
+                        max_columns=sentence_reocr_max,
+                    )
                 selected_groups: list[tuple[int, list[tuple[str, int]]]] = []
                 skipped_group_count = 0
                 for group_index, targets in enumerate(groups, start=1):
@@ -6803,7 +8863,14 @@ def _iter_column_pages(
                     ):
                         should_reocr = False
                         skip_reason = "多模型分列结果已一致，跳过重复整句 OCR"
-                    elif sentence_reocr_strategy == "smart":
+                    elif sentence_reocr_strategy == "smart" and sentence_target_groups is None:
+                        # A selective multi-role router has already decided these
+                        # exact sentence groups are genuine bootstrap conflicts.
+                        # Running the legacy recognizer-local smart filter again
+                        # can re-derive boundaries from seeded text and silently
+                        # skip the very 48px/Manga evidence we asked for.  Only
+                        # use this second-stage heuristic for legacy callers that
+                        # did not provide authoritative sentence groups.
                         should_reocr, skip_reason = _sentence_group_smart_reocr_decision(
                             targets,
                             recognized,
@@ -6811,6 +8878,8 @@ def _iter_column_pages(
                             page_columns,
                             recognition_engine=recognition_engine,
                         )
+                    elif sentence_target_groups is not None:
+                        skip_reason = "外层多模型路由已确认该完整句为真实分歧，按精确句组执行 OCR"
                     if should_reocr:
                         selected_groups.append((group_index, list(targets)))
                         continue
@@ -6869,13 +8938,111 @@ def _iter_column_pages(
                 ] = {}
                 sentence_cache_dir = shared_sentences if shared_sentences is not None else temp
                 with _SentencePageCache(fixed_region_rect, max_pages=4) as sentence_page_cache:
+                    sentence_input_metadata: dict[str, dict] = {}
+                    sentence_transport_failures = 0
                     for group_index, targets in selected_groups:
                         cache_key = _sentence_group_cache_key(
                             targets, page_number_by_path,
                             global_merged=sentence_global_merged_box_reocr,
+                            preserve_body_pixels=preserve_body_pixels,
                             fixed_region_rect=fixed_region_rect,
                         )
-                        if sentence_global_merged_box_reocr:
+                        layout_name = ""
+                        expected_chars = max(
+                            1,
+                            sum(
+                                int(getattr(page_columns[page_path][column_index], "estimated_chars", 0) or 0)
+                                for page_path, column_index in targets
+                            ),
+                        )
+
+                        # 48px is a line recognizer.  Its sentence-role contract is
+                        # therefore a geometry-only left-to-right reflow of the
+                        # already isolated physical glyph cells, never a raw
+                        # multi-column canvas.  If fixed-grid extraction is unsafe,
+                        # fail closed and keep the seeded main-model evidence rather
+                        # than silently feeding an incompatible image shape.
+                        if recognition_engine == "manga_48px":
+                            path = sentence_cache_dir / (
+                                f"sentence_{cache_key}_48px_horizontal_reflow.png"
+                            )
+                            reflow = None
+                            cached_glyph_count = (
+                                _load_sentence_reflow_glyph_count(path)
+                                if path.exists() and path.stat().st_size > 0 else 0
+                            )
+                            if cached_glyph_count > 0:
+                                # A valid sidecar is mandatory because the image alone
+                                # cannot recover the fixed-grid glyph cardinality.
+                                expected_chars = cached_glyph_count
+                                layout_name = "horizontal_reflow"
+                                reflow = "cached"
+                            else:
+                                try:
+                                    reflow = _sentence_group_horizontal_reflow_image(
+                                        page_columns, targets,
+                                        fixed_region_rect=fixed_region_rect,
+                                        shared_page_cache=sentence_page_cache,
+                                        preserve_body_pixels=preserve_body_pixels,
+                                    )
+                                except Exception:
+                                    reflow = None
+                            if reflow != "cached" and (
+                                reflow is None or not reflow.safe or reflow.image is None
+                            ):
+                                sentence_transport_failures += 1
+                                baseline = join_column_parts(
+                                    recognized.get(target, ("□", 0.0, None))[0]
+                                    for target in targets
+                                )
+                                column_ids = [immutable_column_id(target) for target in targets]
+                                owner = targets[0]
+                                reason = (
+                                    "48px Sentence-Reflow 几何校验失败："
+                                    + str(getattr(reflow, "reason", "transport_failed") or "transport_failed")
+                                )
+                                common_meta = {
+                                    "sentence_context_reocr_group": group_index,
+                                    "sentence_context_reocr_column_ids": column_ids,
+                                    "sentence_context_reocr_column_count": len(targets),
+                                    "sentence_context_reocr_layout": "horizontal_reflow_failed",
+                                    "sentence_context_reocr_candidate": "",
+                                    "sentence_context_reocr_baseline": baseline,
+                                    "sentence_context_reocr_confidence": 0.0,
+                                    "sentence_context_reocr_accepted": False,
+                                    "sentence_context_reocr_skipped": True,
+                                    "sentence_context_reocr_strategy": sentence_reocr_strategy,
+                                    "sentence_context_reocr_reason": reason,
+                                    "sentence_context_reocr_owner_column_id": column_ids[0],
+                                }
+                                for position, target in enumerate(targets):
+                                    sentence_reocr_meta[target] = {
+                                        **common_meta,
+                                        "sentence_context_reocr_position": position,
+                                        "sentence_context_reocr_owner": target == owner,
+                                    }
+                                if reflow is not None and reflow != "cached" and reflow.image is not None:
+                                    reflow.image.close()
+                                continue
+                            if reflow != "cached":
+                                expected_chars = max(1, int(reflow.glyph_count or 0))
+                                try:
+                                    temporary = path.with_suffix(path.suffix + ".tmp")
+                                    reflow.image.save(temporary, format="PNG", compress_level=1)
+                                    temporary.replace(path)
+                                    _write_sentence_reflow_sidecar(path, expected_chars)
+                                finally:
+                                    reflow.image.close()
+                            layout_name = "horizontal_reflow"
+                            sentence_input_metadata[str(path)] = {
+                                "layout": "horizontal_reflow",
+                                "expected_chars": expected_chars,
+                                "sentence_role": True,
+                                "transport_version": "48px-horizontal-sentence-reflow-v1",
+                                "source_column_count": len(targets),
+                            }
+
+                        elif sentence_global_merged_box_reocr:
                             cached_global = sentence_cache_dir / (
                                 f"sentence_{cache_key}_global_merged_boxes.png"
                             )
@@ -6894,17 +9061,16 @@ def _iter_column_pages(
                                         page_columns, targets,
                                         fixed_region_rect=fixed_region_rect,
                                         shared_page_cache=sentence_page_cache,
+                                        preserve_body_pixels=preserve_body_pixels,
                                     )
                                     path = cached_global
                                     layout_name = "global_merged_boxes"
                                 except Exception:
-                                    # Geometry anomalies must not abort a whole-book OCR.
-                                    # Fall back to the proven lossless strip layout for
-                                    # only this sentence group.
                                     canvas = _sentence_group_image(
                                         page_columns, targets,
                                         fixed_region_rect=fixed_region_rect,
                                         shared_page_cache=sentence_page_cache,
+                                        preserve_body_pixels=preserve_body_pixels,
                                     )
                                     path = cached_fallback
                                     layout_name = "column_strips_fallback"
@@ -6919,18 +9085,45 @@ def _iter_column_pages(
                                 f"sentence_{cache_key}_column_strips.png"
                             )
                             layout_name = "column_strips"
-                            if not path.exists() or path.stat().st_size <= 0:
-                                canvas = _sentence_group_image(
+                            layout_path = path.with_suffix(path.suffix + ".layout.json")
+                            layout_boxes = ()
+                            try:
+                                cached_layout = json.loads(layout_path.read_text(encoding="utf-8"))
+                                layout_boxes = tuple(
+                                    tuple(int(value) for value in box)
+                                    for box in cached_layout.get("physical_column_boxes", ())
+                                )
+                                if len(layout_boxes) != len(targets) or any(len(box) != 4 for box in layout_boxes):
+                                    layout_boxes = ()
+                            except (OSError, ValueError, TypeError, json.JSONDecodeError):
+                                layout_boxes = ()
+                            if not path.exists() or path.stat().st_size <= 0 or not layout_boxes:
+                                canvas, layout_boxes = _sentence_group_image(
                                     page_columns, targets,
                                     fixed_region_rect=fixed_region_rect,
                                     shared_page_cache=sentence_page_cache,
+                                    preserve_body_pixels=preserve_body_pixels,
+                                    return_layout=True,
                                 )
                                 try:
-                                    temporary = path.with_suffix(path.suffix + ".tmp")
-                                    canvas.save(temporary, format="PNG", compress_level=1)
-                                    temporary.replace(path)
+                                    if not path.exists() or path.stat().st_size <= 0:
+                                        temporary = path.with_suffix(path.suffix + ".tmp")
+                                        canvas.save(temporary, format="PNG", compress_level=1)
+                                        temporary.replace(path)
+                                    layout_temporary = layout_path.with_suffix(layout_path.suffix + ".tmp")
+                                    layout_temporary.write_text(json.dumps({
+                                        "physical_column_boxes": layout_boxes,
+                                    }, ensure_ascii=False), encoding="utf-8")
+                                    layout_temporary.replace(layout_path)
                                 finally:
                                     canvas.close()
+                            sentence_input_metadata[str(path)] = {
+                                "layout": "standard",
+                                "expected_chars": expected_chars,
+                                "physical_column_boxes": layout_boxes,
+                                "sentence_role": True,
+                                "source_column_count": len(targets),
+                            }
                         key = str(path)
                         group_paths.append(key)
                         path_to_group[key] = (group_index, list(targets), layout_name)
@@ -6951,7 +9144,7 @@ def _iter_column_pages(
 
                 if group_paths:
                     total_groups = len(group_paths)
-                    group_results = _session_recognize(
+                    group_results = recognize_batch(
                         session,
                         group_paths,
                         "sentence_context",
@@ -6966,6 +9159,7 @@ def _iter_column_pages(
                             )
                             if phase_callback is not None else None
                         ),
+                        input_metadata=sentence_input_metadata,
                     )
                     for current, path in enumerate(group_paths, start=1):
                         group_index, targets, group_layout = path_to_group[path]
@@ -6986,6 +9180,14 @@ def _iter_column_pages(
                                 _validate_sentence_reocr_candidate(
                                     primary_parts, text, confidence,
                                     recognition_engine=recognition_engine,
+                                    primary_stable=(
+                                        _apple_sentence_primary_stable(
+                                            targets, recognized, selection_meta,
+                                        )
+                                        if recognition_engine in {
+                                            "apple_vision", "macocr", "mac_ocr", "macos_ocr"
+                                        } else False
+                                    ),
                                 )
                             )
                         column_ids = [
@@ -7000,6 +9202,7 @@ def _iter_column_pages(
                             }
                             for page_path, indices in _sentence_group_page_runs(targets)
                         ]
+                        sentence_input_sha256 = _file_sha256(Path(path))
                         common_meta = {
                             "sentence_context_reocr_group": group_index,
                             "sentence_context_reocr_column_ids": column_ids,
@@ -7019,6 +9222,7 @@ def _iter_column_pages(
                             # OCR is cleared or the app exits; proofreading can
                             # therefore show the exact single/multi-column input.
                             "ocr_review_sentence_image_path": path,
+                            "sentence_context_reocr_input_sha256": sentence_input_sha256,
                         }
                         for position, target in enumerate(targets):
                             sentence_reocr_meta[target] = {
@@ -7032,9 +9236,16 @@ def _iter_column_pages(
                                 current,
                                 total_groups,
                                 f"句组 {group_index} · {len(targets)} 列 · "
-                                f"{('合并框' if group_layout == 'global_merged_boxes' else ('合并框失败后条带回退' if group_layout == 'column_strips_fallback' else '逐列拼接'))} · "
+                                f"{('48px横向Sentence-Reflow' if group_layout == 'horizontal_reflow' else ('合并框' if group_layout == 'global_merged_boxes' else ('合并框失败后条带回退' if group_layout == 'column_strips_fallback' else '逐列拼接')))} · "
                                 f"{'采用' if accepted else '回退逐列'}",
                             )
+
+        report_performance("recognition", recognition_metrics["seconds"], {
+            "batches": recognition_metrics["calls"],
+            "items": recognition_metrics["items"],
+            "segment_cache_hits": recognition_metrics["cache_hits"],
+            "segment_cache_misses": recognition_metrics["cache_misses"],
+        })
 
         unresolved = [
             (page_path, column_index)
@@ -7111,9 +9322,11 @@ def _iter_column_pages(
                     "column_ruby_strength": ruby_strength,
                     "column_preserve_body_pixels": bool(preserve_body_pixels),
                     "column_ocr_input_contract": (
-                        "lossless_hard_slot_v1" if preserve_body_pixels else "ruby_excluded_body_boxes_v2"
+                        "lossless_hard_slot_v1" if preserve_body_pixels else CANONICAL_COLUMN_TRANSPORT_VERSION
                     ),
+                    "column_ocr_transport_version": CANONICAL_COLUMN_TRANSPORT_VERSION,
                     "column_ocr_input_profile": input_profile,
+                    "column_isolation_mode": isolation_mode,
                     "column_ocr_input_profile_sha256": input_profile_fingerprint,
                     "column_ocr_rescue_policy": column_rescue_policy,
                 }
@@ -7151,6 +9364,58 @@ def _iter_column_pages(
                 if bool(selected_meta.get("rescue_used", False)):
                     rescue_count += 1
                 column_attempts = list(attempt_map.get(target_key, ["primary"]))
+                if full_height_context:
+                    transport = "visibility_context_full_height_single_column"
+                elif "page_primary" in column_attempts:
+                    transport = (
+                        "ndlocr_full_page_routed_with_canonical_single_column_fallback"
+                        if "primary" in column_attempts
+                        else "ndlocr_full_page_routed"
+                    )
+                else:
+                    transport = CANONICAL_COLUMN_TRANSPORT_VERSION
+
+                # Distinguish the canonical prepared column crop from the image
+                # that actually produced the selected OCR evidence.  This avoids
+                # falsely claiming that NDLOCR page-routed text or a rescue
+                # variant was recognized from the canonical column PNG.
+                sentence_meta = dict(sentence_reocr_meta.get(target_key, {}) or {})
+                seeded_reuse = bool(selected_meta.get("consensus_seeded", False))
+                sentence_accepted = bool(sentence_meta.get("sentence_context_reocr_accepted", False))
+                if is_unresolved or seeded_reuse:
+                    actual_input_sha256 = ""
+                    actual_input_scope = "seeded_reuse" if seeded_reuse else "unavailable"
+                elif sentence_accepted and sentence_meta.get("sentence_context_reocr_input_sha256"):
+                    actual_input_sha256 = str(sentence_meta.get("sentence_context_reocr_input_sha256") or "")
+                    actual_input_scope = "sentence_group"
+                elif recognition_engine == "ndlocr_lite" and selected_method == "page_primary":
+                    actual_input_sha256 = str(ndlocr_page_input_sha256.get(page_path, "") or "")
+                    actual_input_scope = "page_routed" if actual_input_sha256 else "unavailable"
+                elif selected_method in {"", "primary"}:
+                    actual_input_sha256 = str(crop_input_sha256.get(target_key, "") or "")
+                    actual_input_scope = "physical_column" if actual_input_sha256 else "unavailable"
+                else:
+                    selected_input_hashes = list(
+                        rescue_input_hashes.get(target_key, {}).get(selected_method, [])
+                    )
+                    if len(selected_input_hashes) == 1:
+                        actual_input_sha256 = selected_input_hashes[0]
+                        actual_input_scope = "rescue_variant"
+                    elif selected_input_hashes:
+                        # The selected text is assembled from multiple actual OCR
+                        # calls (e.g. vertically separated short blocks).  Keep
+                        # each exact input hash; never collapse them into a fake
+                        # single-image digest.
+                        actual_input_sha256 = ""
+                        actual_input_scope = "rescue_composite"
+                    else:
+                        actual_input_sha256 = ""
+                        actual_input_scope = "rescue_variant_untracked"
+                actual_input_sha256s = list(
+                    rescue_input_hashes.get(target_key, {}).get(selected_method, [])
+                ) if selected_method not in {"", "primary", "page_primary"} else []
+                if actual_input_sha256 and not actual_input_sha256s:
+                    actual_input_sha256s = [actual_input_sha256]
                 block = {
                     "text": text,
                     "confidence": confidence if not is_unresolved else 0.0,
@@ -7173,6 +9438,10 @@ def _iter_column_pages(
                     "column_hard_right": int(column.hard_right),
                     "ruby_candidate_boxes": [list(box) for box in column.ruby_candidate_boxes],
                     "ruby_candidate_confidence": float(column.ruby_candidate_confidence),
+                    "column_supplemental_boxes": [list(box) for box in column.supplemental_boxes],
+                    "column_excluded_boxes": [list(box) for box in column.excluded_boxes],
+                    "column_ruby_guard_boxes": [list(box) for box in column.ruby_guard_boxes],
+                    "column_full_height_slot": bool(column.full_height_slot),
                     "black_ink_estimated_chars": int(column.estimated_chars or 0),
                     "black_ink_content_spans": [list(span) for span in column.content_spans],
                     "preserve_ocr_item": True,
@@ -7193,11 +9462,20 @@ def _iter_column_pages(
                     "column_ruby_strength": ruby_strength,
                     "column_preserve_body_pixels": bool(preserve_body_pixels),
                     "column_ocr_input_contract": (
-                        "lossless_hard_slot_v1" if preserve_body_pixels else "ruby_excluded_body_boxes_v2"
+                        "lossless_hard_slot_v1" if preserve_body_pixels else CANONICAL_COLUMN_TRANSPORT_VERSION
                     ),
+                    "column_ocr_transport_version": CANONICAL_COLUMN_TRANSPORT_VERSION,
                     "column_ocr_input_profile": input_profile,
+                    "column_isolation_mode": isolation_mode,
                     "column_ocr_input_profile_sha256": input_profile_fingerprint,
+                    # Prepared canonical transport is retained separately from
+                    # the exact selected recognizer input.
+                    "column_ocr_input_image_path": crop_input_path.get(target_key, ""),
+                    "column_ocr_transport_profile": transport_profile_id(recognition_engine),
                     "column_ocr_input_sha256": crop_input_sha256.get(target_key, ""),
+                    "column_ocr_actual_input_sha256": actual_input_sha256,
+                    "column_ocr_actual_input_sha256s": actual_input_sha256s,
+                    "column_ocr_actual_input_scope": actual_input_scope,
                     "column_ndlocr_page_input_sha256": (
                         ndlocr_page_input_sha256.get(page_path, "")
                         if recognition_engine == "ndlocr_lite" else ""
@@ -7210,25 +9488,9 @@ def _iter_column_pages(
                     "column_ndlocr_page_mode": (
                         ndlocr_page_mode if recognition_engine == "ndlocr_lite" else ""
                     ),
-                    "column_ocr_transport": (
-                        (
-                            "ndlocr_full_page_routed_with_isolated_fallback"
-                            if "primary" in column_attempts
-                            else "ndlocr_full_page_routed"
-                        )
-                        if "page_primary" in column_attempts
-                        else (
-                            (
-                                "lossless_compact_with_fullsize_safety_fallback"
-                                if "primary_fullsize_fallback" in column_attempts
-                                else "lossless_compact"
-                            )
-                            if (compact_primary_transport or smart_crop)
-                            else "fullsize_masked_page"
-                        )
-                    ),
+                    "column_ocr_transport": transport,
                 }
-                block.update(sentence_reocr_meta.get(target_key, {}))
+                block.update(sentence_meta)
                 if is_unresolved:
                     block.update({
                         "column_ocr_empty": True,
@@ -7276,13 +9538,18 @@ def _iter_column_pages(
             else:
                 yield page_path, blocks, None
 
-    if recognition_engine != "apple_vision":
+    # Most simple recognizers use this generic success marker.  Hayai owns a
+    # richer marker written by HayaiOcrSession (version/backend/device/cache).
+    # Do not overwrite that marker with a bare {ready:true} payload after the
+    # column pipeline finishes, otherwise the next start rejects it as stale
+    # and unnecessarily re-enables Hugging Face online resolution.
+    if recognition_engine not in {"apple_vision", "hayai_ocr"}:
         from adapters.ocr_runtime_catalog import mark_runtime_ready
         mark_runtime_ready(recognition_engine)
 
 def run(
     *,
-    recognition_engine: str = "manga_ocr",
+    recognition_engine: str = "apple_vision",
     column_sensitivity: int = 55,
     column_padding_percent: int = 10,
     strict_column_validation: bool = True,
@@ -7304,7 +9571,10 @@ def run(
     if recognition_engine not in SUPPORTED_RECOGNIZERS:
         raise ValueError(f"不支持的精准分列识字引擎: {recognition_engine}")
     phase_callback = kwargs.pop("phase_callback", None)
+    performance_callback = kwargs.get("performance_callback")
     runtime_engine_options = dict(engine_options or {})
+    if callable(performance_callback):
+        runtime_engine_options["column_performance_callback"] = performance_callback
     runtime_engine_options.setdefault(
         "column_sentence_context_reocr", bool(column_sentence_context_reocr)
     )
@@ -7312,13 +9582,7 @@ def run(
         "column_sentence_context_strategy",
         str(column_sentence_context_strategy or "full"),
     )
-    if str(recognition_engine or "").strip().lower() == "manga_ocr":
-        runtime_engine_options["column_compact_primary_transport"] = True
-    elif str(recognition_engine or "").strip().lower() == "hayai_ocr":
-        runtime_engine_options["column_compact_primary_transport"] = True
-    elif str(recognition_engine or "").strip().lower() == "manga_48px":
-        runtime_engine_options["column_compact_primary_transport"] = True
-    elif str(recognition_engine or "").strip().lower() == "yomitoku":
+    if _recognizer_viewport_mode(recognition_engine) == "compact":
         runtime_engine_options["column_compact_primary_transport"] = True
     else:
         runtime_engine_options.setdefault(
@@ -7340,6 +9604,11 @@ def run(
     if "column_ndlocr_page_mode" not in runtime_engine_options:
         runtime_engine_options["column_ndlocr_page_mode"] = _normalise_ndlocr_page_mode(
             None if legacy_mode_was_explicit else column_ndlocr_page_mode,
+            legacy_page_batch=legacy_mode_value,
+        )
+    elif recognition_engine == "ndlocr_lite":
+        runtime_engine_options["column_ndlocr_page_mode"] = _normalise_ndlocr_page_mode(
+            runtime_engine_options.get("column_ndlocr_page_mode"),
             legacy_page_batch=legacy_mode_value,
         )
     runtime_engine_options.setdefault(
@@ -7372,5 +9641,6 @@ def run(
         verbose=verbose,
         force_text_pages=True,
         strict_column_audit=bool(strict_column_validation),
+        worker_timing_name="column_pipeline_total",
         **kwargs,
     )

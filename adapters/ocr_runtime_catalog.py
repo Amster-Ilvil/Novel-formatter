@@ -29,10 +29,9 @@ from adapters.paddle_ocr_models import (
     PADDLE_RECOGNITION_MODEL,
     PADDLE_RUNTIME_SIGNATURE,
 )
-
 ROOT = Path(__file__).parent.parent
 STATE_DIR = ROOT / ".ocr-runtime-state"
-HAYAI_OCR_RUNTIME_VERSION = os.environ.get("NOVEL_FORMATTER_HAYAI_OCR_VERSION", "2.1.0").strip() or "2.1.0"
+HAYAI_OCR_RUNTIME_VERSION = os.environ.get("NOVEL_FORMATTER_HAYAI_OCR_VERSION", "2.3.0").strip() or "2.3.0"
 HAYAI_OCR_VENV_DIR = persistent_venv_dir("hayai-ocr-v2.1")
 
 
@@ -76,11 +75,6 @@ COMPONENTS: dict[str, RuntimeComponent] = {
         "会下载官方源码、ONNX 模型和独立运行环境。",
         ".venv-ndlocr-lite",
     ),
-    "manga_ocr": RuntimeComponent(
-        "manga_ocr", "Manga OCR", "本地模型",
-        "日文漫画与小说印刷体识别；页面输入会先做物理分列。",
-        ".venv-manga-ocr",
-    ),
     "findtext_centernet_ruby": RuntimeComponent(
         "findtext_centernet_ruby", "findtextCenterNet Ruby 专家", "本地模型",
         "与其它本地 OCR 使用同一套运行环境检测/安装确认；固定 commit 上游源码保持原样，"
@@ -89,29 +83,19 @@ COMPONENTS: dict[str, RuntimeComponent] = {
         ".venv-findtext-centernet",
     ),
     "hayai_ocr": RuntimeComponent(
-        "hayai_ocr", "Hayai OCR v2.1 · PyTorch", "本地模型",
-        "约 150M 参数的 CJK crop 识别器；PyTorch 后端支持批量、MPS/CUDA/CPU 与可选 INT4/INT8，页面输入强制先做物理分列。",
+        "hayai_ocr", "Hayai OCR · PyTorch", "本地模型",
+        "CJK crop 识别器；Hayai OCR 默认使用当前固定兼容运行时，支持批量、MPS/CUDA/CPU 与可选 INT4/INT8，页面输入强制先做物理分列。",
         str(HAYAI_OCR_VENV_DIR),
     ),
     "hayai_ocr_litert": RuntimeComponent(
-        "hayai_ocr_litert", "Hayai OCR v2.1 · LiteRT", "本地模型",
-        "与 PyTorch 版共享独立 Hayai 环境，但会额外安装 LiteRT 运行库并下载独立 TFLite 权重；仅在选择 LiteRT 后端时需要。",
+        "hayai_ocr_litert", "Hayai OCR v2 · LiteRT", "本地模型",
+        "与 PyTorch 版共享独立 Hayai 环境，但会额外安装 LiteRT 运行库并下载独立 TFLite v2 权重；仅在选择 LiteRT 后端时需要。",
         str(HAYAI_OCR_VENV_DIR),
     ),
     "manga_48px": RuntimeComponent(
         "manga_48px", "Manga 48px AR OCR", "本地模型",
         "首次使用下载 Manga Image Translator 官方 48px 自回归权重（约 195 MB）、字符表和独立 PyTorch 环境。",
         ".venv-manga-48px",
-    ),
-    "yomitoku": RuntimeComponent(
-        "yomitoku", "YomiToku OCR", "本地模型",
-        "仅安装 YomiToku OCR 模块；下载 dbnetv2_1 与 PARSeq 日文识别权重。快速模式按需再下载 large 复核模型。非商业用途遵循上游 CC BY-NC-SA 4.0。",
-        ".venv-yomitoku",
-    ),
-    "pdf_craft": RuntimeComponent(
-        "pdf_craft", "PDF Craft / DeepSeek-OCR", "本地大模型",
-        "会安装 PDF Craft 并下载 DeepSeek-OCR 权重。当前上游推理主要面向 CUDA；Mac/CPU 可能无法运行。",
-        ".venv-pdf-craft",
     ),
 }
 
@@ -120,26 +104,20 @@ _PACKAGE_MARKERS = {
     "paddle_structure": ("paddle", "paddleocr", "paddlex"),
     "paddle_vl": ("paddle", "paddleocr", "paddlex"),
     "ndlocr_lite": ("onnxruntime", "cv2", "yaml"),
-    "manga_ocr": ("manga_ocr",),
     "findtext_centernet_ruby": ("torch", "torchvision", "PIL"),
     "hayai_ocr": ("hayai_ocr",),
     "hayai_ocr_litert": ("hayai_ocr", "ai_edge_litert", "tokenizers", "huggingface_hub"),
     "manga_48px": ("torch", "einops", "PIL"),
-    "yomitoku": ("yomitoku", "torch", "cv2"),
-    "pdf_craft": ("pdf_craft", "torch"),
 }
 _DEEP_IMPORTS = {
     "paddle_ocr": "import paddle, paddleocr",
     "paddle_structure": "import paddle, paddleocr, paddlex",
     "paddle_vl": "import paddle, paddleocr, paddlex",
     "ndlocr_lite": "import onnxruntime, cv2, yaml",
-    "manga_ocr": "from manga_ocr import MangaOcr",
     "findtext_centernet_ruby": "import torch, torchvision; from PIL import Image",
     "hayai_ocr": "from hayai_ocr import HayaiOcr",
     "hayai_ocr_litert": "from hayai_ocr import HayaiOcr; import ai_edge_litert, tokenizers, huggingface_hub",
     "manga_48px": "import torch, einops; from PIL import Image",
-    "yomitoku": "from yomitoku.text_detector import TextDetector; from yomitoku.text_recognizer import TextRecognizer",
-    "pdf_craft": "from pdf_craft import transform_markdown; import torch",
 }
 _PROBE_CACHE: dict[tuple[str, bool], RuntimeProbe] = {}
 
@@ -191,7 +169,7 @@ def _module_marker_exists(component_id: str, module: str) -> bool:
 
 def _distribution_version_from_site(component_id: str, distribution: str) -> str:
     """Read an installed distribution version without importing its runtime."""
-    prefix = str(distribution or "").strip().lower().replace("-", "_") + "-"
+    prefix = str(distribution or "").strip().lower().replace("-", "_") + "_"
     for site in _site_package_roots(component_id):
         try:
             for item in site.iterdir():
@@ -212,7 +190,71 @@ def _distribution_version_from_site(component_id: str, distribution: str) -> str
     return ""
 
 
+def _manga_48px_effective_python() -> tuple[Path | None, str]:
+    """Return a verified 48px Python without installing or downloading.
+
+    Runtime readiness must match the adapter's actual launch policy. A stale
+    project-local venv marker used to report READY even when that venv had no
+    torch, while the adapter later fell back to another interpreter or failed.
+    Probe explicit override, private venv, then the current interpreter and
+    accept only a process that can import every required package (and PyTorch
+    2.14+ on M6).
+    """
+    candidates: list[tuple[Path, str]] = []
+    explicit = os.environ.get("NOVEL_FORMATTER_MANGA_48PX_PYTHON", "").strip()
+    if explicit:
+        candidates.append((Path(explicit).expanduser(), "explicit"))
+    private = _venv_python_path("manga_48px")
+    if private is not None:
+        candidates.append((private, "private"))
+    candidates.append((Path(sys.executable).resolve(), "current"))
+    marker = "import torch, einops, numpy; from PIL import Image; assert torch.__version__"
+    try:
+        from utils.apple_silicon_runtime import is_m6
+        m6 = bool(is_m6())
+    except Exception:
+        m6 = False
+    if m6:
+        marker += (
+            "; v=torch.__version__.split('+',1)[0].split('.'); "
+            "n=tuple(int(''.join(c for c in p if c.isdigit()) or 0) for p in v[:2]); "
+            "assert n >= (2,14)"
+        )
+    seen: set[str] = set()
+    for python, source in candidates:
+        key = str(python)
+        if key in seen or not python.is_file():
+            continue
+        seen.add(key)
+        try:
+            proc = subprocess.run(
+                [str(python), "-c", marker],
+                stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True, timeout=20,
+            )
+        except Exception:
+            continue
+        if proc.returncode == 0:
+            return python, source
+    return None, ""
+
+
 def _environment_installed(component_id: str, *, deep: bool = False) -> tuple[bool, str]:
+    if component_id == "manga_48px":
+        python, source = _manga_48px_effective_python()
+        if python is None:
+            return False, "48px 运行环境存在标记，但 torch/einops/Pillow 无法实际导入"
+        if deep:
+            try:
+                result = subprocess.run(
+                    [str(python), "-c", _DEEP_IMPORTS[component_id]],
+                    capture_output=True, text=True, timeout=20,
+                )
+            except Exception as exc:
+                return False, f"48px 环境导入检测失败：{exc}"
+            if result.returncode != 0:
+                detail = (result.stderr or result.stdout or "导入失败").strip().splitlines()[-1]
+                return False, f"48px 环境存在但无法导入：{detail}"
+        return True, f"48px 运行环境已验证（{source}: {python}）"
     python = _venv_python_path(component_id)
     if python is None:
         return False, "未找到独立运行环境"
@@ -287,6 +329,27 @@ def _has_large_file(root: Path, minimum: int = 500_000, name_tokens: tuple[str, 
 
 def _hf_repo_dir(repo_id: str) -> str:
     return "models--" + "--".join(part for part in str(repo_id or "").strip().split("/") if part)
+
+
+def _hf_repo_weight_ready(hf_home: Path, repo_id: str) -> bool:
+    """Return true only when one complete snapshot exposes a real weight file."""
+    repo_dir = _hf_repo_dir(repo_id)
+    roots = (hf_home / "hub" / repo_dir, hf_home / repo_dir)
+    for root in roots:
+        snapshots = root / "snapshots"
+        if not snapshots.is_dir():
+            continue
+        try:
+            for snapshot in snapshots.iterdir():
+                if not snapshot.is_dir():
+                    continue
+                for name in ("model.safetensors", "pytorch_model.bin"):
+                    weight = snapshot / name
+                    if weight.is_file() and weight.stat().st_size > 1_000_000:
+                        return True
+        except OSError:
+            continue
+    return False
 
 
 def _normalise_hf_home(path: Path) -> Path:
@@ -368,7 +431,7 @@ def _hayai_processor_cache_complete(root: Path) -> bool:
 
     Upstream Hayai v2 loads ``AutoProcessor`` from
     ``google/siglip2-base-patch16-naflex`` but loads the text tokenizer
-    separately from ``JustANormalTinkerer/hayai-ocr-v2``.  Requiring a
+    separately from the selected Hayai OCR model repository.  Requiring a
     tokenizer file inside the SigLIP2 snapshot therefore creates a false
     negative after a perfectly successful Hayai download and makes the GUI
     ask to install the model again on every run.  The worker only calls this
@@ -407,6 +470,7 @@ def _hayai_torch_cache_complete(root: Path) -> bool:
     except OSError:
         return False
     return False
+
 
 
 def _model_cache_ready(component_id: str) -> tuple[bool, str]:
@@ -466,11 +530,6 @@ def _model_cache_ready(component_id: str) -> tuple[bool, str]:
             return False, f"48px AR 权重已下载 {partial_mb:.1f}/194.8 MiB，下次会断点续传"
         return False, "环境已安装，但 48px AR 权重尚未下载完整"
 
-    if component_id == "yomitoku":
-        cache = ROOT / ".model-cache" / "yomitoku" / "huggingface"
-        ready = _has_large_file(cache, 1_000_000, ("dbnet", "parseq", "yomitoku"))
-        return (True, "检测到 YomiToku Hugging Face 模型缓存") if ready else (False, "环境已安装，但 YomiToku 模型尚未完成首次下载/推理")
-
     if component_id in {"hayai_ocr", "hayai_ocr_litert"}:
         # Hayai's two backends share one venv but use different model repos.
         # Probe every cache root the actual Hugging Face runtime may already be
@@ -493,8 +552,8 @@ def _model_cache_ready(component_id: str) -> tuple[bool, str]:
             return (True, "检测到完整 Hayai OCR LiteRT/TFLite 权重") if ready else (False, "环境已安装，但 Hayai OCR LiteRT/TFLite 权重不完整或尚未下载")
 
         model_name = os.environ.get(
-            "NOVEL_FORMATTER_HAYAI_OCR_MODEL", "JustANormalTinkerer/hayai-ocr-v2"
-        ).strip() or "JustANormalTinkerer/hayai-ocr-v2"
+            "NOVEL_FORMATTER_HAYAI_OCR_MODEL", "JustANormalTinkerer/hayai-ocr-v2.5-nova"
+        ).strip() or "JustANormalTinkerer/hayai-ocr-v2.5-nova"
         local_model = Path(model_name).expanduser()
         local_model_ready = local_model.exists() and _hayai_torch_cache_complete(local_model)
         repo_dir = _hf_repo_dir(model_name) if not local_model.exists() else ""
@@ -511,27 +570,12 @@ def _model_cache_ready(component_id: str) -> tuple[bool, str]:
                 )
             any_model_ready = any_model_ready or model_ready
             if model_ready and processor_ready:
-                return True, f"检测到完整 Hayai OCR v2 权重与 SigLIP2 processor 缓存（{cache_root}）"
+                return True, f"检测到完整 Hayai OCR 权重与 SigLIP2 processor 缓存（{cache_root}）"
         if any_model_ready and not any_processor_ready:
-            return False, "已检测到 Hayai OCR v2 权重，但 SigLIP2 processor 缓存尚未完成"
+            return False, "已检测到 Hayai OCR 权重，但 SigLIP2 processor 缓存尚未完成"
         if any_processor_ready and not any_model_ready:
-            return False, "已检测到 SigLIP2 processor，但 Hayai OCR v2 权重尚未完成"
-        return False, "环境已安装，但 Hayai OCR v2 PyTorch 权重不完整或尚未下载"
-
-    if component_id == "manga_ocr":
-        candidates = [
-            ROOT / ".model-cache" / "manga-ocr",
-            home / ".cache" / "huggingface" / "hub" / "models--kha-white--manga-ocr-base",
-        ]
-        for env_name in ("HF_HOME", "TRANSFORMERS_CACHE", "HUGGINGFACE_HUB_CACHE"):
-            value = os.environ.get(env_name, "").strip()
-            if value:
-                candidates.append(Path(value).expanduser())
-        return (True, "检测到 Manga OCR 本地权重") if any(_has_large_file(p) for p in candidates) else (False, "环境已安装，但未检测到 Manga OCR 权重")
-
-    if component_id == "pdf_craft":
-        path = ROOT / ".model-cache" / "pdf-craft"
-        return (True, "检测到 PDF Craft 本地权重") if _has_large_file(path, 1_000_000) else (False, "环境已安装，但未检测到 PDF Craft 权重")
+            return False, "已检测到 SigLIP2 processor，但 Hayai OCR 权重尚未完成"
+        return False, "环境已安装，但 Hayai OCR PyTorch 权重不完整或尚未下载"
 
     if component_id == "ndlocr_lite":
         model_dir = ROOT / ".ocr-runtimes" / "ndlocr-lite" / "src" / "model"
@@ -637,11 +681,31 @@ def _read_ready_payload(component_id: str) -> dict | None:
     return candidates[0][1]
 
 
+def _runtime_python_exists(component_id: str) -> bool:
+    """Check the effective runtime while preserving legacy test/plugin hooks."""
+    if component_id == "manga_48px":
+        return _manga_48px_effective_python()[0] is not None
+    return _venv_python_exists(COMPONENTS[component_id].venv_dir)
+
+
 def _state_marker_ready(component_id: str) -> bool:
     try:
         payload = _read_ready_payload(component_id)
-        if not payload or not _venv_python_exists(COMPONENTS[component_id].venv_dir):
+        if not payload or not _runtime_python_exists(component_id):
             return False
+        if component_id == "manga_48px":
+            # A READY marker is only advisory. Verify the effective Python and
+            # local weights every time so an empty/stale venv cannot masquerade
+            # as a usable 48px runtime after copying/upgrading the app.
+            env_ready, _detail = _environment_installed(component_id, deep=False)
+            return bool(env_ready and _model_cache_ready(component_id)[0])
+        if component_id == "ndlocr_lite":
+            source_dir = ROOT / ".ocr-runtimes" / "ndlocr-lite"
+            if not (source_dir / "src" / "ocr.py").is_file():
+                return False
+            # A previous successful run is not enough after the source tree or
+            # ONNX files have been removed/replaced. NDLOCR's worker needs both.
+            return _model_cache_ready(component_id)[0]
         # PaddleOCR v6 medium 在部分网络环境中不可下载；当前运行时允许
         # worker 自动回退到 PaddleOCR 默认日文模型，因此只核对“新版
         # PaddleOCR 运行时”签名，不再把 v6 medium 权重作为唯一 ready 条件。
@@ -668,7 +732,7 @@ def mark_runtime_ready(component_id: str, **details) -> None:
     if component_id not in COMPONENTS:
         return
     component = COMPONENTS[component_id]
-    if not _venv_python_exists(component.venv_dir):
+    if not _runtime_python_exists(component_id):
         return
     payload = {"component": component_id, "ready": True, **details}
     encoded = json.dumps(payload, ensure_ascii=False, indent=2)
@@ -777,7 +841,7 @@ def required_components(
     if engine == "hayai_ocr":
         backend = str((engine_options or {}).get("backend") or "torch").strip().lower()
         return ["hayai_ocr_litert" if backend in {"litert", "tflite", "lite_rt"} else "hayai_ocr"]
-    if engine in {"ndlocr_lite","pdf_craft","manga_ocr","manga_48px","yomitoku"}:
+    if engine in {"ndlocr_lite","manga_48px"}:
         return [engine]
     return []
 
@@ -790,6 +854,10 @@ def missing_components(component_ids: list[str]) -> list[RuntimeComponent]:
         if runtime_ready(cid):
             continue
         if cid in {"hayai_ocr", "hayai_ocr_litert"}:
+            # Cached weights are more important than source-local environment
+            # location.  A new source ZIP may only need its persistent venv
+            # created/repaired; never prompt as if already-local weights must be
+            # downloaded again.
             # Hayai weights are much larger/more important than the small Python
             # environment.  Once the required model assets are already cached,
             # do not show a misleading "install model" confirmation just
@@ -841,5 +909,5 @@ def installed_local_layout_engines() -> list[str]:
 
 
 def installed_local_recognition_engines() -> list[str]:
-    candidates = ["hayai_ocr", "yomitoku", "manga_48px", "manga_ocr", "ndlocr_lite", "paddle_ocr", "pdf_craft"]
+    candidates = ["hayai_ocr", "manga_48px", "ndlocr_lite", "paddle_ocr"]
     return [item for item in candidates if runtime_ready(item)]

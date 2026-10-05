@@ -76,6 +76,53 @@ class OcrRuntimeLimits:
         }
 
 
+def adaptive_ocr_runtime_limits() -> OcrRuntimeLimits:
+    """Return cross-platform, live-memory-aware OCR concurrency.
+
+    Heavy accelerator models remain one-at-a-time when they share a device or
+    unified-memory pool. Light CPU work scales with available cores, while live
+    memory pressure can immediately reduce preparation/ONNX concurrency.
+    """
+    try:
+        from utils.hardware_runtime import (
+            current_available_memory_gb,
+            detect_system_hardware,
+            recommended_encode_workers,
+            recommended_prepare_workers,
+        )
+        hardware = detect_system_hardware()
+        available = current_available_memory_gb()
+    except Exception:
+        hardware = None
+        available = 0.0
+    accelerator = getattr(hardware, "gpu_backend", "cpu") if hardware is not None else "cpu"
+    shared_accelerator = accelerator in {"mps", "apple_gpu", "mlx", "directml", "cuda", "migraphx", "openvino"}
+    if available and available < 2.5:
+        onnx = 1
+        prepare = 2
+        encode = 1
+        remote = 2
+    elif available and available < 5.0:
+        onnx = 1
+        prepare = min(4, recommended_prepare_workers()) if hardware is not None else 4
+        encode = min(2, recommended_encode_workers()) if hardware is not None else 2
+        remote = 3
+    else:
+        onnx = 2 if hardware is not None else 1
+        prepare = recommended_prepare_workers() if hardware is not None else 4
+        encode = recommended_encode_workers() if hardware is not None else 2
+        remote = 4 if hardware is not None else 2
+    return OcrRuntimeLimits(
+        mps_model=1 if shared_accelerator else 1,
+        onnx_model=onnx,
+        native_vision=1,
+        remote_model=remote,
+        alignment=1,
+        image_prepare=prepare,
+        image_encode=encode,
+    )
+
+
 class OcrResourceGovernor:
     """Bounded resource leases with cancellation-aware waits and metrics."""
 
@@ -213,6 +260,7 @@ class OcrPerformanceTrace:
         self._events: list[dict[str, object]] = []
         self._lock = threading.RLock()
         self._finished_at: float | None = None
+        self._finished_monotonic: float | None = None
 
     @contextmanager
     def stage(self, name: str) -> Iterator[None]:
@@ -258,17 +306,19 @@ class OcrPerformanceTrace:
         with self._lock:
             if self._finished_at is None:
                 self._finished_at = time.time()
+                self._finished_monotonic = time.perf_counter()
             return self.snapshot()
 
     def snapshot(self) -> dict[str, object]:
         with self._lock:
             ended = self._finished_at or time.time()
+            ended_monotonic = self._finished_monotonic or time.perf_counter()
             return {
                 "schema": "novel_formatter.ocr_performance_trace.v1",
                 "run_id": self.run_id,
                 "started_at_unix": self.started_at,
                 "finished_at_unix": ended,
-                "elapsed_seconds": max(0.0, time.perf_counter() - self.started_monotonic),
+                "elapsed_seconds": max(0.0, ended_monotonic - self.started_monotonic),
                 "metadata": dict(self.metadata),
                 "stages": {
                     name: {

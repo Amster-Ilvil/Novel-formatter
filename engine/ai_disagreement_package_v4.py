@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import copy
 import hashlib
+import html
 import json
 import os
 import re
@@ -26,6 +27,7 @@ import time
 import zipfile
 from collections import Counter, defaultdict
 from datetime import datetime, timezone
+from difflib import SequenceMatcher
 from pathlib import Path
 from typing import Any, Iterable, Sequence
 
@@ -34,6 +36,7 @@ from engine.ocr_unicode_standardizer import (
     japanese_ocr_comparison_key,
     normalize_japanese_ocr_text,
 )
+from engine.consensus_entropy import calculate_consensus_entropy
 from engine.adaptive_ocr_ensemble import (
     ModelReliability, decide_ensemble, estimate_model_reliability, model_family,
 )
@@ -165,6 +168,50 @@ def _risk_flags(texts: Sequence[str]) -> list[str]:
         flags.append("possibly_unbalanced_quote")
     return flags
 
+_STRUCTURAL_PUNCTUATION = frozenset("「」『』（）［］【】〈〉《》〔〕｛｝……‥―—–─－・")
+
+def _lexical_without_punctuation(text: str) -> str:
+    import unicodedata
+    value = str(text or "")
+    return "".join(
+        char for char in value
+        if not char.isspace() and unicodedata.category(char)[:1] not in {"P", "S"}
+    )
+
+def _classify_conflict_type(texts: Sequence[str]) -> str:
+    usable = [str(value or "") for value in texts if _usable_text(str(value or ""))]
+    if len(usable) < 2:
+        return "missing_candidate"
+    if len(set(usable)) == 1:
+        return "none"
+    lexical = [_lexical_without_punctuation(value) for value in usable]
+    if len(set(lexical)) == 1:
+        structural_signatures = [
+            "".join(char for char in value if char in _STRUCTURAL_PUNCTUATION)
+            for value in usable
+        ]
+        if len(set(structural_signatures)) > 1:
+            return "structural_punctuation_only"
+        return "punctuation_or_whitespace_only"
+    return "substantive_text"
+
+def _context_window(items: Sequence[dict], index: int, radius: int = 2) -> list[dict]:
+    output: list[dict] = []
+    for cursor in range(max(0, index - radius), min(len(items), index + radius + 1)):
+        if cursor == index:
+            continue
+        item = items[cursor]
+        text = str(item.get("edited_text", item.get("original_fused_text", "")) or "").strip()
+        if not text:
+            continue
+        output.append({
+            "relative": cursor - index,
+            "item_id": _item_id(item, cursor),
+            "page": int(item.get("page", 0) or 0),
+            "text": text[:320],
+        })
+    return output
+
 
 def _candidate_health(items: Sequence[dict]) -> dict[str, dict]:
     """Return availability plus book-local agreement calibration per model."""
@@ -235,13 +282,60 @@ def _context_text(items: Sequence[dict], index: int, direction: int) -> str:
     return "\n".join(collected)[-320:] if direction < 0 else "\n".join(collected)[:320]
 
 
+def _v4_export_options(package: dict) -> dict:
+    """Return conservative V4 export filters without changing OCR semantics.
+
+    ``ce_auto_freeze`` is deliberately disabled by default.  Comparison-key
+    equivalence is deterministic and may filter Unicode/presentation-only false
+    conflicts.  Consensus Entropy is weaker evidence: when explicitly enabled,
+    it may only freeze a row whose *existing* authoritative text already belongs
+    to the weighted-majority key.  The exporter never rewrites text to make a CE
+    decision true.
+    """
+    raw = package.get("v4_export_options")
+    raw = raw if isinstance(raw, dict) else {}
+    try:
+        threshold = float(raw.get("ce_auto_freeze_threshold", 0.04) or 0.04)
+    except (TypeError, ValueError, OverflowError):
+        threshold = 0.04
+    threshold = max(0.0, min(0.20, threshold))
+    return {
+        "ce_auto_freeze": bool(raw.get("ce_auto_freeze", False)),
+        "ce_auto_freeze_threshold": threshold,
+    }
+
+
+def _existing_authoritative_item_text(item: dict, candidates: Sequence[dict]) -> str:
+    """Return current row text without deriving/replacing it from compare keys."""
+    current = str(item.get("edited_text", item.get("original_fused_text", "")) or "")
+    if _usable_text(current):
+        return current
+    for candidate in candidates:
+        raw = str(candidate.get("raw_text", "") or "")
+        if _usable_text(raw):
+            return raw
+    return current
+
+
 def build_disagreement_records(package: dict) -> tuple[list[dict], dict]:
-    """Classify every editable item and return records plus summary."""
+    """Classify every editable item and return records plus summary.
+
+    V2.0 keeps ordinary OCR disagreement at whole-sentence granularity.  This
+    exporter may *filter* comparison-key-equivalent false conflicts from the V4
+    cloud package, but it never performs character-level adjudication.  The only
+    evidence-level adjudicator remains the explicit external-Paddle workflow.
+    """
     items = [item for item in (package.get("editable_items") or []) if isinstance(item, dict)]
     health = _candidate_health(items)
+    export_options = _v4_export_options(package)
     records: list[dict] = []
     status_counts: Counter[str] = Counter()
     priority_counts: Counter[str] = Counter()
+    conflict_type_counts: Counter[str] = Counter()
+    raw_disagreement_items = 0
+    normalized_false_conflicts = 0
+    substantive_comparison_conflicts = 0
+    ce_opt_in_frozen_items = 0
 
     for index, item in enumerate(items):
         candidates: list[dict] = []
@@ -298,6 +392,28 @@ def build_disagreement_records(package: dict) -> tuple[list[dict], dict]:
         usable_models = len(voting)
         ignored_models = [c["model"] for c in candidates if c["usable"] and not c["eligible_for_vote"]]
         missing_models = [c["model"] for c in candidates if not c["usable"]]
+        ce_profile = calculate_consensus_entropy(
+            [candidate["raw_text"] for candidate in candidates],
+            comparison_keys=[candidate["compare_key"] for candidate in candidates],
+            excluded_indices=[i for i, candidate in enumerate(candidates) if not candidate["eligible_for_vote"]],
+        )
+        conflict_type = _classify_conflict_type([candidate["raw_text"] for candidate in candidates])
+        usable_candidates = [candidate for candidate in candidates if candidate["usable"]]
+        raw_values = [candidate["raw_text"] for candidate in usable_candidates]
+        key_values = [candidate["compare_key"] for candidate in usable_candidates if candidate["compare_key"]]
+        raw_disagreement = bool(len(raw_values) >= 2 and len(set(raw_values)) > 1)
+        normalized_equivalent = bool(
+            raw_disagreement
+            and len(key_values) >= 2
+            and len(key_values) == len(raw_values)
+            and len(set(key_values)) == 1
+        )
+        substantive_key_conflict = bool(
+            raw_disagreement and len(key_values) >= 2 and len(set(key_values)) > 1
+        )
+        raw_disagreement_items += int(raw_disagreement)
+        normalized_false_conflicts += int(normalized_equivalent)
+        substantive_comparison_conflicts += int(substantive_key_conflict)
 
         accepted_text: str | None = None
         status = "missing_candidate"
@@ -334,11 +450,85 @@ def build_disagreement_records(package: dict) -> tuple[list[dict], dict]:
             priority = "critical" if ensemble.sensitive else "high"
             reason_codes.append("no_independent_model_majority")
 
+        # V2.0 V4 export filter: if the raw OCR strings differ but every usable
+        # candidate collapses to exactly the same ephemeral comparison key, this
+        # is a Unicode/presentation-only false conflict.  Freeze the *existing*
+        # row text; never write the comparison key or silently replace it with a
+        # different candidate.  This changes cloud-export scope only -- OCR
+        # Compare remains a whole-sentence workflow.
+        if normalized_equivalent:
+            accepted_text = _existing_authoritative_item_text(item, candidates)
+            status = "normalized_consensus"
+            action_required = False
+            priority = "none"
+            reason_codes = list(dict.fromkeys([
+                "normalized_consensus_compare_key_equivalent",
+                *reason_codes,
+            ]))
+
+        # A local adjudication may have already resolved this substantive conflict.
+        # Such rows remain in the immutable/all-items index for audit, but must not
+        # be re-opened as LLM work.  The local result is an overlay, not new OCR evidence.
+        local_map = package.get("local_adjudication") if isinstance(package.get("local_adjudication"), dict) else {}
+        item_key = _item_id(item, index)
+        local_info = item.get("local_adjudication") if isinstance(item.get("local_adjudication"), dict) else local_map.get(item_key)
+        if local_info and str(local_info.get("state", "")) in {"AUTO_ACCEPT", "LOCAL_REPAIR"}:
+            local_text = str(local_info.get("chosen_text", "") or "")
+            if _usable_text(local_text):
+                accepted_text = local_text
+                status = "local_adjudicated"
+                action_required = False
+                priority = "none"
+                reason_codes = list(dict.fromkeys(["local_adjudicated", *reason_codes]))
+
         risk_flags = _risk_flags([candidate["raw_text"] for candidate in candidates])
         if action_required and risk_flags:
             priority = "critical" if any(flag in risk_flags for flag in ("numeric_or_level_content", "status_or_structured_content")) else priority
+
+        # Optional second gate.  Disabled by default because agreement is not
+        # correctness.  Even when explicitly enabled we refuse structural
+        # punctuation, sensitive/status rows, fewer-than-three independent OCR
+        # candidates, or any case where the current authoritative text does not
+        # already belong to the weighted-majority comparison key.  Therefore the
+        # exporter can reduce cloud work without rewriting the book.
+        if (
+            action_required
+            and False  # Stable Core: majority may never bypass external adjudication.
+            and export_options["ce_auto_freeze"]
+            and ensemble.status == "majority_consensus"
+            and ce_profile.maximum <= export_options["ce_auto_freeze_threshold"]
+            and len(voting) >= 3
+            and int(ensemble.family_support_count or 0) >= 2
+            and not ensemble.sensitive
+            and not risk_flags
+            and conflict_type not in {"structural_punctuation_only", "missing_candidate"}
+        ):
+            current_text = _existing_authoritative_item_text(item, candidates)
+            current_key = comparison_key_standard_japanese(current_text) if _usable_text(current_text) else ""
+            if current_key and current_key == str(ensemble.chosen_key or ""):
+                accepted_text = current_text
+                status = "ce_majority_consensus_opt_in"
+                action_required = False
+                priority = "none"
+                ce_opt_in_frozen_items += 1
+                reason_codes = list(dict.fromkeys([
+                    "ce_low_disagreement_opt_in_existing_majority_text",
+                    *reason_codes,
+                ]))
+
+        if action_required and ce_profile.difficulty == "high" and priority not in {"critical"}:
+            priority = "high"
+            reason_codes.append("high_consensus_entropy_review_priority")
         provisional = accepted_text or str(item.get("edited_text", item.get("original_fused_text", "")) or "")
         canonical_provisional, provisional_events = canonicalize_standard_japanese(provisional)
+        if not action_required:
+            routing_hint = "frozen_no_external_model"
+        elif conflict_type == "structural_punctuation_only":
+            routing_hint = "image_evidence_or_human"
+        elif ce_profile.difficulty == "high" or priority == "critical":
+            routing_hint = "strong_model_or_human"
+        else:
+            routing_hint = "local_or_low_cost_model_first"
         record = {
             "schema": ITEM_INDEX_SCHEMA,
             "item_id": _item_id(item, index),
@@ -352,8 +542,28 @@ def build_disagreement_records(package: dict) -> tuple[list[dict], dict]:
             "provisional_text_sha256": _sha256_text(canonical_provisional),
             "model_action_required": action_required,
             "review_priority": priority,
+            "routing_hint": routing_hint,
             "reason_codes": reason_codes,
             "risk_flags": risk_flags,
+            "conflict_type": conflict_type,
+            "comparison_filter": {
+                "raw_unique_count": len(set(raw_values)),
+                "comparison_key_unique_count": len(set(key_values)),
+                "raw_disagreement": raw_disagreement,
+                "normalized_consensus_filtered": normalized_equivalent,
+                "authoritative_text_rewritten": False,
+            },
+            "consensus_entropy": {
+                "scores": list(ce_profile.scores),
+                "best_index": ce_profile.best_index,
+                "minimum": ce_profile.minimum,
+                "mean": ce_profile.mean,
+                "maximum": ce_profile.maximum,
+                "active_count": ce_profile.active_count,
+                "difficulty": ce_profile.difficulty,
+                "review_required": ce_profile.review_required,
+                "authority": "diagnostic_only_never_auto_resolves",
+            },
             "ensemble_confidence": round(float(ensemble.confidence or 0.0), 6),
             "ensemble_score_margin": round(float(ensemble.score_margin or 0.0), 6),
             "ensemble_family_support_count": int(ensemble.family_support_count or 0),
@@ -366,6 +576,7 @@ def build_disagreement_records(package: dict) -> tuple[list[dict], dict]:
             "candidates": candidates,
             "context_before": _context_text(items, index, -1),
             "context_after": _context_text(items, index, 1),
+            "context_window": _context_window(items, index, radius=2),
             "source_bbox": item.get("bbox") or item.get("source_bbox") or [],
             "normalization_events": provisional_events,
             "decision_contract": {
@@ -377,18 +588,43 @@ def build_disagreement_records(package: dict) -> tuple[list[dict], dict]:
         records.append(record)
         status_counts[status] += 1
         priority_counts[priority] += 1
+        conflict_type_counts[conflict_type] += 1
 
     frozen = [record for record in records if not record["model_action_required"]]
     conflicts = [record for record in records if record["model_action_required"]]
+    local_adjudicated = [record for record in records if record.get("status") == "local_adjudicated"]
     summary = {
         "schema": SUMMARY_SCHEMA,
         "package_schema": PACKAGE_SCHEMA,
         "total_items": len(records),
         "frozen_item_count": len(frozen),
         "model_action_required_count": len(conflicts),
+        "local_adjudicated_item_count": len(local_adjudicated),
         "status_counts": dict(status_counts),
         "priority_counts": dict(priority_counts),
+        "conflict_type_counts": dict(conflict_type_counts),
         "model_health": health,
+        "comparison_key_filtering": {
+            "raw_disagreement_item_count": raw_disagreement_items,
+            "normalized_consensus_false_conflict_count": normalized_false_conflicts,
+            "substantive_comparison_conflict_count": substantive_comparison_conflicts,
+            "normalized_false_conflict_ratio": round(
+                normalized_false_conflicts / raw_disagreement_items, 6
+            ) if raw_disagreement_items else 0.0,
+            "benefit_band": (
+                "high" if raw_disagreement_items and normalized_false_conflicts / raw_disagreement_items >= 0.30
+                else "worthwhile" if raw_disagreement_items and normalized_false_conflicts / raw_disagreement_items >= 0.25
+                else "low"
+            ),
+            "rule": "comparison-key equivalent rows are frozen without rewriting authoritative text",
+        },
+        "ce_export_filter": {
+            "enabled": export_options["ce_auto_freeze"],
+            "threshold": export_options["ce_auto_freeze_threshold"],
+            "frozen_item_count": ce_opt_in_frozen_items,
+            "default": "disabled",
+            "safety": "never rewrites text; structural punctuation/sensitive/missing-candidate rows excluded",
+        },
         "frozen_item_ids_sha256": _sha256_text("\n".join(record["item_id"] for record in frozen)),
         "editable_item_ids_sha256": _sha256_text("\n".join(record["item_id"] for record in conflicts)),
         "classification_policy": {
@@ -400,6 +636,9 @@ def build_disagreement_records(package: dict) -> tuple[list[dict], dict]:
             "book_local_reliability_gate": "exclude when at least 30 independent anchors and anchor accuracy below 0.55",
             "correlated_family_vote": "second recognizer from the same OCR family contributes only 0.35 vote",
             "sensitive_two_model_agreement": "requires independent verification before freezing",
+            "normalized_consensus_export_filter": "all usable raw candidates may differ, but identical comparison keys freeze the existing row text and skip cloud export",
+            "consensus_entropy": "diagnostic/routing by default; optional ce_auto_freeze is explicit, conservative, and never rewrites OCR text",
+            "ordinary_multi_model_conflict": "remains whole-sentence until explicit external-Paddle local adjudication",
         },
     }
     return records, summary
@@ -515,10 +754,13 @@ def _instructions() -> str:
     ## 工作顺序
 
     1. 阅读 `02_consensus_summary.json`，确认模型健康状态。
-    2. 逐条查看 `03_conflict_items.jsonl` 的原始候选、标准日文副本、前后文和可用裁切图。
-    3. 创建 `decisions.json`，schema 必须是 `{DECISIONS_SCHEMA}`。
-    4. 每个冲突 ID 恰好给出一次决定；不得返回冻结 ID。
-    5. 运行：
+    2. `04_all_items_index.jsonl` 中标记为 `local_adjudicated` 的条目已经通过本地裁决并冻结，禁止重新裁决；它们不会出现在 `03_conflict_items.jsonl`。
+    3. 逐条查看 `03_conflict_items.jsonl` 的原始候选、标准日文副本、`conflict_type`、Consensus Entropy、结构化前后文和可用裁切图。
+    4. `consensus_entropy` 只表示模型彼此接近程度，不证明多数一定正确；不得仅凭低熵覆盖图像证据。
+    5. `structural_punctuation_only` / `punctuation_or_whitespace_only` 条目优先保留本地原始标点风格；引号、括号、省略号、中点、横线等结构标点只有图像明确支持时才改。
+    6. 创建 `decisions.json`，schema 必须是 `{DECISIONS_SCHEMA}`。
+    7. 每个冲突 ID 恰好给出一次决定；不得返回冻结 ID。
+    8. 运行：
 
        `python3 tools/apply_decisions.py --package . --decisions decisions.json --output 最终出版版.epub --audit final_audit.json`
 
@@ -556,6 +798,78 @@ def _instructions() -> str:
     """)
 
 
+def _html_diff_against(reference: str, candidate: str) -> str:
+    """Highlight candidate-side differences for human review only."""
+    ref = str(reference or "")
+    cand = str(candidate or "")
+    chunks: list[str] = []
+    matcher = SequenceMatcher(None, ref, cand, autojunk=False)
+    for tag, i1, i2, j1, j2 in matcher.get_opcodes():
+        if tag == "equal":
+            chunks.append(html.escape(cand[j1:j2]))
+        elif tag in {"insert", "replace"}:
+            chunks.append('<mark class="diff">' + html.escape(cand[j1:j2]) + '</mark>')
+            if tag == "replace" and i1 != i2:
+                chunks.append('<span class="from" title="基准字符">←' + html.escape(ref[i1:i2]) + '</span>')
+        elif tag == "delete":
+            chunks.append('<span class="missing">⟦缺:' + html.escape(ref[i1:i2]) + '⟧</span>')
+    return "".join(chunks)
+
+
+def _disagreement_html_report(records: Sequence[dict], summary: dict) -> str:
+    """Return a self-contained human review report; JSON remains authoritative."""
+    def esc(value) -> str:
+        return html.escape(str(value or ""), quote=True)
+
+    blocks: list[str] = []
+    for record in records:
+        if not record.get("model_action_required"):
+            continue
+        candidate_rows = []
+        reference = str(record.get("provisional_text", "") or "")
+        for candidate in record.get("candidates") or []:
+            if not isinstance(candidate, dict):
+                continue
+            raw_text = str(candidate.get("raw_text", "") or "")
+            highlighted = _html_diff_against(reference, raw_text)
+            candidate_rows.append(
+                "<tr><th>" + esc(candidate.get("model")) + "</th><td><pre>" +
+                highlighted + "</pre></td></tr>"
+            )
+        ce = record.get("consensus_entropy") or {}
+        context = record.get("context_window") or []
+        context_html = "".join(
+            f"<li><b>{esc(item.get('relative'))}</b> · p{esc(item.get('page'))} · {esc(item.get('text'))}</li>"
+            for item in context if isinstance(item, dict)
+        )
+        blocks.append(f"""
+<section class="item">
+  <h2>{esc(record.get('item_id'))}</h2>
+  <div class="meta">
+    <span>{esc(record.get('conflict_type'))}</span>
+    <span>priority={esc(record.get('review_priority'))}</span>
+    <span>CE={esc(ce.get('difficulty'))} / mean {esc(ce.get('mean'))}</span>
+  </div>
+  <table>{''.join(candidate_rows)}</table>
+  <h3>上下文</h3><ul>{context_html}</ul>
+  <p><b>图像证据：</b>{esc(', '.join(record.get('evidence_paths') or []))}</p>
+</section>""")
+    return f"""<!doctype html>
+<html lang="zh-CN"><head><meta charset="utf-8"><title>Novel Formatter V4 OCR 分歧报告</title>
+<style>
+body{{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;max-width:1180px;margin:32px auto;padding:0 24px;line-height:1.55;color:#1d1d1f}}
+header{{position:sticky;top:0;background:#fffffff2;backdrop-filter:blur(16px);padding:12px 0;border-bottom:1px solid #ddd}}
+.item{{border:1px solid #ddd;border-radius:14px;padding:18px;margin:20px 0}} .meta{{display:flex;gap:12px;flex-wrap:wrap;color:#555}}
+table{{width:100%;border-collapse:collapse;margin-top:12px}} th,td{{border-top:1px solid #eee;text-align:left;vertical-align:top;padding:10px}} th{{width:180px}}
+pre{{white-space:pre-wrap;word-break:break-word;margin:0;font-family:ui-monospace,monospace}} li{{margin:4px 0}}
+mark.diff{{background:#fff2a8;border-radius:3px;padding:0 1px}} .missing{{background:#ffd9de;color:#9b1c31;border-radius:3px;padding:0 2px}} .from{{color:#7a7a7a;font-size:.85em;margin-left:2px}}
+</style></head><body>
+<header><b>Novel Formatter V4 OCR 分歧报告</b> · 待处理 {int(summary.get('model_action_required_count',0) or 0)} / 总计 {int(summary.get('total_items',0) or 0)}</header>
+<p>本 HTML 仅用于人工浏览。权威输入仍是 <code>03_conflict_items.jsonl</code>；Consensus Entropy 只表示模型间一致程度，不证明正确性。</p>
+{''.join(blocks)}
+</body></html>"""
+
+
 def _standalone_apply_tool() -> str:
     # Kept self-contained so a model/runtime does not need Novel Formatter.
     return r'''#!/usr/bin/env python3
@@ -563,6 +877,9 @@ from __future__ import annotations
 import argparse, copy, hashlib, json, re, zipfile
 from pathlib import Path
 import xml.etree.ElementTree as ET
+
+XHTML_NS = "http://www.w3.org/1999/xhtml"
+ET.register_namespace("", XHTML_NS)
 
 DECISIONS_SCHEMA = "novel_formatter.ai_disagreement_decisions.v1"
 AI_PREFIXES = ("META-INF/ai-repair/", "META-INF/ai-publication/")
@@ -576,19 +893,71 @@ def local(tag):
 def text_sha(value):
     return hashlib.sha256(str(value or "").encode("utf-8")).hexdigest()
 
+def _ruby_base_text(node):
+    parts=[node.text or ""]
+    for child in list(node):
+        tag=local(child.tag)
+        if tag not in {"rt","rp"}:
+            parts.append(_ruby_base_text(child))
+        if child.tail:
+            parts.append(child.tail)
+    return "".join(parts)
+
+def _append_text(parent, value, last):
+    value=str(value or "")
+    if not value:
+        return last
+    parts=value.split("\n")
+    for idx, part in enumerate(parts):
+        if idx:
+            br=ET.SubElement(parent, "{http://www.w3.org/1999/xhtml}br")
+            br.tail=part
+            last=br
+        elif part:
+            if last is None:
+                parent.text=(parent.text or "")+part
+            else:
+                last.tail=(last.tail or "")+part
+    return last
+
 def set_text(element, value):
     for child in list(element):
         element.remove(child)
     element.text = None
-    parts = str(value or "").split("\n")
-    cursor = element
-    for i, part in enumerate(parts):
-        if i:
-            br = ET.SubElement(element, "{http://www.w3.org/1999/xhtml}br")
-            br.tail = part
-            cursor = br
-        elif part:
-            element.text = part
+    _append_text(element, value, None)
+
+def set_text_preserving_ruby(element, value):
+    """Replace plain text while retaining existing Ruby markup when bases survive."""
+    rubies=[]
+    for node in list(element.iter()):
+        if local(node.tag).lower()=="ruby":
+            base=_ruby_base_text(node)
+            if base:
+                rubies.append((copy.deepcopy(node), base))
+    if not rubies:
+        set_text(element, value)
+        return
+    selected=str(value or "")
+    cursor=0
+    placements=[]
+    for ruby_node, base in rubies:
+        pos=selected.find(base, cursor)
+        if pos < 0:
+            set_text(element, selected)
+            return
+        placements.append((pos, pos+len(base), ruby_node))
+        cursor=pos+len(base)
+    for child in list(element):
+        element.remove(child)
+    element.text=None
+    last=None
+    cursor=0
+    for start,end,ruby_node in placements:
+        last=_append_text(element, selected[cursor:start], last)
+        element.append(ruby_node)
+        last=ruby_node
+        cursor=end
+    _append_text(element, selected[cursor:], last)
 
 def main():
     ap = argparse.ArgumentParser()
@@ -645,7 +1014,7 @@ def main():
                         found.add(item_id)
                         if item_id in by_id:
                             selected = str(by_id[item_id]["selected_text"])
-                            set_text(elem, selected); changed.append({"item_id":item_id,"text_sha256":text_sha(selected)}); touched = True
+                            set_text_preserving_ruby(elem, selected); changed.append({"item_id":item_id,"text_sha256":text_sha(selected)}); touched = True
                         for key in list(elem.attrib):
                             if local(key) in {"data-item-id","data-row-id","data-block-id","data-delete-intentionally"}:
                                 del elem.attrib[key]; touched = True
@@ -672,6 +1041,9 @@ from __future__ import annotations
 import argparse, json, zipfile
 from pathlib import Path
 import xml.etree.ElementTree as ET
+
+XHTML_NS = "http://www.w3.org/1999/xhtml"
+ET.register_namespace("", XHTML_NS)
 
 def main():
     ap=argparse.ArgumentParser(); ap.add_argument("--package",default="."); ap.add_argument("--epub",required=True); ap.add_argument("--audit",required=True); args=ap.parse_args()
@@ -746,11 +1118,31 @@ def export_ai_disagreement_package_v4(
     try:
         skeleton_package = copy.deepcopy(package)
         by_id = {record["item_id"]: record for record in records}
+        ruby_overlay = skeleton_package.get("ruby_overlay") if isinstance(skeleton_package.get("ruby_overlay"), dict) else {}
+        ruby_by_column: dict[str, list[dict]] = {}
+        for ruby_block in ruby_overlay.get("blocks") or []:
+            if not isinstance(ruby_block, dict):
+                continue
+            anns = ((ruby_block.get("metadata") or {}).get("ruby_annotations") or [])
+            if not anns:
+                continue
+            for column_id in ruby_block.get("column_ids") or []:
+                ruby_by_column.setdefault(str(column_id), []).extend(copy.deepcopy(anns))
         for index, item in enumerate(skeleton_package.get("editable_items") or []):
             record = by_id.get(_item_id(item, index))
             if record:
                 item["edited_text"] = record["provisional_text"]
                 item["original_fused_text"] = str(item.get("original_fused_text", item["edited_text"]) or item["edited_text"])
+            # Carry immutable Ruby metadata onto the skeleton item so the
+            # repair map marks affected rows as inline-token safe for round-trip
+            # validation. Ruby itself remains outside OCR voting/adjudication.
+            annotations: list[dict] = []
+            for column_id in item.get("column_ids") or []:
+                for ann in ruby_by_column.get(str(column_id), []):
+                    if ann not in annotations:
+                        annotations.append(copy.deepcopy(ann))
+            if annotations:
+                item["ruby_locked_annotations"] = annotations
         skeleton_path = folder / "framework" / "structure_skeleton.epub"
         # Reuse the mature V3 structure builder (chapter recovery, independent
         # illustration pages, NAV/spine and resource-byte preservation), then
@@ -758,37 +1150,56 @@ def export_ai_disagreement_package_v4(
         # adjudication contract, not the proven EPUB structure pipeline.
         structure_temp = folder / ".structure_build"
         structure_temp.mkdir()
+        has_ruby_overlay = bool(
+            isinstance(skeleton_package.get("ruby_overlay"), dict)
+            and (skeleton_package.get("ruby_overlay") or {}).get("blocks")
+        )
         try:
-            from engine.ai_publication_bundle_v2 import export_ai_publication_bundle_v2
-            structure_report = export_ai_publication_bundle_v2(
-                primary_doc,
-                skeleton_package,
-                structure_temp,
-                mode="one_pass",
-                vertical=vertical,
-                css_template=css_template,
-                custom_css=custom_css,
-                bundle_name="V4结构骨架临时构建",
-                create_zip=False,
-                include_publication_reference=False,
-                publication_reference_path=None,
-                package_mode="compact",
-            )
-            source_framework = Path(str(structure_report.get("primary_framework_epub") or structure_report.get("framework_epub") or ""))
-            if not source_framework.is_file():
-                raise repair.AIRepairEpubError("V3 结构构建器没有生成框架 EPUB。")
-            shutil.copy2(source_framework, skeleton_path)
-            skeleton_report = {
-                "path": str(skeleton_path),
-                "editable_count": int(structure_report.get("editable_count", len(records)) or len(records)),
-                "chapter_count": int(structure_report.get("chapter_count", 0) or 0),
-                "image_count": int(structure_report.get("publication_resource_count", 0) or 0),
-                "structure_builder": "v3_mature_framework_pipeline",
-                "standalone_image_xhtml_count": int(structure_report.get("standalone_image_xhtml_count", 0) or 0),
-            }
+            # The mature V3 publication builder does not consume the V4 Ruby
+            # side-channel.  When Ruby is present, build the row-addressable
+            # skeleton through the repair EPUB path so Ruby is applied before
+            # the skeleton is handed to the external model.  Without Ruby, keep
+            # using the mature V3 structure builder.
+            if has_ruby_overlay:
+                skeleton_report = repair.export_ai_repair_epub(
+                    primary_doc, skeleton_package, skeleton_path,
+                    mode="one_pass", vertical=vertical, css_template=css_template,
+                    custom_css=custom_css, workflow="exchange",
+                )
+                skeleton_report["structure_builder"] = "direct_repair_epub_ruby_preserving"
+            else:
+                from engine.ai_publication_bundle_v2 import export_ai_publication_bundle_v2
+                structure_report = export_ai_publication_bundle_v2(
+                    primary_doc,
+                    skeleton_package,
+                    structure_temp,
+                    mode="one_pass",
+                    vertical=vertical,
+                    css_template=css_template,
+                    custom_css=custom_css,
+                    bundle_name="V4结构骨架临时构建",
+                    create_zip=False,
+                    include_publication_reference=False,
+                    publication_reference_path=None,
+                    package_mode="compact",
+                )
+                source_framework = Path(str(structure_report.get("primary_framework_epub") or structure_report.get("framework_epub") or ""))
+                if not source_framework.is_file():
+                    raise repair.AIRepairEpubError("V3 结构构建器没有生成框架 EPUB。")
+                shutil.copy2(source_framework, skeleton_path)
+                skeleton_report = {
+                    "path": str(skeleton_path),
+                    "editable_count": int(structure_report.get("editable_count", len(records)) or len(records)),
+                    "chapter_count": int(structure_report.get("chapter_count", 0) or 0),
+                    "image_count": int(structure_report.get("publication_resource_count", 0) or 0),
+                    "structure_builder": "v3_mature_framework_pipeline",
+                    "standalone_image_xhtml_count": int(structure_report.get("standalone_image_xhtml_count", 0) or 0),
+                }
         except Exception:
             # A narrow fallback keeps V4 export available for minimal or legacy
             # documents that cannot satisfy the richer V3 publication preflight.
+            # This path also preserves Ruby when the primary structure builder
+            # happens to fail after the side-channel check.
             skeleton_report = repair.export_ai_repair_epub(
                 primary_doc, skeleton_package, skeleton_path,
                 mode="one_pass", vertical=vertical, css_template=css_template,
@@ -837,6 +1248,9 @@ def export_ai_disagreement_package_v4(
         _write_jsonl(folder / "03_conflict_items.jsonl", conflicts)
         _write_jsonl(folder / "04_all_items_index.jsonl", records)
         (folder / "05_terms.json").write_bytes(_json_bytes(_terms_payload(records)))
+        (folder / "06_disagreement_report.html").write_text(
+            _disagreement_html_report(records, summary), encoding="utf-8"
+        )
         (folder / "source" / "full_multi_model_ocr.json").write_bytes(_json_bytes(source_payload, pretty=False))
         (folder / "evidence" / "omissions.json").parent.mkdir(exist_ok=True)
         (folder / "evidence" / "omissions.json").write_bytes(_json_bytes(crop_omissions))
@@ -865,6 +1279,7 @@ def export_ai_disagreement_package_v4(
                 "conflicts": "03_conflict_items.jsonl",
                 "all_items": "04_all_items_index.jsonl",
                 "terms": "05_terms.json",
+                "human_report": "06_disagreement_report.html",
                 "source_multi_model_ocr": "source/full_multi_model_ocr.json",
                 "skeleton_epub": "framework/structure_skeleton.epub",
                 "decision_template": "decisions.template.json",
@@ -874,6 +1289,7 @@ def export_ai_disagreement_package_v4(
             "counts": {
                 "total_items": len(records),
                 "frozen_items": summary["frozen_item_count"],
+                "local_adjudicated_items": summary.get("local_adjudicated_item_count", 0),
                 "model_action_required": summary["model_action_required_count"],
                 "conflict_crops": len(crop_paths),
             },
@@ -924,6 +1340,7 @@ def export_ai_disagreement_package_v4(
             "locked_consensus_count": summary["frozen_item_count"],
             "review_required_count": summary["model_action_required_count"],
             "model_action_required_count": summary["model_action_required_count"],
+            "local_adjudicated_item_count": summary.get("local_adjudicated_item_count", 0),
             "exact_consensus_count": summary["status_counts"].get("exact_consensus", 0),
             "normalized_consensus_count": summary["status_counts"].get("normalized_consensus", 0),
             "majority_consensus_count": summary["status_counts"].get("majority_consensus", 0),

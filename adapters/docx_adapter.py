@@ -126,6 +126,80 @@ def _convert_doc_to_docx(doc_path: str) -> str:
     return out_path
 
 
+
+def _docx_run_is_hidden(run_element) -> bool:
+    """Return True for compatibility fallback runs hidden with w:vanish."""
+    from docx.oxml.ns import qn
+    rpr = run_element.find(qn("w:rPr"))
+    return rpr is not None and rpr.find(qn("w:vanish")) is not None
+
+
+def _texts_below(element, *, skip_rt: bool = False) -> str:
+    from docx.oxml.ns import qn
+    result: list[str] = []
+    for node in element.iter(qn("w:t")):
+        parent = node.getparent()
+        excluded = False
+        while parent is not None and parent is not element:
+            if skip_rt and parent.tag == qn("w:rt"):
+                excluded = True
+                break
+            parent = parent.getparent()
+        if not excluded:
+            result.append(node.text or "")
+    return "".join(result)
+
+
+def _paragraph_text_with_ruby(para) -> tuple[str, str, int]:
+    """Read Word paragraph order while preserving native ``w:ruby`` structure.
+
+    Returns ``(plain_text, aozora_text, ruby_count)``. Hidden fallback runs
+    emitted by our exporter are ignored because the native Ruby node is the
+    authoritative representation.
+    """
+    from docx.oxml.ns import qn
+
+    plain: list[str] = []
+    marked: list[str] = []
+    ruby_count = 0
+
+    def visit(element) -> None:
+        nonlocal ruby_count
+        for child in element:
+            if child.tag == qn("w:ruby"):
+                ruby_base = child.find(qn("w:rubyBase"))
+                reading = child.find(qn("w:rt"))
+                base_text = _texts_below(ruby_base) if ruby_base is not None else ""
+                reading_text = _texts_below(reading) if reading is not None else ""
+                if base_text:
+                    plain.append(base_text)
+                    if reading_text:
+                        marked.append(f"｜{base_text}《{reading_text}》")
+                        ruby_count += 1
+                    else:
+                        marked.append(base_text)
+                continue
+            if child.tag == qn("w:r"):
+                if _docx_run_is_hidden(child):
+                    continue
+                text = _texts_below(child, skip_rt=True)
+                if text:
+                    plain.append(text)
+                    marked.append(text)
+                # Preserve tabs and explicit line breaks which have no w:t.
+                for descendant in child:
+                    if descendant.tag == qn("w:tab"):
+                        plain.append("\t"); marked.append("\t")
+                    elif descendant.tag == qn("w:br") and descendant.get(qn("w:type")) != "page":
+                        plain.append("\n"); marked.append("\n")
+                continue
+            # Hyperlinks/smart-tags may contain ordinary runs or Ruby nodes.
+            visit(child)
+
+    visit(para._p)
+    return "".join(plain), "".join(marked), ruby_count
+
+
 def import_docx(docx_path: str, verbose: bool = True) -> UnifiedDocument:
     """
     导入 DOCX 文件，转换为 UnifiedDocument。
@@ -180,9 +254,12 @@ def import_docx(docx_path: str, verbose: bool = True) -> UnifiedDocument:
 
     order = 0
     chapter_index = 0
+    imported_ruby_count = 0
 
     for para in docx_doc.paragraphs:
-        text = para.text.strip()
+        text, ruby_source, ruby_count = _paragraph_text_with_ruby(para)
+        text = text.strip()
+        ruby_source = ruby_source.strip()
         if not text:
             continue
 
@@ -198,6 +275,10 @@ def import_docx(docx_path: str, verbose: bool = True) -> UnifiedDocument:
             reading_order=order,
             confidence=0.90,
         )
+        if ruby_count and ruby_source:
+            block.metadata["ruby_aozora"] = ruby_source
+            block.metadata["ruby_source"] = "docx_native"
+            imported_ruby_count += ruby_count
 
         if btype == BlockType.CHAPTER:
             chapter_index += 1
@@ -211,6 +292,14 @@ def import_docx(docx_path: str, verbose: bool = True) -> UnifiedDocument:
 
         doc.blocks.append(block)
         order += 1
+
+    if imported_ruby_count:
+        doc.metadata.ruby_preservation_enabled = True
+        doc.metadata.ruby_preservation_report = {
+            "source": "docx_native",
+            "matched_pairs": imported_ruby_count,
+            "unmatched_pairs": 0,
+        }
 
     # 处理图片引用
     for rid, img_path in image_map.items():

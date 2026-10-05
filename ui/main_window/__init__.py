@@ -1,0 +1,1 @@
+"""Main-window coordination helpers."""

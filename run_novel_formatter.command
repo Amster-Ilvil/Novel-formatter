@@ -2,6 +2,7 @@
 set -u
 
 cd "$(dirname "$0")"
+export PYTHONPATH="$PWD${PYTHONPATH:+:$PYTHONPATH}"
 
 APP_NAME="Novel Formatter Studio"
 PYTHON_BIN=""

@@ -9,12 +9,16 @@ from __future__ import annotations
 
 from .base import AIProvider
 from .config import validate_api_key
+from .glm_compat import is_glm53_flash, looks_always_thinking_error
 import itertools
 import logging
 import threading
 
 
 class OpenAIProvider(AIProvider):
+    @staticmethod
+    def _looks_always_thinking_error(exc: Exception) -> bool:
+        return looks_always_thinking_error(exc)
 
     @property
     def name(self) -> str:
@@ -70,6 +74,17 @@ class OpenAIProvider(AIProvider):
             temperature=temperature,
             max_tokens=int(self.kwargs.get("max_tokens", 32000)),
         )
+        provider_name = str(self.kwargs.get("provider_name", "") or "").lower()
+        if is_glm53_flash(provider_name, self.model):
+            # GLM-5.3 Flash is always-thinking.  Map the legacy checkbox to a
+            # reasoning depth rather than trying to disable thinking:
+            # unchecked = low (fast book OCR), checked = high.
+            deep_thinking = bool(self.kwargs.get("glm_thinking", False))
+            params["temperature"] = 1.0
+            params["extra_body"] = {
+                "thinking": {"type": "enabled"},
+                "reasoning_effort": "high" if deep_thinking else "low",
+            }
         if self.kwargs.get("top_p") is not None:
             params["top_p"] = float(self.kwargs.get("top_p"))
         if json_mode and self._json_mode_supported:
@@ -79,15 +94,23 @@ class OpenAIProvider(AIProvider):
         except Exception as exc:
             message = str(exc).lower()
             status = getattr(exc, "status_code", None)
-            unsupported_json = status in (400, 404, 422) and any(
-                marker in message for marker in ("response_format", "json mode", "json_object", "unsupported parameter")
-            )
-            if json_mode and "response_format" in params and unsupported_json:
-                self._json_mode_supported = False
-                params.pop("response_format", None)
-                response = client.chat.completions.create(**params)
+            if is_glm53_flash(provider_name, self.model) and self._looks_always_thinking_error(exc):
+                effort = "high" if bool(self.kwargs.get("glm_thinking", False)) else "low"
+                raise RuntimeError(
+                    "GLM-5.3 Flash 本身无法关闭思考。Novel Formatter 已发送 "
+                    f"thinking=enabled + reasoning_effort={effort}，但服务端仍拒绝请求。"
+                    "请确认 Base URL / 模型 ID / 网关实现。原始错误：" + str(exc)
+                ) from exc
             else:
-                raise
+                unsupported_json = status in (400, 404, 422) and any(
+                    marker in message for marker in ("response_format", "json mode", "json_object", "unsupported parameter")
+                )
+                if json_mode and "response_format" in params and unsupported_json:
+                    self._json_mode_supported = False
+                    params.pop("response_format", None)
+                    response = client.chat.completions.create(**params)
+                else:
+                    raise
         usage = getattr(response, "usage", None)
         prompt_details = getattr(usage, "prompt_tokens_details", None) if usage else None
         completion_details = getattr(usage, "completion_tokens_details", None) if usage else None

@@ -11,7 +11,8 @@ from __future__ import annotations
 import logging
 from collections.abc import Callable
 
-from PySide6.QtWidgets import QHBoxLayout, QMessageBox, QPushButton, QWidget
+from PySide6.QtWidgets import QHBoxLayout, QPushButton, QWidget
+from ui.localized_dialogs import LocalizedMessageBox as QMessageBox, ui_message
 
 logger = logging.getLogger(__name__)
 
@@ -115,39 +116,53 @@ class ClearManager:
         raise AttributeError("EPUBTab 缺少 clear_doc()")
 
 
-def attach_workspace_clear_button(
+def create_workspace_clear_button(
     tab: QWidget,
     label: str,
     callback: Callable[[QWidget], None],
+    *,
+    target_layout=None,
+    target_index: int | None = None,
+    target_height: int | None = None,
 ) -> QPushButton:
-    """Append one unobtrusive reset button below a workspace card."""
+    """Create one reset button, optionally placing it in an existing action row."""
     existing = tab.findChild(QPushButton, "novelFormatterWorkspaceClear")
     if existing is not None:
         return existing
 
-    layout = tab.layout()
-    if layout is None or not hasattr(layout, "addLayout"):
-        raise RuntimeError(f"无法为 {type(tab).__name__} 添加清空按钮：缺少顶层布局")
-
-    row = QHBoxLayout()
-    row.setContentsMargins(10, 0, 10, 8)
-    row.addStretch(1)
+    if target_layout is None:
+        layout = tab.layout()
+        if layout is None or not hasattr(layout, "addLayout"):
+            raise RuntimeError(f"无法为 {type(tab).__name__} 添加清空按钮：缺少顶层布局")
     button = QPushButton(f"清空{label}")
     button.setObjectName("novelFormatterWorkspaceClear")
     button.setProperty("variant", "danger")
     button.setToolTip(f"清除当前{label}工作区，不影响磁盘上的原始文件")
+    if target_layout is None:
+        button_style = (
+            "QPushButton { background:#FFF0EF; color:#C4322B; border:1px solid #E9B7B3;"
+            "border-radius:8px; padding:6px 12px; min-height:28px; font-weight:600; }"
+        )
+    else:
+        # Inline actions use the compact shared action style.  A caller may
+        # provide an exact row height; in that case avoid a QSS max-height
+        # rule that would override QWidget.setFixedHeight during repolish.
+        height_rule = "" if target_height is not None else " min-height:18px; max-height:18px;"
+        button_style = (
+            "QPushButton { background:#FFF0EF; color:#C4322B; border:1px solid #E9B7B3;"
+            f"border-radius:7px; padding:6px 12px;{height_rule} font-weight:500; }}"
+        )
     button.setStyleSheet(
-        "QPushButton { background:#FFF0EF; color:#C4322B; border:1px solid #E9B7B3;"
-        "border-radius:8px; padding:6px 12px; min-height:28px; font-weight:600; }"
-        "QPushButton:hover { background:#FFF1F0; border-color:#D96C65; }"
-        "QPushButton:pressed { background:#FFE4E0; }"
+        button_style
+        + "QPushButton:hover { background:#FFF1F0; border-color:#D96C65; }"
+        + "QPushButton:pressed { background:#FFE4E0; }"
     )
 
     def run_reset() -> None:
         answer = QMessageBox.question(
             tab,
             "确认清空",
-            f"确定清空当前{label}工作区？\n\n磁盘上的原始文件不会被删除。",
+            ui_message("clear.workspace.confirm", name=label),
             QMessageBox.Yes | QMessageBox.No,
             QMessageBox.No,
         )
@@ -157,9 +172,34 @@ def attach_workspace_clear_button(
             callback(tab)
         except Exception:
             logger.exception("Failed to clear %s workspace", label)
-            QMessageBox.critical(tab, "清空失败", f"{label}工作区未能完全清空，请查看终端日志。")
+            QMessageBox.critical(
+                tab, "清空失败", ui_message("clear.workspace.failed", name=label)
+            )
 
     button.clicked.connect(run_reset)
-    row.addWidget(button)
-    layout.addLayout(row)
+    if target_layout is None:
+        row = QHBoxLayout()
+        row.setContentsMargins(10, 0, 10, 8)
+        row.addStretch(1)
+        row.addWidget(button)
+        layout.addLayout(row)
+    else:
+        if not hasattr(target_layout, "addWidget"):
+            raise RuntimeError(f"无法为 {type(tab).__name__} 添加清空按钮：目标布局无效")
+        if target_index is None:
+            target_layout.addWidget(button)
+        else:
+            index = max(0, min(int(target_index), target_layout.count()))
+            target_layout.insertWidget(index, button)
+    if target_height is not None:
+        button.setFixedHeight(max(1, int(target_height)))
     return button
+
+
+def attach_workspace_clear_button(
+    tab: QWidget,
+    label: str,
+    callback: Callable[[QWidget], None],
+) -> QPushButton:
+    """Append one unobtrusive reset button below a workspace card."""
+    return create_workspace_clear_button(tab, label, callback)

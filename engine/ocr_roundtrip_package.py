@@ -30,8 +30,9 @@ from pathlib import Path
 from typing import Iterable, Sequence
 
 from models.document import Block, BlockType, UnifiedDocument
+from core.multi_ocr_roles import MULTI_OCR_ROLE_SCHEMA, SUPPORTED_MULTI_OCR_ROLE_SCHEMAS
 
-SCHEMA = "novel_formatter.ocr_roundtrip.v1"
+SCHEMA = "novel_formatter.ocr_roundtrip.v2"
 MODE_SINGLE = "single_ocr"
 MODE_MULTI = "multi_model_fusion"
 _TEXT_TYPES = {
@@ -121,7 +122,14 @@ def _bbox_dict(block: Block | None):
 
 
 def _column_geometry_snapshot(doc: UnifiedDocument) -> dict[str, dict]:
-    """Return deterministic per-column geometry for independent order checks."""
+    """Return deterministic per-column geometry for independent order checks.
+
+    Column OCR deliberately keeps the sentence/column :class:`Block` free of a
+    synthetic ``bbox`` and stores the authoritative source geometry in
+    ``ocr_review_regions`` instead.  The V5 adjudication package needs that
+    geometry to generate evidence crops, so prefer the per-column review region
+    and only fall back to ``Block.bbox`` for older/non-column documents.
+    """
     raw: list[tuple[int, str, dict, str]] = []
     for block in doc.blocks:
         if block.type not in _TEXT_TYPES:
@@ -135,10 +143,32 @@ def _column_geometry_snapshot(doc: UnifiedDocument) -> dict[str, dict]:
         ids = [str(value) for value in values if str(value)]
         if not ids:
             continue
-        bbox = _bbox_dict(block)
-        if bbox is None:
-            continue
+
+        region_by_column: dict[str, dict] = {}
+        regions = metadata.get("ocr_review_regions") or []
+        if isinstance(regions, dict):
+            regions = [regions]
+        if isinstance(regions, (list, tuple)):
+            for region in regions:
+                if not isinstance(region, dict):
+                    continue
+                column_id = str(region.get("column_id", "") or "")
+                bbox_values = region.get("bbox") or []
+                if not column_id or not isinstance(bbox_values, (list, tuple)) or len(bbox_values) < 4:
+                    continue
+                try:
+                    x, y, w, h = (_finite_float(value) for value in bbox_values[:4])
+                except Exception:
+                    continue
+                if w <= 0.0 or h <= 0.0:
+                    continue
+                region_by_column[column_id] = {"x": x, "y": y, "w": w, "h": h}
+
+        fallback_bbox = _bbox_dict(block)
         for column_id in ids:
+            bbox = region_by_column.get(column_id) or fallback_bbox
+            if bbox is None:
+                continue
             raw.append((int(getattr(block, "page", 0) or 0), column_id, bbox, str(getattr(block, "id", "") or "")))
     by_page: dict[int, list[tuple[int, str, dict, str]]] = {}
     for entry in raw:
@@ -450,7 +480,42 @@ def _metadata_list(metadata, key: str) -> list[str]:
     return [str(item) for item in value if str(item)]
 
 
-def _row_payload(row, labels: Sequence[str], row_index: int) -> dict:
+def _document_role_metadata(document, model_index: int, label: str) -> dict:
+    metadata = getattr(document, "metadata", None)
+    raw = getattr(metadata, "__dict__", {}) if metadata is not None else {}
+    if not isinstance(raw, dict):
+        raw = {}
+    role = str(raw.get("multi_ocr_role", "") or "").strip()
+    source_engine = str(
+        raw.get("source_engine", "")
+        or getattr(metadata, "source_engine", "")
+        or ""
+    ).strip()
+    try:
+        from core.multi_ocr_roles import ROLE_LABELS
+        role_label = str(ROLE_LABELS.get(role, role) or role)
+    except Exception:
+        role_label = role
+    granularity = {
+        "column": "column",
+        "page": "page",
+        "sentence": "column",
+        "review1": "column_review",
+        "review2": "column_review",
+        "review3": "column_review",
+    }.get(role, "")
+    return {
+        "model_index": int(model_index),
+        "model_label": str(label or f"模型{model_index + 1}"),
+        "role": role,
+        "role_label": role_label,
+        "source_engine": source_engine,
+        "input_granularity": granularity,
+        "role_schema": int(raw.get("multi_ocr_role_schema", 0) or 0),
+    }
+
+
+def _row_payload(row, labels: Sequence[str], row_index: int, model_meta: Sequence[dict] | None = None) -> dict:
     texts = [str(value or "") for value in list(getattr(row, "texts", []) or [])]
     # Row IDs are structural. Repair/audit fields stay outside this lineage,
     # so rebuilding or repairing alignment never changes stable row IDs.
@@ -478,6 +543,11 @@ def _row_payload(row, labels: Sequence[str], row_index: int) -> dict:
         original_fused = texts[chosen] if 0 <= chosen < len(texts) else next((text for text in texts if text), "")
     candidates = []
     model_confidences = list(getattr(row, "model_confidences", ()) or ())
+    seeded_models = {
+        int(value) for value in (getattr(row, "consensus_seeded_models", ()) or ())
+        if isinstance(value, (int, float)) or str(value).isdigit()
+    }
+    model_meta = list(model_meta or [])
     for model_index, text in enumerate(texts):
         confidence = 0.0
         if model_index < len(model_confidences):
@@ -485,12 +555,20 @@ def _row_payload(row, labels: Sequence[str], row_index: int) -> dict:
                 confidence = float(model_confidences[model_index] or 0.0)
             except (TypeError, ValueError, OverflowError):
                 confidence = 0.0
+        meta = model_meta[model_index] if model_index < len(model_meta) and isinstance(model_meta[model_index], dict) else {}
+        seeded_reuse = model_index in seeded_models
         candidates.append({
             "model_index": model_index,
             "model_label": labels[model_index] if model_index < len(labels) else f"模型{model_index + 1}",
+            "model_role": str(meta.get("role", "") or ""),
+            "model_role_label": str(meta.get("role_label", "") or ""),
+            "source_engine": str(meta.get("source_engine", "") or ""),
+            "input_granularity": str(meta.get("input_granularity", "") or ""),
             "text": text,
             "confidence": confidence,
             "text_sha256": _sha256(text.encode("utf-8")),
+            "seeded_reuse": seeded_reuse,
+            "independently_executed": not seeded_reuse,
         })
     return {
         "row_id": row_id,
@@ -519,6 +597,14 @@ def _row_payload(row, labels: Sequence[str], row_index: int) -> dict:
         "character_fusion_auto_selected": bool(getattr(row, "character_fusion_auto_selected", False)),
         "local_reocr_recommended": bool(getattr(row, "local_reocr_recommended", False)),
         "character_fusion_evidence": copy.deepcopy(getattr(row, "character_fusion_evidence", {}) or {}),
+        "consensus_entropy_scores": [float(value) for value in (getattr(row, "consensus_entropy_scores", ()) or ())],
+        "consensus_entropy_best_index": int(getattr(row, "consensus_entropy_best_index", -1)),
+        "consensus_entropy_min": float(getattr(row, "consensus_entropy_min", 1.0) or 0.0),
+        "consensus_entropy_mean": float(getattr(row, "consensus_entropy_mean", 1.0) or 0.0),
+        "consensus_entropy_max": float(getattr(row, "consensus_entropy_max", 1.0) or 0.0),
+        "consensus_entropy_difficulty": str(getattr(row, "consensus_entropy_difficulty", "insufficient") or "insufficient"),
+        "consensus_entropy_review_required": bool(getattr(row, "consensus_entropy_review_required", True)),
+        "comparison_equivalence_only": bool(getattr(row, "comparison_equivalence_only", False)),
         "candidates": candidates,
         "original_fused_text": original_fused,
         "edited_text": original_fused,
@@ -549,6 +635,8 @@ def _comparison_payload(comparison) -> dict:
         "character_fused_rows": int(getattr(comparison, "character_fused_rows", 0) or 0),
         "character_auto_selected_rows": int(getattr(comparison, "character_auto_selected_rows", 0) or 0),
         "local_reocr_rows": int(getattr(comparison, "local_reocr_rows", 0) or 0),
+        "high_entropy_rows": int(getattr(comparison, "high_entropy_rows", 0) or 0),
+        "unicode_equivalence_rows": int(getattr(comparison, "unicode_equivalence_rows", 0) or 0),
     }
 
 
@@ -569,7 +657,30 @@ def export_multi_package(
     safe_labels = [str(value) for value in list(labels or [])[:len(docs)]]
     while len(safe_labels) < len(docs):
         safe_labels.append(f"模型{len(safe_labels) + 1}")
-    items = [_row_payload(row, safe_labels, index) for index, row in enumerate(rows)]
+    model_role_metadata = [
+        _document_role_metadata(doc, index, safe_labels[index])
+        for index, doc in enumerate(docs)
+    ]
+    allowed_roles = {"column", "page", "sentence", "review1", "review2", "review3"}
+    roles = [str(item.get("role", "") or "") for item in model_role_metadata]
+    if any(int(item.get("role_schema", 0) or 0) not in SUPPORTED_MULTI_OCR_ROLE_SCHEMAS for item in model_role_metadata):
+        supported = "/".join(str(value) for value in sorted(SUPPORTED_MULTI_OCR_ROLE_SCHEMAS))
+        raise RoundtripPackageError(f"当前多模型校对包要求显式 role_schema={supported}；不兼容旧无角色会话。")
+    if any(role not in allowed_roles for role in roles) or len(set(roles)) != len(roles):
+        raise RoundtripPackageError("当前多模型校对包要求唯一且有效的六角色模型槽位。")
+    if any(not str(item.get("source_engine", "") or "") for item in model_role_metadata):
+        raise RoundtripPackageError("当前多模型校对包缺少 source_engine。")
+    if any(not str(item.get("input_granularity", "") or "") for item in model_role_metadata):
+        raise RoundtripPackageError("当前多模型校对包缺少 input_granularity。")
+    items = [_row_payload(row, safe_labels, index, model_role_metadata) for index, row in enumerate(rows)]
+    package["multi_ocr_role_schema"] = max([int(item.get("role_schema", 0) or 0) for item in model_role_metadata] or [0])
+    package["multi_ocr_model_roles"] = copy.deepcopy(model_role_metadata)
+    package["multi_ocr_roles_executed"] = [
+        str(item.get("role", "") or "") for item in model_role_metadata if str(item.get("role", "") or "")
+    ]
+    package["multi_ocr_engines_executed"] = [
+        str(item.get("source_engine", "") or "") for item in model_role_metadata
+    ]
     from engine.multi_ocr_compare import physical_column_text_snapshot
     physical_snapshots: list[tuple[dict[str, str], str]] = [
         physical_column_text_snapshot(doc) for doc in docs
@@ -584,9 +695,14 @@ def export_multi_package(
             fragments = [str(snapshot.get(column_id, "") or "") for column_id in column_ids]
             geometry = [copy.deepcopy(geometry_snapshots[model_index].get(column_id)) for column_id in column_ids]
             geometry = [value for value in geometry if isinstance(value, dict)]
+            meta = model_role_metadata[model_index] if model_index < len(model_role_metadata) else {}
             item["physical_column_candidates"].append({
                 "model_index": model_index,
                 "model_label": label,
+                "model_role": str(meta.get("role", "") or ""),
+                "model_role_label": str(meta.get("role_label", "") or ""),
+                "source_engine": str(meta.get("source_engine", "") or ""),
+                "input_granularity": str(meta.get("input_granularity", "") or ""),
                 "source": source,
                 "column_texts": fragments,
                 "column_text_sha256": _sha256(fragments),
@@ -595,6 +711,21 @@ def export_multi_package(
         item["column_geometry"] = copy.deepcopy(
             [geometry_snapshots[0].get(column_id) for column_id in column_ids if geometry_snapshots and geometry_snapshots[0].get(column_id)]
         )
+        # V5 visual evidence crops consume one row-level bbox.  Preserve the
+        # exact union of the primary model's physical-column review regions so
+        # a sentence spanning one or more columns can always be mapped back to
+        # its source page even when the sentence Block itself has no bbox.
+        geometry_boxes = [
+            value.get("bbox") for value in item["column_geometry"]
+            if isinstance(value, dict) and isinstance(value.get("bbox"), (list, tuple)) and len(value.get("bbox")) >= 4
+        ]
+        if geometry_boxes:
+            left = min(float(box[0]) for box in geometry_boxes)
+            top = min(float(box[1]) for box in geometry_boxes)
+            right = max(float(box[0]) + float(box[2]) for box in geometry_boxes)
+            bottom = max(float(box[1]) + float(box[3]) for box in geometry_boxes)
+            if right > left and bottom > top:
+                item["source_bbox"] = [left, top, right - left, bottom - top]
     if result_lines is None and delete_flags is not None:
         raise RoundtripPackageError("delete_flags 只能与 result_lines 一起导出。")
     if result_lines is not None:
@@ -677,6 +808,8 @@ def _validate_common(
     mode = str(package.get("mode", "") or "")
     if expected_mode and mode != expected_mode:
         raise RoundtripPackageError(f"需要 {expected_mode} 校对包，实际为 {mode or '未知'}。")
+    if mode == MODE_MULTI:
+        _validate_current_multi_contract(package)
     structure = package.get("structure_document")
     if not isinstance(structure, dict):
         raise RoundtripPackageError("校对包缺少 structure_document，无法保留原始版式。")
@@ -699,6 +832,52 @@ def _validate_common(
         _validate_editable_structure(package)
     if validate_immutable_manifest:
         _validate_immutable_manifest(package)
+
+
+def _validate_current_multi_contract(package: dict) -> None:
+    if int(package.get("multi_ocr_role_schema", 0) or 0) not in SUPPORTED_MULTI_OCR_ROLE_SCHEMAS:
+        supported = "/".join(str(value) for value in sorted(SUPPORTED_MULTI_OCR_ROLE_SCHEMAS))
+        raise RoundtripPackageError(f"当前多模型校对包要求显式 multi_ocr_role_schema={supported}；不兼容旧无角色格式。")
+    roles = package.get("multi_ocr_model_roles")
+    if not isinstance(roles, list) or not roles:
+        raise RoundtripPackageError("当前多模型校对包缺少 multi_ocr_model_roles。")
+    allowed = {"column", "page", "sentence", "review1", "review2", "review3"}
+    seen: set[str] = set()
+    for expected_index, meta in enumerate(roles):
+        if not isinstance(meta, dict):
+            raise RoundtripPackageError("multi_ocr_model_roles 中存在非对象条目。")
+        if int(meta.get("model_index", -1)) != expected_index:
+            raise RoundtripPackageError("multi_ocr_model_roles 的 model_index 不连续。")
+        role = str(meta.get("role", "") or "")
+        if role not in allowed or role in seen:
+            raise RoundtripPackageError("当前多模型校对包要求唯一且有效的模型角色。")
+        if int(meta.get("role_schema", 0) or 0) not in SUPPORTED_MULTI_OCR_ROLE_SCHEMAS:
+            supported = "/".join(str(value) for value in sorted(SUPPORTED_MULTI_OCR_ROLE_SCHEMAS))
+            raise RoundtripPackageError(f"当前多模型校对包模型 role_schema 必须为 {supported}。")
+        if not str(meta.get("source_engine", "") or ""):
+            raise RoundtripPackageError("当前多模型校对包模型缺少 source_engine。")
+        if not str(meta.get("input_granularity", "") or ""):
+            raise RoundtripPackageError("当前多模型校对包模型缺少 input_granularity。")
+        seen.add(role)
+    items = package.get("editable_items") or []
+    for item in items:
+        if not isinstance(item, dict):
+            raise RoundtripPackageError("当前多模型校对包存在非对象校对行。")
+        row_id = str(item.get("row_id", "") or "")
+        if not str(item.get("sentence_group_id", "") or ""):
+            raise RoundtripPackageError(f"当前多模型校对包行 {row_id or '<unknown>'} 缺少 sentence_group_id。")
+        candidates = item.get("candidates")
+        if not isinstance(candidates, list) or len(candidates) != len(roles):
+            raise RoundtripPackageError(f"当前多模型校对包行 {row_id or '<unknown>'} 的候选数与角色数不一致。")
+        for expected_index, (candidate, meta) in enumerate(zip(candidates, roles)):
+            if not isinstance(candidate, dict) or int(candidate.get("model_index", -1)) != expected_index:
+                raise RoundtripPackageError(f"当前多模型校对包行 {row_id or '<unknown>'} 的候选模型顺序已改变。")
+            if str(candidate.get("model_role", "") or "") != str(meta.get("role", "") or ""):
+                raise RoundtripPackageError(f"当前多模型校对包行 {row_id or '<unknown>'} 的候选角色不匹配。")
+            if str(candidate.get("source_engine", "") or "") != str(meta.get("source_engine", "") or ""):
+                raise RoundtripPackageError(f"当前多模型校对包行 {row_id or '<unknown>'} 的候选引擎不匹配。")
+            if str(candidate.get("input_granularity", "") or "") != str(meta.get("input_granularity", "") or ""):
+                raise RoundtripPackageError(f"当前多模型校对包行 {row_id or '<unknown>'} 的候选输入粒度不匹配。")
 
 
 def _validate_editable_structure(package: dict) -> None:
@@ -893,8 +1072,8 @@ def import_single_package(package: dict, *, current_document: UnifiedDocument | 
             refresh_preserved_ruby(result)
         else:
             strip_ruby_overlay(result, strip_candidate_geometry=False, strip_logs=False)
-    except Exception:
-        pass
+    except Exception as exc:
+        raise RoundtripPackageError(f"Ruby 侧通道恢复失败：{exc}") from exc
     result.metadata.source_engine = f"{result.metadata.source_engine or 'ocr'}+external_ai_roundtrip"
     result.add_log("external_ai_roundtrip", f"严格导入单 OCR 校对包，共 {len(expected_ids)} 个正文块", len(expected_ids))
     return result
@@ -905,7 +1084,6 @@ def _comparison_from_package(package: dict):
         MultiOcrComparison,
         MultiOcrRow,
         _finalize_comparison,
-        repair_adjacent_alignment_shifts,
     )
 
     comp_data = package.get("comparison") or {}
@@ -960,6 +1138,14 @@ def _comparison_from_package(package: dict):
             character_fusion_auto_selected=bool(item.get("character_fusion_auto_selected", False)),
             local_reocr_recommended=bool(item.get("local_reocr_recommended", False)),
             character_fusion_evidence=copy.deepcopy(item.get("character_fusion_evidence") or {}),
+            consensus_entropy_scores=tuple(float(value) for value in (item.get("consensus_entropy_scores") or [])),
+            consensus_entropy_best_index=int(item.get("consensus_entropy_best_index", -1) if item.get("consensus_entropy_best_index", -1) is not None else -1),
+            consensus_entropy_min=float(item.get("consensus_entropy_min", 1.0) or 0.0),
+            consensus_entropy_mean=float(item.get("consensus_entropy_mean", 1.0) or 0.0),
+            consensus_entropy_max=float(item.get("consensus_entropy_max", 1.0) or 0.0),
+            consensus_entropy_difficulty=str(item.get("consensus_entropy_difficulty", "insufficient") or "insufficient"),
+            consensus_entropy_review_required=bool(item.get("consensus_entropy_review_required", True)),
+            comparison_equivalence_only=bool(item.get("comparison_equivalence_only", False)),
         ))
     comparison = MultiOcrComparison(
         labels=labels,
@@ -984,12 +1170,10 @@ def _comparison_from_package(package: dict):
         character_fused_rows=int(comp_data.get("character_fused_rows", 0) or 0),
         character_auto_selected_rows=int(comp_data.get("character_auto_selected_rows", 0) or 0),
         local_reocr_rows=int(comp_data.get("local_reocr_rows", 0) or 0),
+        high_entropy_rows=int(comp_data.get("high_entropy_rows", 0) or 0),
+        unicode_equivalence_rows=int(comp_data.get("unicode_equivalence_rows", 0) or 0),
     )
-    repairs = repair_adjacent_alignment_shifts(comparison)
-    if repairs:
-        comparison.alignment_revision = 2
-        comparison.physical_column_source = "legacy_package_adjacent_shift_repair"
-        _finalize_comparison(comparison)
+    _finalize_comparison(comparison)
     return comparison
 
 
@@ -1033,10 +1217,9 @@ def import_multi_package(
             item.get("delete_intentionally", False),
             field=f"条目 {row_id} 的 delete_intentionally",
         )
-        # Legacy packages produced before physical-column alignment revision 2
-        # may contain an untouched duplicated sentence caused by a one-row
-        # model shift.  Use the repaired candidate only when the user has not
-        # changed the exported text; explicit external edits always win.
+        # A current session may mark a row alignment_repaired before export.
+        # Preserve that repaired candidate only when the external editor left
+        # the row untouched; explicit external edits always win.
         if row.alignment_repaired and edited == original and not delete_intentionally:
             result_lines.append(str(row.output_text or ""))
         else:
@@ -1053,108 +1236,6 @@ def import_multi_package(
     result.metadata.source_engine = f"{primary.metadata.source_engine or 'ocr'}+external_ai_multi_fusion"
     result.add_log("external_ai_multi_fusion", f"严格导入多模型融合包，共 {len(items)} 句", len(items))
     return result, comparison, result_lines
-
-
-def repair_multi_package_alignment(package: dict) -> tuple[dict, dict]:
-    """Upgrade a legacy multi-model package without changing row/column IDs.
-
-    Only conservative adjacent one-row shifts are repaired.  Candidate texts,
-    hashes, confidence and default fused text are resealed.  A user-modified
-    ``edited_text`` is never replaced; untouched defaults follow the repaired
-    candidate so importing the upgraded package cannot duplicate the shifted
-    sentence.
-    """
-    _validate_common(
-        package, MODE_MULTI,
-        validate_editable_structure=True,
-        validate_immutable_manifest=True,
-    )
-    repaired = copy.deepcopy(package)
-    existing_comparison = repaired.get("comparison") or {}
-    existing_operations = int(existing_comparison.get("alignment_shift_repairs", 0) or 0)
-    comparison = _comparison_from_package(repaired)
-    items = list(repaired.get("editable_items") or [])
-    existing_repaired_flags = [bool(item.get("alignment_repaired", False)) for item in items]
-    if len(items) != len(comparison.rows):
-        raise RoundtripPackageError("比较行数与 editable_items 不一致，无法修复。")
-
-    repaired_rows = 0
-    preserved_manual_edits = 0
-    changed_defaults = 0
-    for item_index, (item, row) in enumerate(zip(items, comparison.rows)):
-        # Audit metadata is refreshed for every row. It does not affect row IDs,
-        # column IDs, structure hashes, or user-edited text.
-        item["alignment_repaired"] = bool(row.alignment_repaired)
-        item["alignment_notes"] = [str(value) for value in (row.alignment_notes or ())]
-        item["alignment_status"] = str(row.alignment_status or "unreviewed")
-        item["sentence_group_id"] = str(row.sentence_group_id or "")
-        item["repair_reason"] = str(row.repair_reason or "")
-        item["character_fused_text"] = str(row.character_fused_text or "")
-        item["character_fusion_confidence"] = float(row.character_fusion_confidence or 0.0)
-        item["character_fusion_reason"] = str(row.character_fusion_reason or "")
-        item["character_fusion_warnings"] = [str(value) for value in (row.character_fusion_warnings or ())]
-        item["character_fusion_auto_selected"] = bool(row.character_fusion_auto_selected)
-        item["local_reocr_recommended"] = bool(row.local_reocr_recommended)
-        item["character_fusion_evidence"] = copy.deepcopy(row.character_fusion_evidence or {})
-        item["recommended_model_index"] = int(row.chosen_index)
-        item["confidence"] = float(row.confidence)
-        item["reason"] = str(row.reason or "")
-        item["warnings"] = [str(value) for value in (row.warnings or ())]
-        if not row.alignment_repaired:
-            continue
-        if not existing_repaired_flags[item_index]:
-            repaired_rows += 1
-        old_original = str(item.get("original_fused_text", "") or "")
-        old_edited = str(item.get("edited_text", "") or "")
-        candidates = item.get("candidates") or []
-        if not isinstance(candidates, list):
-            candidates = []
-            item["candidates"] = candidates
-        while len(candidates) < len(row.texts):
-            model_index = len(candidates)
-            labels = list(comparison.labels or [])
-            candidates.append({
-                "model_index": model_index,
-                "model_label": labels[model_index] if model_index < len(labels) else f"模型{model_index + 1}",
-            })
-        for model_index, text in enumerate(row.texts):
-            candidate = candidates[model_index]
-            if not isinstance(candidate, dict):
-                candidate = {"model_index": model_index}
-                candidates[model_index] = candidate
-            value = str(text or "")
-            candidate["text"] = value
-            candidate["text_sha256"] = _sha256(value.encode("utf-8"))
-        new_original = str(row.output_text or "")
-        item["original_fused_text"] = new_original
-        if old_edited == old_original:
-            item["edited_text"] = new_original
-            if new_original != old_edited:
-                changed_defaults += 1
-        else:
-            preserved_manual_edits += 1
-
-    total_repaired_rows = sum(1 for row in comparison.rows if row.alignment_repaired)
-    total_operations = int(comparison.alignment_shift_repairs)
-    report = {
-        "alignment_revision": 2,
-        "repair_kind": "adjacent_physical_column_shift",
-        "repaired_rows": repaired_rows,
-        "repair_operations": max(0, total_operations - existing_operations),
-        "total_repaired_rows": total_repaired_rows,
-        "total_repair_operations": total_operations,
-        "changed_untouched_defaults": changed_defaults,
-        "preserved_manual_edits": preserved_manual_edits,
-        "remaining_empty_cells": int(comparison.unresolved_empty_cells),
-        "true_empty_rows": int(comparison.true_empty_rows),
-        "single_model_only_rows": int(comparison.single_model_only_rows),
-    }
-    repaired["comparison"] = _comparison_payload(comparison)
-    repaired["alignment_repair_report"] = report
-    repaired["editable_structure_sha256"] = _editable_structure_hash(items)
-    repaired.pop("immutable_manifest_sha256", None)
-    _seal_package(repaired)
-    return repaired, report
 
 
 def package_to_json(package: dict, *, indent: int = 2) -> str:

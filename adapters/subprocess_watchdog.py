@@ -33,6 +33,37 @@ def env_seconds(name: str, default: float, *, minimum: float = 1.0, maximum: flo
     return max(float(minimum), min(float(maximum), value))
 
 
+def workload_timeout(
+    base_seconds: float,
+    *,
+    megapixels: float = 0.0,
+    seconds_per_megapixel: float = 2.0,
+    minimum: float = 30.0,
+    maximum: float = 1800.0,
+) -> float:
+    """Scale a worker watchdog to the current image workload.
+
+    OCR latency grows roughly with pixel count, while a fixed timeout either
+    kills legitimate 600-DPI pages or leaves small pages stuck for too long.
+    The caller supplies the largest image in the current request so one huge
+    page gets headroom without multiplying the timeout by the whole batch.
+    """
+    try:
+        base = float(base_seconds)
+    except (TypeError, ValueError):
+        base = float(minimum)
+    try:
+        mp = max(0.0, float(megapixels))
+    except (TypeError, ValueError):
+        mp = 0.0
+    try:
+        scale = max(0.0, float(seconds_per_megapixel))
+    except (TypeError, ValueError):
+        scale = 2.0
+    value = base + mp * scale
+    return max(float(minimum), min(float(maximum), value))
+
+
 def isolated_process_kwargs() -> dict:
     """Return kwargs that let us terminate a worker and its descendants on POSIX."""
     if os.name == "posix":
@@ -204,12 +235,23 @@ class LinePump:
             return str(item)
 
     def close(self) -> None:
+        """Stop the reader without deadlocking on TextIO's internal lock.
+
+        ``TextIOWrapper.close()`` may wait for a lock currently held by another
+        thread blocked inside ``readline()``.  OCR watchdogs call this path
+        precisely after killing a stalled child, so close-the-stream-first can
+        turn a successful timeout into a permanent parent-process hang.  Give
+        the killed child's pipe a chance to reach EOF first; only close the
+        wrapper once the reader has exited.  A still-alive reader is daemonized
+        and must never block teardown.
+        """
         self._closed.set()
-        try:
-            if self.stream is not None:
-                self.stream.close()
-        except Exception:
-            pass
         thread = self.thread
         if thread is not None and thread.is_alive():
             thread.join(timeout=1.0)
+        if thread is None or not thread.is_alive():
+            try:
+                if self.stream is not None:
+                    self.stream.close()
+            except Exception:
+                pass

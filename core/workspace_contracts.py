@@ -25,9 +25,8 @@ WORKSPACE_SPECS: tuple[WorkspaceSpec, ...] = (
     WorkspaceSpec("pages", "page", produces=("page_context",), heavy_when_hidden=True),
     WorkspaceSpec("ocr", "ocr", consumes=("page_context",), produces=("ocr_document", "multi_ocr_session"), heavy_when_hidden=True),
     WorkspaceSpec("pdf_text", "ocr", consumes=("page_context",), produces=("ocr_document",)),
+    WorkspaceSpec("ai_image", "ocr", consumes=("page_context",), produces=("reviewed_document",), heavy_when_hidden=True),
     WorkspaceSpec("formatter", "format", consumes=("ocr_document", "reviewed_document"), produces=("formatted_document",)),
-    WorkspaceSpec("text_compare", "proof", consumes=("document_versions", "page_context"), produces=("reviewed_document",), heavy_when_hidden=True),
-    WorkspaceSpec("replacement", "proof", consumes=("ocr_document", "formatted_document", "reviewed_document"), produces=("reviewed_document",)),
     WorkspaceSpec("ocr_compare", "proof", consumes=("multi_ocr_session",), produces=("reviewed_document", "stable_row"), heavy_when_hidden=True),
     WorkspaceSpec("image_review", "proof", consumes=("ocr_document", "stable_row"), produces=("reviewed_document", "stable_row"), heavy_when_hidden=True),
     WorkspaceSpec("epub", "epub", consumes=("reviewed_document", "formatted_document", "page_context"), produces=("epub",), heavy_when_hidden=True),
@@ -56,7 +55,7 @@ def validate_workspace_contracts(specs: Iterable[WorkspaceSpec] = WORKSPACE_SPEC
             errors.append("workspace key/section cannot be empty")
         for topic in spec.produces:
             producers.setdefault(topic, set()).add(spec.key)
-    external_topics = {"document_versions"}
+    external_topics: set[str] = set()
     for spec in values:
         for topic in spec.consumes:
             if topic not in producers and topic not in external_topics:

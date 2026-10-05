@@ -47,15 +47,26 @@ def main() -> int:
     if args.launch:
         env = dict(os.environ)
         process = subprocess.Popen([sys.executable, str(ROOT / "gui_pyside6.py")], cwd=ROOT, env=env)
+        def _normalized_child_status(value: int) -> int:
+            value = int(value)
+            if value < 0:
+                signal_no = -value
+                print(f"GUI_EXIT_SIGNAL={signal_no}", file=sys.stderr, flush=True)
+                # Shell exit codes are unsigned 8-bit.  Returning -11 used to
+                # become 245 and the launcher mislabeled a GUI SIGSEGV as a
+                # dependency-preparation failure.  Use the conventional 128+N.
+                return 128 + signal_no
+            return value
+
         try:
-            return int(process.wait())
+            return _normalized_child_status(process.wait())
         except KeyboardInterrupt:
             process.terminate()
             try:
-                return int(process.wait(timeout=10))
+                return _normalized_child_status(process.wait(timeout=10))
             except subprocess.TimeoutExpired:
                 process.kill()
-                return int(process.wait(timeout=10))
+                return _normalized_child_status(process.wait(timeout=10))
     return 0
 
 

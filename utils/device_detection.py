@@ -39,11 +39,17 @@ class RuntimeBackend:
     runtime: str
     python: str
     torch_version: str = ""
+    python_architecture: str = ""
+    python_bits: int = 0
     cuda_available: bool = False
     cuda_devices: tuple[str, ...] = ()
     mps_available: bool = False
+    mps_built: bool = False
     onnxruntime_version: str = ""
     onnx_providers: tuple[str, ...] = ()
+    mlx_version: str = ""
+    mlx_vlm_version: str = ""
+    mlx_available: bool = False
     detail: str = ""
 
     def to_dict(self) -> dict:
@@ -65,6 +71,8 @@ class DeviceReport:
     runtimes: tuple[RuntimeBackend, ...]
     acceleration_summary: str
     notes: tuple[str, ...] = ()
+    cpu_topology: str = ""
+    neural_engine: str = ""
 
     def to_dict(self) -> dict:
         return {
@@ -78,6 +86,8 @@ class DeviceReport:
             "runtimes": [item.to_dict() for item in self.runtimes],
             "acceleration_summary": self.acceleration_summary,
             "notes": list(self.notes),
+            "cpu_topology": self.cpu_topology,
+            "neural_engine": self.neural_engine,
         }
 
 
@@ -306,7 +316,7 @@ def _memory_bytes() -> int:
         try:
             return int(raw)
         except ValueError:
-            return 0
+            pass
     try:
         pages = int(os.sysconf("SC_PHYS_PAGES"))
         page_size = int(os.sysconf("SC_PAGE_SIZE"))
@@ -320,6 +330,18 @@ def _cpu_name() -> str:
         value = _run_text(["/usr/sbin/sysctl", "-n", "machdep.cpu.brand_string"], timeout=5.0)
         if value:
             return value
+        profiler = shutil.which("system_profiler") or "/usr/sbin/system_profiler"
+        raw = _run_text([profiler, "SPHardwareDataType", "-json"], timeout=20.0)
+        try:
+            items = json.loads(raw).get("SPHardwareDataType", [])
+            chip = next(
+                (str(item.get("chip_type") or "").strip() for item in items if isinstance(item, dict)),
+                "",
+            )
+            if chip:
+                return chip
+        except (json.JSONDecodeError, AttributeError, TypeError):
+            pass
     if os.name == "nt":
         powershell = _powershell_executable()
         if powershell:
@@ -339,44 +361,69 @@ def _cpu_name() -> str:
     return platform.processor() or platform.machine() or "未知 CPU"
 
 
+def _apple_silicon_capabilities(cpu_name: str, architecture: str) -> tuple[str, str]:
+    """Return documented M6 base-chip specs without implying runtime pinning."""
+    normalized = " ".join(str(cpu_name or "").lower().split())
+    if architecture.lower() not in {"arm64", "aarch64"} or "m6" not in normalized:
+        return "", ""
+    if any(variant in normalized for variant in ("pro", "max", "ultra")):
+        return "", ""
+    return "2 Super + 4 性能 + 6 能效（芯片规格）", "双 16 核 Neural Engine（由系统调度）"
+
+
 def _runtime_python_candidates() -> list[tuple[str, Path]]:
     candidates = [("主程序", Path(sys.executable))]
+    # Hayai moved to the persistent per-user OCR runtime.  Probing the old
+    # project-local .venv made Settings incorrectly report MPS=False even when
+    # the actual Hayai worker used a different, MPS-capable interpreter.
+    try:
+        from adapters.runtime_env import persistent_venv_dir, venv_python
+        candidates.append(("Hayai OCR", venv_python(persistent_venv_dir("hayai-ocr-v2.1"))))
+    except Exception:
+        pass
     for label, folder in (
-        ("Manga OCR", ".venv-manga-ocr"),
-        ("Hayai OCR v2.1", ".venv-hayai-ocr"),
+        # wins whenever it exists.
+        # Legacy/project-local Hayai fallback. The persistent runtime candidate
+        # above wins when present; this keeps older installations diagnosable.
+        ("Hayai OCR", ".venv-hayai-ocr"),
         ("48px AR", ".venv-manga-48px"),
-        ("YomiToku", ".venv-yomitoku"),
+        ("findtextCenterNet Ruby", ".venv-findtext-centernet"),
         ("NDLOCR-Lite", ".venv-ndlocr-lite"),
         ("PaddleOCR", ".venv-paddle"),
-        ("PDF Craft", ".venv-pdf-craft"),
+        ("PaddleOCR-VL MLX", ".venv-mlx-vlm"),
     ):
         root = ROOT / folder
         python = root / ("Scripts/python.exe" if os.name == "nt" else "bin/python")
         candidates.append((label, python))
     result: list[tuple[str, Path]] = []
     seen: set[str] = set()
+    seen_labels: set[str] = set()
     for label, python in candidates:
-        try:
-            key = str(python.resolve())
-        except OSError:
-            key = str(python)
-        if key in seen or not python.is_file():
+        key = os.path.normcase(os.path.abspath(os.path.expanduser(str(python))))
+        if key in seen or label in seen_labels or not python.is_file():
             continue
         seen.add(key)
+        seen_labels.add(label)
         result.append((label, python))
     return result
 
 
 _RUNTIME_PROBE = r'''
 import json
+import platform, sys
 out = {
+    "python_architecture": platform.machine().lower(),
+    "python_bits": 64 if sys.maxsize > 2**32 else 32,
     "torch_version": "", "cuda_available": False, "cuda_devices": [],
-    "mps_available": False, "onnxruntime_version": "", "onnx_providers": [],
+    "mps_available": False, "mps_built": False, "mps_probe_error": "",
+    "onnxruntime_version": "", "onnx_providers": [],
+    "mlx_version": "", "mlx_vlm_version": "", "mlx_available": False,
     "errors": []
 }
 try:
     import torch
     out["torch_version"] = str(getattr(torch, "__version__", ""))
+    out["mps_built"] = bool(hasattr(torch.backends, "mps") and torch.backends.mps.is_built())
     try:
         out["cuda_available"] = bool(torch.cuda.is_available())
         if out["cuda_available"]:
@@ -386,7 +433,17 @@ try:
     try:
         out["mps_available"] = bool(hasattr(torch.backends, "mps") and torch.backends.mps.is_available())
     except Exception as exc:
-        out["errors"].append("MPS: " + str(exc))
+        out["mps_probe_error"] = str(exc)
+    if out["mps_built"]:
+        try:
+            probe = torch.ones((1,), device="mps")
+            probe.add_(1)
+            if hasattr(torch, "mps") and hasattr(torch.mps, "synchronize"):
+                torch.mps.synchronize()
+            del probe
+        except Exception as exc:
+            out["mps_available"] = False
+            out["mps_probe_error"] = str(exc)
 except Exception as exc:
     out["errors"].append("PyTorch: " + str(exc))
 try:
@@ -395,6 +452,13 @@ try:
     out["onnx_providers"] = list(ort.get_available_providers())
 except Exception as exc:
     out["errors"].append("ONNX Runtime: " + str(exc))
+try:
+    from importlib.metadata import version
+    out["mlx_version"] = version("mlx")
+    out["mlx_vlm_version"] = version("mlx-vlm")
+    out["mlx_available"] = True
+except Exception:
+    pass
 print(json.dumps(out, ensure_ascii=False))
 '''
 
@@ -423,15 +487,27 @@ def _probe_runtime(label: str, python: Path) -> RuntimeBackend:
     except json.JSONDecodeError:
         return RuntimeBackend(runtime=label, python=str(python), detail="探测输出不是有效 JSON")
     errors = [str(item) for item in payload.get("errors", []) if str(item)]
+    mps_probe_error = str(payload.get("mps_probe_error") or "").strip()
+    if mps_probe_error:
+        if payload.get("mps_built") and not payload.get("mps_available"):
+            errors.append("MPS 已编译但初始化/设备探测失败：" + mps_probe_error)
+        else:
+            errors.append("MPS：" + mps_probe_error)
     return RuntimeBackend(
         runtime=label,
         python=str(python),
         torch_version=str(payload.get("torch_version") or ""),
+        python_architecture=str(payload.get("python_architecture") or ""),
+        python_bits=int(payload.get("python_bits") or 0),
         cuda_available=bool(payload.get("cuda_available")),
         cuda_devices=tuple(str(item) for item in payload.get("cuda_devices", []) if str(item)),
         mps_available=bool(payload.get("mps_available")),
+        mps_built=bool(payload.get("mps_built")),
         onnxruntime_version=str(payload.get("onnxruntime_version") or ""),
         onnx_providers=tuple(str(item) for item in payload.get("onnx_providers", []) if str(item)),
+        mlx_version=str(payload.get("mlx_version") or ""),
+        mlx_vlm_version=str(payload.get("mlx_vlm_version") or ""),
+        mlx_available=bool(payload.get("mlx_available")),
         detail="；".join(errors),
     )
 
@@ -439,8 +515,11 @@ def _probe_runtime(label: str, python: Path) -> RuntimeBackend:
 def _acceleration_summary(runtimes: tuple[RuntimeBackend, ...], gpus: tuple[GPUDevice, ...]) -> str:
     cuda = [item.runtime for item in runtimes if item.cuda_available]
     mps = [item.runtime for item in runtimes if item.mps_available]
+    mps_failed = [item.runtime for item in runtimes if item.mps_built and not item.mps_available]
+    mlx = [item.runtime for item in runtimes if item.mlx_available]
     directml = [item.runtime for item in runtimes if "DmlExecutionProvider" in item.onnx_providers]
     ort_cuda = [item.runtime for item in runtimes if "CUDAExecutionProvider" in item.onnx_providers]
+    coreml = [item.runtime for item in runtimes if "CoreMLExecutionProvider" in item.onnx_providers]
     parts: list[str] = []
     if cuda:
         parts.append("PyTorch CUDA 可用：" + "、".join(cuda))
@@ -448,8 +527,14 @@ def _acceleration_summary(runtimes: tuple[RuntimeBackend, ...], gpus: tuple[GPUD
         parts.append("ONNX CUDA 可用：" + "、".join(ort_cuda))
     if directml:
         parts.append("ONNX DirectML 可用：" + "、".join(directml))
+    if coreml:
+        parts.append("ONNX CoreML 可用：" + "、".join(coreml))
     if mps:
         parts.append("Apple MPS 可用：" + "、".join(mps))
+    if mps_failed:
+        parts.append("PyTorch MPS 已编译但运行时初始化失败：" + "、".join(mps_failed))
+    if mlx:
+        parts.append("MLX-VLM 环境可用（未启动模型服务）：" + "、".join(mlx))
     if not parts:
         parts.append("当前已安装 OCR 运行时仅确认 CPU 可用")
         if gpus:
@@ -487,17 +572,27 @@ def detect_devices(*, progress_callback: ProgressCallback | None = None) -> Devi
     if os.name == "nt" and not _powershell_executable():
         notes.append("未找到 PowerShell，Windows CIM 设备信息可能不完整。")
     memory = _memory_bytes()
+    cpu_name = _cpu_name()
+    architecture = platform.machine() or "未知"
+    cpu_topology, neural_engine = _apple_silicon_capabilities(cpu_name, architecture)
+    if cpu_topology:
+        notes.append(
+            "M6 核心拓扑与 Neural Engine 信息来自 Apple 芯片规格，不代表应用可绑定特定 CPU 核或独占 NPU；"
+            "Vision/Core ML 计算设备由系统选择。"
+        )
     report = DeviceReport(
         platform_name=platform_name,
         platform_release=platform.release() or platform.version(),
-        architecture=platform.machine() or "未知",
-        cpu=_cpu_name(),
+        architecture=architecture,
+        cpu=cpu_name,
         logical_cores=int(os.cpu_count() or 0),
         memory_gb=round(memory / (1024 ** 3), 1) if memory else 0.0,
         gpus=gpus,
         runtimes=tuple(runtimes),
         acceleration_summary=_acceleration_summary(tuple(runtimes), gpus),
         notes=tuple(notes),
+        cpu_topology=cpu_topology,
+        neural_engine=neural_engine,
     )
     _emit(progress_callback, "done", 3, 3, "设备与 GPU 检测完成")
     return report
