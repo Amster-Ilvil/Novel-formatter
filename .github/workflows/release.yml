@@ -1,6 +1,10 @@
 name: Build and publish Novel Formatter releases
 
 on:
+  push:
+    branches: [main]
+    paths:
+      - VERSION
   workflow_dispatch:
 
 permissions:
@@ -34,7 +38,7 @@ jobs:
           VERSION="$(tr -d '[:space:]' < VERSION)"
           test -n "$VERSION"
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
-          echo "tag=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "tag=v${VERSION}" >> "$GITHUB_OUTPUT"
           echo "Novel Formatter release: $VERSION"
 
   windows:
@@ -321,6 +325,13 @@ jobs:
 
           本 Release 直接由当前 main 提交 **${GITHUB_SHA}** 在 GitHub Actions 干净环境中构建。
 
+          ### v2.1 基于最新 main 的改进
+          - 新增多模型 OCR 全文逐句比较、字符级差异高亮和只读融合视图。
+          - 改善 OCR 对比、图文对照、人工裁决状态和任务进度反馈。
+          - 优化 Hayai、NDL、48px OCR 运行适配与模型配置，清理旧兼容链。
+          - 增强工作区快照恢复及 AI 裁决包导出导入。
+          - 新增 EPUB 发布校验报告及问题定位界面。
+
           ### 推荐下载
           - **Windows x64（推荐）**：**NovelFormatter_${VERSION}_Windows_x64_Setup.exe** —— 双击安装，无需管理员权限；安装后从开始菜单启动。
           - **Windows x64 便携版**：**NovelFormatter_${VERSION}_Windows_x64.zip** —— 解压后双击“启动Windows.bat”。
@@ -375,23 +386,3 @@ jobs:
           grep -Fq "NovelFormatter_${VERSION}_Linux_ARM64.AppImage" <<< "$BODY"
           gh release view "$RELEASE_TAG" --json url,name,tagName,isDraft,isPrerelease,assets \
             --jq '{url,name,tagName,isDraft,isPrerelease,assets:[.assets[].name]}'
-
-      - name: Remove older GitHub Releases
-        shell: bash
-        run: |
-          set -euo pipefail
-          mapfile -t tags < <(gh release list --repo "$GITHUB_REPOSITORY" --limit 100 --json tagName --jq '.[].tagName')
-          for tag in "${tags[@]}"; do
-            if [[ -n "$tag" && "$tag" != "$RELEASE_TAG" ]]; then
-              echo "Deleting old GitHub Release: $tag"
-              gh release delete "$tag" --repo "$GITHUB_REPOSITORY" --yes
-            fi
-          done
-
-          mapfile -t remaining < <(gh release list --repo "$GITHUB_REPOSITORY" --limit 100 --json tagName --jq '.[].tagName')
-          for tag in "${remaining[@]}"; do
-            if [[ "$tag" != "$RELEASE_TAG" ]]; then
-              echo "Unexpected old Release remains: $tag" >&2
-              exit 1
-            fi
-          done
