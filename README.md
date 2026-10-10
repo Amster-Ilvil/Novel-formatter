@@ -1,3 +1,9 @@
+<div align="center">
+
+**简体中文** · [English](README_en.md) · [日本語](README_ja.md)
+
+</div>
+
 <p align="center">
   <img src="assets/novel_formatter_banner.webp" alt="Novel Formatter" width="100%">
 </p>
