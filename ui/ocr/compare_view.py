@@ -12,23 +12,61 @@ from ui.ocr.review_flow import candidate_for_key, step_pending
 
 
 class OCRCompareViewMixin:
+    def _set_compare_task_progress(
+        self,
+        visible: bool,
+        *,
+        value: int | None = None,
+        text: str = "",
+        indeterminate: bool = False,
+    ) -> None:
+        """Mirror long-running AI/exchange work into the visible compact toolbar.
+
+        Batch 37 deliberately hides the legacy dense header.  Its historical
+        source-correction/AI progress bars therefore became invisible even
+        though the worker signals still fired.  This is the single user-visible
+        progress authority for AI adjudication and package exchange.
+        """
+        bar = getattr(self, "_compact_task_progress", None)
+        if bar is None:
+            return
+        if indeterminate:
+            bar.setRange(0, 0)
+        else:
+            if bar.minimum() == 0 and bar.maximum() == 0:
+                bar.setRange(0, 100)
+            if value is not None:
+                bar.setValue(max(0, min(100, int(value))))
+        if text:
+            bar.setFormat(str(text))
+        bar.setVisible(bool(visible))
+
     def _set_advanced_actions_visible(self, visible: bool):
         self._advanced_actions_panel.setVisible(bool(visible))
         self._more_actions_btn.setText("收起操作 ▴" if visible else "更多操作 ▾")
 
 
     def _sync_compact_compare_controls(self) -> None:
-        """Mirror backend control state into the Phase 20 compact command bar."""
+        """Mirror backend state into the full-overview command bar."""
         full = getattr(self, "_compact_full_compare_btn", None)
+        backend = getattr(self, "_full_text_compare_check", None)
         if full is not None:
-            backend = getattr(self, "_full_text_compare_check", None)
             enabled = bool(backend is not None and backend.isEnabled())
             full.setEnabled(enabled)
-            if backend is not None and full.isChecked() != backend.isChecked():
-                full.blockSignals(True)
-                full.setChecked(backend.isChecked())
-                full.blockSignals(False)
-            full.setText("返回逐句" if bool(backend is not None and backend.isChecked()) else "显示全文")
+            full.setText("显示全文")
+            full.setVisible(getattr(self, "_review_mode", "full") == "decision")
+        image_review = getattr(self, "_compact_image_review_btn", None)
+        if image_review is not None:
+            # The visible button is the action authority.  Do not proxy-click the
+            # hidden reference-card button: restored sessions can leave that
+            # compatibility widget stale even though a valid multi-model session
+            # is active.
+            image_review.setEnabled(self._multi_review_controls_available())
+            image_review.setVisible(getattr(self, "_review_mode", "full") != "decision")
+        apply_all = getattr(self, "_compact_apply_all_btn", None)
+        backend_apply = getattr(self, "_apply_btn", None)
+        if apply_all is not None:
+            apply_all.setEnabled(bool(backend_apply is not None and backend_apply.isEnabled()))
         ai = getattr(self, "_compact_ai_btn", None)
         backend_ai = getattr(self, "_ai_adjudicate_btn", None)
         if ai is not None:
@@ -44,6 +82,70 @@ class OCRCompareViewMixin:
                 value = summary.text().strip()
             status.setText(value or "等待 OCR 结果")
 
+
+    def _refresh_full_only_text(self) -> None:
+        """Use the complete aligned three-model rows, never the single-card editors.
+
+        The table is read-only and virtualized. A single scrollbar synchronizes
+        OCR models and the fused result. No source model or decision is changed.
+        """
+        target = getattr(self, "_full_comparison_table", None)
+        if target is None:
+            return
+        rows = getattr(getattr(self, "_comparison", None), "rows", ())
+        reset = target.set_comparison(self._comparison, self._fusion_states, self._labels)
+        if reset and rows:
+            from PySide6.QtCore import QItemSelectionModel
+            current = min(max(0, int(getattr(self, "_current_row_index", 0))), len(rows) - 1)
+            idx = target.model().index(current, 0)
+            target.selectionModel().select(idx, QItemSelectionModel.ClearAndSelect | QItemSelectionModel.Rows)
+            target.scrollTo(idx, QAbstractItemView.PositionAtCenter)
+        note = getattr(self, "_full_overview_note", None)
+        if note is not None:
+            pending = sum(bool(state.unresolved) for state in self._fusion_states)
+            conflicts = sum(target.model().row_disagrees(i) for i in range(len(rows)))
+            note.setText(
+                f"多模型全文对照 · {len(rows)} 行 / {len(self._documents)} 模型 · "
+                f"模型不一致 {conflicts} 行 · 待裁决 {pending} 行"
+                " · 红色文字=字符差异，浅红底=行分歧；双击行进入逐句校对"
+            )
+
+    def _open_full_comparison_row(self, index) -> None:
+        """Jump from a full-book difference to the same editable stable row."""
+        if not index.isValid():
+            return
+        row = index.row()
+        self._set_full_only_view(False)
+        toggle = getattr(self, "_full_only_check", None)
+        if toggle is not None:
+            toggle.blockSignals(True)
+            toggle.setChecked(False)
+            toggle.blockSignals(False)
+        self._set_review_mode("decision")
+        self._select_row(row)
+
+    def _set_full_only_view(self, checked: bool) -> None:
+        """Display-only switch: source texts, queue, drafts and verdicts persist."""
+        self._full_only_enabled = bool(checked)
+        self._sync_full_only_visibility()
+
+    def _sync_full_only_visibility(self) -> None:
+        panel = getattr(self, "_full_overview_panel", None)
+        if panel is None:
+            return
+        only = bool(
+            getattr(self, "_full_only_enabled", False)
+            and self._review_mode == "full"
+            and self._multi_review_controls_available()
+        )
+        if only:
+            self._refresh_full_only_text()
+        panel.setVisible(only)
+        self._main_splitter.setVisible(not only)
+        toggle = getattr(self, "_full_only_check", None)
+        if toggle is not None:
+            toggle.setVisible(self._review_mode == "full")
+            toggle.setEnabled(self._multi_review_controls_available())
 
     def _multi_review_controls_available(self) -> bool:
         """Return whether a real multi-model comparison is currently active."""
@@ -68,32 +170,47 @@ class OCRCompareViewMixin:
         return available
 
 
+    def _show_multimodel_full(self) -> None:
+        """Visible '显示全文' must open the complete multi-model comparison."""
+        if not self._multi_review_controls_available():
+            return
+        self._set_review_mode("full")
+        toggle = getattr(self, "_full_only_check", None)
+        if toggle is not None:
+            toggle.setChecked(True)
+
     def _toggle_full_text_compare(self, checked: bool):
-        """Expose the existing full/one-sentence presentation through one switch."""
-        # Restored multi-model sessions previously left the visible switch
-        # disabled even though the comparison had already been restored.  Heal
-        # the control state first and never let a stale disabled flag make the
-        # visible button appear inert.
+        """Switch the legacy mode control to the same full-book display."""
         if not self._sync_review_mode_controls():
             return
-        self._set_review_mode("full" if bool(checked) else "decision")
-
+        if bool(checked):
+            self._show_multimodel_full()
+        else:
+            self._set_review_mode("decision")
 
     def _set_review_mode(self, mode: str, _checked=False, *, force: bool = False):
         """Switch view organization only; OCR documents and decisions stay shared."""
-        mode = str(mode or "decision")
+        mode = str(mode or "full")
         if mode not in {"decision", "full"}:
             return
+        if not self._multi_review_controls_available():
+            return
+        # “图文对照” is the *original* sentence decision surface, not the
+        # deleted independent ImageReview workspace. Both modes own no duplicate
+        # OCR documents or adjudication state.
         if not force and mode == self._review_mode:
             return
         self._review_mode = mode
+        title = getattr(self, "_compact_title_label", None)
+        if title is not None:
+            title.setText("图文对照" if mode == "decision" else "全文总览")
         decision_mode = mode == "decision"
         self._decision_mode_btn.setChecked(decision_mode)
         self._full_mode_btn.setChecked(not decision_mode)
         self._full_text_compare_check.blockSignals(True)
         self._full_text_compare_check.setChecked(not decision_mode)
         self._full_text_compare_check.blockSignals(False)
-        self._decision_queue_panel.setVisible(decision_mode)
+        self._decision_queue_panel.setVisible(True)
         self._auto_advance_check.setVisible(False)
         self._review_only_check.setVisible(False)
         # Phase 20: the default adjudication surface mirrors the redesign mockup:
@@ -102,8 +219,12 @@ class OCRCompareViewMixin:
         # is discarded or re-OCRed when the presentation changes.
         if hasattr(self, "_source_area") and self._mode == "multi":
             self._source_area.setVisible(not decision_mode)
+        if hasattr(self, "_result_panel") and self._mode == "multi":
+            # Full-text mode retains disagreement candidates and adjudication;
+            # only the per-sentence reference imagery is hidden.
+            self._result_panel.setVisible(True)
         if hasattr(self, "_main_splitter"):
-            self._main_splitter.setSizes([0, 820] if decision_mode else [500, 320])
+            self._main_splitter.setSizes([0, 820] if decision_mode else [340, 820])
 
         self._single_card_check.blockSignals(True)
         self._single_card_check.setChecked(decision_mode)
@@ -116,18 +237,22 @@ class OCRCompareViewMixin:
 
         if decision_mode:
             self._result_title.setText("候选结果")
-            self._workspace_title.setText("OCR 对比 · 逐句裁决")
+            self._workspace_title.setText("图文对照 · 逐句裁决")
             self._refresh_decision_queue(force=True)
         else:
             self._result_title.setText("全文融合结果")
-            self._workspace_title.setText("OCR 对比 · 全文对比")
+            self._workspace_title.setText("OCR 对比 · 全文总览")
+            self._refresh_decision_queue(force=True)
+        self._sync_full_only_visibility()
         self._sync_compact_compare_controls()
         if self._comparison is not None and self._fusion_states:
+            # Navigation only: keep the exact stable row (including a resolved
+            # row or unconfirmed draft), never jump to another queue item.
             self._select_row(self._current_row())
 
 
     def _request_image_review(self):
-        self.image_review_requested.emit(int(self._current_row()))
+        self._set_review_mode("decision")
 
 
     @staticmethod
@@ -180,9 +305,20 @@ class OCRCompareViewMixin:
 
 
     def disagreement_queue_row_order(self) -> tuple[int, ...]:
-        """Return the active pending-row order for the synchronized image queue."""
+        """Return exactly the row order currently exposed by the review queue.
+
+        Image Review is a synchronized view of OCR Compare.  When OCR Compare is
+        filtered (for example to three-way disagreements, broken candidates, or a
+        page/text search), publishing the unfiltered pending order makes switching
+        views jump to a different task set.  Prefer the visible queue model whenever
+        it is active; fall back to the underlying navigation order before the queue
+        has been built.
+        """
         if bool(getattr(self, "_show_resolved_history", False)):
             return ()
+        model = getattr(self, "_decision_queue_model", None)
+        if model is not None and str(getattr(self, "_review_mode", "")) == "decision":
+            return tuple(int(value) for value in (getattr(model, "rows", ()) or ()))
         return tuple(self._decision_navigation_rows())
 
 
@@ -422,6 +558,8 @@ class OCRCompareViewMixin:
                 badge = "待裁决"
         else:
             badge = "待裁决"
+        if not history_mode and row_index in getattr(self, "_manual_decision_drafts", {}):
+            badge = "未确认草稿"
 
         page_label = f"第 {row_index + 1} 句"
         column_label = ""
@@ -477,11 +615,115 @@ class OCRCompareViewMixin:
         return f"第 {row_index + 1} 句 · {suffix}"
 
 
+    def _decision_queue_scope_changed(self, _index: int = -1) -> None:
+        """Synchronize the visible queue scope with the existing backend toggles."""
+        if bool(getattr(self, "_syncing_queue_scope", False)):
+            return
+        combo = getattr(self, "_decision_queue_scope", None)
+        scope = str(combo.currentData() or "pending") if combo is not None else "pending"
+        self._syncing_queue_scope = True
+        try:
+            history = scope == "history"
+            risk = scope == "risk"
+            if getattr(self, "_resolved_history_check", None) is not None:
+                self._resolved_history_check.setChecked(history)
+            if getattr(self, "_active_review_check", None) is not None:
+                self._active_review_check.setChecked(risk)
+        finally:
+            self._syncing_queue_scope = False
+        self._refresh_decision_queue(force=True)
+
+    def _decision_queue_search_changed(self, _text: str = "") -> None:
+        self._decision_queue_signature = ()
+        self._refresh_decision_queue(force=True)
+
+    def _decision_queue_search_blob(self, row_index: int) -> str:
+        """Cheap searchable text for the virtual queue; never builds tooltips."""
+        if not 0 <= int(row_index) < len(self._fusion_states):
+            return ""
+        index = int(row_index)
+        state = self._fusion_states[index]
+        fields = [str(index + 1)]
+        if self._comparison is not None and index < len(self._comparison.rows):
+            row = self._comparison.rows[index]
+            page = int(getattr(row, "page", 0) or 0)
+            if page > 0:
+                fields.extend((f"p{page:03d}", f"p{page:05d}", str(page)))
+            fields.extend(str(value) for value in (getattr(row, "column_ids", ()) or ()))
+            fields.extend(str(value or "") for value in (getattr(row, "texts", ()) or ()))
+        for candidate in (getattr(state, "candidates", ()) or ()):
+            fields.append(str(getattr(candidate, "text", "") or ""))
+            fields.append(str(getattr(candidate, "display_label", "") or ""))
+        draft = getattr(self, "_manual_decision_drafts", {}).get(index)
+        if draft is not None:
+            fields.append("未确认草稿")
+            fields.append(str(getattr(self, "_manual_decision_draft_sources", {}).get(index, "") or ""))
+            fields.append(str(draft or ""))
+        return " ".join(fields).casefold()
+
+    def _row_is_threeway_disagreement(self, row_index: int) -> bool:
+        if self._comparison is None or not 0 <= int(row_index) < len(self._comparison.rows):
+            return False
+        values = {
+            str(value or "").strip()
+            for value in (getattr(self._comparison.rows[int(row_index)], "texts", ()) or ())
+            if str(value or "").strip()
+        }
+        return len(values) >= 3
+
+    def _row_has_broken_candidate(self, row_index: int) -> bool:
+        if self._comparison is None or not 0 <= int(row_index) < len(self._comparison.rows):
+            return False
+        texts = tuple(str(value or "") for value in (getattr(self._comparison.rows[int(row_index)], "texts", ()) or ()))
+        return any((not value.strip()) or ("□" in value) or ("�" in value) for value in texts)
+
+    def _refresh_decision_queue_stats(self) -> None:
+        label = getattr(self, "_decision_queue_stats", None)
+        if label is None:
+            return
+        unresolved = tuple(index for index, state in enumerate(self._fusion_states) if state.unresolved)
+        threeway = sum(1 for index in unresolved if self._row_is_threeway_disagreement(index))
+        broken = sum(1 for index in unresolved if self._row_has_broken_candidate(index))
+        resolved = len(self._resolved_history_rows())
+        drafts = sum(1 for index in unresolved if index in getattr(self, "_manual_decision_drafts", {}))
+        draft_note = f" · 草稿 {drafts}" if drafts else ""
+        label.setText(f"待判 {len(unresolved)} · 三方 {threeway} · 空/占位 {broken}{draft_note} · 已裁决 {resolved}")
+
+    def _refresh_compare_overview_strip(self) -> None:
+        strip = getattr(self, "_compare_sentence_strip", None)
+        if strip is None:
+            return
+        explicit_origins = {
+            "human_ocr_compare", "human_image_review", "human_manual_edit",
+            "restored_human", "external_ai_package", "ai_adjudication_result",
+            "ai_visual_batch_adjudication", "ai_gpt_grade_adjudication",
+            "ai_overlay", "local_targeted_retry_majority_adjudication",
+        }
+        states = []
+        for state in self._fusion_states:
+            if state.unresolved:
+                states.append("judge")
+            elif state.selected_index is not None:
+                states.append("changed" if str(getattr(state, "selection_origin", "") or "") in explicit_origins else "reviewed")
+            else:
+                states.append("pending")
+        strip.set_states(states, self._current_row_index)
+
     def _refresh_decision_queue(self, *, force: bool = False):
         if not hasattr(self, "_decision_queue") or self._decision_queue_model is None:
             return
         history_mode = bool(getattr(self, "_show_resolved_history", False))
         rows = self._resolved_history_rows() if history_mode else self._decision_navigation_rows()
+        scope_combo = getattr(self, "_decision_queue_scope", None)
+        visible_scope = str(scope_combo.currentData() or "pending") if scope_combo is not None else "pending"
+        if not history_mode and visible_scope == "threeway":
+            rows = tuple(row for row in rows if self._row_is_threeway_disagreement(row))
+        elif not history_mode and visible_scope == "broken":
+            rows = tuple(row for row in rows if self._row_has_broken_candidate(row))
+        query_widget = getattr(self, "_decision_queue_search", None)
+        query = str(query_widget.text() if query_widget is not None else "").strip().casefold()
+        if query:
+            rows = tuple(row for row in rows if query in self._decision_queue_search_blob(row))
         active_priority = bool(
             not history_mode
             and getattr(self, "_active_review_check", None) is not None
@@ -493,6 +735,17 @@ class OCRCompareViewMixin:
             "priority" if active_priority else "source_order",
         )
         self._decision_queue_count.setText(str(len(rows)))
+        scope_combo = getattr(self, "_decision_queue_scope", None)
+        if scope_combo is not None and not bool(getattr(self, "_syncing_queue_scope", False)):
+            current_scope = str(scope_combo.currentData() or "pending")
+            wanted = "history" if history_mode else ("risk" if active_priority else (current_scope if current_scope in {"threeway", "broken"} else "pending"))
+            pos = scope_combo.findData(wanted)
+            if pos >= 0 and scope_combo.currentIndex() != pos:
+                self._syncing_queue_scope = True
+                try:
+                    scope_combo.setCurrentIndex(pos)
+                finally:
+                    self._syncing_queue_scope = False
         if hasattr(self, "_decision_queue_title"):
             title = "已裁决历史" if history_mode else "分歧队列"
             self._decision_queue_title.setText(f"{title} · {len(rows)}")
@@ -509,6 +762,8 @@ class OCRCompareViewMixin:
         self._select_current_queue_item()
         if not history_mode:
             self._publish_disagreement_queue_order(rows)
+        self._refresh_compare_overview_strip()
+        self._refresh_decision_queue_stats()
 
 
     def _remove_decision_queue_rows(self, row_indices) -> int:
@@ -697,6 +952,10 @@ class OCRCompareViewMixin:
             mounted._body_layout.insertWidget(0, mounted._reference_preview)
             self._mounted_reference_row = None
         active = dict(self._fusion_widgets)
+        for widget in active.values():
+            cancel = getattr(widget, "cancel_pending_reference_load", None)
+            if callable(cancel):
+                cancel()
         while self._fusion_layout.count() > 1:
             item = self._fusion_layout.takeAt(0)
             widget = item.widget()
@@ -744,6 +1003,7 @@ class OCRCompareViewMixin:
             # Publish selected-candidate edits without rebuilding the editor
             # under the user's cursor or advancing to another sentence.
             widget.manual_text_changed.connect(self._publish_fusion_decision)
+            widget.draft_requested.connect(self._stage_manual_candidate)
             widget.resolved.connect(self._fusion_row_resolved)
             widget.reopened.connect(self._fusion_row_reopened)
             if hasattr(self, "_history_service"):
@@ -751,18 +1011,21 @@ class OCRCompareViewMixin:
                 widget.reopened.connect(self._history_service.commit_reopen)
         else:
             widget.sync_from_state()
-        if row_index == int(getattr(self, "_current_row_index", -1)):
+        show_reference = bool(self._single_card_enabled and getattr(self, "_review_mode", "decision") != "full")
+        widget.set_reference_visible(show_reference)
+        if show_reference and row_index == int(getattr(self, "_current_row_index", -1)):
             viewport = self._fusion_scroll.viewport()
             widget.set_reference_target_height(max(380, viewport.height() - 26))
         else:
             widget.setMinimumHeight(0)
-        if self._comparison is not None and 0 <= row_index < len(self._comparison.rows):
+        if show_reference and self._comparison is not None and 0 <= row_index < len(self._comparison.rows):
             provider = getattr(self, "_recovery_page_image_provider", None)
             try:
                 page_images = tuple(provider() or ()) if callable(provider) else ()
             except Exception:
                 page_images = ()
-            widget.set_reference_source(self._primary_doc, self._comparison.rows[row_index], page_images)
+            reference_doc = getattr(self, "_reference_doc", None) or self._primary_doc
+            widget.set_reference_source(reference_doc, self._comparison.rows[row_index], page_images)
         widget.set_review_only_candidates(self._review_only_enabled)
         widget.set_history_mode(bool(getattr(self, "_show_resolved_history", False)))
         locked = bool(self._comparison is not None and len(self._documents) >= 2
@@ -770,11 +1033,11 @@ class OCRCompareViewMixin:
         widget.set_consensus_locked(locked)
         host = getattr(self, "_proof_reference_host", None)
         if host is not None:
-            host.setVisible(bool(self._single_card_enabled))
-            if self._single_card_enabled:
+            host.setVisible(show_reference)
+            if show_reference:
                 widget._body_layout.removeWidget(widget._reference_preview)
                 self._proof_reference_layout.addWidget(widget._reference_preview, 1)
-                widget._reference_preview.show()
+                widget.set_reference_visible(True)
                 self._mounted_reference_row = widget
             else:
                 # Full-text mode is for comparing complete OCR documents; its
@@ -785,6 +1048,7 @@ class OCRCompareViewMixin:
 
 
     def _rebuild_fusion_rows(self, *, auto_choose: bool):
+        getattr(self, "_manual_decision_draft_candidates", {}).clear()
         from engine.ocr_compare_view_model import build_fusion_states
         if hasattr(self, "_history_service"):
             self._history_service.clear()
@@ -811,6 +1075,7 @@ class OCRCompareViewMixin:
             self._virtual_hint.setText("")
             return
         from engine.ocr_compare_view_model import windowed_row_indices
+        full_mode = getattr(self, "_review_mode", "decision") == "full"
         history_mode = bool(getattr(self, "_show_resolved_history", False))
         if history_mode:
             eligible_rows = list(self._resolved_history_rows())
@@ -822,7 +1087,7 @@ class OCRCompareViewMixin:
             current_row = int(current_row)
             if current_row not in eligible_rows:
                 current_row = eligible_rows[0]
-            if self._single_card_enabled:
+            if full_mode or self._single_card_enabled:
                 indices = (current_row,)
             else:
                 position = eligible_rows.index(current_row)
@@ -832,6 +1097,13 @@ class OCRCompareViewMixin:
                 start_at = max(0, end_at - self._fusion_window_size)
                 indices = tuple(eligible_rows[start_at:end_at])
             eligible = len(eligible_rows)
+        elif full_mode:
+            # The 924-style full-text workspace keeps the complete model texts
+            # above, while the lower-right pane follows the selected conflict
+            # and shows only that row's per-model candidates.
+            current_row = max(0, min(int(current_row), len(self._fusion_states) - 1))
+            indices = (current_row,)
+            eligible = sum(1 for state in self._fusion_states if state.unresolved)
         elif self._single_card_enabled:
             current_row = max(0, min(int(current_row), len(self._fusion_states) - 1))
             indices = (current_row,)
@@ -864,6 +1136,8 @@ class OCRCompareViewMixin:
             self._virtual_hint.setText(
                 f"裁决历史 {eligible} 句 · 当前 {indices[0] + 1}/{total}" if indices else "当前筛选没有已裁决句"
             )
+        elif indices and full_mode:
+            self._virtual_hint.setText(f"全文 + 当前分歧 · 第 {indices[0] + 1}/{total} 句")
         elif indices and self._single_card_enabled:
             self._virtual_hint.setText(f"单框逐句 · 当前 {indices[0] + 1}/{total} 句")
         elif indices:
@@ -911,12 +1185,24 @@ class OCRCompareViewMixin:
         self._labels = []
         self._comparison = None
         self._primary_doc = None
+        self._reference_doc = None
         self._initial_payload = None
         # A true clear/new-book boundary must never retain Ruby annotations
         # from the previous multi-model session. Temporary multi -> single
         # switching saves/restores this overlay explicitly in _capture_multi_state.
         self._ruby_overlay_doc = None
         self._fusion_states = []
+        self._full_only_enabled = False
+        if hasattr(self, "_full_only_refresh_timer"):
+            self._full_only_refresh_timer.stop()
+        if hasattr(self, "_full_only_check"):
+            self._full_only_check.blockSignals(True)
+            self._full_only_check.setChecked(False)
+            self._full_only_check.blockSignals(False)
+        if hasattr(self, "_full_overview_panel"):
+            self._full_overview_panel.setVisible(False)
+            self._main_splitter.setVisible(True)
+            self._full_comparison_table.set_comparison(None, (), ())
         self._show_resolved_history = False
         self._resolved_history_group = "all"
         if hasattr(self, "_resolved_history_check"):
@@ -1038,9 +1324,12 @@ class OCRCompareViewMixin:
 
 
     def install_keyboard_flow(self) -> None:
-        """合并编辑器式键盘流：Alt+1..9 采用候选，Alt+↑/↓ 上/下一个待判断句。
+        """Diff-editor keyboard flow with explicit draft/final separation.
 
-        只在本页获得焦点时生效；采用后自动跳到下一个待判断句（可连按数字键快速过稿）。
+        Alt+1..9 only stages a candidate into the manual editor.  It never
+        resolves the row or navigates away. Ctrl+Alt+1..9 is the deliberate
+        fast-path for direct acceptance. The manual draft is confirmed with
+        the visible button; Ctrl+Shift+Return confirms and moves to the next conflict.
         """
         self._keyboard_flow_shortcuts = []
         def bind(seq, slot):
@@ -1050,10 +1339,26 @@ class OCRCompareViewMixin:
             self._keyboard_flow_shortcuts.append(sc)
         for n in range(1, 10):
             bind(f"Alt+{n}", partial(self._choose_candidate_by_number, n))
+            bind(f"Ctrl+Alt+{n}", partial(self._accept_candidate_by_number, n))
+        bind("Ctrl+Shift+Return", self._commit_manual_decision_and_next)
         bind("Alt+Down", partial(self._goto_pending_row, True))
         bind("Alt+Up", partial(self._goto_pending_row, False))
+        bind("F7", self._jump_next_group)
+        bind("Shift+F7", self._jump_previous_group)
+        bind("Alt+I", self._request_image_review)
 
     def _choose_candidate_by_number(self, number: int) -> None:
+        """Stage one candidate as manual-edit baseline; do not resolve/navigate."""
+        widget = self._fusion_widgets.get(self._current_row())
+        if widget is None or getattr(self, "_show_resolved_history", False):
+            return
+        index = candidate_for_key(number, len(widget._cards))
+        if index is None:
+            return
+        widget.stage_candidate(index)
+
+    def _accept_candidate_by_number(self, number: int) -> None:
+        """Explicit fast-path: accept one candidate as final authority."""
         widget = self._fusion_widgets.get(self._current_row())
         if widget is None or getattr(self, "_show_resolved_history", False):
             return
@@ -1061,7 +1366,6 @@ class OCRCompareViewMixin:
         if index is None:
             return
         widget.choose(index)
-        QTimer.singleShot(140, partial(self._goto_pending_row, True))   # 采用后自动到下一个
 
     def _goto_pending_row(self, forward: bool = True) -> None:
         model = getattr(self, "_decision_queue_model", None)
@@ -1129,8 +1433,8 @@ class OCRCompareViewMixin:
         timer = getattr(self, "_manual_decision_commit_timer", None)
         if timer is not None and timer.isActive():
             timer.stop()
-            if hasattr(self, "_commit_manual_decision_editor"):
-                self._commit_manual_decision_editor()
+        # Manual text is a per-row draft. Navigating to another row must never
+        # silently convert that draft into an authoritative adjudication.
         self._current_row_index = row
         self._active_source_index = source_index
         self._syncing_cursor = True
@@ -1186,6 +1490,7 @@ class OCRCompareViewMixin:
         if hasattr(self, "_next_sentence_btn"):
             self._next_sentence_btn.setEnabled(row + 1 < len(self._comparison.rows))
         self._select_current_queue_item()
+        self._refresh_compare_overview_strip()
         if hasattr(self, "_sync_manual_decision_editor"):
             self._sync_manual_decision_editor()
         self.current_row_changed.emit(int(row))
@@ -1341,6 +1646,10 @@ class OCRCompareViewMixin:
         if not active:
             self._highlight_timer.stop()
             return
-        self._last_highlight_signature = None
+        # Keep the previous highlight signature across hide/show.  It already
+        # includes source revision, current row and visible rows, so unchanged
+        # text/geometry can skip an expensive QTextEdit ExtraSelection rebuild.
+        # Real source edits call _invalidate_highlight_cache(), and a changed
+        # viewport naturally changes visible_rows in the signature.
         if self._comparison is not None:
             self._highlight_timer.start()

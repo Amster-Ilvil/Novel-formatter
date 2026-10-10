@@ -14,6 +14,7 @@ from ui.theme.tokens import (
 )
 from ui.design.components import DesignBrandLabel, DesignNavButton, tinted_svg_icon
 from ui.design.metrics import SIDEBAR_WIDTH, SIDEBAR_PAD_X, SIDEBAR_PAD_TOP, SIDEBAR_ITEM_GAP, SIDEBAR_BRAND_GAP
+from core.command_catalog import PRIMARY_NAVIGATION_SPECS, primary_navigation_shortcut_label
 
 
 def _tinted_icon(path: Path, color: str) -> str:
@@ -28,14 +29,8 @@ def _tinted_icon(path: Path, color: str) -> str:
         return str(path)
 
 
-REFERENCE_SECTION_ITEMS = (
-    ("workspace", "工作区"),
-    ("book", "页面管理"),
-    ("ocr", "OCR 识别"),
-    ("format", "格式处理"),
-    ("proof", "文字校对"),
-    ("export", "EPUB生成"),
-    ("settings", "设置"),
+REFERENCE_SECTION_ITEMS = tuple(
+    (spec.icon_name, spec.title) for spec in PRIMARY_NAVIGATION_SPECS
 )
 SECTION_WORKSPACE = 0
 SECTION_PAGE = 1
@@ -70,10 +65,11 @@ class ReferenceSectionHost(QWidget):
 
     current_changed = Signal(int)
 
-    def __init__(self, tabs: list[tuple[str, QWidget]], parent=None, *, overlay_tabs: bool = False, overlay_width: int = 408):
+    def __init__(self, tabs: list[tuple[str, QWidget]], parent=None, *, overlay_tabs: bool = False, overlay_width: int = 408, show_segment_bar: bool = True):
         super().__init__(parent)
         self._overlay_tabs = bool(overlay_tabs)
         self._overlay_width = max(220, int(overlay_width))
+        self._show_segment_bar = bool(show_segment_bar)
         self.setObjectName("referenceSectionHost")
         self.setStyleSheet(f"QWidget#referenceSectionHost{{background:{BG};border:none;}}")
 
@@ -123,7 +119,13 @@ class ReferenceSectionHost(QWidget):
 
         bar_layout.addStretch(1)
         self._segment_bar = bar
-        if self._overlay_tabs:
+        if not self._show_segment_bar:
+            # Some workspaces provide their own in-page view switch.  Keep the
+            # stacked host API and hidden segment buttons for compatibility, but
+            # do not reserve the historical 42 px navigation strip.
+            bar.setVisible(False)
+            layout.addWidget(self._stack, 1)
+        elif self._overlay_tabs:
             # Keep the OCR/PDF switcher only over the left control column.
             # The content stack itself starts at y=0, so the right preview/log
             # gains the full height that was previously wasted by a full-width bar.
@@ -143,7 +145,7 @@ class ReferenceSectionHost(QWidget):
 
     def resizeEvent(self, event) -> None:
         super().resizeEvent(event)
-        if getattr(self, "_overlay_tabs", False):
+        if getattr(self, "_overlay_tabs", False) and getattr(self, "_show_segment_bar", True):
             bar = getattr(self, "_segment_bar", None)
             if bar is not None:
                 bar.setGeometry(0, 0, min(self.width(), self._overlay_width), 42)
@@ -165,8 +167,8 @@ class Sidebar(QWidget):
     section_changed = Signal(int)
     command_palette_requested = Signal()
 
-    # 七个主功能区；工作区独立于页面管理。OCR 对比、图文对照与 PDF 文字层
-    # 通过主功能区顶部页签融合。
+    # 七个主功能区；工作区独立于页面管理。OCR/PDF 保留紧凑顶部切换；
+    # 文字校对的全文总览/图文对照改为页内互切，不再占用额外顶部栏。
     ITEMS = list(REFERENCE_SECTION_ITEMS)
 
     def __init__(self, parent=None):
@@ -194,7 +196,6 @@ class Sidebar(QWidget):
         layout.addLayout(brand)
         layout.addSpacing(SIDEBAR_BRAND_GAP)
 
-        mod_key = "⌘" if sys.platform == "darwin" else "Ctrl+"
         self._buttons: list[DesignNavButton] = []
         icon_root = Path(__file__).resolve().parents[2] / "assets" / "ui_icons"
         for icon_name, label in self.ITEMS:
@@ -216,7 +217,7 @@ class Sidebar(QWidget):
                 btn.setIcon(icon)
                 btn.setIconSize(QSize(18, 18))
             idx = len(self._buttons)
-            btn.setToolTip(f"{label}（{mod_key}{idx + 1}）")
+            btn.setToolTip(f"{label}（{primary_navigation_shortcut_label(idx)}）")
             btn.clicked.connect(partial(self._on_click, idx))
             layout.addWidget(btn)
             self._buttons.append(btn)

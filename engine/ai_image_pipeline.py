@@ -24,6 +24,7 @@ from PIL import Image, ImageOps
 
 from ai.config import AISettings, CONFIG_PATH
 from ai.multimodal_client import MultimodalClient
+from utils.atomic_io import atomic_write_text
 from ai.provider_factory import create_provider
 from models.document import Block, BlockType, BoundingBox, Metadata, PageInfo, TocEntry, UnifiedDocument
 from engine.page_ocr_policy import page_type_value
@@ -1448,7 +1449,7 @@ class AIImageBookProcessor:
 
     def _cached_call(
         self, client: MultimodalClient, prompt: str, images: list[str], *,
-        namespace: str, reasoning_effort: str | None = None,
+        namespace: str, reasoning_effort: str | None = None, cancel_check=None,
     ) -> tuple[str, bool]:
         image_hashes = [_sha256_file(path) for path in images]
         identity = {
@@ -1469,19 +1470,32 @@ class AIImageBookProcessor:
                     return payload["raw"], True
             except Exception:
                 pass
+        if cancel_check and cancel_check():
+            raise RuntimeError("AI 图文处理已停止")
+        call_kwargs = {"temperature": 0.0}
         if reasoning_effort:
-            try:
-                raw = client.call_json(prompt, images, temperature=0.0, reasoning_effort=reasoning_effort)
-            except TypeError as exc:
-                # Test doubles and third-party custom clients may still implement
-                # the pre-v2.2 signature. Only fall back for that exact contract.
-                if "reasoning_effort" not in str(exc):
-                    raise
-                raw = client.call_json(prompt, images, temperature=0.0)
-        else:
-            raw = client.call_json(prompt, images, temperature=0.0)
+            call_kwargs["reasoning_effort"] = reasoning_effort
+        if cancel_check is not None:
+            call_kwargs["cancel_check"] = cancel_check
+        try:
+            raw = client.call_json(prompt, images, **call_kwargs)
+        except TypeError as exc:
+            # Keep third-party/test clients with the older call_json signature
+            # working while the built-in client supports cancellable backoff.
+            message = str(exc)
+            retry_kwargs = dict(call_kwargs)
+            changed = False
+            if "cancel_check" in message and "cancel_check" in retry_kwargs:
+                retry_kwargs.pop("cancel_check", None)
+                changed = True
+            if "reasoning_effort" in message and "reasoning_effort" in retry_kwargs:
+                retry_kwargs.pop("reasoning_effort", None)
+                changed = True
+            if not changed:
+                raise
+            raw = client.call_json(prompt, images, **retry_kwargs)
         if self.options.use_cache:
-            path.write_text(json.dumps({"raw": raw}, ensure_ascii=False), encoding="utf-8")
+            atomic_write_text(path, json.dumps({"raw": raw}, ensure_ascii=False))
         return raw, False
 
     # ------------------------------------------------------------------
@@ -1596,7 +1610,7 @@ class AIImageBookProcessor:
                 image_paths = [p.prepared_path for p in batch]
                 local_hits = 0
                 local_splits = 0
-                raw, hit = self._cached_call(client, prompt, image_paths, namespace="page")
+                raw, hit = self._cached_call(client, prompt, image_paths, namespace="page", cancel_check=cancel_event.is_set if cancel_event else None)
                 local_hits += int(hit)
                 known_pages = {p.page_no for p in batch}
                 try:
@@ -1610,7 +1624,7 @@ class AIImageBookProcessor:
                           "即使该页无正文也返回b=[]。不得漏页。"
                     )
                     log(f"AI 返回结构不完整，正在重试本批次：{first_error}")
-                    raw, retry_hit = self._cached_call(client, retry_prompt, image_paths, namespace="page-retry")
+                    raw, retry_hit = self._cached_call(client, retry_prompt, image_paths, namespace="page-retry", cancel_check=cancel_event.is_set if cancel_event else None)
                     local_hits += int(retry_hit)
                     try:
                         payload = _json_object(raw)
@@ -1758,7 +1772,7 @@ class AIImageBookProcessor:
                     rescue_image = self._prepare_page_rescue(prepared_page)
                     prompt = self._rescue_prompt(prepared_page)
                     log(f"第 {prepared_page.page_no} 页首轮无正文，正在进行一次高清遗漏保护复核…")
-                    raw, hit = self._cached_call(client, prompt, [rescue_image], namespace="page-rescue")
+                    raw, hit = self._cached_call(client, prompt, [rescue_image], namespace="page-rescue", cancel_check=cancel_event.is_set if cancel_event else None)
                     cache_hits += int(hit)
                     payload = _json_object(raw)
                     page_payload = _validated_page_payloads(payload, {prepared_page.page_no})[prepared_page.page_no]
@@ -1826,6 +1840,7 @@ class AIImageBookProcessor:
                     raw, hit = self._cached_call(
                         client, prompt, [rescue_image], namespace="page-structure-audit",
                         reasoning_effort=audit_effort,
+                        cancel_check=cancel_event.is_set if cancel_event else None,
                     )
                     cache_hits += int(hit)
                     payload = _json_object(raw)
@@ -1916,7 +1931,7 @@ class AIImageBookProcessor:
                 prompt = self._edge_integrity_prompt(prepared_page, old_records, reason)
                 log(f"第 {page_no} 页正文接近物理页顶/右边缘，正在核对最右列与第一句是否完整…")
                 try:
-                    raw, hit = self._cached_call(client, prompt, [rescue_image], namespace="edge-integrity")
+                    raw, hit = self._cached_call(client, prompt, [rescue_image], namespace="edge-integrity", cancel_check=cancel_event.is_set if cancel_event else None)
                     cache_hits += int(hit)
                     payload = _json_object(raw)
                     page_payload = _validated_page_payloads(payload, {page_no})[page_no]
@@ -1969,7 +1984,7 @@ class AIImageBookProcessor:
                     f"({first_chars} 字；相邻至少 {neighbour_floor} 字)，正在做一次定向高清漏文审计…"
                 )
                 try:
-                    raw, hit = self._cached_call(client, prompt, [rescue_image], namespace="page-short-rescue")
+                    raw, hit = self._cached_call(client, prompt, [rescue_image], namespace="page-short-rescue", cancel_check=cancel_event.is_set if cancel_event else None)
                     cache_hits += int(hit)
                     payload = _json_object(raw)
                     page_payload = _validated_page_payloads(payload, {page_no})[page_no]
@@ -2011,7 +2026,7 @@ class AIImageBookProcessor:
                     ]
                     prompt = self._review_prompt(group, record_map)
                     log(f"视觉复核疑难区域 {group_start + 1}–{min(group_start + len(group), len(limited))} / {len(limited)}")
-                    raw, hit = self._cached_call(client, prompt, crop_paths, namespace="review")
+                    raw, hit = self._cached_call(client, prompt, crop_paths, namespace="review", cancel_check=cancel_event.is_set if cancel_event else None)
                     cache_hits += int(hit)
                     payload = _json_object(raw)
                     expected_ids = {region.block_id for region in group}
@@ -2053,7 +2068,7 @@ class AIImageBookProcessor:
                     prompt = self._boundary_prompt(left, right)
                     paths = [prepared[left.page_no].prepared_path, prepared[right.page_no].prepared_path]
                     log(f"检测到第 {left.page_no}/{right.page_no} 页边界重复，正在做一次定向视觉核验…")
-                    raw, hit = self._cached_call(client, prompt, paths, namespace="boundary")
+                    raw, hit = self._cached_call(client, prompt, paths, namespace="boundary", cancel_check=cancel_event.is_set if cancel_event else None)
                     cache_hits += int(hit)
                     try:
                         action = _safe_text(_json_object(raw).get("a"))

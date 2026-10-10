@@ -12,6 +12,7 @@ from __future__ import annotations
 import copy
 from difflib import SequenceMatcher
 import gzip
+import io
 from datetime import datetime, timezone
 import hashlib
 import json
@@ -34,12 +35,13 @@ from engine.multi_ocr_compare import (
     physical_column_text_snapshot,
     project_fused_text_to_physical_columns,
 )
-from engine.ocr_roundtrip_package import structure_hash, layout_hash
+from engine.ocr_roundtrip_package import _json_detached, structure_hash, layout_hash
 from utils.safe_archive import (
     UnsafeArchiveError,
     ZipExtractionLimits,
     validate_zip,
 )
+from utils.atomic_io import atomic_output_path
 
 SCHEMA = "novel_formatter.multi_ocr_source_correction.v3"
 CANONICAL_CORRECTIONS_SCHEMA = "novel_formatter.multi_ocr_canonical_adjudication.v5"
@@ -158,7 +160,7 @@ def _column_texts(metadata: dict, ids: Sequence[str], block_text: str) -> list[s
 
 def _source_structure_hash(doc: UnifiedDocument) -> str:
     """Stable structure identity that excludes every mutable OCR text field."""
-    value = copy.deepcopy(doc.to_dict())
+    value = _json_detached(doc.to_dict())
     value.pop("processing_log", None)
     metadata = value.get("metadata")
     if isinstance(metadata, dict):
@@ -1739,7 +1741,7 @@ def build_source_correction_payload(
         from engine.ocr_common_mode_guard import select_common_mode_risks
         common_mode_risk_items = select_common_mode_risks(rows)
         for risk in common_mode_risk_items:
-            row_index = int(risk.get("row_index", -1) or -1)
+            row_index = int(risk.get("row_index", -1))  # 0 is a valid first-row index
             if not 0 <= row_index < len(rows):
                 continue
             item = rows[row_index]
@@ -1916,7 +1918,7 @@ def _compact_ai_candidates(row: dict) -> list[dict]:
 
 
 _AI_QUICK_CLI = r'''#!/usr/bin/env python3
-import argparse, gzip, json, pathlib, zipfile
+import argparse, gzip, json, os, pathlib, zipfile
 ROOT = pathlib.Path(__file__).resolve().parent
 TASKS = ROOT / "04_ai_tasks_compact.jsonl"
 ANSWERS = ROOT / "AI_OUTPUT" / "answers.jsonl"
@@ -1941,7 +1943,25 @@ def load_gz(path):
 def status():
     tasks=read_jsonl(TASKS); answers=read_jsonl(ANSWERS)
     ids={str(x.get("id")) for x in answers}
-    print(json.dumps({"tasks":len(tasks),"answered":sum(str(t.get("id")) in ids for t in tasks),"remaining":sum(str(t.get("id")) not in ids for t in tasks)},ensure_ascii=False))
+    batches=[]
+    batch_size=40
+    for start in range(0,len(tasks),batch_size):
+        chunk=tasks[start:start+batch_size]
+        answered=sum(str(t.get("id")) in ids for t in chunk)
+        batches.append({
+            "batch":len(batches)+1,
+            "first_id":str(chunk[0].get("id")) if chunk else "",
+            "last_id":str(chunk[-1].get("id")) if chunk else "",
+            "tasks":len(chunk),
+            "answered":answered,
+            "remaining":len(chunk)-answered,
+        })
+    print(json.dumps({
+        "tasks":len(tasks),
+        "answered":sum(str(t.get("id")) in ids for t in tasks),
+        "remaining":sum(str(t.get("id")) not in ids for t in tasks),
+        "batches":batches,
+    },ensure_ascii=False))
 
 def _validate_answers(require_complete=False):
     tasks={str(x.get("id")):x for x in read_jsonl(TASKS)}
@@ -1954,21 +1974,29 @@ def _validate_answers(require_complete=False):
         if tid in seen:
             errors.append(f"duplicate task id: {tid}"); continue
         seen.add(tid)
+        if "delete_intentionally" in ans and ans["delete_intentionally"] is not True:
+            errors.append(f"delete_intentionally must be literal true when supplied: {tid}"); continue
+        has_delete=ans.get("delete_intentionally") is True
         if bool(ans.get("unresolved",False)):
-            if "pick" in ans or "text" in ans:
-                errors.append(f"unresolved answer must not also contain pick/text: {tid}")
+            if "pick" in ans or "text" in ans or has_delete:
+                errors.append(f"unresolved answer must not also contain pick/text/delete: {tid}")
             continue
         has_pick="pick" in ans; has_text="text" in ans
-        if has_pick==has_text:
-            errors.append(f"answer needs exactly one of pick/text/unresolved: {tid}"); continue
-        if has_pick:
-            try: pick=int(ans["pick"])
-            except Exception:
+        if sum((has_pick,has_text,has_delete)) != 1:
+            errors.append(f"answer needs exactly one of pick/text/delete_intentionally/unresolved: {tid}"); continue
+        if has_delete:
+            pass  # Deliberate whole-row omission, with a sealed row binding.
+        elif has_pick:
+            raw_pick=ans["pick"]
+            if type(raw_pick) is not int:
                 errors.append(f"pick must be integer: {tid}"); continue
+            pick=raw_pick
             candidates=tasks[tid].get("c") or []
             if pick<0 or pick>=len(candidates):
                 errors.append(f"pick out of range: {tid}"); continue
-            if bool(candidates[pick].get("fail")):
+            if (bool(candidates[pick].get("f"))
+                    or bool(candidates[pick].get("fail"))
+                    or not str(candidates[pick].get("t") or "").strip()):
                 errors.append(f"cannot pick failed OCR candidate: {tid}")
         else:
             if not str(ans.get("text") or "").strip():
@@ -2005,7 +2033,10 @@ def finish():
         row=rows[idx]
         if str(row.get("row_id"))!=str(binding.get("row_id")): raise SystemExit(f"row binding mismatch: {tid}")
         if str(row.get("base_row_sha256"))!=str(binding.get("base_row_sha256")): raise SystemExit(f"base hash mismatch: {tid}")
-        if "pick" in ans:
+        delete_intentionally=ans.get("delete_intentionally") is True
+        if delete_intentionally:
+            text=""
+        elif "pick" in ans:
             pick=int(ans["pick"]); chosen=(task.get("c") or [])[pick]; text=str(chosen.get("t") or "")
         else:
             text=str(ans.get("text") or "")
@@ -2015,11 +2046,20 @@ def finish():
         try: conf=float(ans.get("confidence",0.98))
         except Exception: conf=0.98
         verdict["confidence"]=max(0.0,min(1.0,conf))
-        verdict["delete_intentionally"]=False
+        verdict["delete_intentionally"]=delete_intentionally
     payload=json.dumps(auth,ensure_ascii=False,separators=(",",":")).encode("utf-8")
-    with zipfile.ZipFile(OUT,"w",compression=zipfile.ZIP_DEFLATED,compresslevel=1) as z:
-        z.writestr("AI_OUTPUT/model_corrections.json",payload)
-        if ANSWERS.exists(): z.write(ANSWERS,"AI_OUTPUT/answers.jsonl")
+    tmp=OUT.with_name(f".{OUT.name}.tmp")
+    try:
+        with zipfile.ZipFile(tmp,"w",compression=zipfile.ZIP_DEFLATED,compresslevel=1) as z:
+            z.writestr("AI_OUTPUT/model_corrections.json",payload)
+            if ANSWERS.exists(): z.write(ANSWERS,"AI_OUTPUT/answers.jsonl")
+        with zipfile.ZipFile(tmp,"r") as check:
+            bad=check.testzip()
+            if bad: raise SystemExit(f"AI_IMPORT ZIP CRC failed: {bad}")
+        os.replace(tmp,OUT)
+    finally:
+        try: tmp.unlink()
+        except FileNotFoundError: pass
     print(json.dumps({"output":str(OUT),"answers":len(answers),"tasks":len(tasks)},ensure_ascii=False))
 
 def main():
@@ -2046,8 +2086,738 @@ def _ai_short_model_label(label: str) -> str:
     return value.split("·")[-1].strip() or value
 
 
-def _ai_visible_quick_tasks(tasks: Sequence[dict]) -> list[dict]:
+_AI_CONTEXT_TRIM = " \t\r\n　、。！？!?「」『』（）()［］[]【】〈〉《》…‥・：:；;—―-"
+_AI_KATAKANA_TERM_RE = re.compile(r"[ァ-ヶー]{2,16}")
+_AI_HIRAGANA_ONLY_TERM_RE = re.compile(r"^[ぁ-ゖ]+$")
+_AI_KATAKANA_ONLY_TERM_RE = re.compile(r"^[ァ-ヶー]+$")
+_AI_INFORMATIONAL_TERM_RE = re.compile(r"[一-龯々〆ヵヶァ-ヶー0-9０-９]")
+
+
+def _ai_stable_context_text(row: dict) -> str:
+    """Return only high-trust in-workspace text for web-GPT context anchors.
+
+    The exported web bundle must not manufacture a reference truth.  Only exact
+    independently executed OCR consensus can contribute global context.  Fresh
+    conflict/provisional rows and prior adjudication results are excluded.
+    """
+    status = str(row.get("status", "") or "")
+    if status == "exact_consensus" and not bool(row.get("editable")):
+        evidence = [
+            str(item.get("text", "") or "")
+            for item in (row.get("model_evidence") or [])
+            if isinstance(item, dict) and bool(item.get("independently_executed", True))
+            and str(item.get("text", "") or "").strip()
+        ]
+        if evidence:
+            normalized = {_ai_compact_candidate_key(value) for value in evidence}
+            if len(normalized) == 1:
+                return evidence[0]
+    # Do not use prior AI/human adjudications as context truth.  The web-GPT
+    # bundle is meant to improve *fresh* adjudication from OCR evidence, so
+    # global anchors come from independently executed exact-consensus OCR only.
+    return ""
+
+
+def _ai_variant_windows(candidate_texts: Sequence[str], *, limit: int = 20) -> list[str]:
+    """Extract only ambiguity-bearing terms from candidate differences.
+
+    Do not export every proper name that merely happens to occur in a disputed
+    sentence.  Whole-book web packages become much smaller when shared context
+    is attached only to the actual differing span.  If a changed span touches a
+    Katakana token, export the full token (e.g. ニノ, グディオン), not fragments
+    such as オン/ール.  Non-Katakana changes keep a short one/two-character
+    window so 目/日 or 魔王/魔土 can still find stable book evidence.
+    """
+    texts = [str(value or "") for value in candidate_texts if str(value or "").strip()]
+    unique = list(dict.fromkeys(texts))
+    terms: list[str] = []
+
+    def add(value: str, *, from_diff: bool = False) -> None:
+        value = str(value or "").strip(_AI_CONTEXT_TRIM)
+        if len(value) < 2 or len(value) > 18:
+            return
+        if _AI_HIRAGANA_ONLY_TERM_RE.fullmatch(value):
+            return
+        if not _AI_INFORMATIONAL_TERM_RE.search(value):
+            return
+        if from_diff and _AI_KATAKANA_ONLY_TERM_RE.fullmatch(value):
+            # Full Katakana tokens are added explicitly from the changed span.
+            return
+        if value not in terms:
+            terms.append(value)
+
+    def add_overlapping_katakana(text: str, start: int, end: int) -> None:
+        if not text:
+            return
+        probe_start = max(0, start - 1)
+        probe_end = min(len(text), max(end, start + 1) + 1)
+        for match in _AI_KATAKANA_TERM_RE.finditer(text):
+            if match.end() <= probe_start or match.start() >= probe_end:
+                continue
+            add(match.group(0))
+
+    for left_index in range(len(unique)):
+        for right_index in range(left_index + 1, len(unique)):
+            left, right = unique[left_index], unique[right_index]
+            matcher = SequenceMatcher(None, left, right, autojunk=False)
+            for tag, i1, i2, j1, j2 in matcher.get_opcodes():
+                if tag == "equal":
+                    continue
+                add_overlapping_katakana(left, i1, i2)
+                add_overlapping_katakana(right, j1, j2)
+                for text, start, end in ((left, i1, i2), (right, j1, j2)):
+                    if not text:
+                        continue
+                    if start == end:
+                        start = max(0, start - 1)
+                        end = min(len(text), end + 1)
+                    for radius in (1, 2):
+                        window = text[max(0, start - radius):min(len(text), end + radius)]
+                        add(window, from_diff=True)
+                        if len(terms) >= limit:
+                            return terms
+    return terms
+
+def _ai_context_snippet(text: str, term: str, *, radius: int = 42) -> str:
+    value = str(text or "")
+    pos = value.find(term)
+    if pos < 0:
+        return value[: max(32, radius * 2)]
+    start = max(0, pos - radius)
+    end = min(len(value), pos + len(term) + radius)
+    return value[start:end]
+
+
+def _build_ai_shared_context(
+    rows: Sequence[dict], tasks: Sequence[dict]
+) -> tuple[dict[str, list[str]], list[dict]]:
+    """Build a de-duplicated book-context index for web GPT review.
+
+    Batch 41 embedded up to six full anchor objects in every task.  On a real
+    1,715-task book that tripled the visible JSONL size because popular names
+    such as ``ニノ`` and ``シオン`` repeated the same examples hundreds of
+    times.  Store each anchor once and let tasks reference compact ``Axxxxx``
+    IDs instead.
+    """
+    stable_rows: list[tuple[str, int, str, str]] = []
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        text = _ai_stable_context_text(row)
+        if not text.strip():
+            continue
+        stable_rows.append((
+            str(row.get("row_id", "") or ""),
+            int(row.get("page", 0) or 0),
+            text,
+            "locked_exact_consensus" if str(row.get("status", "") or "") == "exact_consensus" else "locked_canonical",
+        ))
+
+    task_terms: dict[str, list[str]] = {}
+    all_terms: list[str] = []
+    for task in tasks:
+        task_id = str(task.get("id", "") or "")
+        candidate_texts = [
+            str(item.get("t", "") or "")
+            for item in (task.get("c") or [])
+            if isinstance(item, dict) and not bool(item.get("fail", False))
+        ]
+        terms = _ai_variant_windows(candidate_texts)
+        task_terms[task_id] = terms
+        for term in terms:
+            if term not in all_terms:
+                all_terms.append(term)
+
+    raw_anchors: dict[str, dict] = {}
+    for term in all_terms:
+        count = 0
+        examples: list[dict] = []
+        for row_id, page, text, source in stable_rows:
+            occurrences = text.count(term)
+            if occurrences <= 0:
+                continue
+            count += occurrences
+            if len(examples) < 3:
+                examples.append({
+                    "row_id": row_id,
+                    "page": page,
+                    "text": _ai_context_snippet(text, term),
+                    "source": source,
+                })
+        if count > 0:
+            raw_anchors[term] = {"t": term, "n": count, "e": examples}
+
+    # Stable deterministic IDs make package diffs and resumable web review easy.
+    ordered_terms = sorted(
+        raw_anchors,
+        key=lambda term: (-int(raw_anchors[term].get("n", 0) or 0), len(term), term),
+    )
+    anchors: list[dict] = []
+    id_by_term: dict[str, str] = {}
+    for index, term in enumerate(ordered_terms, start=1):
+        anchor_id = f"A{index:05d}"
+        id_by_term[term] = anchor_id
+        anchors.append({"id": anchor_id, **raw_anchors[term]})
+
+    context_by_task: dict[str, list[str]] = {}
+    for task_id, terms in task_terms.items():
+        ids = [id_by_term[term] for term in terms if term in id_by_term]
+        if ids:
+            context_by_task[task_id] = ids[:6]
+    return context_by_task, anchors
+
+
+def _build_ai_task_context(rows: Sequence[dict], tasks: Sequence[dict]) -> dict[str, list[dict]]:
+    """Backward-compatible expanded view used by older internal callers/tests."""
+    context_by_task, anchors = _build_ai_shared_context(rows, tasks)
+    by_id = {str(item.get("id", "")): item for item in anchors}
+    return {
+        task_id: [copy.deepcopy(by_id[anchor_id]) for anchor_id in ids if anchor_id in by_id]
+        for task_id, ids in context_by_task.items()
+    }
+
+
+def _build_ai_consistency_groups(
+    context_by_task: dict[str, list[str]], anchors: Sequence[dict]
+) -> list[dict]:
+    by_id = {str(item.get("id", "")): item for item in anchors}
+    grouped: dict[str, dict] = {}
+    for task_id, anchor_ids in context_by_task.items():
+        for anchor_id in anchor_ids:
+            anchor = by_id.get(str(anchor_id))
+            if not anchor:
+                continue
+            bucket = grouped.setdefault(str(anchor_id), {
+                "anchor_id": str(anchor_id),
+                "term": str(anchor.get("t", "") or ""),
+                "task_ids": [],
+                "stable_count": int(anchor.get("n", 0) or 0),
+            })
+            if task_id not in bucket["task_ids"]:
+                bucket["task_ids"].append(task_id)
+    groups = [item for item in grouped.values() if len(item["task_ids"]) >= 2]
+    groups.sort(key=lambda item: (-len(item["task_ids"]), -int(item["stable_count"] or 0), item["term"]))
+    return groups[:200]
+
+
+def _ai_group_member_hint(task: dict, term: str) -> dict:
+    """Describe how a strong term anchor applies to one visible review row.
+
+    This is deliberately a *hint*, not an automatic answer.  A web reviewer can
+    settle a repeated proper-name/term once at group level, then reuse that
+    decision for rows whose only candidate difference lies inside that term.
+    Rows with any residual punctuation/lexical difference remain in the normal
+    row-review pass.
+    """
+    term = str(term or "")
+    valid_candidates: list[tuple[int, str]] = []
+    for index, candidate in enumerate(task.get("c") or []):
+        if not isinstance(candidate, dict) or bool(candidate.get("f", False)):
+            continue
+        text = str(candidate.get("t", "") or "")
+        if text:
+            valid_candidates.append((index, text))
+
+    anchor_picks = [index for index, text in valid_candidates if term and term in text]
+    anchor_only = False
+    if len(anchor_picks) == 1 and not task.get("r"):
+        anchor_index = anchor_picks[0]
+        anchor_text = next(text for index, text in valid_candidates if index == anchor_index)
+        spans: list[tuple[int, int]] = []
+        start = 0
+        while term:
+            position = anchor_text.find(term, start)
+            if position < 0:
+                break
+            spans.append((position, position + len(term)))
+            start = position + len(term)
+
+        if spans:
+            anchor_only = True
+            for other_index, other_text in valid_candidates:
+                if other_index == anchor_index:
+                    continue
+                matcher = SequenceMatcher(None, anchor_text, other_text, autojunk=False)
+                for tag, i1, i2, _j1, _j2 in matcher.get_opcodes():
+                    if tag == "equal":
+                        continue
+                    if i1 == i2:
+                        inside_term = any(left <= i1 <= right for left, right in spans)
+                    else:
+                        inside_term = any(i1 < right and i2 > left for left, right in spans)
+                    if not inside_term:
+                        anchor_only = False
+                        break
+                if not anchor_only:
+                    break
+
+    hint = {
+        "id": str(task.get("id", "") or ""),
+        "anchor_picks": anchor_picks,
+        "anchor_only": bool(anchor_only),
+    }
+    if anchor_only and len(anchor_picks) == 1:
+        hint["direct_pick"] = anchor_picks[0]
+    return hint
+
+
+_AI_VISUAL_NUMERIC_GLYPHS = frozenset("0123456789０１２３４５６７８９一二三四五六七八九十百千万億兆零〇")
+_AI_VISUAL_NEGATION_TOKENS = (
+    "ない", "無い", "ぬ", "ず", "ません", "じゃない", "ではない", "なく", "なかった", "なければ",
+)
+_AI_VISUAL_PUNCT_RE = re.compile(r"[\s、。！？!?…‥・「」『』（）()［］【】〈〉《》〔〕—―─ー〜～:：;；,.，．\-]+")
+_AI_SMALL_KANA = frozenset("ぁぃぅぇぉゃゅょっゎァィゥェォャュョッヮヵヶ")
+_AI_REPEAT_KANA_RE = re.compile(r"([ぁ-んァ-ヶー])\1{2,}")
+_AI_STATUS_LEADING_NUMBER_RE = re.compile(r"^[\s「『【]*(?:[0-9０-９]{1,3})(?=名前|種族|ランク|レベル|職業)")
+_AI_NUMERIC_MEASUREMENT_RE = re.compile(
+    r"[0-9０-９一二三四五六七八九十百千万億兆零〇]+"
+    r"(?:年|歳|人|匹|個|回|階|日|時間|時|分|秒|枚|本|体|頭|羽|冊|巻|章|レベル|以上|以下|程度)"
+)
+_AI_DIALOGUE_MARKS = frozenset("「」『』!?！？")
+
+
+def _ai_candidate_diff_hints(task: dict, *, limit: int = 6) -> list[dict]:
+    """Return compact candidate-only diff hints for visual focus.
+
+    Hints contain no reference truth and never choose an answer.  They merely
+    expose the exact snippets that differ so a web reviewer does not miss a
+    one-glyph conflict inside a long vertical crop.
+    """
+    candidates = [
+        candidate for candidate in (task.get("c") or [])
+        if isinstance(candidate, dict) and not bool(candidate.get("f", False))
+        and str(candidate.get("t", "") or "")
+    ]
+    hints: list[dict] = []
+    seen: set[tuple[str, str]] = set()
+    for left_index, left in enumerate(candidates):
+        left_text = str(left.get("t", "") or "")
+        for right in candidates[left_index + 1:]:
+            right_text = str(right.get("t", "") or "")
+            matcher = SequenceMatcher(None, left_text, right_text, autojunk=False)
+            for tag, i1, i2, j1, j2 in matcher.get_opcodes():
+                if tag == "equal":
+                    continue
+                a = left_text[i1:i2]
+                b = right_text[j1:j2]
+                if not a and not b:
+                    continue
+                key = (a, b)
+                reverse = (b, a)
+                if key in seen or reverse in seen:
+                    continue
+                seen.add(key)
+                hints.append({
+                    "a": a, "b": b,
+                    "a_models": list(left.get("m") or []),
+                    "b_models": list(right.get("m") or []),
+                    "micro": max(len(a), len(b)) <= 2,
+                })
+                if len(hints) >= limit:
+                    return hints
+    return hints
+
+
+def _ai_single_lexical_substitution(task: dict) -> tuple[list[str], int, str, str] | None:
+    """Return the sole lexical substitution after punctuation stripping.
+
+    The helper is deliberately structural: it never evaluates which glyph is
+    correct. It is used only to decide whether one tiny disagreement deserves
+    pixel review.
+    """
+    forms: list[str] = []
+    for candidate in (task.get("c") or []):
+        if not isinstance(candidate, dict) or bool(candidate.get("f", False)):
+            continue
+        text = str(candidate.get("t", "") or "")
+        if not text:
+            continue
+        lexical = _AI_VISUAL_PUNCT_RE.sub("", text)
+        if lexical not in forms:
+            forms.append(lexical)
+    if len(forms) != 2 or len(forms[0]) != len(forms[1]):
+        return None
+    changes = [(index, left, right) for index, (left, right) in enumerate(zip(forms[0], forms[1])) if left != right]
+    if len(changes) != 1:
+        return None
+    index, left, right = changes[0]
+    return forms, index, left, right
+
+
+def _ai_is_cjk_glyph(value: str) -> bool:
+    if len(value) != 1:
+        return False
+    code = ord(value)
+    return 0x3400 <= code <= 0x9FFF or 0xF900 <= code <= 0xFAFF
+
+
+def _ai_is_hiragana(value: str) -> bool:
+    return len(value) == 1 and 0x3040 <= ord(value) <= 0x309F
+
+
+def _ai_hard_visual_guard_reasons(task: dict) -> list[str]:
+    """Candidate-only hard-error guards learned from failure *types*, not truth.
+
+    These guards are intentionally generic.  They do not embed any corrected
+    text from post-hoc references; they only detect evidence shapes that proved
+    unsafe to settle from model count or language plausibility alone.
+    """
+    candidates = [
+        candidate for candidate in (task.get("c") or [])
+        if isinstance(candidate, dict)
+    ]
+    good = [candidate for candidate in candidates if not bool(candidate.get("f", False)) and str(candidate.get("t", "") or "")]
+    texts = list(dict.fromkeys(str(candidate.get("t", "") or "") for candidate in good))
+    if len(texts) < 2:
+        return []
+
+    reasons: list[str] = []
+    hints = _ai_candidate_diff_hints(task, limit=12)
+    lexical_hints = [
+        hint for hint in hints
+        if _AI_VISUAL_PUNCT_RE.sub("", str(hint.get("a", "") or "") + str(hint.get("b", "") or ""))
+    ]
+
+    # A 2:1 majority is not image truth, but forcing every one/two-character
+    # disagreement to pixels is too expensive. Escalate only the narrow class
+    # that repeatedly caused real book errors: one CJK substitution with a
+    # majority-backed candidate, or a one-kana passive/causative verb-stem
+    # substitution immediately before ``される`` / related forms.
+    supports = [len(candidate.get("m") or []) for candidate in good]
+    substitution = _ai_single_lexical_substitution(task)
+    if supports and max(supports) >= 2 and substitution is not None:
+        forms, index, left, right = substitution
+        if _ai_is_cjk_glyph(left) and _ai_is_cjk_glyph(right):
+            reasons.append("majority_single_cjk_substitution")
+        elif _ai_is_hiragana(left) and _ai_is_hiragana(right):
+            left_tail = forms[0][index + 1:index + 7]
+            right_tail = forms[1][index + 1:index + 7]
+            passive_suffixes = ("される", "された", "されて", "されれ", "させる", "させた")
+            if left_tail.startswith(passive_suffixes) or right_tail.startswith(passive_suffixes):
+                reasons.append("passive_verb_stem_micro_conflict")
+
+    # If one recognizer failed entirely, the remaining disagreement has less
+    # independent redundancy than its row count suggests.
+    if any(bool(candidate.get("f", False)) or not str(candidate.get("t", "") or "") for candidate in candidates):
+        reasons.append("failed_model_with_surviving_conflict")
+
+    # Small-kana and emphatic dialogue length are semantically/voice relevant
+    # but easy to miss in compact crops.
+    dialogue_like = any(any(mark in text for mark in _AI_DIALOGUE_MARKS) for text in texts)
+    if dialogue_like and any(any(char in _AI_SMALL_KANA for char in (str(h.get("a", "")) + str(h.get("b", "")))) for h in hints):
+        reasons.append("dialogue_small_kana_conflict")
+    if dialogue_like and any(_AI_REPEAT_KANA_RE.search(text) for text in texts):
+        reasons.append("dialogue_repeated_kana_emphasis")
+
+    # Status cards frequently share the crop with a printed page number.  The
+    # number must not be copied into body text just because multiple OCR engines
+    # saw it.
+    if any(_AI_STATUS_LEADING_NUMBER_RE.search(text) for text in texts):
+        reasons.append("leading_status_page_number_risk")
+
+    # Common-mode numeric errors are invisible to a candidate-diff-only gate:
+    # every recognizer can agree on the same wrong number while disagreeing on
+    # an unrelated name. If all surviving candidates contain the same explicit
+    # measurement/counter token, require pixels for that measurement too.
+    measurement_sets = [set(_AI_NUMERIC_MEASUREMENT_RE.findall(text)) for text in texts]
+    if measurement_sets and set.intersection(*measurement_sets):
+        reasons.append("shared_numeric_measurement_in_disagreement")
+
+    return list(dict.fromkeys(reasons))
+
+
+def _ai_visual_focus_hints(task: dict, reasons: Sequence[str]) -> list[str]:
+    """Human/GPT-facing attention hints that never encode an answer."""
+    hints: list[str] = []
+    reason_set = set(str(value) for value in reasons)
+    if "failed_model_with_surviving_conflict" in reason_set:
+        hints.append("One OCR engine failed; do not treat the two surviving candidates as a reliable majority.")
+    if "majority_single_cjk_substitution" in reason_set or "passive_verb_stem_micro_conflict" in reason_set:
+        hints.append("Inspect the exact one-glyph lexical substitution shown in diff_hints; model count is not image truth.")
+    if "dialogue_small_kana_conflict" in reason_set or "dialogue_repeated_kana_emphasis" in reason_set:
+        hints.append("Verify small kana, repeated-kana count, ellipsis and any trailing prolonged-sound mark (ー) at the dialogue tail.")
+    if "leading_status_page_number_risk" in reason_set:
+        hints.append("Check whether leading digits are a printed page number outside the status-card text; do not copy them into body text.")
+    if "shared_numeric_measurement_in_disagreement" in reason_set:
+        hints.append("Verify every numeric measurement/counter directly from pixels even when all candidates agree on the digits.")
+    if "number_or_numeric_lookalike" in reason_set:
+        hints.append("Verify the differing number/numeric-lookalike glyph directly from pixels.")
+    if "punctuation_or_geometry" in reason_set:
+        hints.append("Verify punctuation/long-line geometry from pixels; Unicode lookalikes may be layout-equivalent but are not automatically interchangeable.")
+    return list(dict.fromkeys(hints))
+
+
+def _ai_visual_review_reasons(task: dict) -> list[str]:
+    """Return conservative reasons that make source pixels mandatory.
+
+    This does *not* auto-resolve a row.  It only moves rows with known
+    high-risk evidence patterns to the visual pass so web review can handle
+    cheap text/context rows first.  False positives are acceptable here;
+    false negatives must still be allowed to open the original row image.
+    """
+    reasons: list[str] = []
+    if task.get("r"):
+        reasons.append("common_mode")
+
+    texts = [
+        str(candidate.get("t", "") or "")
+        for candidate in (task.get("c") or [])
+        if isinstance(candidate, dict) and not bool(candidate.get("f", False)) and str(candidate.get("t", "") or "")
+    ]
+    texts = list(dict.fromkeys(texts))
+    if len(texts) < 2:
+        return reasons
+
+    diff_chunks: list[tuple[str, str]] = []
+    base = texts[0]
+    for other in texts[1:]:
+        matcher = SequenceMatcher(None, base, other, autojunk=False)
+        for tag, i1, i2, j1, j2 in matcher.get_opcodes():
+            if tag != "equal":
+                diff_chunks.append((base[i1:i2], other[j1:j2]))
+
+    if any(
+        any(char in _AI_VISUAL_NUMERIC_GLYPHS for char in (left + right))
+        for left, right in diff_chunks
+    ):
+        reasons.append("number_or_numeric_lookalike")
+
+    for token in _AI_VISUAL_NEGATION_TOKENS:
+        if len({token in text for text in texts}) > 1:
+            reasons.append("negation")
+            break
+
+    lexical_forms = {_AI_VISUAL_PUNCT_RE.sub("", text) for text in texts}
+    if len(lexical_forms) == 1 and len(texts) > 1:
+        reasons.append("punctuation_or_geometry")
+
+    reasons.extend(_ai_hard_visual_guard_reasons(task))
+    return list(dict.fromkeys(reasons))
+
+
+def _build_ai_evidence_cost_plan(batch: Sequence[dict], review_passes: dict) -> dict:
+    """Order remaining row review by evidence cost without changing answers."""
+    task_by_id = {str(task.get("id", "") or ""): task for task in batch}
+    row_ids = [
+        str(task_id or "") for task_id in (review_passes.get("row_review_task_ids") or [])
+        if str(task_id or "") in task_by_id
+    ]
+    anchor_text_first: list[str] = []
+    text_first: list[str] = []
+    visual_required: list[dict] = []
+    for task_id in row_ids:
+        task = task_by_id[task_id]
+        reasons = _ai_visual_review_reasons(task)
+        if reasons:
+            visual_required.append({
+                "id": task_id,
+                "image": str(task.get("i", "") or ""),
+                "page": int(task.get("p", 0) or 0),
+                "reasons": reasons,
+                "diff_hints": _ai_candidate_diff_hints(task),
+                "focus_hints": _ai_visual_focus_hints(task, reasons),
+            })
+        elif task.get("x"):
+            anchor_text_first.append(task_id)
+        else:
+            text_first.append(task_id)
+    visual_ids = [item["id"] for item in visual_required]
+    return {
+        "strategy": "lowest_evidence_cost_first",
+        "anchor_text_first_task_ids": anchor_text_first,
+        "text_first_task_ids": text_first,
+        "visual_required": visual_required,
+        "visual_required_task_ids": visual_ids,
+        "ordered_row_review_task_ids": anchor_text_first + text_first + visual_ids,
+        "counts": {
+            "anchor_text_first": len(anchor_text_first),
+            "text_first": len(text_first),
+            "visual_required": len(visual_required),
+            "row_review": len(row_ids),
+        },
+        "contract": "Priority changes review order only. Any text-first row may still open its original image when evidence is insufficient; every visual_required row must inspect source pixels before answering.",
+    }
+
+
+def _ai_visual_contact_sheet_bytes(items: Sequence[dict], folder: Path) -> bytes | None:
+    """Pack native-resolution row crops into one labeled lossless WebP without resampling."""
+    if not items:
+        return None
+    try:
+        from PIL import Image, ImageDraw
+    except Exception:
+        return None
+
+    opened: list[tuple[dict, object]] = []
+    for item in items:
+        rel = str(item.get("image", "") or "")
+        source = folder / rel
+        if not rel or not source.is_file():
+            continue
+        try:
+            image = Image.open(source).convert("L")
+        except Exception:
+            continue
+        opened.append((item, image))
+    if not opened:
+        return None
+
+    label_h = 26
+    gap = 10
+    min_cell_width = 220
+    max_row_width = 2400
+    reason_codes = {
+        "number_or_numeric_lookalike": "N",
+        "negation": "NEG",
+        "punctuation_or_geometry": "P",
+        "common_mode": "CM",
+        "majority_single_cjk_substitution": "CJK",
+        "passive_verb_stem_micro_conflict": "PV",
+        "failed_model_with_surviving_conflict": "F",
+        "dialogue_small_kana_conflict": "SK",
+        "dialogue_repeated_kana_emphasis": "REP",
+        "leading_status_page_number_risk": "PN",
+        "shared_numeric_measurement_in_disagreement": "NM",
+    }
+
+    def cell_width(pair) -> int:
+        return max(min_cell_width, int(pair[1].width))
+
+    rows: list[list[tuple[dict, object]]] = []
+    current: list[tuple[dict, object]] = []
+    current_width = 0
+    for pair in opened:
+        width = cell_width(pair)
+        add_width = width + (gap if current else 0)
+        if current and current_width + add_width > max_row_width:
+            rows.append(current)
+            current = []
+            current_width = 0
+            add_width = width
+        current.append(pair)
+        current_width += add_width
+    if current:
+        rows.append(current)
+
+    row_sizes: list[tuple[int, int]] = []
+    for row in rows:
+        width = sum(cell_width(pair) for pair in row) + gap * max(0, len(row) - 1)
+        height = max(int(pair[1].height) for pair in row) + label_h
+        row_sizes.append((width, height))
+    canvas_w = max(width for width, _height in row_sizes)
+    canvas_h = sum(height for _width, height in row_sizes) + gap * max(0, len(rows) - 1)
+    canvas = Image.new("L", (canvas_w, canvas_h), 255)
+    draw = ImageDraw.Draw(canvas)
+    y = 0
+    for row, (_row_w, row_h) in zip(rows, row_sizes):
+        x = 0
+        for item, image in row:
+            width = cell_width((item, image))
+            codes = "/".join(reason_codes.get(reason, "?") for reason in (item.get("reasons") or []))
+            label = f"{item.get('id', '')} p{item.get('page', '')} [{codes}]"
+            draw.text((x + 4, y + 5), label, fill="black")
+            image_x = x + max(0, (width - int(image.width)) // 2)
+            canvas.paste(image, (image_x, y + label_h))
+            x += width + gap
+        y += row_h + gap
+
+    output = io.BytesIO()
+    canvas.save(output, format="WEBP", lossless=True, quality=100, method=2)
+    return output.getvalue()
+
+
+def _build_ai_batch_review_passes(
+    batch: Sequence[dict],
+    batch_groups: Sequence[dict],
+    batch_anchors: Sequence[dict],
+) -> dict:
+    """Build a non-overlapping strong-group-first web review plan.
+
+    ``consistency_groups`` can overlap heavily (for example ``ルーティ`` and
+    the fragment ``ティ``).  Assign each task to at most one primary strong
+    group, preferring the group that covers more rows and the longer term.  The
+    full consistency-group list remains in the package for audit; this plan is
+    only the efficient execution order for the current web batch.
+    """
+    task_by_id = {str(task.get("id", "") or ""): task for task in batch}
+    anchor_by_id = {str(anchor.get("id", "") or ""): anchor for anchor in batch_anchors}
+
+    eligible: list[tuple[dict, list[str]]] = []
+    for group in batch_groups:
+        anchor_id = str(group.get("anchor_id", "") or "")
+        anchor = anchor_by_id.get(anchor_id) or {}
+        stable_count = int(group.get("stable_count", anchor.get("n", 0)) or 0)
+        term = str(group.get("term", "") or "")
+        # Keep the reusable fast path deliberately narrower than the global
+        # consistency index.  Batch 44 promotes only strong Katakana lexical
+        # terms (proper names / named entities / stable loanword terms).  Mixed
+        # prose fragments such as ``魔王を`` or generic Kanji words remain
+        # available in consistency_groups but must stay in ordinary row review.
+        if not _AI_KATAKANA_ONLY_TERM_RE.fullmatch(term) or len(term) < 2:
+            continue
+        local_task_ids = [
+            str(task_id) for task_id in (group.get("task_ids") or [])
+            if str(task_id) in task_by_id
+        ]
+        if stable_count < 3 or len(local_task_ids) < 2:
+            continue
+        eligible.append((group, local_task_ids))
+
+    eligible.sort(key=lambda pair: (
+        -len(pair[1]),
+        -len(str(pair[0].get("term", "") or "")),
+        -int(pair[0].get("stable_count", 0) or 0),
+        str(pair[0].get("term", "") or ""),
+    ))
+
+    assigned: set[str] = set()
+    direct: set[str] = set()
+    group_first: list[dict] = []
+    for group, local_task_ids in eligible:
+        task_ids = [task_id for task_id in local_task_ids if task_id not in assigned]
+        if len(task_ids) < 2:
+            continue
+        term = str(group.get("term", "") or "")
+        member_hints = [_ai_group_member_hint(task_by_id[task_id], term) for task_id in task_ids]
+        direct_task_ids = [
+            str(item.get("id", "") or "")
+            for item in member_hints
+            if bool(item.get("anchor_only")) and isinstance(item.get("direct_pick"), int)
+        ]
+        residual_task_ids = [task_id for task_id in task_ids if task_id not in set(direct_task_ids)]
+        group_first.append({
+            "anchor_id": str(group.get("anchor_id", "") or ""),
+            "term": term,
+            "stable_count": int(group.get("stable_count", 0) or 0),
+            "task_ids": task_ids,
+            "direct_task_ids": direct_task_ids,
+            "residual_task_ids": residual_task_ids,
+            "members": member_hints,
+        })
+        assigned.update(task_ids)
+        direct.update(direct_task_ids)
+
+    row_review_task_ids = [
+        str(task.get("id", "") or "") for task in batch
+        if str(task.get("id", "") or "") not in direct
+    ]
+    return {
+        "strategy": "strong_group_first_then_row",
+        "group_first": group_first,
+        "grouped_task_count": len(assigned),
+        "direct_after_group_count": len(direct),
+        "row_review_task_ids": row_review_task_ids,
+        "row_review_count": len(row_review_task_ids),
+        "contract": "A group decision never replaces row output: write one independent answer per stable task id. direct_pick is usable only after accepting that strong in-book anchor for the group; residual rows still require normal row evidence review.",
+    }
+
+def _ai_visible_quick_tasks(
+    tasks: Sequence[dict],
+    *,
+    context_by_task: dict[str, list[str]] | None = None,
+) -> list[dict]:
     visible = []
+    context_by_task = context_by_task or {}
     for task in tasks:
         candidates = []
         for candidate in task.get("c", []) or []:
@@ -2056,13 +2826,32 @@ def _ai_visible_quick_tasks(tasks: Sequence[dict]) -> list[dict]:
             if bool(candidate.get("fail", False)):
                 entry["f"] = 1
             candidates.append(entry)
+        task_id = str(task.get("id", ""))
         entry = {
-            "id": str(task.get("id", "")),
+            "id": task_id,
+            "p": int(task.get("page", 0) or 0),
+            "cols": list(task.get("cols") or []),
+            "s": str(task.get("status", "") or ""),
             "b": str(task.get("before", "") or ""),
             "c": candidates,
             "a": str(task.get("after", "") or ""),
             "i": str(task.get("img", "") or ""),
         }
+        if str(task.get("before2", "") or "").strip():
+            entry["b2"] = str(task.get("before2", "") or "")
+        if task.get("before_candidates"):
+            entry["bc"] = list(task.get("before_candidates") or [])
+        if task.get("before2_candidates"):
+            entry["b2c"] = list(task.get("before2_candidates") or [])
+        if str(task.get("after2", "") or "").strip():
+            entry["a2"] = str(task.get("after2", "") or "")
+        if task.get("after_candidates"):
+            entry["ac"] = list(task.get("after_candidates") or [])
+        if task.get("after2_candidates"):
+            entry["a2c"] = list(task.get("after2_candidates") or [])
+        anchors = context_by_task.get(task_id) or []
+        if anchors:
+            entry["x"] = anchors
         if task.get("risk"):
             entry["r"] = task.get("risk")
         visible.append(entry)
@@ -2085,10 +2874,13 @@ def _write_ai_quick_bundle(
     is redundant.
     """
     quick_output = output if direct_output else output.with_name(f"{output.stem}_GPT.zip")
-    quick_tmp = quick_output.with_name(f".{quick_output.name}.tmp")
     authority = (folder / "AI_OUTPUT" / "model_corrections.json").read_bytes()
-    visible_tasks = _ai_visible_quick_tasks(compact_ai_tasks)
     rows = payload.get("rows") or []
+    context_by_task, shared_context = _build_ai_shared_context(rows, compact_ai_tasks)
+    consistency_groups = _build_ai_consistency_groups(context_by_task, shared_context)
+    visible_tasks = _ai_visible_quick_tasks(
+        compact_ai_tasks, context_by_task=context_by_task,
+    )
     bindings = []
     for task in compact_ai_tasks:
         # Row zero is a valid authority row.  ``value or -1`` used to turn the
@@ -2108,8 +2900,195 @@ def _write_ai_quick_bundle(
             "row_id": str(row.get("row_id", "")),
             "base_row_sha256": str(row.get("base_row_sha256", "")),
         })
+    review_batches = []
+    batch_size = 40
+    shared_context_by_id = {str(item.get("id", "")): item for item in shared_context}
+    visible_task_by_id = {str(item.get("id", "")): item for item in visible_tasks}
+    book_term_aggregate: dict[tuple[str, str], dict] = {}
+    for start in range(0, len(visible_tasks), batch_size):
+        batch = visible_tasks[start:start + batch_size]
+        if not batch:
+            continue
+        batch_number = len(review_batches) + 1
+        task_ids = {str(task.get("id", "") or "") for task in batch}
+        anchor_ids: list[str] = []
+        for task in batch:
+            for anchor_id in task.get("x") or []:
+                anchor_id = str(anchor_id or "")
+                if anchor_id and anchor_id not in anchor_ids:
+                    anchor_ids.append(anchor_id)
+        batch_anchors = [
+            shared_context_by_id[anchor_id]
+            for anchor_id in anchor_ids
+            if anchor_id in shared_context_by_id
+        ]
+        batch_groups = []
+        for group in consistency_groups:
+            local_task_ids = [
+                str(task_id) for task_id in (group.get("task_ids") or [])
+                if str(task_id) in task_ids
+            ]
+            if not local_task_ids:
+                continue
+            batch_groups.append({
+                "anchor_id": str(group.get("anchor_id", "") or ""),
+                "term": str(group.get("term", "") or ""),
+                "stable_count": int(group.get("stable_count", 0) or 0),
+                "task_ids": local_task_ids,
+                "global_task_count": len(group.get("task_ids") or []),
+            })
+        batch_anchors_compact = [
+            {
+                "id": str(anchor.get("id", "") or ""),
+                "t": str(anchor.get("t", "") or ""),
+                "n": int(anchor.get("n", 0) or 0),
+                "strong": int(anchor.get("n", 0) or 0) >= 3,
+                "e": [
+                    str(example.get("text", "") or "")
+                    for example in (anchor.get("e") or [])
+                    if isinstance(example, dict) and str(example.get("text", "") or "").strip()
+                ],
+            }
+            for anchor in batch_anchors
+        ]
+        review_passes = _build_ai_batch_review_passes(batch, batch_groups, batch_anchors_compact)
+        evidence_cost = _build_ai_evidence_cost_plan(batch, review_passes)
+        for group in review_passes.get("group_first") or []:
+            anchor_id = str(group.get("anchor_id", "") or "")
+            term = str(group.get("term", "") or "")
+            key = (anchor_id, term)
+            aggregate = book_term_aggregate.setdefault(key, {
+                "anchor_id": anchor_id,
+                "term": term,
+                "stable_count": int(group.get("stable_count", 0) or 0),
+                "batches": [],
+                "task_ids": [],
+                "direct_task_ids": [],
+                "residual_task_ids": [],
+                "direct_answers": [],
+            })
+            aggregate["stable_count"] = max(
+                int(aggregate.get("stable_count", 0) or 0),
+                int(group.get("stable_count", 0) or 0),
+            )
+            if batch_number not in aggregate["batches"]:
+                aggregate["batches"].append(batch_number)
+            for field in ("task_ids", "direct_task_ids", "residual_task_ids"):
+                for task_id in group.get(field) or []:
+                    task_id = str(task_id or "")
+                    if task_id and task_id not in aggregate[field]:
+                        aggregate[field].append(task_id)
+            member_by_id = {
+                str(member.get("id", "") or ""): member
+                for member in (group.get("members") or [])
+                if isinstance(member, dict) and str(member.get("id", "") or "")
+            }
+            known_direct_ids = {
+                str(item.get("id", "") or "")
+                for item in aggregate.get("direct_answers") or []
+                if isinstance(item, dict)
+            }
+            for task_id in group.get("direct_task_ids") or []:
+                task_id = str(task_id or "")
+                member = member_by_id.get(task_id) or {}
+                direct_pick = member.get("direct_pick")
+                if task_id and isinstance(direct_pick, int) and task_id not in known_direct_ids:
+                    aggregate["direct_answers"].append({"id": task_id, "pick": direct_pick})
+                    known_direct_ids.add(task_id)
+        review_batches.append({
+            "batch": batch_number,
+            "path": f"BATCHES/B{batch_number:03d}_REVIEW.json",
+            "first_id": str(batch[0].get("id", "") or ""),
+            "last_id": str(batch[-1].get("id", "") or ""),
+            "count": len(batch),
+            "with_book_context": sum(bool(item.get("x")) for item in batch),
+            "with_images": sum(bool(str(item.get("i", "") or "")) for item in batch),
+            "common_mode": sum(bool(item.get("r")) for item in batch),
+            "grouped_tasks": int(review_passes.get("grouped_task_count", 0) or 0),
+            "direct_after_group": int(review_passes.get("direct_after_group_count", 0) or 0),
+            "row_review": int(review_passes.get("row_review_count", len(batch)) or 0),
+            "anchor_text_first": int((evidence_cost.get("counts") or {}).get("anchor_text_first", 0) or 0),
+            "text_first": int((evidence_cost.get("counts") or {}).get("text_first", 0) or 0),
+            "visual_required": int((evidence_cost.get("counts") or {}).get("visual_required", 0) or 0),
+            "visual_sheet_count": (int((evidence_cost.get("counts") or {}).get("visual_required", 0) or 0) + 7) // 8,
+        })
+
+    ordered_book_terms = sorted(
+        book_term_aggregate.values(),
+        key=lambda item: (
+            -len(item.get("task_ids") or []),
+            -len(str(item.get("term", "") or "")),
+            str(item.get("term", "") or ""),
+            str(item.get("anchor_id", "") or ""),
+        ),
+    )
+    book_term_id_by_key: dict[tuple[str, str], str] = {}
+    book_term_entries: list[dict] = []
+    for index, aggregate in enumerate(ordered_book_terms, start=1):
+        anchor_id = str(aggregate.get("anchor_id", "") or "")
+        term = str(aggregate.get("term", "") or "")
+        term_id = f"K{index:04d}"
+        book_term_id_by_key[(anchor_id, term)] = term_id
+        anchor = shared_context_by_id.get(anchor_id) or {}
+        representative_tasks = []
+        sample_ids = list(aggregate.get("direct_task_ids") or [])[:2]
+        for task_id in aggregate.get("residual_task_ids") or []:
+            if task_id not in sample_ids:
+                sample_ids.append(task_id)
+            if len(sample_ids) >= 3:
+                break
+        for task_id in sample_ids[:3]:
+            task = visible_task_by_id.get(str(task_id)) or {}
+            representative_tasks.append({
+                "id": str(task_id),
+                "c": [
+                    {
+                        "t": str(candidate.get("t", "") or ""),
+                        "m": list(candidate.get("m") or []),
+                        "f": bool(candidate.get("f", False)),
+                    }
+                    for candidate in (task.get("c") or [])
+                    if isinstance(candidate, dict)
+                ],
+                "i": str(task.get("i", "") or ""),
+            })
+        book_term_entries.append({
+            "id": term_id,
+            "anchor_id": anchor_id,
+            "term": term,
+            "stable_count": int(aggregate.get("stable_count", 0) or 0),
+            "batches": list(aggregate.get("batches") or []),
+            "task_count": len(aggregate.get("task_ids") or []),
+            "direct_task_count": len(aggregate.get("direct_task_ids") or []),
+            "residual_task_count": len(aggregate.get("residual_task_ids") or []),
+            "copy_ready_direct_answer_count": len(aggregate.get("direct_answers") or []),
+            "direct_answers_if_accepted": list(aggregate.get("direct_answers") or []),
+            "fallback_task_ids_if_not_accepted": list(aggregate.get("task_ids") or []),
+            "task_ids": list(aggregate.get("task_ids") or []),
+            "anchor_examples": [
+                str(example.get("text", "") or "")
+                for example in (anchor.get("e") or [])
+                if isinstance(example, dict) and str(example.get("text", "") or "").strip()
+            ],
+            "representative_tasks": representative_tasks,
+        })
+
+    # Count the Batch-44-style per-batch group decisions directly from the
+    # aggregated batch membership: one decision for every term/batch pair.
+    batch_group_decision_count = sum(len(item.get("batches") or []) for item in book_term_entries)
+    cross_batch_reused_decisions = max(0, batch_group_decision_count - len(book_term_entries))
+    copy_ready_direct_answer_count = sum(
+        len(item.get("direct_answers_if_accepted") or []) for item in book_term_entries
+    )
+    evidence_cost_totals = {
+        "anchor_text_first": sum(int(item.get("anchor_text_first", 0) or 0) for item in review_batches),
+        "text_first": sum(int(item.get("text_first", 0) or 0) for item in review_batches),
+        "visual_required": sum(int(item.get("visual_required", 0) or 0) for item in review_batches),
+        "visual_sheet_count": sum(int(item.get("visual_sheet_count", 0) or 0) for item in review_batches),
+    }
+
     manifest = {
-        "schema": "novel_formatter.ai_quick_adjudication.v1",
+        "schema": "novel_formatter.ai_quick_adjudication.v4",
         "package_id": str(payload.get("package_id", "")),
         "task_count": len(compact_ai_tasks),
         "conflict_task_count": int(payload.get("pending_conflict_rows", 0) or 0),
@@ -2121,22 +3100,50 @@ def _write_ai_quick_bundle(
         "full_package": "" if direct_output else output.name,
         "authority_hidden": True,
         "physical_column_evidence_in_full_package": False if direct_output else True,
+        "start_here": "00_GPT_START_HERE.md",
+        "task_path": "04_ai_tasks_compact.jsonl",
+        "consistency_groups_path": "02_consistency_groups.json",
+        "book_context_path": "03_BOOK_CONTEXT.json",
+        "batch_dir": "BATCHES",
+        "tasks_with_book_context": len(context_by_task),
+        "book_context_anchor_count": len(shared_context),
+        "consistency_group_count": len(consistency_groups),
+        "book_context_policy": "locked_exact_consensus_only_shared_index",
+        "review_strategy": "book_term_copy_ready_then_b49_hard_error_guard_visual_sheet_dedup",
+        "hard_error_guard_version": "b49.v1",
+        "hard_error_guard_contract": "candidate-only escalation; no reference truth or corrected text embedded",
+        "book_term_review_path": "BOOK_TERM_PASS.json",
+        "book_term_count": len(book_term_entries),
+        "copy_ready_direct_answer_count": copy_ready_direct_answer_count,
+        "batch_group_decision_count": batch_group_decision_count,
+        "cross_batch_reused_term_decisions": cross_batch_reused_decisions,
+        "evidence_cost_totals": evidence_cost_totals,
+        "visual_sheet_max_items": 8,
+        "visual_storage_policy": "lossless_sheet_is_canonical_for_visual_required; duplicate_single_crop_omitted; text_first_single_crop_retained",
+        "book": copy.deepcopy(payload.get("book") or {}),
     }
     instructions = """# GPT OCR 裁决包 — 完整操作命令
 
 ## 目标
 
-只裁决 `04_ai_tasks_compact.jsonl` 中的任务，把扫描图能够支持的**原作品日文**还原出来。
+只裁决本包任务，把扫描图能够支持的**原作品日文**还原出来。网页端先读一次 `BOOK_TERM_PASS.json`，把整本重复 strong 片假名专名/术语先做一次书级词形判断；随后按 `BATCHES/Bxxx_REVIEW.json` 分批处理。每个 REVIEW 文件仍内含该批任务、所需书内锚点与一致性组。`04_ai_tasks_compact.jsonl` 仅作为完整任务总表与兼容入口。
 这不是润色任务：不得为了语法更顺、现代写法或个人偏好改写原文。
 
 ## 文件含义
 
-- `04_ai_tasks_compact.jsonl`：唯一待处理任务集。
-- `b` / `a`：当前句前文 / 后文，只用于上下文判断。
+- `04_ai_tasks_compact.jsonl`：唯一待处理任务集。`p` 是页码，`cols` 是稳定物理列 ID，`s` 是送审状态。
+- `b` / `a`：紧邻当前句且已经稳定的前文 / 后文；`b2` / `a2` 是再向外一条。若邻接行本身也有分歧，不会偷偷选第一模型，而会放进 `bc` / `ac`（以及 `b2c` / `a2c`）作为“邻接未决候选”。
 - `c`：真正独立执行过的 OCR 候选；相同文字已合并。`m` 是支持该候选的模型。
 - `f=1`：该 OCR 失败/占位，**不是原文字符**，不能选。
 - `i`：对应扫描句图。文字证据不足时必须看图。
 - `r`：Common-Mode 风险原因。它只解释为什么送审，绝不是答案。
+- `x`：共享书内上下文 anchor ID 列表。具体词形、稳定出现次数和例句只在 `03_BOOK_CONTEXT.json` 保存一次，避免每条任务重复携带同样证据。
+- `02_consistency_groups.json`：多个待审任务共享同一稳定专名/术语时的分组索引。先看这些组，可以保持跨任务一致。
+- `03_BOOK_CONTEXT.json`：仅来自锁定 exact-consensus OCR 行的共享书内证据；不是外部真值。
+- `BOOK_TERM_PASS.json`：整本一次性的 strong 片假名专名/术语预审；同一 term 只判断一次，并列出稳定例句、代表性候选、涉及批次，以及**仅在接受该 term 后才可复制**的逐 row `direct_answers_if_accepted`。
+- `BATCHES/Bxxx_REVIEW.json`：网页端首选的**单文件批次入口**；每批默认 40 条，内含 `tasks + anchors + consistency_groups + evidence_cost`，其中 group 会引用 `book_term_id`。
+- `VISUAL_REVIEW/Bxxx_Sxx.webp`：把本批明确需要像素证据的原始 row 裁片按 stable ID 拼成联系表，**不缩放、不重采样**。对已成功写入联系表的 `visual_required` 行，任务 `i` 直接指向该无损 sheet，重复的单张裁片不再写入 ZIP；文字优先行仍保留原 `i` 单图用于必要时 fallback。
+- 全局 `02_consistency_groups.json` / `03_BOOK_CONTEXT.json`：只用于跨批最终一致性审计，普通逐批裁决不需要加载。
 - `_BINDINGS/`：稳定 ID/hash 密封数据，只供脚本使用；不要读取、修改或重写。
 - `AI_OUTPUT/answers.jsonl`：唯一需要写入的答案文件。
 
@@ -2148,28 +3155,35 @@ def _write_ai_quick_bundle(
    python adjudicate.py status
    ```
 
-2. 按任务顺序逐条判断。优先看 `b + c + a`；以下情况必须打开 `i`：
-   - 人名、地名、技能名、数字、等级、否定词；
-   - `目/日`、`ニ/二`、`カ/力` 等形近字；
+2. 先只做一次 `BOOK_TERM_PASS.json`：每个 `Kxxxx` strong 片假名专名/术语只判断一次。若稳定 anchor 与代表性候选不冲突，就把该词形视为本轮书级锁；此时可直接复制该 term 的 `direct_answers_if_accepted` 到最终逐 row 答案（它们已经是独立 stable-ID `{id,pick}` 记录，不是组级答案）。若证据不足或冲突，**绝不能复制这组 direct answers**，而必须按 `fallback_task_ids_if_not_accepted` 把相关 row 全部送回普通逐行/看图复核。
+
+3. 再按 `BATCHES/Bxxx_REVIEW.json` 分批判断；其中 `review_passes.group_first` 的每个组通过 `book_term_id` 引用上一步书级决定。已接受的 term 不再跨批重复判断；`anchor_only=true` 且给出 `direct_pick` 的 row 可直接按各自 stable ID 写答案。`residual_task_ids` 仍逐 row 复核，因为这些行还有标点、其他字符或其他未决差异。
+
+   每批随后按 `review_passes.evidence_cost` 的顺序处理：先 `anchor_text_first_task_ids`，再 `text_first_task_ids`，最后 `visual_required_task_ids`。前两类只是“先尝试文字证据”，证据不足仍可打开原图；`visual_required` 必须看像素。若提供 `visual_sheets`，优先打开联系表一次查看多条原裁片，stable ID 已写在每个裁片上；成功 sheet 化的 `visual_required` 行其 `i` 本身就指向该无损 sheet，不再重复携带单张裁片。文字优先行若证据不足仍可打开其原 `i` 单图。只有跨批一致性审计时才需要全局 `02_consistency_groups.json` / `03_BOOK_CONTEXT.json`。逐 row 时优先看 `b2/b2c + b/bc + c + a/ac + a2/a2c`；任务出现 `x` 时查本批 context 的对应 anchor；以下情况必须打开像素证据：
+   - 人名、地名、技能名若**没有** `strong=true` 的同书稳定 anchor，或 anchor 与当前候选冲突；
+   - 数字、等级、否定词；
+   - `目/日`、`ニ/二`、`カ/力` 等形近字，除非对应专名已有 `strong=true` 的同书稳定 anchor；
    - 小假名、促音、长音、引号、粘句/漏句；
    - Common-Mode (`r` 存在)；
    - 候选都不自然或无法仅靠上下文确定。
 
-3. **不要按票数裁决。** 2:1、3:1 只表示模型数量，不代表图像真值。
+4. **不要按票数裁决。** 2:1、3:1 只表示模型数量，不代表图像真值。
    seeded/copied 证据不会出现在 `c`，不要自行把缺失模型补成一票。
 
-4. 写 `AI_OUTPUT/answers.jsonl`，一行一个 JSON，ID 必须与任务一致：
+5. 写 `AI_OUTPUT/answers.jsonl`，一行一个 JSON，ID 必须与任务一致：
 
    - 原候选正确：
      `{"id":"T00001","pick":0,"confidence":0.99,"reason":"image+context"}`
    - 所有候选都错，图像能确定完整正文：
      `{"id":"T00002","text":"完整正确正文","confidence":0.98,"reason":"corrected_from_image"}`
+   - 确认是独立页码/页眉等非正文、应从正文有意剔除（必须核对扫描图）：
+     `{"id":"T00003","delete_intentionally":true,"confidence":0.99,"reason":"scan_confirmed_running_page_number"}`
    - 图像仍不足以确定：
-     `{"id":"T00003","unresolved":true}`
+     `{"id":"T00004","unresolved":true}`
 
    `text` 必须是**完整当前句/当前行正文**，不能只写差异字符。
 
-5. 中途或完成后验证答案格式：
+6. 中途或完成后验证答案格式：
 
    ```bash
    python adjudicate.py validate
@@ -2178,7 +3192,7 @@ def _write_ai_quick_bundle(
 
    `validate` 必须通过；最终 `remaining` 应为 0。
 
-6. 生成 Novel Formatter 可直接导回的文件：
+7. 生成 Novel Formatter 可直接导回的文件：
 
    ```bash
    python adjudicate.py finish
@@ -2186,7 +3200,7 @@ def _write_ai_quick_bundle(
 
    输出：`AI_IMPORT.zip`。脚本会再次检查任务 ID、候选索引、密封 row/hash 绑定和完整性。
 
-7. 可选再做 ZIP CRC 检查：
+8. 可选再做 ZIP CRC 检查：
 
    ```bash
    python -m zipfile -t AI_IMPORT.zip
@@ -2194,7 +3208,7 @@ def _write_ai_quick_bundle(
 
 ## 裁决原则
 
-- **包内扫描句图 + OCR 候选 + 前后文是唯一裁决依据。不要联网寻找、不要读取或依赖电子版/参考稿来生成答案。** 参考版若由用户另行提供，只能在全部裁决完成并生成 `AI_IMPORT.zip` 之后做事后质量评估，不能反向修改本轮答案。
+- **包内扫描句图 + OCR 候选 + 前后文 + `x` 稳定工作区上下文是唯一裁决依据。不要联网寻找、不要读取或依赖电子版/参考稿来生成答案。** `x` 只是当前 OCR 工作区的内部一致性证据，不是出版社真值。参考版若由用户另行提供，只能在全部裁决完成并生成 `AI_IMPORT.zip` 之后做事后质量评估，不能反向修改本轮答案。
 - 保留作者语气、异体/口语写法；纯全半角、装饰符号等不影响含义的差异不要为了机械一致而过度改。
 - 对会影响翻译的项目优先严格核对：专名、数字、否定、助词导致的主客体变化、漏字、粘句、句界。
 - Common-Mode 任务即使只有一个候选也必须看图；本地三个模型可能共同识别错。
@@ -2202,11 +3216,210 @@ def _write_ai_quick_bundle(
 
 最终只交回 `AI_IMPORT.zip`；不要修改原 OCR JSON、图片、manifest 或 `_BINDINGS`。
 """
-    try:
+    with atomic_output_path(quick_output) as quick_tmp:
         with zipfile.ZipFile(quick_tmp, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=1) as archive:
             archive.writestr("manifest.json", _json_bytes(manifest, pretty=True))
+            start_here = (
+                "# Novel Formatter · GPT 网页裁决入口\n\n"
+                "请先读本文件，再按 `BATCHES/Bxxx_REVIEW.json` 分批处理。\n\n"
+                "推荐顺序：\n"
+                "1. 先读 `01_REVIEW_PLAN.json`，确认当前批次。\n"
+                "2. 先只打开一次 `BOOK_TERM_PASS.json`，把 strong 的片假名专名/术语做书级词形锁定；接受后可直接复制该 term 的逐 row `direct_answers_if_accepted`，证据不足则按 fallback 列表回普通复核。\n"
+                "3. 再一次只打开当前 `BATCHES/Bxxx_REVIEW.json`；其中 `review_passes.group_first` 通过 `book_term_id` 复用已接受的书级 term，再按 `review_passes.evidence_cost` 从低成本文字证据到强制视觉证据处理。每条仍必须按 stable task ID 独立写答案。\n"
+                "   全局 `02_consistency_groups.json` / `03_BOOK_CONTEXT.json` 只用于跨批最终一致性审计，普通逐批裁决不需要打开。\n"
+                "4. 只写 `AI_OUTPUT/answers.jsonl`，不要修改 OCR 原始候选或 `_BINDINGS/`。\n"
+                "5. 完成后运行 `python adjudicate.py validate` 与 `python adjudicate.py finish`，交回 `AI_IMPORT.zip`。\n\n"
+                "详细规则见 `AGENTS.md`。\n"
+            )
+            archive.writestr("00_GPT_START_HERE.md", start_here.encode("utf-8"))
             archive.writestr("AGENTS.md", instructions.encode("utf-8"))
+            review_plan = {
+                "schema": "novel_formatter.ai_web_review_plan.v8",
+                "book": copy.deepcopy(payload.get("book") or {}),
+                "task_count": len(visible_tasks),
+                "tasks_with_book_context": [task["id"] for task in visible_tasks if task.get("x")],
+                "tasks_with_images": [task["id"] for task in visible_tasks if str(task.get("i", "") or "")],
+                "common_mode_tasks": [task["id"] for task in visible_tasks if task.get("r")],
+                "book_context_path": "03_BOOK_CONTEXT.json",
+                "consistency_groups_path": "02_consistency_groups.json",
+                "book_term_review_path": "BOOK_TERM_PASS.json",
+                "book_term_count": len(book_term_entries),
+                "copy_ready_direct_answer_count": copy_ready_direct_answer_count,
+                "batch_group_decision_count": batch_group_decision_count,
+                "cross_batch_reused_term_decisions": cross_batch_reused_decisions,
+                "evidence_cost_totals": evidence_cost_totals,
+                "visual_sheet_max_items": 8,
+                "batches": review_batches,
+                "recommended_order": [
+                    "book_term_pass_copy_direct_answers",
+                    "anchor_text_first",
+                    "text_first",
+                    "visual_required_contact_sheets",
+                    "global_consistency_audit",
+                ],
+                "unresolved_policy": "evidence_insufficient_only",
+            }
+            archive.writestr("01_REVIEW_PLAN.json", _json_bytes(review_plan, pretty=True))
+            archive.writestr("BOOK_TERM_PASS.json", _json_bytes({
+                "schema": "novel_formatter.ai_book_term_pass.v2",
+                "source": "strong Katakana groups already admitted by the Batch 44 safe group-first gate",
+                "term_count": len(book_term_entries),
+                "copy_ready_direct_answer_count": copy_ready_direct_answer_count,
+                "batch_group_decision_count": batch_group_decision_count,
+                "cross_batch_reused_term_decisions": cross_batch_reused_decisions,
+                "rules": [
+                    "Judge each Kxxxx term once for the whole book from locked exact-consensus anchor evidence and representative OCR candidates.",
+                    "Accept a term only when the strong in-book anchor is applicable and non-conflicting; otherwise leave that term unlocked and review every related row normally.",
+                    "Only after accepting a Kxxxx term may direct_answers_if_accepted be copied; those entries are already independent stable-ID row answers, never one group-level answer.",
+                    "If a Kxxxx term is not accepted, do not copy its direct answers; review fallback_task_ids_if_not_accepted normally.",
+                    "Numbers, negation, common-mode risk and residual punctuation/geometry remain row/image review even when a term is accepted.",
+                ],
+                "terms": book_term_entries,
+            }, pretty=True))
+            archive.writestr("02_consistency_groups.json", _json_bytes({
+                "schema": "novel_formatter.ai_consistency_groups.v2",
+                "source": "locked exact-consensus OCR rows in this workspace only",
+                "groups": consistency_groups,
+            }, pretty=True))
+            archive.writestr("03_BOOK_CONTEXT.json", _json_bytes({
+                "schema": "novel_formatter.ai_shared_book_context.v1",
+                "source": "locked exact-consensus OCR rows in this workspace only",
+                "anchors": shared_context,
+            }, pretty=True))
             archive.writestr("adjudicate.py", _AI_QUICK_CLI.encode("utf-8"))
+            # Batch 48: successful lossless visual sheets become the canonical
+            # image entry for visual-required rows.  Their duplicate single-row
+            # crops are omitted from the web package, while text-first rows keep
+            # the original crop for fallback.  Book-term representative images
+            # are retained when referenced directly by BOOK_TERM_PASS.json.
+            protected_image_paths = {
+                str(task.get("i", "") or "")
+                for term in book_term_entries
+                for task in (term.get("representative_tasks") or [])
+                if str(task.get("i", "") or "")
+            }
+            deduplicated_image_paths: set[str] = set()
+            visual_sheet_ref_by_task: dict[str, dict] = {}
+            for batch_index, start in enumerate(range(0, len(visible_tasks), batch_size), start=1):
+                batch = visible_tasks[start:start + batch_size]
+                anchor_ids: list[str] = []
+                task_ids = {str(task.get("id", "") or "") for task in batch}
+                for task in batch:
+                    for anchor_id in task.get("x") or []:
+                        anchor_id = str(anchor_id or "")
+                        if anchor_id and anchor_id not in anchor_ids:
+                            anchor_ids.append(anchor_id)
+                batch_anchors = [shared_context_by_id[anchor_id] for anchor_id in anchor_ids if anchor_id in shared_context_by_id]
+                batch_groups = []
+                for group in consistency_groups:
+                    local_task_ids = [
+                        str(task_id) for task_id in (group.get("task_ids") or [])
+                        if str(task_id) in task_ids
+                    ]
+                    if not local_task_ids:
+                        continue
+                    batch_groups.append({
+                        "anchor_id": str(group.get("anchor_id", "") or ""),
+                        "term": str(group.get("term", "") or ""),
+                        "stable_count": int(group.get("stable_count", 0) or 0),
+                        "task_ids": local_task_ids,
+                        "global_task_count": len(group.get("task_ids") or []),
+                    })
+                batch_anchors_compact = [
+                    {
+                        "id": str(anchor.get("id", "") or ""),
+                        "t": str(anchor.get("t", "") or ""),
+                        "n": int(anchor.get("n", 0) or 0),
+                        "strong": int(anchor.get("n", 0) or 0) >= 3,
+                        "e": [
+                            str(example.get("text", "") or "")
+                            for example in (anchor.get("e") or [])
+                            if isinstance(example, dict) and str(example.get("text", "") or "").strip()
+                        ],
+                    }
+                    for anchor in batch_anchors
+                ]
+                review_passes = _build_ai_batch_review_passes(batch, batch_groups, batch_anchors_compact)
+                for group in review_passes.get("group_first") or []:
+                    book_term_id = book_term_id_by_key.get((
+                        str(group.get("anchor_id", "") or ""),
+                        str(group.get("term", "") or ""),
+                    ))
+                    if book_term_id:
+                        group["book_term_id"] = book_term_id
+                        group["decision_source"] = "BOOK_TERM_PASS.json"
+                        group["fallback_task_ids_if_not_accepted"] = list(group.get("task_ids") or [])
+                review_passes["strategy"] = "book_term_copy_ready_then_b49_hard_error_guard_visual_sheet_dedup"
+                review_passes["book_term_review_path"] = "BOOK_TERM_PASS.json"
+                review_passes["row_review_task_ids_if_all_terms_rejected"] = [
+                    str(task.get("id", "") or "") for task in batch if str(task.get("id", "") or "")
+                ]
+                evidence_cost = _build_ai_evidence_cost_plan(batch, review_passes)
+                visual_items = list(evidence_cost.get("visual_required") or [])
+                visual_sheets = []
+                for sheet_number, offset in enumerate(range(0, len(visual_items), 8), start=1):
+                    sheet_items = visual_items[offset:offset + 8]
+                    sheet_path = f"VISUAL_REVIEW/B{batch_index:03d}_S{sheet_number:02d}.webp"
+                    sheet_bytes = _ai_visual_contact_sheet_bytes(sheet_items, folder)
+                    if sheet_bytes:
+                        archive.writestr(sheet_path, sheet_bytes, compress_type=zipfile.ZIP_STORED)
+                        visual_sheets.append({
+                            "path": sheet_path,
+                            "task_ids": [str(item.get("id", "") or "") for item in sheet_items],
+                            "count": len(sheet_items),
+                            "native_resolution": True,
+                            "lossless": True,
+                            "resampled": False,
+                            "single_crop_deduplicated": True,
+                        })
+                        batch_task_by_id = {str(task.get("id", "") or ""): task for task in batch}
+                        for tile_index, item in enumerate(sheet_items):
+                            task_id = str(item.get("id", "") or "")
+                            original_image = str(item.get("image", "") or "")
+                            task = batch_task_by_id.get(task_id)
+                            if task is not None:
+                                task["i"] = sheet_path
+                                task["vi"] = {
+                                    "sheet": sheet_path,
+                                    "tile_index": tile_index,
+                                    "source_image": original_image,
+                                    "native_resolution": True,
+                                    "lossless": True,
+                                }
+                            item["source_image"] = original_image
+                            item["image"] = sheet_path
+                            item["sheet_index"] = tile_index
+                            visual_sheet_ref_by_task[task_id] = {
+                                "sheet": sheet_path,
+                                "tile_index": tile_index,
+                                "source_image": original_image,
+                            }
+                            if original_image and original_image not in protected_image_paths:
+                                deduplicated_image_paths.add(original_image)
+                evidence_cost["visual_sheets"] = visual_sheets
+                review_passes["evidence_cost"] = evidence_cost
+                archive.writestr(f"BATCHES/B{batch_index:03d}_REVIEW.json", _json_bytes({
+                    "schema": "novel_formatter.ai_web_batch_review.v9",
+                    "batch": batch_index,
+                    "task_count": len(batch),
+                    "answer_path": "AI_OUTPUT/answers.jsonl",
+                    "source": "OCR candidates + local neighbourhood + locked exact-consensus in-workspace anchors only",
+                    "rules": [
+                        "Do not vote by model count; judge original Japanese from evidence.",
+                        "Use anchors for in-book name/term consistency; anchors are OCR consensus evidence, not external truth.",
+                        "A strong anchor (strong=true, >=3 locked exact-consensus occurrences) may settle a repeated in-book name/term without reopening the image; otherwise open i for names/lookalikes, and always for numbers, negation, common-mode risk, conflicting anchors, or insufficient text evidence.",
+                        "Run BOOK_TERM_PASS.json once before batches. If a Kxxxx term is accepted, its copy-ready direct answers may be copied as independent stable-ID row answers. If rejected/uncertain, do not use direct_pick and review fallback_task_ids_if_not_accepted normally. residual_task_ids always remain row review.",
+                        "Even when a group decision is reused, output one independent answer for every stable task id; never emit one group-level answer in place of row answers.",
+                        "Use review_passes.evidence_cost in order: anchor_text_first, text_first, then visual_required. Text-first is only an ordering hint and retains its original i crop for fallback; visual_required must inspect source pixels and, when a lossless visual sheet exists, its i points directly to that sheet so the duplicate single crop is omitted from the ZIP.",
+                        "For visual_required rows, inspect focus_hints and diff_hints first. They only direct attention and never identify the correct answer. B49 explicitly escalates single-CJK majority conflicts, passive-verb micro-conflicts, failed-model residual disagreements, dialogue small-kana/emphasis tails, shared numeric measurements and status-card leading-number risk to pixels.",
+                        "For leading_status_page_number_risk, treat an isolated margin/page number as layout metadata unless the scan clearly places it inside the status text.",
+                        "If still uncertain, write unresolved=true rather than guessing.",
+                    ],
+                    "review_passes": review_passes,
+                    "tasks": batch,
+                    "anchors": batch_anchors_compact,
+                    "consistency_groups": batch_groups,
+                }))
             task_bytes = b"".join(_json_bytes(task) + b"\n" for task in visible_tasks)
             archive.writestr("04_ai_tasks_compact.jsonl", task_bytes)
             archive.writestr("AI_OUTPUT/answers.jsonl", b"")
@@ -2216,12 +3429,15 @@ def _write_ai_quick_bundle(
                 rel = str(task.get("img", "") or "")
                 if not rel:
                     continue
+                if rel in deduplicated_image_paths:
+                    continue
                 source = folder / rel
                 if source.is_file():
                     archive.write(source, rel, compress_type=zipfile.ZIP_STORED)
-        os.replace(quick_tmp, quick_output)
-    finally:
-        quick_tmp.unlink(missing_ok=True)
+        with zipfile.ZipFile(quick_tmp, "r") as check:
+            bad = check.testzip()
+            if bad:
+                raise SourceCorrectionError(f"GPT 裁决交换包 ZIP CRC 失败：{bad}")
     return {"path": str(quick_output), "bytes": quick_output.stat().st_size, "tasks": len(compact_ai_tasks)}
 
 
@@ -3427,29 +4643,45 @@ def export_source_correction_bundle(
                 row_index = int(row.get("row_index", -1))
             except (TypeError, ValueError, OverflowError):
                 row_index = -1
-            previous_text = ""
-            next_text = ""
-            if row_index > 0 and row_index - 1 < len(payload["rows"]):
-                previous = payload["rows"][row_index - 1]
-                previous_text = str(
-                    previous.get("resolved_verdict", {}).get("final_text", "")
-                    or next(iter((previous.get("base_model_texts") or {}).values()), "")
-                    or ""
-                )
-            if row_index + 1 < len(payload["rows"]):
-                following = payload["rows"][row_index + 1]
-                next_text = str(
-                    following.get("resolved_verdict", {}).get("final_text", "")
-                    or next(iter((following.get("base_model_texts") or {}).values()), "")
-                    or ""
-                )
+            def _context_at(index: int) -> tuple[str, list[str]]:
+                if not 0 <= index < len(payload["rows"]):
+                    return "", []
+                item = payload["rows"][index]
+                stable_text = _ai_stable_context_text(item)
+                if stable_text:
+                    return stable_text, []
+                verdict = item.get("resolved_verdict") if isinstance(item.get("resolved_verdict"), dict) else {}
+                final_text = str(verdict.get("final_text", "") or "")
+                if final_text:
+                    return final_text, []
+                candidates = []
+                for candidate in _compact_ai_candidates(item):
+                    text = str(candidate.get("t", "") or "")
+                    if bool(candidate.get("fail", False)) or not text.strip() or text in candidates:
+                        continue
+                    candidates.append(text)
+                if len(candidates) == 1:
+                    return candidates[0], []
+                return "", candidates[:4]
+
+            previous_text, previous_candidates = _context_at(row_index - 1)
+            previous_text_2, previous_candidates_2 = _context_at(row_index - 2)
+            next_text, next_candidates = _context_at(row_index + 1)
+            next_text_2, next_candidates_2 = _context_at(row_index + 2)
             candidates = _compact_ai_candidates(row)
             compact_ai_tasks.append({
                 "id": f"T{task_number:05d}",
                 "row": row_index,
+                "page": int(row.get("page", 0) or 0),
                 "before": previous_text,
+                "before2": previous_text_2,
+                "before_candidates": previous_candidates,
+                "before2_candidates": previous_candidates_2,
                 "c": candidates,
                 "after": next_text,
+                "after2": next_text_2,
+                "after_candidates": next_candidates,
+                "after2_candidates": next_candidates_2,
                 "img": str(row.get("evidence_image", "") or ""),
                 "cols": list(row.get("column_ids") or []),
                 "status": str(row.get("status", "") or ""),
@@ -3549,7 +4781,6 @@ OCR 模型、不改变原物理列、不重新对齐；原始各模型分歧继�
             package_files = [path for path in sorted(folder.rglob("*")) if path.is_file()]
             _report_progress(progress_callback, "压缩逐源纠错包", 0, 1)
             local_zip = Path(temp) / f".{output.name}.building"
-            destination_tmp = output.with_name(f".{output.name}.tmp")
             try:
                 with zipfile.ZipFile(local_zip, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=1) as archive:
                     for path in package_files:
@@ -3560,13 +4791,20 @@ OCR 模型、不改变原物理列、不重新对齐；原始各模型分歧继�
                             else zipfile.ZIP_DEFLATED
                         )
                         archive.write(path, relative, compress_type=compression)
+                with zipfile.ZipFile(local_zip, "r") as check:
+                    bad = check.testzip()
+                    if bad:
+                        raise SourceCorrectionError(f"逐源纠错包 ZIP CRC 失败：{bad}")
                 _report_progress(progress_callback, "写入裁决包目标位置", 0, 1)
-                shutil.copyfile(local_zip, destination_tmp)
-                os.replace(destination_tmp, output)
+                with atomic_output_path(output) as destination_tmp:
+                    shutil.copyfile(local_zip, destination_tmp)
+                    with zipfile.ZipFile(destination_tmp, "r") as check:
+                        bad = check.testzip()
+                        if bad:
+                            raise SourceCorrectionError(f"目标裁决包 ZIP CRC 失败：{bad}")
                 _report_progress(progress_callback, "写入裁决包目标位置", 1, 1)
             finally:
                 local_zip.unlink(missing_ok=True)
-                destination_tmp.unlink(missing_ok=True)
             _report_progress(progress_callback, "压缩逐源纠错包", 1, 1)
             ai_quick_report = _write_ai_quick_bundle(
                 folder, output=output, payload=payload, compact_ai_tasks=compact_ai_tasks
@@ -4336,6 +5574,11 @@ def import_source_corrections(
             f" 不一致模型：{', '.join(mismatched[:6])}"
         )
 
+    # Post-import textual plausibility is separate from sealed structural
+    # validation.  Never reject or silently rewrite an accepted verdict here.
+    from engine.ocr_adjudication_quality_risks import audit_import_quality_rows
+    quality_review_warnings = audit_import_quality_rows(payload.get("rows", []))
+
     report = {
         "schema": "novel_formatter.multi_ocr_hybrid_correction_import_report.v5",
         "package_id": str(payload.get("package_id", "") or ""),
@@ -4359,6 +5602,8 @@ def import_source_corrections(
         "resolved_history_rows_annotated": historical_rows_annotated,
         "accepted_canonical_decisions": accepted_count,
         "unresolved_canonical_decisions": unresolved_count,
+        "quality_review_warning_count": len(quality_review_warnings),
+        "quality_review_warnings": quality_review_warnings,
         "prefilled_resolved_decisions": prefilled_resolved,
         "native_accepted_decisions": native_accepted,
         "rejected_placeholder_decisions": rejected_placeholder,
@@ -4499,16 +5744,15 @@ def export_fusion_and_skeleton_bundle(
             "epub_report": epub_report,
         }
         (folder / "00_manifest.json").write_bytes(_json_bytes(manifest, pretty=True))
-        temp_zip = output.with_name(f".{output.name}.tmp")
-        try:
+        with atomic_output_path(output) as temp_zip:
             with zipfile.ZipFile(temp_zip, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=6) as archive:
                 for path in sorted(folder.rglob("*")):
                     if path.is_file():
                         archive.write(path, path.relative_to(folder).as_posix())
-            os.replace(temp_zip, output)
-        finally:
-            if temp_zip.exists():
-                temp_zip.unlink(missing_ok=True)
+            with zipfile.ZipFile(temp_zip, "r") as check:
+                bad = check.testzip()
+                if bad:
+                    raise SourceCorrectionError(f"融合骨架包 ZIP CRC 失败：{bad}")
     return {
         "path": str(output),
         "fusion_json_sha256": manifest["fusion_json_sha256"],
@@ -4557,7 +5801,7 @@ def documents_with_comparison_texts(
     docs = list(source_docs)
     active = [(index, updates) for index, updates in enumerate(updates_by_model) if updates]
     for position, (model_index, updates) in enumerate(active, start=1):
-        doc_copy = copy.deepcopy(source_docs[model_index])
+        doc_copy = source_docs[model_index].snapshot_clone()
         _apply_column_updates(doc_copy, updates, audit={
             "audit_id": "comparison_editor_sync",
             "package_id": "",

@@ -18,6 +18,7 @@ from typing import Iterable
 
 from .config import AISettings, validate_api_key
 from .glm_compat import is_glm53_flash, looks_always_thinking_error, looks_image_payload_error
+from .request_limiter import retry_delay_seconds
 
 
 class MultimodalCapabilityError(RuntimeError):
@@ -47,6 +48,12 @@ class MultimodalClient:
         self._client_cycle = None
         self._client_lock = threading.Lock()
         self._cycle_lock = threading.Lock()
+        self._anthropic_clients = []
+        self._anthropic_cycle = None
+        self._anthropic_client_lock = threading.Lock()
+        self._anthropic_cycle_lock = threading.Lock()
+        self._gemini_model = None
+        self._gemini_model_lock = threading.Lock()
         self._usage_lock = threading.Lock()
         self._usage = {
             "requests": 0,
@@ -164,6 +171,7 @@ class MultimodalClient:
     def call_json(
         self, prompt: str, image_paths: Iterable[str | Path], *,
         temperature: float = 0.0, reasoning_effort: str | None = None,
+        cancel_check=None,
     ) -> str:
         images = [str(Path(p)) for p in image_paths]
         if not images:
@@ -172,6 +180,8 @@ class MultimodalClient:
         max_attempts = 3
         last_error: Exception | None = None
         for attempt in range(max_attempts):
+            if cancel_check and cancel_check():
+                raise RuntimeError("AI 图文处理已停止")
             self._record_transport_attempt(retry=attempt > 0)
             try:
                 if provider == "anthropic":
@@ -222,9 +232,23 @@ class MultimodalClient:
                     ) from exc
                 if attempt + 1 >= max_attempts or not self._looks_transient_error(exc):
                     raise
-                # Deterministic exponential backoff.  Re-entering the OpenAI-
-                # compatible path also advances the configured API-key cycle.
-                time.sleep(0.75 * (2 ** attempt))
+                # Share the same Retry-After-aware bounded backoff used by the
+                # text provider stack. Re-entering a pooled provider path also
+                # advances the configured API-key cycle where applicable.
+                remaining = max(0.0, float(retry_delay_seconds(exc, attempt)))
+                if remaining <= 0.0:
+                    # Keep the retry path scheduler-friendly even when a provider
+                    # explicitly allows an immediate retry (Retry-After: 0).
+                    time.sleep(0.0)
+                    continue
+                deadline = time.monotonic() + remaining
+                while True:
+                    if cancel_check and cancel_check():
+                        raise RuntimeError("AI 图文处理已停止")
+                    left = deadline - time.monotonic()
+                    if left <= 0:
+                        break
+                    time.sleep(min(0.20, left))
         assert last_error is not None
         raise last_error
 
@@ -241,7 +265,9 @@ class MultimodalClient:
         key = settings.api_key
         if settings.requires_key:
             key = validate_api_key(key)
-        elif not key:
+        elif key:
+            key = validate_api_key(key, required=False)
+        else:
             key = "local"
         keys = [x.strip() for x in str(key or "").split(",") if x.strip()] or ["local"]
         base_url = str(settings.base_url or "").strip()
@@ -375,64 +401,111 @@ class MultimodalClient:
     # ------------------------------------------------------------------
     # Anthropic
     # ------------------------------------------------------------------
-    def _call_anthropic(self, prompt: str, images: list[str], temperature: float) -> str:
+    def _build_anthropic_clients(self) -> None:
         try:
             import httpx
             from anthropic import Anthropic
         except ImportError as exc:
             raise ImportError("请安装 anthropic/httpx：pip install anthropic httpx") from exc
-        key = validate_api_key(self.settings.api_key)
+        keys = [
+            validate_api_key(item)
+            for item in str(self.settings.api_key or "").split(",")
+            if item.strip()
+        ]
+        if not keys:
+            raise ValueError("Anthropic API Key 不能为空")
         timeout = float(self.settings.request_timeout or 180)
-        kwargs = {
-            "api_key": key,
-            "timeout": timeout,
-            "max_retries": 0,
-            "http_client": httpx.Client(timeout=timeout),
-        }
-        if str(self.settings.base_url or "").strip():
-            kwargs["base_url"] = str(self.settings.base_url).strip()
-        client = Anthropic(**kwargs)
+        base_url = str(self.settings.base_url or "").strip()
+        clients = []
         try:
-            content = [{"type": "text", "text": prompt}]
-            for image in images:
-                mime, payload = self._image_data(image)
-                content.append({
-                    "type": "image",
-                    "source": {"type": "base64", "media_type": mime, "data": payload},
-                })
-            response = client.messages.create(
-                model=self.settings.model,
-                max_tokens=int(self.settings.max_tokens or 24000),
-                temperature=float(temperature),
-                messages=[{"role": "user", "content": content}],
-            )
-            usage = getattr(response, "usage", None)
-            prompt_tokens = getattr(usage, "input_tokens", 0) if usage else 0
-            completion_tokens = getattr(usage, "output_tokens", 0) if usage else 0
-            self._record_usage(
-                prompt=prompt_tokens,
-                completion=completion_tokens,
-                total=prompt_tokens + completion_tokens,
-                cached=(getattr(usage, "cache_read_input_tokens", 0) or 0) if usage else 0,
-            )
-            return "".join(str(getattr(item, "text", "") or "") for item in response.content)
-        finally:
-            try:
-                client.close()
-            except Exception:
-                logging.getLogger(__name__).debug("Anthropic multimodal client close failed", exc_info=True)
+            for key in keys:
+                kwargs = {
+                    "api_key": key,
+                    "timeout": timeout,
+                    "max_retries": 0,
+                    "http_client": httpx.Client(
+                        limits=httpx.Limits(
+                            max_connections=32,
+                            max_keepalive_connections=16,
+                            keepalive_expiry=60.0,
+                        ),
+                        timeout=timeout,
+                    ),
+                }
+                if base_url:
+                    kwargs["base_url"] = base_url
+                clients.append(Anthropic(**kwargs))
+        except Exception:
+            for client in clients:
+                try:
+                    close = getattr(client, "close", None)
+                    if callable(close):
+                        close()
+                except Exception:
+                    pass
+            raise
+        self._anthropic_clients.extend(clients)
+        self._anthropic_cycle = itertools.cycle(self._anthropic_clients)
+
+    def _next_anthropic_client(self):
+        if not self._anthropic_clients:
+            with self._anthropic_client_lock:
+                if not self._anthropic_clients:
+                    self._build_anthropic_clients()
+        with self._anthropic_cycle_lock:
+            return next(self._anthropic_cycle)
+
+    def _call_anthropic(self, prompt: str, images: list[str], temperature: float) -> str:
+        client = self._next_anthropic_client()
+        content = [{"type": "text", "text": prompt}]
+        for image in images:
+            mime, payload = self._image_data(image)
+            content.append({
+                "type": "image",
+                "source": {"type": "base64", "media_type": mime, "data": payload},
+            })
+        response = client.messages.create(
+            model=self.settings.model,
+            max_tokens=int(self.settings.max_tokens or 24000),
+            temperature=float(temperature),
+            messages=[{"role": "user", "content": content}],
+        )
+        usage = getattr(response, "usage", None)
+        prompt_tokens = getattr(usage, "input_tokens", 0) if usage else 0
+        completion_tokens = getattr(usage, "output_tokens", 0) if usage else 0
+        self._record_usage(
+            prompt=prompt_tokens,
+            completion=completion_tokens,
+            total=prompt_tokens + completion_tokens,
+            cached=(
+                (getattr(usage, "cache_read_input_tokens", 0) or 0)
+                + (getattr(usage, "cache_creation_input_tokens", 0) or 0)
+            ) if usage else 0,
+        )
+        return "".join(str(getattr(item, "text", "") or "") for item in response.content)
 
     # ------------------------------------------------------------------
     # Gemini
     # ------------------------------------------------------------------
+    def _get_gemini_model(self):
+        if self._gemini_model is None:
+            with self._gemini_model_lock:
+                if self._gemini_model is None:
+                    try:
+                        import google.generativeai as genai
+                    except ImportError as exc:
+                        raise ImportError("请安装 google-generativeai：pip install google-generativeai") from exc
+                    genai.configure(api_key=validate_api_key(self.settings.api_key))
+                    self._gemini_model = genai.GenerativeModel(self.settings.model)
+        return self._gemini_model
+
     def _call_gemini(self, prompt: str, images: list[str], temperature: float) -> str:
         try:
             import google.generativeai as genai
             from PIL import Image
         except ImportError as exc:
             raise ImportError("请安装 google-generativeai 和 Pillow") from exc
-        genai.configure(api_key=validate_api_key(self.settings.api_key))
-        model = genai.GenerativeModel(self.settings.model)
+        model = self._get_gemini_model()
         opened = []
         try:
             for path in images:
@@ -479,9 +552,15 @@ class MultimodalClient:
             clients = self._clients
             self._clients = []
             self._client_cycle = None
+        with self._anthropic_client_lock:
+            anthropic_clients = self._anthropic_clients
+            self._anthropic_clients = []
+            self._anthropic_cycle = None
+        with self._gemini_model_lock:
+            self._gemini_model = None
         with self._image_cache_lock:
             self._image_cache.clear()
-        for client in clients:
+        for client in [*clients, *anthropic_clients]:
             try:
                 close = getattr(client, "close", None)
                 if callable(close):

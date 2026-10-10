@@ -77,7 +77,7 @@ def apply_exact_publication_corrections(
     rewrite.  The audit ledger is returned and also stored in metadata when the
     model supports dynamic attributes.
     """
-    out = copy.deepcopy(doc) if copy_document else doc
+    out = doc.snapshot_clone() if copy_document else doc
     applied: list[AppliedCorrection] = []
 
     for corr in corrections:
@@ -127,7 +127,7 @@ def merge_split_dialogues_across_images(
     completed dialogue so the illustration remains at the nearest paragraph
     boundary without being dropped or re-encoded.
     """
-    out = copy.deepcopy(doc) if copy_document else doc
+    out = doc.snapshot_clone() if copy_document else doc
     src = list(out.blocks)
     dst: list[Block] = []
     report: list[dict] = []

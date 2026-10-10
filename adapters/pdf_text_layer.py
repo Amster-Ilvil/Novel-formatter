@@ -724,6 +724,7 @@ def extract_pdf_text_layer(
     col_width: float = COL_WIDTH,
     progress_callback: Optional[Callable[[int, int, str], None]] = None,
     split_stacked_pages: str = "auto",
+    cancel_check: Optional[Callable[[], bool]] = None,
 ) -> UnifiedDocument:
     """
     从带文字层的 PDF 直接、忠实地提取正文字符和几何。
@@ -745,6 +746,7 @@ def extract_pdf_text_layer(
         progress_callback: (current_physical_page, total_physical_pages, label) -> None
         split_stacked_pages: ``auto``（默认，保守检测）/ ``off`` / ``force``。
                             ``force`` 仅供特殊文件显式使用；自动模式不会硬切。
+        cancel_check: 可选的协作式取消检查；返回 True 时在物理页边界停止。
 
     Returns:
         UnifiedDocument。``PageInfo.page_no`` 和 ``Block.page`` 使用逻辑页号；
@@ -793,6 +795,9 @@ def extract_pdf_text_layer(
 
     with _suspend_automatic_gc():
         for page_idx, page in enumerate(pdf):
+            if cancel_check is not None and cancel_check():
+                pdf.close()
+                raise InterruptedError("PDF 文字层提取已停止")
             physical_page_no = page_idx + 1
             page_w = float(page.rect.width)
             page_height = float(page.rect.height)
@@ -841,6 +846,9 @@ def extract_pdf_text_layer(
                 for ch in raw_span.get("chars", [])
             )
             if needs_texttrace:
+                if cancel_check is not None and cancel_check():
+                    pdf.close()
+                    raise InterruptedError("PDF 文字层提取已停止")
                 try:
                     for trace_span in page.get_texttrace():
                         trace_font = str(trace_span.get("font", "") or "")

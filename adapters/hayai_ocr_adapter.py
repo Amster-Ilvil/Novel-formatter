@@ -14,6 +14,7 @@ import subprocess
 import tempfile
 import threading
 import time
+import sys
 from pathlib import Path
 from typing import Iterator
 
@@ -138,6 +139,38 @@ def _resolved_model_cache(backend: str = "torch") -> Path:
     return MODEL_CACHE
 
 
+def _current_interpreter_runtime() -> Path | None:
+    """Reuse an already-provisioned exact Hayai runtime without invoking pip.
+
+    This is primarily useful for offline/cloud bundles and system-managed app
+    environments.  It is deliberately conservative: the exact Hayai package
+    must be present and a local model path (or a previously verified offline
+    cache) must exist.  A merely importable package is not enough to suppress
+    the normal private-venv installer.
+    """
+    try:
+        from importlib.metadata import version
+        if version("hayai-ocr") != HAYAI_OCR_VERSION:
+            return None
+        transformers_version = version("transformers")
+        major, minor = (int(part) for part in transformers_version.split("+", 1)[0].split(".")[:2])
+        if major != 4 or minor < 49:
+            return None
+    except Exception:
+        return None
+
+    model_value = os.environ.get("NOVEL_FORMATTER_HAYAI_OCR_MODEL", "").strip()
+    local_model_ready = bool(model_value and Path(model_value).expanduser().exists())
+    cache_ready = False
+    try:
+        cache_ready = _offline_cache_ready("torch")
+    except Exception:
+        cache_ready = False
+    if not (local_model_ready or cache_ready):
+        return None
+    return Path(sys.executable).resolve()
+
+
 def setup_venv(*, verbose: bool = True, backend: str = "torch") -> Path:
     backend = _normalise_backend(backend)
     # Offline/cloud acceptance can reuse an already-provisioned exact Hayai
@@ -148,6 +181,15 @@ def setup_venv(*, verbose: bool = True, backend: str = "torch") -> Path:
         path = Path(explicit).expanduser()
         if path.is_file():
             return path
+    # If this process already has the pinned runtime and is explicitly bound to
+    # a local model/cache, do not create a second venv and never invoke pip.
+    # LiteRT still uses its isolated dependency set unless explicitly overridden.
+    if backend == "torch":
+        current_python = _current_interpreter_runtime()
+        if current_python is not None:
+            if verbose:
+                print(f"[Hayai OCR] reuse current offline runtime: {current_python}", flush=True)
+            return current_python
     package = HAYAI_OCR_PACKAGE
     if backend == "litert" and "[litert]" not in package:
         if "==" in package:
@@ -243,7 +285,12 @@ def _worker_env(backend: str = "torch") -> dict[str, str]:
     # during ordinary OCR starts.  This enforces the project's "no silent model
     # update on startup" contract; explicit cache removal/manual maintenance is
     # required before a new upstream snapshot can be fetched.
-    if _offline_cache_ready(backend):
+    explicit_model = str(env.get("NOVEL_FORMATTER_HAYAI_OCR_MODEL") or "").strip()
+    explicit_local_model = bool(explicit_model and Path(explicit_model).expanduser().exists())
+    if _offline_cache_ready(backend) or explicit_local_model:
+        # An explicitly local model is a no-network contract.  If its processor
+        # assets are incomplete, fail with a local-cache error rather than
+        # silently contacting Hugging Face during an OCR button click.
         env["HF_HUB_OFFLINE"] = "1"
         env["TRANSFORMERS_OFFLINE"] = "1"
         env["NOVEL_FORMATTER_HAYAI_OFFLINE_ACTIVE"] = "1"
@@ -708,69 +755,83 @@ class HayaiOcrSession:
         return results
 
     def close(self, *, force: bool = False) -> None:
+        """Stop the persistent worker with strictly bounded teardown.
+
+        Pipe reader threads can be blocked inside ``readline()``. Closing their
+        TextIOWrapper from another thread may then wait forever on the wrapper's
+        internal lock, which used to make Stop/close look like a frozen GUI.
+        Terminate the process (or request graceful shutdown) first, wait only for
+        bounded intervals, and close a read pipe only after its reader exited.
+        """
         proc = self.proc
         self.proc = None
         if proc is None:
             return
+
+        from adapters.subprocess_watchdog import terminate_process
         shutdown_requested = False
         termination_requested = False
         initial_ret = proc.poll()
         ret = initial_ret
-        try:
-            if not force and initial_ret is None and proc.stdin is not None:
+
+        if initial_ret is None and not force and proc.stdin is not None:
+            try:
                 proc.stdin.write(json.dumps({"command": "close"}) + "\n")
                 proc.stdin.flush()
                 shutdown_requested = True
-        except Exception:
-            pass
+            except Exception:
+                pass
+
+        if initial_ret is None:
+            if force:
+                termination_requested = True
+                ret = terminate_process(proc, grace=1.5)
+            elif shutdown_requested:
+                try:
+                    ret = proc.wait(timeout=4.0)
+                except subprocess.TimeoutExpired:
+                    termination_requested = True
+                    ret = terminate_process(proc, grace=1.5)
+                except Exception:
+                    termination_requested = True
+                    ret = terminate_process(proc, grace=1.5)
+            else:
+                termination_requested = True
+                ret = terminate_process(proc, grace=1.5)
+
+        # Writers are safe to close once shutdown has completed/been signalled.
         try:
             if proc.stdin:
                 proc.stdin.close()
         except Exception:
             pass
-        try:
-            if force and proc.poll() is None:
-                proc.terminate()
-                termination_requested = True
-            ret = proc.wait(timeout=12 if shutdown_requested else 5 if force else 1)
-        except subprocess.TimeoutExpired:
-            if proc.poll() is None:
-                try:
-                    proc.terminate()
-                    termination_requested = True
-                    ret = proc.wait(timeout=3)
-                except subprocess.TimeoutExpired:
-                    proc.kill()
-                    termination_requested = True
-                    ret = proc.wait()
-        except Exception:
-            if proc.poll() is None:
-                try:
-                    proc.kill()
-                    termination_requested = True
-                except Exception:
-                    pass
-            ret = proc.wait()
 
         self._stderr_stop.set()
-        if self._stderr_thread is not None:
-            self._stderr_thread.join(timeout=1.5)
-        try:
-            if proc.stderr:
-                proc.stderr.close()
-        except Exception:
-            pass
+        stderr_thread = self._stderr_thread
+        if stderr_thread is not None and stderr_thread.is_alive():
+            stderr_thread.join(timeout=1.0)
+        # Never close a TextIOWrapper underneath a thread still blocked in
+        # readline(); leave that daemon reader to observe EOF instead.
+        if stderr_thread is None or not stderr_thread.is_alive():
+            try:
+                if proc.stderr:
+                    proc.stderr.close()
+            except Exception:
+                pass
         self._stderr_thread = None
+
         if self._stdout_pump is not None:
             self._stdout_pump.close()
             self._stdout_pump = None
-        try:
-            if proc.stdout:
-                proc.stdout.close()
-        except Exception:
-            pass
+        else:
+            try:
+                if proc.stdout:
+                    proc.stdout.close()
+            except Exception:
+                pass
+
         intentional = bool(force or shutdown_requested or termination_requested)
-        if ret not in (0, -15) and not intentional:
+        if ret not in (0, -15, -9, None) and not intentional:
             tail = "\n".join(self._stderr_lines[-30:])
             raise RuntimeError(f"Hayai OCR worker 异常退出 (code={ret}):\n{tail}")
 

@@ -23,6 +23,7 @@ def build_ocr_preview_panel(tab, top_row):
     # Phase 21: match the supplied reference navigation row.  The controls
     # remain the same objects/signals; only their visual order changes.
     preview_nav_row = QHBoxLayout()
+    self._preview_nav_row = preview_nav_row
     preview_nav_row.setContentsMargins(0, 0, 0, 0)
     preview_nav_row.setSpacing(6)
 
@@ -58,12 +59,16 @@ def build_ocr_preview_panel(tab, top_row):
     preview_nav_row.addWidget(self._preview_filename_lbl, 1)
 
     self._preview_detector_box_check = QCheckBox("检测框")
+    self._preview_detector_box_check.setObjectName("ocrPreviewDetectorBoxToggle")
     self._preview_detector_box_check.setChecked(True)
-    self._preview_detector_box_check.setToolTip("显示/隐藏右侧实时预览中的检测框")
+    self._preview_detector_box_check.setStyleSheet("QCheckBox{color:#B91C1C;font-size:11px;font-weight:650;}")
+    self._preview_detector_box_check.setToolTip("显示/隐藏右侧实时预览中的红色实线检测框")
     preview_nav_row.addWidget(self._preview_detector_box_check)
     self._preview_input_box_check = QCheckBox("输入框")
-    self._preview_input_box_check.setChecked(False)
-    self._preview_input_box_check.setToolTip("显示/隐藏右侧实时预览中的 OCR 输入原像素框")
+    self._preview_input_box_check.setObjectName("ocrPreviewInputBoxToggle")
+    self._preview_input_box_check.setChecked(True)
+    self._preview_input_box_check.setStyleSheet("QCheckBox{color:#15803D;font-size:11px;font-weight:650;}")
+    self._preview_input_box_check.setToolTip("显示/隐藏右侧实时预览中的绿色实线 OCR 输入原像素框")
     preview_nav_row.addWidget(self._preview_input_box_check)
 
     self._preview_enabled_cb = QCheckBox("实时预览")
@@ -102,6 +107,10 @@ def build_ocr_preview_panel(tab, top_row):
     self._preview_page_lbl.setAlignment(Qt.AlignCenter)
     self._preview_page_lbl.setStyleSheet(f"color: {INK}; font-size: 12px; font-weight: 700;")
     preview_nav_row.insertWidget(1, self._preview_page_lbl)
+    # Keep the destructive crop reset next to page navigation, where the user
+    # needs it while stepping through pages; it no longer hides at the far end.
+    preview_nav_row.removeWidget(self._preview_clear_crop_btn)
+    preview_nav_row.insertWidget(3, self._preview_clear_crop_btn)
 
     cv.addLayout(preview_nav_row)
 

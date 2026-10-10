@@ -28,8 +28,10 @@ from typing import Any, Iterable, Iterator, Sequence
 import xml.etree.ElementTree as ET
 
 from builder.epub_builder import build_epub
+from engine import ocr_roundtrip_package as roundtrip
 from models.document import Block, BlockType, UnifiedDocument
 from engine.document_alignment import looks_like_chapter_title
+from utils.atomic_io import atomic_output_path
 
 AI_REPAIR_SCHEMA = "novel_formatter.ai_repair_epub.v2"
 AI_REPAIR_EDITS_SCHEMA = "novel_formatter.ai_repair_edits.v2"
@@ -320,7 +322,7 @@ def build_repair_document(
             target = min(max(target, 0), len(primary_doc.blocks))
             insertions.setdefault(target, []).append(item)
 
-    result = copy.deepcopy(primary_doc)
+    result = primary_doc.snapshot_clone()
     rebuilt: list[Block] = []
 
     def emit_items(rows: Iterable[dict], source: Block | None) -> None:
@@ -377,7 +379,7 @@ def _normalised_image_path(value: str | Path) -> str:
 def _retain_only_publication_images(doc: UnifiedDocument, allowed_image_paths: set[str]) -> UnifiedDocument:
     """Remove OCR source-page images without disturbing text-item mapping."""
     allowed = {_normalised_image_path(value) for value in allowed_image_paths if str(value or "").strip()}
-    result = copy.deepcopy(doc)
+    result = doc.snapshot_clone()
     result.pages = [
         page for page in result.pages
         if _normalised_image_path(getattr(page, "image_path", "")) in allowed
@@ -1746,22 +1748,26 @@ def _result_schema() -> dict:
 
 
 def _rewrite_archive_with_metadata(epub_path: Path, additions: dict[str, bytes]) -> None:
-    temp_path = epub_path.with_suffix(epub_path.suffix + ".tmp")
+    """Rewrite EPUB metadata crash-safely and publish only a valid ZIP."""
     skip = set(additions) | {"mimetype"}
-    with zipfile.ZipFile(epub_path, "r") as source, zipfile.ZipFile(temp_path, "w") as target:
-        mime_info = zipfile.ZipInfo("mimetype")
-        mime_info.compress_type = zipfile.ZIP_STORED
-        target.writestr(mime_info, b"application/epub+zip")
-        for info in source.infolist():
-            if info.filename in skip:
-                continue
-            target.writestr(info, source.read(info.filename))
-        for name, data in additions.items():
-            info = zipfile.ZipInfo(name)
-            info.compress_type = zipfile.ZIP_DEFLATED
-            info.external_attr = 0o644 << 16
-            target.writestr(info, data)
-    os.replace(temp_path, epub_path)
+    with atomic_output_path(epub_path, suffix=epub_path.suffix + ".tmp") as temp_path:
+        with zipfile.ZipFile(epub_path, "r") as source, zipfile.ZipFile(temp_path, "w") as target:
+            mime_info = zipfile.ZipInfo("mimetype")
+            mime_info.compress_type = zipfile.ZIP_STORED
+            target.writestr(mime_info, b"application/epub+zip")
+            for info in source.infolist():
+                if info.filename in skip:
+                    continue
+                target.writestr(info, source.read(info.filename))
+            for name, data in additions.items():
+                info = zipfile.ZipInfo(name)
+                info.compress_type = zipfile.ZIP_DEFLATED
+                info.external_attr = 0o644 << 16
+                target.writestr(info, data)
+        with zipfile.ZipFile(temp_path, "r") as check_zip:
+            bad_member = check_zip.testzip()
+            if bad_member is not None:
+                raise zipfile.BadZipFile(f"EPUB metadata rewrite CRC failed: {bad_member}")
 
 
 def _chapter_payloads(items: Sequence[dict]) -> tuple[list[dict], dict[str, bytes]]:
@@ -2386,7 +2392,7 @@ def load_ai_repair_json(
         payload = _json_loads_strict(raw, source=str(path))
         source_name = str(path)
     else:
-        payload = copy.deepcopy(source)
+        payload = roundtrip._json_detached(source)
         _validate_json_shape(payload)
         source_name = "memory"
 

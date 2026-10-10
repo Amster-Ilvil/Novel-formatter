@@ -707,7 +707,7 @@ def validate_authoritative_transition(source: UnifiedDocument, result: UnifiedDo
 
 def sanitize_authoritative_source(doc: UnifiedDocument) -> UnifiedDocument:
     """Remove non-prose payloads before AI. Never alter valid prose."""
-    result = copy.deepcopy(doc)
+    result = doc.snapshot_clone()
     cleaned = []
     removed = 0
     for block in result.blocks:
@@ -722,7 +722,7 @@ def sanitize_authoritative_source(doc: UnifiedDocument) -> UnifiedDocument:
 
 
 def mark_authoritative(doc: UnifiedDocument, report: AuthorityReport) -> UnifiedDocument:
-    result = copy.deepcopy(doc)
+    result = doc.snapshot_clone()
     result.metadata.ai_processing_mode = "authoritative_text"
     result.metadata.ai_layout_locked = True
     # Metadata is intentionally extensible and serializes all fields in __dict__.

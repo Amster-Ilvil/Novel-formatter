@@ -211,25 +211,33 @@ def wrap_in_card(owner: QWidget) -> QHBoxLayout:
 
 
 def polish_reference_workspace(root: QWidget) -> None:
-    """统一所有工作区的交互密度和细节，不改变任何业务信号。"""
-    for widget_type in (QPushButton, QToolButton, QCheckBox, QRadioButton):
-        for button in root.findChildren(widget_type):
-            button.setCursor(QCursor(Qt.PointingHandCursor))
-    for splitter in root.findChildren(QSplitter):
-        if not bool(splitter.property("nfPreserveHandleWidth")):
-            splitter.setHandleWidth(1)
-        splitter.setChildrenCollapsible(False)
-    for tabs in root.findChildren(QTabWidget):
-        tabs.setDocumentMode(True)
-    for scroll in root.findChildren(QScrollArea):
-        scroll.setFrameShape(QFrame.NoFrame)
-    for combo in root.findChildren(QComboBox):
-        if combo.maximumHeight() >= 30:
-            combo.setMinimumHeight(max(30, combo.minimumHeight()))
-    for edit in root.findChildren(QLineEdit):
-        edit.setMinimumHeight(max(30, edit.minimumHeight()))
-    # Run once during construction as well as through the application event
-    # filter.  This covers disabled controls that are already visible in the
-    # initial empty-document state (EPUB/Formatter/文字校对等工作区).
+    """统一所有工作区的交互密度和细节，不改变任何业务信号。
+
+    Traverse the QObject tree once.  The previous implementation performed a
+    separate findChildren() walk for every widget class and then another walk for
+    button contrast; on the OCR workspace this meant thousands of Python/C++
+    wrapper visits during first entry.
+    """
+    widgets = root.findChildren(QWidget)
+    for widget in widgets:
+        if isinstance(widget, (QPushButton, QToolButton, QCheckBox, QRadioButton)):
+            widget.setCursor(QCursor(Qt.PointingHandCursor))
+        if isinstance(widget, QSplitter):
+            if not bool(widget.property("nfPreserveHandleWidth")):
+                widget.setHandleWidth(1)
+            widget.setChildrenCollapsible(False)
+        elif isinstance(widget, QTabWidget):
+            widget.setDocumentMode(True)
+        elif isinstance(widget, QScrollArea):
+            widget.setFrameShape(QFrame.NoFrame)
+        elif isinstance(widget, QComboBox):
+            combo = widget
+            if combo.maximumHeight() >= 30:
+                combo.setMinimumHeight(max(30, combo.minimumHeight()))
+        elif isinstance(widget, QLineEdit):
+            widget.setMinimumHeight(max(30, widget.minimumHeight()))
+    # The clickable guard is suspended while lazy workspaces are installed, so
+    # one explicit contrast pass here is enough and avoids recursive StyleChange
+    # storms.
     enforce_button_contrast_tree(root)
 

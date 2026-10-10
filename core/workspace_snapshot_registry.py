@@ -42,7 +42,7 @@ class WorkspaceSnapshotRegistry(Generic[T]):
 
     def publish(self, key: str, value: T, *, clone: bool = True) -> T:
         snapshot_key = self._normalise_key(key)
-        snapshot = copy.deepcopy(value) if clone else value
+        snapshot = self.clone(value) if clone else value
         with self._lock:
             self._revision += 1
             self.aliases[snapshot_key] = snapshot
@@ -55,7 +55,7 @@ class WorkspaceSnapshotRegistry(Generic[T]):
             raise ValueError("at least one snapshot alias is required")
         # Keep the expensive/deep operation outside the registry lock. The
         # resulting snapshot is committed to every alias in one critical section.
-        snapshot = copy.deepcopy(value) if clone else value
+        snapshot = self.clone(value) if clone else value
         with self._lock:
             self._revision += 1
             revision = self._revision
@@ -96,4 +96,7 @@ class WorkspaceSnapshotRegistry(Generic[T]):
 
     @staticmethod
     def clone(value: T) -> T:
+        fast_clone = getattr(value, "snapshot_clone", None)
+        if callable(fast_clone):
+            return fast_clone()
         return copy.deepcopy(value)

@@ -337,7 +337,12 @@ class AISettingsDialog(QDialog):
                 self._replace_model_items([model] if model else [], model)
             if not self.base_url.text().strip() or self.base_url.text().strip()==old_url:self.base_url.setText(url)
         self._last_provider=provider
-        self.key.setPlaceholderText("本地 Ollama 无需 API Key" if provider=="ollama" else "请输入 API Key")
+        if provider == "ollama":
+            self.key.setPlaceholderText("本地 Ollama 无需 API Key")
+        elif provider == "custom":
+            self.key.setPlaceholderText("API Key 可选（无鉴权接口可留空）")
+        else:
+            self.key.setPlaceholderText("请输入 API Key")
         is_deepseek=provider=="deepseek"
         is_glm=provider in {"zhipu", "zai"}
         self.glm_thinking.setEnabled(is_glm)

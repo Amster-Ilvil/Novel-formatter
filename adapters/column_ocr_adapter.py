@@ -83,7 +83,7 @@ _COMPACT_VIEWPORT_ENGINES = frozenset({
 })
 _CONTEXT_VIEWPORT_ENGINES = frozenset({
     key for key in ("apple_vision", "macocr", "mac_ocr", "macos_ocr", "windows_snipping_ocr", "ndlocr_lite",
-                    "paddle_ocr", "google_vision")
+                    "paddle_ocr")
     if get_ocr_engine_profile(key).viewport_mode == "context"
 })
 
@@ -6032,7 +6032,6 @@ class _RecognizerSession:
         self._retained_session = False
         self._hayai = None
         self._manga48 = None
-        self._mangaocr = None
         self._persistent = None
         self._jsonl_persistent = None
         self._serial = 0
@@ -6063,14 +6062,6 @@ class _RecognizerSession:
                 engine_options=self.engine_options,
             )
             self._manga48.__enter__()
-        elif self.engine == "manga_ocr":
-            from adapters.manga_ocr_adapter import MangaOcrSession
-            self._mangaocr = MangaOcrSession(
-                cancel_check=self.cancel_check,
-                verbose=self.verbose,
-                load_progress_callback=self.load_progress_callback,
-            )
-            self._mangaocr.__enter__()
         # Preserve the monkeypatch hook used by tests/plugins.  Persistent native
         # sessions are enabled only when the stock bridge is active.
         elif _recognizer_iterator is recognizer_iterator and self.engine == "apple_vision":
@@ -6153,10 +6144,6 @@ class _RecognizerSession:
             return self._manga48.recognize(
                 paths, progress_callback=progress_callback, input_metadata=metadata
             )
-        if self._mangaocr is not None:
-            return self._mangaocr.recognize(
-                paths, progress_callback=progress_callback, input_metadata=metadata
-            )
         if self._persistent is not None:
             results: dict[str, tuple[str, float, str | None]] = {}
             total = max(1, len(paths))
@@ -6229,11 +6216,6 @@ class _RecognizerSession:
                 return self._manga48.__exit__(exc_type, exc, tb)
             finally:
                 self._manga48 = None
-        if self._mangaocr is not None:
-            try:
-                return self._mangaocr.__exit__(exc_type, exc, tb)
-            finally:
-                self._mangaocr = None
         if self._persistent is not None:
             try:
                 return self._persistent.__exit__(exc_type, exc, tb)
@@ -7890,7 +7872,7 @@ def _iter_column_pages(
             })
             session_parts = [
                 getattr(session, name, None)
-                for name in ("_hayai", "_manga48", "_mangaocr", "_persistent", "_jsonl_persistent")
+                for name in ("_hayai", "_manga48", "_persistent", "_jsonl_persistent")
             ]
             active_session = next((part for part in session_parts if part is not None), None)
             if active_session is not None:

@@ -53,7 +53,7 @@ def project_page_document_to_sentences(
         [canonical_document, page_document],
         ["canonical", str(page_label or "page")],
     )
-    projected = copy.deepcopy(canonical_document)
+    projected = canonical_document.snapshot_clone()
     projected.blocks = []
     source_pages = list(getattr(page_document, "pages", []) or [])
     projected.pages = copy.deepcopy(source_pages or getattr(canonical_document, "pages", []) or [])
@@ -174,7 +174,7 @@ def canonicalize_page_document_sentences(
     import uuid
     from engine.multi_ocr_compare import sentence_units
 
-    projected = copy.deepcopy(page_document)
+    projected = page_document.snapshot_clone()
     projected.blocks = []
     units = sentence_units(page_document)
     for order, unit in enumerate(units):
@@ -198,7 +198,7 @@ def canonicalize_page_document_sentences(
         block.modified_by = "page_sentence_canonicalization"
         projected.blocks.append(block)
 
-    projected.metadata = copy.deepcopy(page_document.metadata)
+    # snapshot_clone() already detached metadata exactly.
     projected.metadata.__dict__["page_sentence_canonicalized"] = True
     projected.metadata.__dict__["page_sentence_projection_alignment_mode"] = "page_self_sentence_split"
     projected.add_log(

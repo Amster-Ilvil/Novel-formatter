@@ -17,13 +17,14 @@ from pathlib import Path
 import re
 import shutil
 import tempfile
+import threading
 import uuid
 import zipfile
 import csv
 import io
 from typing import Iterable, Mapping, Any
 
-from utils.atomic_io import atomic_write_text
+from utils.atomic_io import atomic_write_bytes, atomic_write_text
 from utils.safe_archive import safe_extract_zip
 from core.ocr_segment_cache import OcrSegmentCache
 from core.artifact_pipeline import (
@@ -40,6 +41,24 @@ RUN_LOG_SCHEMA_VERSION = 4
 RUN_STATUSES = {"running", "ok", "cancelled", "error", "warning"}
 ADJUDICATION_EVENT_FILE = "adjudication/local/events.jsonl"
 ADJUDICATION_EVENT_SCHEMA_VERSION = 2
+
+# Multiple ProjectWorkspaceManager instances may target the same active project:
+# the GUI owns one while low-frequency checkpoint workers create short-lived
+# managers.  Keep append + checkpoint-compaction operations serialized per
+# journal path so a decision appended while a 35 MB checkpoint is being written
+# can never be erased by a later journal reset.
+_ADJUDICATION_JOURNAL_LOCKS_GUARD = threading.Lock()
+_ADJUDICATION_JOURNAL_LOCKS: dict[str, threading.RLock] = {}
+
+
+def _adjudication_journal_lock(path: Path) -> threading.RLock:
+    key = str(path.resolve())
+    with _ADJUDICATION_JOURNAL_LOCKS_GUARD:
+        lock = _ADJUDICATION_JOURNAL_LOCKS.get(key)
+        if lock is None:
+            lock = threading.RLock()
+            _ADJUDICATION_JOURNAL_LOCKS[key] = lock
+        return lock
 
 
 class LegacyWorkspaceCompatibilityUnavailable(ValueError):
@@ -169,6 +188,9 @@ class ProjectWorkspaceManager:
         self.workspace_root = Path(workspace_root).expanduser() if workspace_root else default
         self.active_project: Path | None = None
         self._checked_adjudication_journals: set[str] = set()
+        # Recent-project dashboards refresh frequently.  Cache parsed project.json
+        # metadata by exact file identity so refreshes pay only a cheap stat call.
+        self._project_info_cache: dict[str, tuple[int, int, ProjectInfo | None]] = {}
 
     # ------------------------------------------------------------------
     # workspace/project discovery
@@ -194,10 +216,24 @@ class ProjectWorkspaceManager:
         if not root.exists():
             return []
         result: list[ProjectInfo] = []
+        seen_cache_keys: set[str] = set()
         for folder in sorted((p for p in root.iterdir() if p.is_dir()), key=lambda p: p.name.casefold()):
+            try:
+                seen_cache_keys.add(str(folder.resolve()))
+            except OSError:
+                seen_cache_keys.add(str(folder))
             info = self._read_project_info(folder)
             if info is not None:
                 result.append(info)
+        # External folder deletion/renames must not leave an unbounded metadata cache.
+        for cache_key in tuple(self._project_info_cache):
+            if cache_key not in seen_cache_keys:
+                self._project_info_cache.pop(cache_key, None)
+        if len(self._project_info_cache) > 512:
+            # list_projects() reads in deterministic folder order; retaining the most
+            # recent 512 entries is ample while keeping memory bounded.
+            for cache_key in tuple(self._project_info_cache)[:-512]:
+                self._project_info_cache.pop(cache_key, None)
         result.sort(key=lambda item: (item.updated_at, item.name.casefold()), reverse=True)
         return result
 
@@ -1051,7 +1087,36 @@ class ProjectWorkspaceManager:
         doc = resolved if isinstance(resolved, dict) else None
         if not isinstance(doc, dict):
             raise ValueError("当前 stage document_ref 未解析为 JSON 对象。")
+        # Stage documents may be created on a different Mac/Windows/Linux path.
+        # Rebind only a matching copy already owned by this project.  Never
+        # modify the content-addressed payload, source hashes, or OCR decisions.
+        self._rebind_stage_image_paths(doc, project)
         return str(raw.get("stage") or "ocr"), doc
+
+    @staticmethod
+    def _rebind_stage_image_paths(doc: dict, project: Path) -> int:
+        source_dir = project / "source" / "original"
+        if not source_dir.is_dir():
+            return 0
+        changed = 0
+        for group in (doc.get("pages"), doc.get("blocks")):
+            if not isinstance(group, list):
+                continue
+            for item in group:
+                if not isinstance(item, dict):
+                    continue
+                original = item.get("image_path")
+                if not isinstance(original, str) or not original:
+                    continue
+                # Path separators can differ between the source and target OS.
+                name = original.replace("\\", "/").rsplit("/", 1)[-1]
+                if not name or name in (".", ".."):
+                    continue
+                local_copy = source_dir / name
+                if local_copy.is_file() and original != str(local_copy):
+                    item["image_path"] = str(local_copy)
+                    changed += 1
+        return changed
 
     def documents_compatible_with_pages(self) -> bool:
         project = self._require_project()
@@ -1217,12 +1282,15 @@ class ProjectWorkspaceManager:
         payload.setdefault("timestamp", _now_iso())
         payload.setdefault("schema_version", ADJUDICATION_EVENT_SCHEMA_VERSION)
         line = json.dumps(payload, ensure_ascii=False, separators=(",", ":")) + "\n"
-        # Open/append/close intentionally flushes the Python and libc buffers on
-        # every decision while avoiding the much higher cost of fsyncing the
-        # complete project snapshot.
-        with path.open("a", encoding="utf-8", newline="") as fh:
-            fh.write(line)
-            fh.flush()
+        # A checkpoint worker can compact the journal concurrently with manual
+        # review.  Serialize the tiny append/compaction critical sections while
+        # leaving the expensive checkpoint compression outside the lock.
+        with _adjudication_journal_lock(path):
+            # Open/append/close intentionally flushes the Python and libc buffers
+            # on every decision while avoiding a full-project fsync.
+            with path.open("a", encoding="utf-8", newline="") as fh:
+                fh.write(line)
+                fh.flush()
         return path
 
     def load_adjudication_events(self) -> list[dict]:
@@ -1256,12 +1324,59 @@ class ProjectWorkspaceManager:
             events.append(item)
         return events
 
+    def adjudication_event_checkpoint_marker(self) -> dict[str, Any]:
+        """Return a stable prefix marker for the current adjudication journal.
+
+        The marker is captured on the GUI thread together with the OCR snapshot.
+        A background checkpoint may later remove exactly this prefix while
+        preserving decisions appended after the snapshot was captured.
+        """
+        project = self._require_project()
+        path = project / ADJUDICATION_EVENT_FILE
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with _adjudication_journal_lock(path):
+            raw = path.read_bytes() if path.exists() else b""
+        return {
+            "size": len(raw),
+            "sha256": hashlib.sha256(raw).hexdigest(),
+        }
+
+    def compact_adjudication_events_through(self, marker: Mapping[str, Any] | None) -> bool:
+        """Drop only journal bytes already represented by a saved checkpoint.
+
+        New decisions may be appended while the 35 MB checkpoint is compressed.
+        Under the shared per-path lock we verify that the saved prefix is still
+        byte-identical, then atomically replace the file with only the suffix.
+        A mismatch is conservative: nothing is deleted.
+        """
+        if not isinstance(marker, Mapping):
+            return False
+        try:
+            prefix_size = max(0, int(marker.get("size") or 0))
+        except (TypeError, ValueError, OverflowError):
+            return False
+        expected = str(marker.get("sha256") or "")
+        project = self._require_project()
+        path = project / ADJUDICATION_EVENT_FILE
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with _adjudication_journal_lock(path):
+            raw = path.read_bytes() if path.exists() else b""
+            if prefix_size > len(raw):
+                return False
+            prefix = raw[:prefix_size]
+            if hashlib.sha256(prefix).hexdigest() != expected:
+                return False
+            atomic_write_bytes(path, raw[prefix_size:])
+            self._checked_adjudication_journals.discard(str(path.resolve()))
+        return True
+
     def clear_adjudication_events(self) -> None:
         project = self._require_project()
         path = project / ADJUDICATION_EVENT_FILE
         path.parent.mkdir(parents=True, exist_ok=True)
-        atomic_write_text(path, "")
-        self._checked_adjudication_journals.discard(str(path.resolve()))
+        with _adjudication_journal_lock(path):
+            atomic_write_text(path, "")
+            self._checked_adjudication_journals.discard(str(path.resolve()))
 
     def load_adjudication_state(self, *, channel: str = "local") -> dict:
         project = self._require_project()
@@ -2307,19 +2422,30 @@ class ProjectWorkspaceManager:
 
     def _read_project_info(self, project: Path) -> ProjectInfo | None:
         path = project / PROJECT_FILE
-        if not path.exists():
+        try:
+            stat = path.stat()
+        except OSError:
+            self._project_info_cache.pop(str(project), None)
             return None
+        cache_key = str(project.resolve())
+        identity = (int(stat.st_mtime_ns), int(stat.st_size))
+        cached = self._project_info_cache.get(cache_key)
+        if cached is not None and cached[:2] == identity:
+            return cached[2]
         try:
             payload = json.loads(path.read_text(encoding="utf-8"))
             if int(payload.get("schema_version", 0)) != SCHEMA_VERSION:
-                return None
-            if str(payload.get("format") or "") != PROJECT_FORMAT:
-                return None
-            if not str(payload.get("project_id") or ""):
-                return None
-            return self._project_info_from_payload(project, payload)
+                info = None
+            elif str(payload.get("format") or "") != PROJECT_FORMAT:
+                info = None
+            elif not str(payload.get("project_id") or ""):
+                info = None
+            else:
+                info = self._project_info_from_payload(project, payload)
         except Exception:
-            return None
+            info = None
+        self._project_info_cache[cache_key] = (identity[0], identity[1], info)
+        return info
 
     @staticmethod
     def _read_project_payload(project: Path) -> dict:
@@ -2333,9 +2459,9 @@ class ProjectWorkspaceManager:
             raise ValueError(f"project.json format 必须为 {PROJECT_FORMAT}")
         return raw
 
-    @staticmethod
-    def _write_project_payload(project: Path, payload: Mapping[str, Any]) -> None:
+    def _write_project_payload(self, project: Path, payload: Mapping[str, Any]) -> None:
         atomic_write_text(project / PROJECT_FILE, json.dumps(dict(payload), ensure_ascii=False, indent=2) + "\n")
+        self._project_info_cache.pop(str(project.resolve()), None)
 
     def _touch_project_payload(self, project: Path, payload: dict) -> None:
         payload["updated_at"] = _now_iso()

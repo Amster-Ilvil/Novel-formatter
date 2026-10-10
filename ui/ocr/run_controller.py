@@ -226,6 +226,9 @@ def _run_ocr_impl(
     self._switch_view("log")
     self._ocr_log_buffer.clear()
     self._ocr_log_flush_timer.start()
+    # Every new OCR run starts in live-tail mode.  The user can scroll upward
+    # after output begins without being forced back to the newest line.
+    self._ocr_log_follow_tail = True
     self._log_view.clear()
     self._log_view.appendPlainText(
         f"🧭 OCR 模式：{ocr_profile.label} · {ocr_profile.language} · "
@@ -270,17 +273,10 @@ def _run_ocr_impl(
         self._log_view.appendPlainText(
             "🧭 48px AR 行识别模式：使用紧裁物理列，竖列自动旋转并缩放到 48px 高。"
         )
-    self._run_btn.setEnabled(False)
-    if hasattr(self, "_handwriting_run_btn"):
-        self._handwriting_run_btn.setEnabled(False)
-    self._rerun_btn.setVisible(False)
-    self._pause_btn.setVisible(True)
-    self._pause_btn.setEnabled(True)
-    self._pause_btn.setText("停止 OCR")
     cancel_event = threading.Event()
     self._cancel_event = cancel_event
     self._review_preview_run_active = bool(manual_review_requested)
-    self._ocr_run_active = True
+    self._ocr_run_lifecycle._set_run_ui_state("running")
     self._ocr_last_activity_at = time.monotonic()
     self._ocr_stall_notice_emitted = False
     self._ocr_hard_timeout_requested = False
@@ -314,13 +310,12 @@ def _run_ocr_impl(
         elif configured_engine == "ndlocr_lite":
             runtime_backend_config[configured_engine].setdefault("backend", "NDLOCR-Lite / ONNX Runtime")
             runtime_backend_config[configured_engine].setdefault("device", "provider-selected")
-        elif configured_engine in {"hayai_ocr", "manga_48px", "manga_ocr", "paddle_ocr"}:
+        elif configured_engine in {"hayai_ocr", "manga_48px", "paddle_ocr"}:
             runtime_backend_config[configured_engine].setdefault(
                 "backend",
                 {
                     "hayai_ocr": "PyTorch or LiteRT",
                     "manga_48px": "PyTorch",
-                    "manga_ocr": "PyTorch / VisionEncoderDecoder",
                     "paddle_ocr": str(options.get("pipeline") or "PaddleOCR"),
                 }[configured_engine],
             )
@@ -375,7 +370,6 @@ def _run_ocr_impl(
                 "ndlocr_lite": "ndlocr_lite_adapter.py",
                 "hayai_ocr": "hayai_ocr_adapter.py",
                 "manga_48px": "manga_48px_adapter.py",
-                "manga_ocr": "manga_ocr_adapter.py",
                 "paddle_ocr": "paddle_ocr_adapter.py",
                 "paddle_aistudio": "paddle_aistudio_adapter.py",
             }
@@ -438,6 +432,13 @@ def _run_ocr_impl(
         # Caching is an optimization/safety layer; never block OCR if its
         # bookkeeping cannot be initialized.
         self._log_view.appendPlainText(f"⚠️ OCR 缓存初始化已跳过：{exc}")
+
+    # Reuse the checkpoint identity already calculated on the GUI thread.
+    # Do not compute another digest or read original images for telemetry.
+    if ocr_project_cache_context.get("pipeline_signature"):
+        performance_trace.metadata["pipeline_signature"] = str(
+            ocr_project_cache_context["pipeline_signature"]
+        )
 
     self._active_ocr_performance_trace = performance_trace
     self._active_ocr_log_session_id = performance_trace.run_id
@@ -1348,7 +1349,7 @@ def _run_ocr_impl(
                         # Native Paddle on macOS is a CPU path; do not block an
                         # unrelated MPS model just because both are OCR engines.
                         return "cpu_model"
-                    if key in {"manga_48px", "manga_ocr"}:
+                    if key == "manga_48px":
                         return "mps_model"
                     if key == "ndlocr_lite":
                         return "onnx_model"
@@ -3483,4 +3484,10 @@ def _run_ocr_impl(
     self._ocr_worker_thread = threading.Thread(
         target=worker, daemon=True, name=f"novel-ocr-{run_generation}"
     )
-    self._ocr_worker_thread.start()
+    try:
+        self._ocr_worker_thread.start()
+    except Exception as exc:
+        # Thread admission failure must roll the visible task state back just as
+        # a worker-side failure would; otherwise Start remains disabled forever.
+        self._ocr_worker_thread = None
+        self._on_error(f"无法启动 OCR 后台线程：{exc}")

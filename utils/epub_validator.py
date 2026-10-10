@@ -194,7 +194,7 @@ def _run_python_wrapper(epub_path: str) -> EpubValidationReport:
     except ImportError:
         return EpubValidationReport(
             skipped=True,
-            skip_reason="未安装 epubcheck Python 包（推荐 5.3.x，用于稳定 EPUB 3.3 校验）",
+            skip_reason="未找到可用的 EPUBCheck JAR / Python wrapper；可安装官方 EPUBCheck 5.4.x（项目仍以稳定 EPUB 3.3 为发布目标）",
         )
 
     version = _wrapper_version()

@@ -52,7 +52,7 @@ class DecisionQueueDelegate(QStyledItemDelegate):
             return (QColor("#DDEBFF" if not dark else "#1E3A5F"), QColor("#3165C7" if not dark else "#B8D3FF"))
         if "紧急" in status or "高风险" in status:
             return (QColor("#FDE7E7" if not dark else "#5A2626"), QColor("#B42318" if not dark else "#FFC3BD"))
-        if "复核" in status:
+        if "复核" in status or "草稿" in status or "未保存" in status:
             return (QColor("#FFF2D6" if not dark else "#57401F"), QColor("#9A6700" if not dark else "#FFD98A"))
         return (QColor("#EDF2F7" if not dark else "#2B3542"), QColor("#607086" if not dark else "#C7D0DB"))
 
@@ -124,6 +124,7 @@ _OCR_MODEL_COLORS = [
 
 class _FusionCandidateCard(QFrame):
     selected = Signal(int, int)
+    drafted = Signal(int, int)
     focused = Signal(int)
     text_edited = Signal(int)
 
@@ -193,17 +194,19 @@ class _FusionCandidateCard(QFrame):
         self._caption.setWordWrap(False)
         self._caption.setFixedHeight(24)
         self._caption.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
-        self._caption.setAlignment(Qt.AlignCenter)
+        self._caption.setAlignment(Qt.AlignLeft | Qt.AlignVCenter)
         layout.addWidget(self._caption)
 
         self.editor = MouseWheelPlainTextEdit()
         self.editor.setPlainText(text)
-        if self._candidate_state is not None and not self._historical_evidence:
-            self.editor.textChanged.connect(self._sync_candidate_text)
-        self.editor.setReadOnly(self._historical_evidence)
+        # Model/AI candidates are evidence, not the manual editing surface.
+        # Keep them immutable and copy the chosen baseline into the dedicated
+        # manual-decision editor instead.  This guarantees a "use as draft"
+        # action never rewrites OCR evidence before the user confirms.
+        self.editor.setReadOnly(True)
         self.editor.setLineWrapMode(QPlainTextEdit.WidgetWidth)
-        self.editor.setMinimumHeight(64)
-        self.editor.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        self.editor.setMinimumHeight(54)
+        self.editor.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
         # Candidate text is always fully expanded.  The outer fusion workspace
         # owns scrolling, so long sentences never disappear inside a nested
         # editor scrollbar.
@@ -230,12 +233,28 @@ class _FusionCandidateCard(QFrame):
         if self._candidate_reason:
             tooltip += f"\n{self._candidate_reason}"
         self.editor.setToolTip(tooltip)
+        self._last_editor_layout_width = -1
         self.editor.viewport().installEventFilter(self)
         self.editor.textChanged.connect(self._fit_editor_height)
         QTimer.singleShot(0, self._fit_editor_height)
         layout.addWidget(self.editor, 1)
 
-        self.check = QCheckBox("采用")
+        self._draft = QPushButton("作为底稿")
+        self._draft.setCursor(QCursor(Qt.PointingHandCursor))
+        self._draft.setStyleSheet(
+            "QPushButton{color:#2559E0;font-weight:700;border:1px solid #BFD3F7;"
+            "background:#F7FAFF;border-radius:9px;padding:5px 10px;}"
+            "QPushButton:hover{background:#EAF1FF;}"
+        )
+        self._draft.setToolTip(
+            f"Alt+{candidate_index + 1}：复制到手动编辑框；不会完成裁决，也不会跳转"
+            if candidate_index < 9 else "复制到手动编辑框；不会完成裁决，也不会跳转"
+        )
+        self._draft.clicked.connect(
+            lambda: self.drafted.emit(self.row_index, self.candidate_index)
+        )
+
+        self.check = QCheckBox("直接采用")
         self.check.setCursor(QCursor(Qt.PointingHandCursor))
         self.check.setStyleSheet(
             "QCheckBox{color:#2F6BFF;font-weight:700;border:1px solid #E2E5E9;"
@@ -244,14 +263,17 @@ class _FusionCandidateCard(QFrame):
             "QCheckBox::indicator{width:0;height:0;border:none;background:transparent;}"
         )
         self.check.setToolTip(
-            f"快捷键 Alt+{candidate_index + 1} 采用此候选" if candidate_index < 9
-            else "采用此候选"
+            f"Ctrl+Alt+{candidate_index + 1}：直接采用并完成当前裁决"
+            if candidate_index < 9 else "直接采用并完成当前裁决"
         )
         self.check.clicked.connect(lambda checked: self.selected.emit(self.row_index, self.candidate_index) if checked else None)
+        self._draft.setVisible(not self._historical_evidence)
+        self._draft.setEnabled(not self._historical_evidence)
         self.check.setVisible(not self._historical_evidence)
         self.check.setEnabled(not self._historical_evidence)
         footer = QHBoxLayout()
         footer.addStretch(1)
+        footer.addWidget(self._draft, 0, Qt.AlignRight)
         footer.addWidget(self.check, 0, Qt.AlignRight)
         layout.addLayout(footer)
 
@@ -329,24 +351,33 @@ class _FusionCandidateCard(QFrame):
         """Expand the editor to the complete wrapped document, without a height cap."""
         try:
             document = self.editor.document()
-            usable_width = max(220, self.editor.viewport().width() - 4)
+            usable_width = max(1, self.editor.viewport().width())
             # Reflow against the actual visible width before reading the layout
             # height.  This follows Qt's wrapping rather than estimating by
             # character count, so punctuation, Latin text and manual line breaks
             # are all fully represented.
             document.setTextWidth(float(usable_width))
-            document_height = int(math.ceil(document.documentLayout().documentSize().height()))
-            margins = self.editor.contentsMargins()
-            chrome = (
-                self.editor.frameWidth() * 2
-                + margins.top() + margins.bottom()
-                + 18
-            )
-            target = max(64, document_height + max(12, chrome - 8))
+            # QPlainTextDocumentLayout.documentSize().height() counts lines,
+            # rather than pixels. Measure each laid-out block to include every
+            # wrapped line and every explicit newline at the current width.
+            document_layout = document.documentLayout()
+            block = document.begin()
+            block_height = 0.0
+            while block.isValid():
+                block_height += document_layout.blockBoundingRect(block).height()
+                block = block.next()
+            document_height = int(math.ceil(block_height + document.documentMargin() * 2))
+            chrome = max(0, self.editor.height() - self.editor.viewport().height())
+            # Reserve one extra wrapped line because Qt's plain-text document
+            # layout can report fractional line heights before the final paint.
+            # Without this small guard, the last line of a long candidate may
+            # sit below the fixed-height viewport on some font/scale settings.
+            line_guard = max(16, self.editor.fontMetrics().lineSpacing())
+            target = max(54, document_height + chrome + line_guard)
             # Content sets the minimum; the editor receives all spare card
             # height instead of leaving that space around the model caption.
-            if self.editor.minimumHeight() != target:
-                self.editor.setMinimumHeight(target)
+            if self.editor.height() != target or self.editor.minimumHeight() != target or self.editor.maximumHeight() != target:
+                self.editor.setFixedHeight(target)
         except RuntimeError:
             # The card may already be scheduled for deletion from the virtual cache.
             return
@@ -356,14 +387,23 @@ class _FusionCandidateCard(QFrame):
         QTimer.singleShot(0, self._fit_editor_height)
 
     def eventFilter(self, watched, event):
-        if watched is self.editor.viewport() and event.type() == QEvent.MouseButtonPress:
-            self.focused.emit(self.row_index)
+        if watched is self.editor.viewport():
+            if event.type() == QEvent.MouseButtonPress:
+                self.focused.emit(self.row_index)
+            elif event.type() == QEvent.Resize:
+                width = int(watched.width())
+                if width != self._last_editor_layout_width:
+                    self._last_editor_layout_width = width
+                    QTimer.singleShot(0, self._fit_editor_height)
         return super().eventFilter(watched, event)
+
+    def set_draft_source(self, active: bool) -> None:
+        self._draft.setText("✓ 手动编辑底稿" if active else "作为底稿")
 
     def set_selected(self, selected: bool):
         self.check.blockSignals(True)
         self.check.setChecked(selected)
-        self.check.setText("已选" if selected else "采用")
+        self.check.setText("✓ 已采用" if selected else "直接采用")
         self.check.blockSignals(False)
         self.setStyleSheet(self._selected_style if selected else self._normal_style)
 
@@ -374,12 +414,15 @@ class _FusionCandidateCard(QFrame):
         # Keep the chosen mark visible for audit, but make it impossible to
         # change authority while the history filter is active.  Historical
         # evidence candidates remain permanently non-selectable.
+        self._draft.setVisible(not self._historical_evidence)
+        self._draft.setEnabled((not enabled) and (not self._historical_evidence))
         self.check.setVisible(not self._historical_evidence)
         self.check.setEnabled((not enabled) and (not self._historical_evidence))
 
 
 class _FusionDecisionRow(QFrame):
     reference_ready = Signal(str, str)
+    draft_requested = Signal(int, int, str, str)
     focused = Signal(int)
     about_to_resolve = Signal(int, int)
     resolved = Signal(int)
@@ -412,6 +455,7 @@ class _FusionDecisionRow(QFrame):
         self._review_only_candidates = False
         self._showing_history = False
         self._consensus_locked = False
+        self._reference_enabled = True
         self.setObjectName("fusionDecisionRow")
         self.setStyleSheet(
             "QFrame#fusionDecisionRow{background:#FFFFFF;border:1px solid #D7E3F4;border-radius:12px;}"
@@ -442,13 +486,14 @@ class _FusionDecisionRow(QFrame):
 
         from ui.ocr.proofread_widgets import OCRProofreadImageLabel
         self._reference_preview = QFrame(self)
-        self._reference_preview.setFixedWidth(240)
+        self._reference_preview.setMinimumWidth(255)
+        self._reference_preview.setMaximumWidth(320)
         self._reference_preview.setMinimumHeight(0)
         self._reference_preview.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Expanding)
         preview_layout = QVBoxLayout(self._reference_preview)
         preview_layout.setContentsMargins(0, 0, 0, 0)
         self._reference_preview_text = OCRProofreadImageLabel(self)
-        self._reference_preview_text.setMinimumSize(220, 220)
+        self._reference_preview_text.setMinimumSize(235, 260)
         self._reference_preview_text.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
         self._reference_preview_text.setText("正在载入参考原图…")
         self._reference_preview_text.setToolTip("完整参考裁片；点击原尺寸查看可放大阅读。")
@@ -459,8 +504,15 @@ class _FusionDecisionRow(QFrame):
         preview_layout.addWidget(self._reference_open)
         self._reference_path = ""
         self._reference_source_key = ""
+        self._reference_inflight_key = ""
+        self._reference_pending_request = None
+        self._reference_load_timer = QTimer(self)
+        self._reference_load_timer.setSingleShot(True)
+        self._reference_load_timer.setInterval(70)
+        self._reference_load_timer.timeout.connect(self._start_reference_load)
         self.reference_ready.connect(self._install_reference_image)
         body.addWidget(self._reference_preview, 0)
+        self._reference_preview.setVisible(False)
 
         cards_wrap = QWidget(self)
         cards_wrap.setStyleSheet("background:transparent;border:none;")
@@ -483,8 +535,9 @@ class _FusionDecisionRow(QFrame):
                 self,
                 candidate_state=candidate,
             )
-            card.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+            card.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Maximum)
             card.selected.connect(self._select_from_signal)
+            card.drafted.connect(self._draft_from_signal)
             card.focused.connect(self.focused)
             card.text_edited.connect(self._candidate_text_changed)
             self._cards_layout.addWidget(card)
@@ -492,12 +545,15 @@ class _FusionDecisionRow(QFrame):
 
         if not self._cards:
             card = _FusionCandidateCard(row_index, 0, "", (), self.labels, self)
-            card.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+            card.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Maximum)
             card.selected.connect(self._select_from_signal)
+            card.drafted.connect(self._draft_from_signal)
             card.focused.connect(self.focused)
             card.text_edited.connect(self._candidate_text_changed)
             self._cards_layout.addWidget(card)
             self._cards.append(card)
+
+        self._cards_layout.addStretch(1)
 
         self._review_card_indices = tuple(self._decision_state.review_indices)
 
@@ -549,22 +605,55 @@ class _FusionDecisionRow(QFrame):
             self._state.setText("多模型结果一致 · 只读")
 
     def set_reference_target_height(self, height: int) -> None:
-        """Fill the visible candidate viewport with the matching reference image."""
-        target = max(380, int(height or 0))
+        """Keep one adjudication row compact; the outer scroll owns long content."""
+        target = 300 if self._reference_preview.isVisible() else 0
         self.setMinimumHeight(target)
 
     def set_reference_source(self, document, row, page_images=()):
-        import tempfile
-        import threading
+        if not self._reference_enabled:
+            return
         key = f"{id(document)}:{id(row)}"
-        if key == self._reference_source_key:
+        if key == self._reference_source_key and (
+            bool(self._reference_path)
+            or self._reference_load_timer.isActive()
+            or self._reference_pending_request is not None
+            or self._reference_inflight_key == key
+        ):
             return
         self._reference_source_key = key
         self._reference_path = ""
         self._reference_open.setEnabled(False)
+        self._reference_preview.setVisible(False)
         self._reference_preview_text.clear_image("正在载入参考原图…")
+        # Reference crops can be relatively expensive because a restored
+        # workspace may need to reconstruct canonical OCR transport pixels.
+        # Defer the work briefly: fast F7/next/previous navigation then cancels
+        # rows the user never actually stopped on instead of spawning one
+        # background crop thread per transient sentence.
+        self._reference_pending_request = (
+            key, document, row, tuple(page_images or ()),
+        )
+        self._reference_load_timer.start()
+
+    def cancel_pending_reference_load(self) -> None:
+        """Cancel only not-yet-started crop work when a virtual row leaves view."""
+        self._reference_load_timer.stop()
+        self._reference_pending_request = None
+
+    def _start_reference_load(self) -> None:
+        request = self._reference_pending_request
+        self._reference_pending_request = None
+        if request is None or not self._reference_enabled:
+            return
+        key, document, row, page_images = request
+        if key != self._reference_source_key:
+            return
+
+        import tempfile
+        import threading
         cache = tempfile.TemporaryDirectory(prefix="novel-ocr-reference-")
         self._reference_cache = cache
+        self._reference_inflight_key = key
 
         def worker():
             path = ""
@@ -579,16 +668,27 @@ class _FusionDecisionRow(QFrame):
                 self.reference_ready.emit(key, str(path or ""))
             except RuntimeError:
                 pass  # This virtual row was disposed while its crop was loading.
+
         threading.Thread(target=worker, daemon=True, name="ocr-reference-crop").start()
 
     def _install_reference_image(self, key, path):
         if key != self._reference_source_key:
             return
+        if self._reference_inflight_key == key:
+            self._reference_inflight_key = ""
         self._reference_path = path
         available = bool(path and self._reference_preview_text.set_image_path(path))
         self._reference_open.setEnabled(available)
+        self._reference_preview.setVisible(available and self._reference_enabled)
         if not available:
             self._reference_preview_text.clear_image("此句没有可定位的参考裁片，请在图文对照查看源页。")
+
+    def set_reference_visible(self, visible: bool) -> None:
+        """Keep asynchronous image loads from reopening the full-text preview."""
+        self._reference_enabled = bool(visible)
+        self._reference_preview.setVisible(self._reference_enabled and bool(self._reference_path))
+        if not self._reference_enabled:
+            self.setMinimumHeight(0)
 
     def _open_reference_image(self):
         if not self._reference_path:
@@ -638,6 +738,8 @@ class _FusionDecisionRow(QFrame):
 
     def sync_from_state(self) -> None:
         """Refresh check marks/visibility after off-screen or transactional edits."""
+        self._cards_layout.addStretch(1)
+
         self._review_card_indices = tuple(self._decision_state.review_indices)
         self._showing_history = False
         selected = self._decision_state.selected_index
@@ -678,7 +780,9 @@ class _FusionDecisionRow(QFrame):
         """Render an already-adjudicated row as immutable audit history."""
         self._showing_history = bool(enabled)
         for card in self._cards:
-            card.set_history_read_only(bool(enabled) or self._consensus_locked)
+            card.set_history_read_only(bool(enabled))
+            if self._consensus_locked and not enabled:
+                card.set_history_read_only(True)
         if enabled:
             self._reopen.setVisible(False)
             from engine.ocr_compare_view_model import fusion_decision_origin_label
@@ -806,6 +910,23 @@ class _FusionDecisionRow(QFrame):
             card.setVisible(index in allowed)
         self._refresh_candidate_diffs()
 
+    def _draft_from_signal(self, row_index: int, candidate_index: int):
+        if row_index != self.row_index or not 0 <= int(candidate_index) < len(self._cards):
+            return
+        card = self._cards[int(candidate_index)]
+        self.draft_requested.emit(
+            self.row_index, int(candidate_index), card.editor.toPlainText(), str(card._base_caption or "候选")
+        )
+        self.focused.emit(self.row_index)
+
+    def stage_candidate(self, candidate_index: int) -> bool:
+        if self._showing_history or self._consensus_locked:
+            return False
+        if not 0 <= int(candidate_index) < len(self._cards):
+            return False
+        self._draft_from_signal(self.row_index, int(candidate_index))
+        return True
+
     def _select_from_signal(self, row_index: int, candidate_index: int):
         if row_index == self.row_index:
             self.choose(candidate_index, collapse=True)
@@ -822,8 +943,14 @@ class _FusionDecisionRow(QFrame):
             return
         if emit_signals:
             self.about_to_resolve.emit(self.row_index, int(candidate_index))
-        if not self._decision_state.choose(candidate_index, origin="human_ocr_compare"):
-            return
+            if not self._decision_state.choose(candidate_index, origin="human_ocr_compare"):
+                return
+        else:
+            # Constructor/state-sync calls are presentation-only.  Re-selecting
+            # an already authoritative imported/manual candidate here used to
+            # overwrite selection_origin with human_ocr_compare.
+            if self._decision_state.selected_index != int(candidate_index):
+                self._decision_state.selected_index = int(candidate_index)
         self._showing_history = False
         keep_evidence = bool(
             getattr(self._decision_state, "preserve_candidates_visible", False)

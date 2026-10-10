@@ -484,7 +484,7 @@ def _copy_block_with_text(block: Block, text: str, action: str) -> Block:
 
 def repair_high_confidence_publication_issues(doc: UnifiedDocument) -> tuple[UnifiedDocument, PublicationRepairReport]:
     """Apply only deterministic, character-preserving publication repairs."""
-    result = copy.deepcopy(doc)
+    result = doc.snapshot_clone()
     rebuilt: list[Block] = []
     details: list[str] = []
     changed = removed = overlaps = dialogue_splits = type_repairs = duplicates = quote_repairs = quote_joins = ocr_confusables = 0

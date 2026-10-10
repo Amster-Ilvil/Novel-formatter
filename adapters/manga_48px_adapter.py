@@ -30,7 +30,7 @@ from utils.apple_silicon_runtime import is_m6, recommended_cpu_threads, torch_wo
 ROOT = Path(__file__).parent.parent
 VENV_DIR = ROOT / ".venv-manga-48px"
 WORKER_SCRIPT = Path(__file__).parent / "manga_48px_worker.py"
-MODEL_CACHE = ROOT / ".model-cache" / "manga-48px-ar"
+MODEL_CACHE = Path(os.environ.get("NOVEL_FORMATTER_CLOUD_48PX_CACHE", "").strip() or (ROOT / ".model-cache" / "manga-48px-ar")).expanduser()
 MANGA_48PX_TORCH_PACKAGE = os.environ.get(
     "NOVEL_FORMATTER_MANGA_48PX_TORCH",
     "torch>=2.14,<2.15" if is_m6() else "torch>=2.3,<3",
@@ -206,6 +206,21 @@ class Manga48pxSession(JsonWorkerSessionBase):
         python = setup_venv(verbose=self.verbose)
         if announce_environment:
             self._emit_load("environment", 1, 1, "48px AR 运行环境已就绪 · 检查官方权重")
+        # Strictly offline runs must never fall through to the model/source
+        # downloader if an externally provisioned cache is incomplete.
+        if any(os.environ.get(flag, "").strip().lower() in {"1", "true", "yes"}
+               for flag in ("HF_HUB_OFFLINE", "TRANSFORMERS_OFFLINE", "NOVEL_FORMATTER_OCR_OFFLINE")):
+            required = (
+                MODEL_CACHE / "ocr_ar_48px.ckpt",
+                MODEL_CACHE / "alphabet-all-v7.txt",
+                MODEL_CACHE / "upstream-source" / "model_48px.py",
+                MODEL_CACHE / "upstream-source" / "xpos_relative_position.py",
+            )
+            missing = [str(path) for path in required if not path.is_file()]
+            if missing:
+                raise FileNotFoundError(
+                    "48px AR 离线资源不完整，已禁止联网下载：" + ", ".join(missing)
+                )
         MODEL_CACHE.mkdir(parents=True, exist_ok=True)
         ensure_runtime_files(
             MODEL_CACHE,

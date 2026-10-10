@@ -101,12 +101,18 @@ class AISettings:
 
     @property
     def requires_key(self) -> bool:
-        return self.provider not in {"ollama"}
+        # Local/custom OpenAI-compatible gateways may intentionally run without
+        # authentication. Cloud-managed providers still require a real key.
+        return self.provider not in {"ollama", "custom"}
 
     @property
     def configured(self) -> bool:
         if not self.provider or not self.model:
             return False
+        if self.provider == "custom":
+            if not str(self.base_url or "").strip():
+                return False
+            return not bool(self.api_key) or not api_key_validation_error(self.api_key)
         if not self.requires_key:
             return True
         return bool(self.api_key and not api_key_validation_error(self.api_key))

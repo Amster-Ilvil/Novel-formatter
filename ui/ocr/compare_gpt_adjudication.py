@@ -14,6 +14,68 @@ from ui.dialogs import show_error_dialog
 from ui.localized_dialogs import LocalizedMessageBox as QMessageBox
 from ui.ocr.compare_widgets import OCRAIAdjudicationDialog
 from ui.settings.ai_dialog import ensure_ai_settings
+from utils.atomic_io import atomic_write_json
+
+
+def _apply_ai_report_to_fusion_states(fusion_states, lines, package_items, audit_report):
+    """Apply accepted AI judgements, including explicit no-change confirmations.
+
+    A reviewed row is a decision even when the final text is byte-for-byte equal
+    to the pre-review fusion text.  Marking that existing candidate with an
+    explicit AI origin removes it from the pending queue and makes the decision
+    durable in the canonical/project snapshot without altering raw OCR evidence.
+    """
+    from engine.ocr_compare_view_model import upsert_external_candidate
+
+    uncertain_ids = {str(value) for value in (audit_report.get("low_uncertain") or []) if str(value)}
+    report_by_id = {
+        str(entry.get("item_id", "") or ""): entry
+        for entry in (audit_report.get("items") or [])
+        if isinstance(entry, dict) and str(entry.get("item_id", "") or "")
+    }
+    stats = {"resolved": 0, "confirmed_unchanged": 0, "changed": 0, "uncertain": 0}
+    if len(lines) != len(fusion_states):
+        return stats
+
+    for row_index, (state, text) in enumerate(zip(fusion_states, lines)):
+        row_id = (
+            str(package_items[row_index].get("row_id", "") or "")
+            if row_index < len(package_items) and isinstance(package_items[row_index], dict)
+            else ""
+        )
+        report_entry = report_by_id.get(row_id, {})
+        if row_id in uncertain_ids:
+            state.local_reocr_recommended = True
+            state.fusion_reason = str(
+                report_entry.get("reason", "视觉证据不足，保留人工复核")
+                or "视觉证据不足，保留人工复核"
+            )
+            stats["uncertain"] += 1
+            continue
+        if not report_entry or bool(report_entry.get("needs_human_review", False)):
+            if report_entry:
+                stats["uncertain"] += 1
+            continue
+
+        before = str(report_entry.get("before", "") or "")
+        after = str(report_entry.get("after", text) or "")
+        selected = upsert_external_candidate(
+            state,
+            after,
+            display_label="出版级 AI 裁决",
+            select=True,
+            reason=str(report_entry.get("reason", "") or ("AI 已核验原文无需修改" if after == before else "")),
+            allow_empty=False,
+            selection_origin="ai_gpt_grade_adjudication",
+        )
+        if selected is None:
+            continue
+        stats["resolved"] += 1
+        if after == before:
+            stats["confirmed_unchanged"] += 1
+        else:
+            stats["changed"] += 1
+    return stats
 
 
 class OCRCompareGPTAdjudicationController:
@@ -40,7 +102,7 @@ class OCRCompareGPTAdjudicationController:
             return
         settings = ensure_ai_settings(
             self,
-            "请先在 AI 设置中选择支持图片输入的模型并填写 API Key。AI 裁决会把多条 OCR 分歧拼成证据板批量提交。",
+            "请先在 AI 设置中选择支持图片输入的模型；仅在当前 Provider 需要鉴权时填写 API Key。AI 裁决会把多条 OCR 分歧拼成证据板批量提交。",
         )
         if settings is None:
             return
@@ -235,44 +297,18 @@ class OCRCompareGPTAdjudicationController:
                 output_dir.mkdir(parents=True, exist_ok=True)
                 package_path = output_dir / f"{title}_AI_GPT级裁决.json"
                 report_path = output_dir / f"{title}_AI_GPT级裁决报告.json"
-                package_path.write_text(json.dumps(reviewed_package, ensure_ascii=False, indent=2), encoding="utf-8")
-                report_path.write_text(json.dumps(audit_report, ensure_ascii=False, indent=2), encoding="utf-8")
+                atomic_write_json(package_path, reviewed_package, ensure_ascii=False, indent=2)
+                atomic_write_json(report_path, audit_report, ensure_ascii=False, indent=2)
 
                 fused, imported_comparison, lines = import_multi_package(
                     reviewed_package,
                     current_primary=current_primary,
                 )
                 fusion_states = build_fusion_states(imported_comparison.rows, auto_choose=False)
-                uncertain_ids = set(str(value) for value in (audit_report.get("low_uncertain") or []))
-                report_by_id = {
-                    str(entry.get("item_id", "") or ""): entry
-                    for entry in (audit_report.get("items") or [])
-                    if isinstance(entry, dict)
-                }
                 package_items = list(reviewed_package.get("editable_items") or [])
-                if len(lines) == len(fusion_states):
-                    for row_index, (state, text) in enumerate(zip(fusion_states, lines)):
-                        row_id = str(package_items[row_index].get("row_id", "") or "") if row_index < len(package_items) else ""
-                        report_entry = report_by_id.get(row_id, {})
-                        if row_id in uncertain_ids:
-                            state.local_reocr_recommended = True
-                            state.fusion_reason = str(report_entry.get("reason", "视觉证据不足，保留人工复核") or "视觉证据不足，保留人工复核")
-                            continue
-                        if not report_entry or bool(report_entry.get("needs_human_review", False)):
-                            continue
-                        before = str(report_entry.get("before", "") or "")
-                        after = str(report_entry.get("after", text) or "")
-                        if after == before:
-                            continue
-                        upsert_external_candidate(
-                            state,
-                            after,
-                            display_label="AI GPT级裁决",
-                            select=True,
-                            reason=str(report_entry.get("reason", "") or ""),
-                            allow_empty=False,
-                            selection_origin="ai_gpt_grade_adjudication",
-                        )
+                state_stats = _apply_ai_report_to_fusion_states(
+                    fusion_states, lines, package_items, audit_report
+                )
                 source_texts = [
                     "\n".join(row.texts[index] for row in imported_comparison.rows)
                     for index in range(len(imported_comparison.labels))
@@ -286,6 +322,7 @@ class OCRCompareGPTAdjudicationController:
                     "path": str(package_path),
                     "ai_adjudication_report": audit_report,
                     "ai_adjudication_paths": (str(package_path), str(report_path)),
+                    "ai_adjudication_state_stats": state_stats,
                 })
             except Exception:
                 import traceback
@@ -326,6 +363,9 @@ class OCRCompareGPTAdjudicationController:
         value = min(99, max(0, int(current * 100 / total)))
         self._ai_adjudication_progress.setValue(value)
         self._ai_adjudication_progress.setFormat(f"{stage} {current}/{total}")
+        self._set_compare_task_progress(
+            True, value=value, text=f"{stage} {current}/{total}", indeterminate=False
+        )
         page_start = int(event.get("page_start", 0) or 0)
         page_end = int(event.get("page_end", 0) or 0)
         page_note = f"；第 {page_start}–{page_end} 页" if page_start else ""
@@ -356,7 +396,7 @@ class OCRCompareGPTAdjudicationController:
                 self.run_log_event.emit({
                     "event": "finished", "session_id": task_id, "stage": "ai_adjudication",
                     "status": "cancelled",
-                    "details": {"summary": "GPT级 AI OCR 裁决已取消"},
+                    "details": {"summary": "出版级 AI OCR 裁决已取消"},
                 })
             self._summary.setText("AI 审定已取消；当前融合稿没有被半途改写。")
             return
@@ -364,7 +404,7 @@ class OCRCompareGPTAdjudicationController:
             self.run_log_event.emit({
                 "event": "finished", "session_id": task_id, "stage": "ai_adjudication",
                 "status": "failed", "error": str(details or "未知错误"),
-                "details": {"summary": "GPT级 AI OCR 裁决失败"},
+                "details": {"summary": "出版级 AI OCR 裁决失败"},
             })
         show_error_dialog(self, "AI 审定融合稿失败", str(details or "未知错误"))
     def _on_ai_adjudication_ready(self, token: int, result: object) -> None:
@@ -378,6 +418,9 @@ class OCRCompareGPTAdjudicationController:
         self._ai_adjudication_cancel_btn.setVisible(False)
         self._ai_adjudication_progress.setValue(100)
         self._ai_adjudication_progress.setFormat("AI 审定与独立审计完成")
+        self._set_compare_task_progress(
+            True, value=100, text="AI 审定与独立审计完成", indeterminate=False
+        )
         self._ai_adjudication_report = result.get("ai_adjudication_report")
         task_id = self._ai_adjudication_task_id
         self._ai_adjudication_task_id = ""
@@ -388,7 +431,7 @@ class OCRCompareGPTAdjudicationController:
                 "event": "finished", "session_id": task_id, "stage": "ai_adjudication",
                 "status": "ok",
                 "details": {
-                    "summary": "GPT级 AI OCR 裁决完成",
+                    "summary": "出版级 AI OCR 裁决完成",
                     "target_items": int(stats.get("target_items", 0) or 0),
                     "final_uncertain_items": int(stats.get("final_uncertain_items", 0) or 0),
                     "visual_applied_changes": int(stats.get("visual_applied_changes", 0) or 0),

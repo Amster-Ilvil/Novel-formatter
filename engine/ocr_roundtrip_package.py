@@ -32,7 +32,14 @@ from typing import Iterable, Sequence
 from models.document import Block, BlockType, UnifiedDocument
 from core.multi_ocr_roles import MULTI_OCR_ROLE_SCHEMA, SUPPORTED_MULTI_OCR_ROLE_SCHEMAS
 
+try:
+    import orjson as _orjson
+except Exception:  # optional fast JSON clone path
+    _orjson = None
+
 SCHEMA = "novel_formatter.ocr_roundtrip.v2"
+LEGACY_SCHEMAS = frozenset({"novel_formatter.ocr_roundtrip.v1"})
+SUPPORTED_SCHEMAS = frozenset({SCHEMA, *LEGACY_SCHEMAS})
 MODE_SINGLE = "single_ocr"
 MODE_MULTI = "multi_model_fusion"
 _TEXT_TYPES = {
@@ -95,6 +102,18 @@ def _json_bytes(value) -> bytes:
 def _sha256(value) -> str:
     data = value if isinstance(value, (bytes, bytearray)) else _json_bytes(value)
     return hashlib.sha256(data).hexdigest()
+
+
+def _json_detached(value):
+    """Return a detached JSON-shaped value without Python object-graph deepcopy."""
+    try:
+        if _orjson is not None:
+            return _orjson.loads(_orjson.dumps(value))
+        return json.loads(json.dumps(value, ensure_ascii=False))
+    except Exception:
+        # Package/document payloads are normally JSON-safe.  Preserve support for
+        # temporary third-party extension objects instead of failing hard.
+        return copy.deepcopy(value)
 
 
 def _safe_metadata(value) -> dict:
@@ -196,16 +215,12 @@ def _column_geometry_snapshot(doc: UnifiedDocument) -> dict[str, dict]:
 
 
 def _structure_document_dict(doc: UnifiedDocument) -> dict:
-    """Return a complete skeleton while keeping original text as a fallback.
-
-    The structure hash below ignores mutable text, but the embedded document
-    keeps it so the package can be reopened even after the app has restarted.
-    """
-    return copy.deepcopy(doc.to_dict())
+    """Return a complete detached skeleton while keeping text as fallback."""
+    return _json_detached(doc.to_dict())
 
 
 def _structure_projection(document_dict: dict) -> dict:
-    value = copy.deepcopy(document_dict if isinstance(document_dict, dict) else {})
+    value = _json_detached(document_dict if isinstance(document_dict, dict) else {})
     value.pop("processing_log", None)
     metadata = value.get("metadata")
     if isinstance(metadata, dict):
@@ -404,25 +419,40 @@ def _base_package(doc: UnifiedDocument, mode: str) -> dict:
 
 
 def _editable_structure_hash(items: Sequence[dict]) -> str:
-    immutable = []
-    for raw in items:
-        item = copy.deepcopy(raw if isinstance(raw, dict) else {})
-        item.pop("edited_text", None)
-        item.pop("delete_intentionally", None)
-        immutable.append(item)
+    # Hash only the immutable projection.  Do not deepcopy the complete
+    # (potentially tens-of-megabytes) package rows just to drop two fields:
+    # _sha256 serializes immediately and never mutates nested values.
+    immutable = [
+        {
+            key: value
+            for key, value in (raw.items() if isinstance(raw, dict) else ())
+            if key not in {"edited_text", "delete_intentionally"}
+        }
+        for raw in items
+    ]
     return _sha256(immutable)
 
 
 def _immutable_manifest_hash(package: dict) -> str:
     """Protect every non-editable package field without blocking text edits."""
-    value = copy.deepcopy(package if isinstance(package, dict) else {})
-    value.pop("immutable_manifest_sha256", None)
-    items = value.get("editable_items")
+    source = package if isinstance(package, dict) else {}
+    # Build a filtered top-level view rather than recursively copying the whole
+    # package.  Nested values are serialization inputs only and are never mutated.
+    value = {
+        key: item
+        for key, item in source.items()
+        if key != "immutable_manifest_sha256"
+    }
+    items = source.get("editable_items")
     if isinstance(items, list):
-        for raw in items:
-            if isinstance(raw, dict):
-                raw.pop("edited_text", None)
-                raw.pop("delete_intentionally", None)
+        value["editable_items"] = [
+            {
+                key: item
+                for key, item in (raw.items() if isinstance(raw, dict) else ())
+                if key not in {"edited_text", "delete_intentionally"}
+            }
+            for raw in items
+        ]
     return _sha256(value)
 
 
@@ -803,13 +833,17 @@ def _validate_common(
 ) -> None:
     if not isinstance(package, dict):
         raise RoundtripPackageError("校对包根节点必须是 JSON 对象。")
-    if package.get("schema") != SCHEMA:
+    schema = str(package.get("schema", "") or "")
+    if schema not in SUPPORTED_SCHEMAS:
         raise RoundtripPackageError(f"不支持的校对包 schema：{package.get('schema')!r}")
     mode = str(package.get("mode", "") or "")
     if expected_mode and mode != expected_mode:
         raise RoundtripPackageError(f"需要 {expected_mode} 校对包，实际为 {mode or '未知'}。")
     if mode == MODE_MULTI:
-        _validate_current_multi_contract(package)
+        if schema == SCHEMA:
+            _validate_current_multi_contract(package)
+        else:
+            _validate_legacy_multi_contract(package)
     structure = package.get("structure_document")
     if not isinstance(structure, dict):
         raise RoundtripPackageError("校对包缺少 structure_document，无法保留原始版式。")
@@ -833,6 +867,60 @@ def _validate_common(
     if validate_immutable_manifest:
         _validate_immutable_manifest(package)
 
+
+
+def _validate_legacy_multi_contract(package: dict) -> None:
+    """Safely import sealed v1 multi-model packages without inventing role metadata.
+
+    v1 predates explicit role schemas, but it already seals model order, labels,
+    candidate text hashes, the structure document and the immutable manifest.
+    Accept it only when those original invariants are intact.  New exports remain
+    v2; this is read/import compatibility for existing user projects.
+    """
+    labels = package.get("model_labels")
+    if not isinstance(labels, list) or len(labels) < 2:
+        raise RoundtripPackageError("旧版多模型校对包缺少有效 model_labels。")
+    labels = [str(value or "") for value in labels]
+    if any(not value for value in labels):
+        raise RoundtripPackageError("旧版多模型校对包包含空模型标签。")
+
+    sources = package.get("model_sources")
+    if sources is not None:
+        if not isinstance(sources, list) or len(sources) != len(labels):
+            raise RoundtripPackageError("旧版多模型校对包的 model_sources 与模型标签数量不一致。")
+        for expected_index, source in enumerate(sources):
+            if not isinstance(source, dict):
+                raise RoundtripPackageError("旧版多模型校对包包含无效 model_source。")
+            if int(source.get("model_index", -1)) != expected_index:
+                raise RoundtripPackageError("旧版多模型校对包的 model_source 顺序已改变。")
+            source_label = str(source.get("model_label", "") or "")
+            if source_label and source_label != labels[expected_index]:
+                raise RoundtripPackageError("旧版多模型校对包的 model_source 标签已改变。")
+
+    items = package.get("editable_items") or []
+    if not isinstance(items, list):
+        raise RoundtripPackageError("旧版多模型校对包缺少 editable_items。")
+    for item in items:
+        if not isinstance(item, dict):
+            raise RoundtripPackageError("旧版多模型校对包存在非对象校对行。")
+        row_id = str(item.get("row_id", "") or "")
+        if not row_id:
+            raise RoundtripPackageError("旧版多模型校对包存在缺少 row_id 的校对行。")
+        candidates = item.get("candidates")
+        if not isinstance(candidates, list) or len(candidates) != len(labels):
+            raise RoundtripPackageError(f"旧版多模型校对包行 {row_id} 的候选数与模型数不一致。")
+        for expected_index, candidate in enumerate(candidates):
+            if not isinstance(candidate, dict) or int(candidate.get("model_index", -1)) != expected_index:
+                raise RoundtripPackageError(f"旧版多模型校对包行 {row_id} 的候选模型顺序已改变。")
+            candidate_label = str(candidate.get("model_label", "") or "")
+            if candidate_label and candidate_label != labels[expected_index]:
+                raise RoundtripPackageError(f"旧版多模型校对包行 {row_id} 的候选模型标签已改变。")
+            text = str(candidate.get("text", "") or "")
+            expected_text_hash = str(candidate.get("text_sha256", "") or "")
+            if expected_text_hash and _sha256(text) != expected_text_hash:
+                # Legacy v1 stored SHA-256 of UTF-8 text bytes, not JSON encoding.
+                if hashlib.sha256(text.encode("utf-8")).hexdigest() != expected_text_hash:
+                    raise RoundtripPackageError(f"旧版多模型校对包行 {row_id} 的候选文本已改变。")
 
 def _validate_current_multi_contract(package: dict) -> None:
     if int(package.get("multi_ocr_role_schema", 0) or 0) not in SUPPORTED_MULTI_OCR_ROLE_SCHEMAS:
@@ -926,13 +1014,28 @@ def _strict_item_map(items: Iterable[dict], id_key: str) -> dict[str, dict]:
 
 
 def _document_from_dict_lossless(data: dict) -> UnifiedDocument:
-    """Restore dynamic Metadata fields that the generic legacy loader ignores."""
-    document = UnifiedDocument.from_dict(copy.deepcopy(data))
-    raw_metadata = data.get("metadata") if isinstance(data, dict) else None
-    if isinstance(raw_metadata, dict):
-        for key, value in raw_metadata.items():
-            setattr(document.metadata, str(key), copy.deepcopy(value))
-    return document
+    """Restore an isolated document from canonical JSON package data.
+
+    ``structure_document`` is JSON by contract.  A generic ``deepcopy`` of a
+    multi-megabyte OCR package recursively visits hundreds of thousands of
+    tiny Python containers before ``UnifiedDocument.from_dict`` immediately
+    walks them again.  Clone through the JSON representation instead: orjson is
+    substantially faster when installed, while stdlib json is a safe fallback.
+    Current ``UnifiedDocument.from_dict`` already preserves dynamic Metadata
+    fields, so the historical second per-field deepcopy is no longer needed.
+    """
+    payload = data if isinstance(data, dict) else {}
+    try:
+        if _orjson is not None:
+            detached = _orjson.loads(_orjson.dumps(payload))
+        else:
+            detached = json.loads(json.dumps(payload, ensure_ascii=False))
+    except Exception:
+        # Defensive compatibility for callers that bypass the package validator
+        # and attach a temporary non-JSON object. Canonical packages never need
+        # this slower path.
+        detached = copy.deepcopy(payload)
+    return UnifiedDocument.from_dict(detached)
 
 
 def _rebind_assets(base: UnifiedDocument, current: UnifiedDocument | None) -> UnifiedDocument:
@@ -1249,11 +1352,11 @@ def _markdown_fence(text: str) -> str:
 
 def package_to_markdown(package: dict) -> str:
     _validate_common(package)
-    manifest = copy.deepcopy(package)
     # The human-readable sections below are authoritative for edited_text.
     # Keeping edited text in the manifest too makes an untouched MD round-trip
     # exact and allows recovery if a tool strips only the prose around it.
-    packed = base64.b64encode(zlib.compress(_json_bytes(manifest), level=9)).decode("ascii")
+    # _json_bytes is read-only, so copying the full package here only wastes time/memory.
+    packed = base64.b64encode(zlib.compress(_json_bytes(package), level=9)).decode("ascii")
     title = str((package.get("book") or {}).get("title", "") or "OCR 校对包")
     mode_text = "多模型 OCR 对比融合" if package.get("mode") == MODE_MULTI else "单 OCR 原格式校对"
     lines = [
@@ -1330,7 +1433,7 @@ def _loose_json(text: str) -> dict:
             value, _end = decoder.raw_decode(raw[match.start():])
         except json.JSONDecodeError:
             continue
-        if isinstance(value, dict) and value.get("schema") == SCHEMA:
+        if isinstance(value, dict) and str(value.get("schema", "") or "") in SUPPORTED_SCHEMAS:
             return value
     raise RoundtripPackageError("没有找到有效的 Novel Formatter OCR 校对包 JSON。")
 

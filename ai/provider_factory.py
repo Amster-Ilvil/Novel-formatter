@@ -13,6 +13,8 @@ def create_provider(settings: AISettings):
     api_key = settings.api_key
     if settings.requires_key:
         api_key = validate_api_key(api_key)
+    elif api_key:
+        api_key = validate_api_key(api_key, required=False)
     if name == "openai":
         return OpenAIProvider(api_key, settings.model, **kwargs)
     if name == "deepseek":

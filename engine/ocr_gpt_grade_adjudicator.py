@@ -83,9 +83,12 @@ def _attach_visual_evidence(package: dict, report: dict) -> dict:
     its independent auditor consume the actual first-pass image transcription
     without relying on hidden process state.
     """
-    from engine.ocr_roundtrip_package import _editable_structure_hash, _seal_package
+    from engine.ocr_roundtrip_package import _editable_structure_hash, _json_detached, _seal_package
 
-    result = copy.deepcopy(package)
+    # Roundtrip packages are JSON-shaped.  A JSON detach is substantially faster
+    # than walking a 20-30 MB package with Python deepcopy and gives the same
+    # isolation guarantee before visual evidence is attached.
+    result = _json_detached(package)
     evidence = _visual_evidence_map(report)
     for item in list(result.get("editable_items") or []):
         if not isinstance(item, dict):

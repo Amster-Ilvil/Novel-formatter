@@ -144,7 +144,7 @@ def apply_pdf_text_visual_repairs(doc, corrections: Mapping[str, str], *, copy_d
     longer contain U+FFFD, preventing stale review packages from corrupting a
     newer document snapshot.
     """
-    target = deepcopy(doc) if copy_document else doc
+    target = doc.snapshot_clone() if copy_document else doc
     items = {item["item_id"]: item for item in collect_pdf_text_replacement_items(target)}
     by_block: dict[int, list[tuple[int, str, str]]] = {}
     skipped: list[str] = []

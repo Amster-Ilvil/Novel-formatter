@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import copy
+import html
 import json
 import shutil
 import threading
+from collections import OrderedDict
 from functools import partial
 from pathlib import Path
 from typing import Optional
@@ -50,6 +52,12 @@ class _FormatterBookPreview(QTextEdit):
     """Scrollable book-style Formatter preview with block-level formatting."""
 
     _SAMPLE = "人間というものを見た。\n記憶している。\nニャーニャー泣いていた事だけは\n何でも薄暗いじめじめした所で\nどこで生れたかとんと見當がつかぬ。\n吾輩は猫である。名前はまだ無い。"
+    # Multiple Formatter panes often render the same book.  Font shaping is
+    # substantially more expensive than the percentile arithmetic, so share a
+    # tiny bounded cache of the representative sample's measured width.  This
+    # caches only a visual width estimate; text and layout remain independent.
+    _WIDTH_CACHE: OrderedDict[tuple, int] = OrderedDict()
+    _WIDTH_CACHE_LIMIT = 32
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -139,68 +147,93 @@ class _FormatterBookPreview(QTextEdit):
         QTimer.singleShot(0, lambda ratio=old_ratio: self._restore_scroll_ratio(ratio))
 
     def _render_blocks(self, blocks) -> None:
-        self.document().clear()
-        cursor = QTextCursor(self.document())
-        cursor.beginEditBlock()
-        for index, (kind, text) in enumerate(blocks):
-            if index:
-                cursor.insertBlock()
-            block_format = QTextBlockFormat()
-            block_format.setLineHeight(155, QTextBlockFormat.ProportionalHeight.value)
-            char_format = QTextCharFormat()
+        """Render the read-only book preview in one Qt rich-text transaction.
+
+        Building thousands of QTextBlocks one-by-one through QTextCursor forces
+        repeated document-layout bookkeeping.  Qt's HTML importer creates the
+        same paragraph structure in one pass and is substantially faster on
+        full novels.  All source text is escaped before insertion, so OCR/book
+        content can never become active markup.
+        """
+        style = (
+            "p{white-space:pre-wrap;line-height:155%;margin-top:0;"
+            "margin-bottom:14px;text-indent:16px;}"
+            ".chapter{text-align:center;font-size:19pt;font-weight:700;"
+            "margin-top:24px;margin-bottom:22px;text-indent:0;}"
+            ".section{text-align:center;font-size:16pt;font-weight:600;"
+            "margin-top:18px;margin-bottom:16px;text-indent:0;}"
+            ".dialogue{margin-left:32px;margin-right:12px;margin-bottom:10px;text-indent:0;}"
+            ".ruby{font-size:14pt;color:#555;margin-bottom:10px;}"
+            ".image{text-align:center;font-style:italic;color:#555;"
+            "margin-top:10px;margin-bottom:10px;text-indent:0;}"
+            ".small{font-size:14pt;margin-bottom:8px;}"
+        )
+        parts = [f"<html><head><style>{style}</style></head><body>"]
+        for kind, text in blocks:
             clean_text = str(text).strip(" \t\r\n\u3000")
             if kind == BlockType.CHAPTER:
-                block_format.setAlignment(Qt.AlignHCenter)
-                block_format.setTopMargin(24)
-                block_format.setBottomMargin(22)
-                char_format.setFontPointSize(19)
-                char_format.setFontWeight(QFont.Bold)
+                css_class = "chapter"
             elif kind == BlockType.SECTION:
-                block_format.setAlignment(Qt.AlignHCenter)
-                block_format.setTopMargin(18)
-                block_format.setBottomMargin(16)
-                char_format.setFontPointSize(16)
-                char_format.setFontWeight(QFont.DemiBold)
+                css_class = "section"
             elif kind == BlockType.DIALOGUE:
-                block_format.setLeftMargin(32)
-                block_format.setRightMargin(12)
-                block_format.setBottomMargin(10)
+                css_class = "dialogue"
             elif kind == BlockType.RUBY:
-                block_format.setTextIndent(16)
-                block_format.setBottomMargin(10)
-                char_format.setFontPointSize(14)
-                char_format.setForeground(Qt.darkGray)
+                css_class = "ruby"
             elif kind == BlockType.IMAGE_REF:
-                block_format.setAlignment(Qt.AlignHCenter)
-                block_format.setTopMargin(10)
-                block_format.setBottomMargin(10)
-                char_format.setFontItalic(True)
-                char_format.setForeground(Qt.darkGray)
+                css_class = "image"
             elif kind in {BlockType.FOOTNOTE, BlockType.TOC_ENTRY}:
-                block_format.setBottomMargin(8)
-                char_format.setFontPointSize(14)
+                css_class = "small"
             else:
-                block_format.setTextIndent(16)
-                block_format.setBottomMargin(14)
-            cursor.setBlockFormat(block_format)
-            cursor.insertText(clean_text, char_format)
-        cursor.endEditBlock()
+                css_class = "normal"
+            parts.append(f'<p class="{css_class}">{html.escape(clean_text)}</p>')
+        parts.append("</body></html>")
+        self.setHtml("".join(parts))
+        cursor = self.textCursor()
         cursor.movePosition(QTextCursor.Start)
         self.setTextCursor(cursor)
         self.document().setModified(False)
 
     def _update_reading_width(self, content: list[str]) -> None:
-        """Size the page between a readable minimum and the 1320px cap."""
+        """Size the page from a bounded representative sample.
+
+        Font shaping every paragraph is surprisingly expensive on a 4k-block
+        novel and this value is only a visual reading-width estimate.  Uniform
+        sampling preserves the same 80th-percentile policy while bounding GUI
+        work regardless of book length.
+        """
+        values = [text for text in content if text.strip()]
+        sample_limit = 256
+        if len(values) > sample_limit:
+            last = len(values) - 1
+            values = [
+                values[round(index * last / (sample_limit - 1))]
+                for index in range(sample_limit)
+            ]
         metric = self.fontMetrics()
-        widths = sorted(
-            metric.horizontalAdvance(text[:160])
-            for text in content
-            if text.strip()
+        font = self.font()
+        sample_key = tuple(text[:160] for text in values)
+        cache_key = (
+            font.family(),
+            round(float(font.pointSizeF()), 3),
+            int(font.weight()),
+            bool(font.italic()),
+            bool(font.underline()),
+            sample_key,
         )
-        if widths:
-            typical = widths[min(len(widths) - 1, int((len(widths) - 1) * 0.8))]
+        cache = type(self)._WIDTH_CACHE
+        typical = cache.get(cache_key)
+        if typical is None:
+            widths = sorted(metric.horizontalAdvance(text) for text in sample_key)
+            if widths:
+                typical = widths[min(len(widths) - 1, int((len(widths) - 1) * 0.8))]
+            else:
+                typical = 0
+            cache[cache_key] = int(typical)
+            cache.move_to_end(cache_key)
+            while len(cache) > type(self)._WIDTH_CACHE_LIMIT:
+                cache.popitem(last=False)
         else:
-            typical = 0
+            cache.move_to_end(cache_key)
         target = max(760, min(self._reading_width, int(typical + 130)))
         parent_width = self.parentWidget().contentsRect().width() if self.parentWidget() else 0
         available_width = max(parent_width, self.width())
@@ -240,6 +273,13 @@ class FormatterTab(QWidget):
         self._formatter_ai_checkpoint_root: str = ""
         self._formatter_checkpoint_override: str = ""
         self._last_manual_batch_restore: dict | None = None
+        # The advanced editors contain the full book text and are hidden in the
+        # default compact workspace.  Hydrate them only when the user actually
+        # opens the advanced view; this keeps ordinary book loading responsive.
+        self._advanced_editors_dirty = True
+        self._hydrating_advanced_editors = False
+        self._compact_preview_dirty = True
+        self._pdf_preview_dirty = True
         self._build()
 
     def _build(self):
@@ -867,6 +907,35 @@ class FormatterTab(QWidget):
             switch.setChecked(desired)
             switch.blockSignals(old)
 
+    def _advanced_editors_visible(self) -> bool:
+        return bool(
+            getattr(self, "_advanced_left", None) is not None
+            and (self._advanced_left.isVisible() or self._advanced_right.isVisible())
+        )
+
+    def _materialize_advanced_editors(self, *, force: bool = False) -> None:
+        """Populate the two full-book editors only when the advanced UI needs them."""
+        if not force and not getattr(self, "_advanced_editors_dirty", True):
+            return
+        self._hydrating_advanced_editors = True
+        before_blocked = self._before.blockSignals(True)
+        after_blocked = self._after.blockSignals(True)
+        try:
+            if self._ocr_doc is not None:
+                self._show_doc(self._ocr_doc, self._before)
+            else:
+                self._clear_editor(self._before)
+            if self._fmt_doc is not None:
+                self._show_doc(self._fmt_doc, self._after)
+            else:
+                self._clear_editor(self._after)
+            self._advanced_editors_dirty = False
+        finally:
+            self._before.blockSignals(before_blocked)
+            self._after.blockSignals(after_blocked)
+            self._hydrating_advanced_editors = False
+        self._sync_compact_preview_text()
+
     def _set_formatter_compact_mode(self, compact: bool) -> None:
         compact = bool(compact)
         self._formatter_compact_view.setVisible(compact)
@@ -875,19 +944,50 @@ class FormatterTab(QWidget):
         if compact:
             self._sync_compact_step_state()
             self._sync_compact_preview_text()
+        else:
+            self._materialize_advanced_editors()
 
 
     def _sync_compact_preview_text(self) -> None:
         preview = getattr(self, "_compact_preview", None)
-        if preview is None:
+        if preview is None or getattr(self, "_hydrating_advanced_editors", False):
             return
-        if self._fmt_doc is not None and self._after.toPlainText().strip():
-            text = self._after.toPlainText()
-        elif self._ocr_doc is not None:
-            text = self._before.toPlainText()
-        else:
-            text = ""
-        preview.set_text(text)
+        compact_view = getattr(self, "_formatter_compact_view", None)
+        if compact_view is not None and not compact_view.isVisible():
+            self._compact_preview_dirty = True
+            return
+        # Re-showing the Formatter page must be O(1) when the document has not
+        # changed. ``set_document`` still scans thousands of blocks to build its
+        # content signature, so honor the view dirty bit before doing that work.
+        # Advanced-editor text changes happen while the compact view is hidden
+        # and mark this bit above, so unsaved edits remain visible on return.
+        if not getattr(self, "_compact_preview_dirty", True):
+            return
+        # Unsaved edits only exist in the advanced editors.  While they are
+        # visible, mirror those edits into the compact preview.  Otherwise use
+        # the typed document directly and avoid converting the entire book to
+        # plain text merely to feed a hidden editor.
+        if self._advanced_editors_visible():
+            if self._fmt_doc is not None and self._after.toPlainText().strip():
+                preview.set_text(self._after.toPlainText())
+                self._compact_preview_dirty = False
+                return
+            if self._ocr_doc is not None:
+                preview.set_text(self._before.toPlainText())
+                self._compact_preview_dirty = False
+                return
+        preview.set_document(self._fmt_doc or self._ocr_doc)
+        self._compact_preview_dirty = False
+
+    def _materialize_pdf_preview(self) -> None:
+        if not getattr(self, "_pdf_preview_dirty", True):
+            return
+        preview = getattr(self, "_pdf_format_preview", None)
+        view = getattr(self, "_pdf_format_view", None)
+        if preview is None or view is None or not view.isVisible():
+            return
+        preview.set_document(self._fmt_doc or self._ocr_doc)
+        self._pdf_preview_dirty = False
 
     def _set_pdf_format_view_active(self, active: bool) -> None:
         active = bool(active)
@@ -898,8 +998,10 @@ class FormatterTab(QWidget):
             self._formatter_compact_view.setVisible(False)
             self._advanced_left.setVisible(False)
             self._advanced_right.setVisible(False)
+            self._materialize_pdf_preview()
         elif not self._advanced_left.isVisible() and not self._advanced_right.isVisible():
             self._formatter_compact_view.setVisible(True)
+            self._sync_compact_preview_text()
 
     def _open_pdf_advanced_formatter(self) -> None:
         self._pdf_format_view.setVisible(False)
@@ -1210,12 +1312,17 @@ class FormatterTab(QWidget):
     def _current_doc(self) -> Optional[UnifiedDocument]:
         return self._fmt_doc or self._ocr_doc
 
+    @staticmethod
+    def _snapshot_clone_document(doc: UnifiedDocument) -> UnifiedDocument:
+        """Create an exact detached document snapshot without generic deepcopy."""
+        return doc.snapshot_clone()
+
     def _set_base_doc(self, doc: UnifiedDocument, notify: bool = True):
         self._last_manual_batch_restore = None
         if hasattr(self, "_restore_batch_btn"):
             self._restore_batch_btn.setEnabled(False)
-        self._original_doc = copy.deepcopy(doc)
-        self._ocr_doc = copy.deepcopy(doc)
+        self._original_doc = self._snapshot_clone_document(doc)
+        self._ocr_doc = self._snapshot_clone_document(doc)
         self._fmt_doc = None
         source_engine = str(getattr(doc.metadata, "source_engine", "") or "")
         pdf_mode = bool(getattr(doc.metadata, "pdf_text_layer_mode", False))
@@ -1260,17 +1367,18 @@ class FormatterTab(QWidget):
             self.doc_formatted.emit(self._ocr_doc)
 
     def _refresh_editor_views(self):
-        if self._ocr_doc is not None:
-            self._show_doc(self._ocr_doc, self._before)
+        # Only the currently visible heavy surface is materialized.  Compact,
+        # advanced and PDF views each keep a dirty bit and hydrate on demand.
+        self._advanced_editors_dirty = True
+        self._compact_preview_dirty = True
+        self._pdf_preview_dirty = True
+        if self._advanced_editors_visible():
+            self._materialize_advanced_editors()
+        elif getattr(self, "_pdf_format_view", None) is not None and self._pdf_format_view.isVisible():
+            self._materialize_pdf_preview()
         else:
-            self._clear_editor(self._before)
-        if self._fmt_doc is not None:
-            self._show_doc(self._fmt_doc, self._after)
-        else:
-            self._clear_editor(self._after)
-        self._sync_compact_preview_text()
+            self._sync_compact_preview_text()
         if hasattr(self, "_pdf_format_preview"):
-            self._pdf_format_preview.set_document(self._fmt_doc or self._ocr_doc)
             self._refresh_pdf_format_summary(self._fmt_doc or self._ocr_doc)
 
     def _operation_steps(self, doc: Optional[UnifiedDocument]) -> set[str]:
@@ -1480,7 +1588,7 @@ class FormatterTab(QWidget):
             return None, 0
 
         changed = 0
-        new_doc = copy.deepcopy(doc)
+        new_doc = self._snapshot_clone_document(doc)
         editable_idx = 0
         for block in new_doc.blocks:
             if block.type not in {BlockType.PARAGRAPH, BlockType.DIALOGUE, BlockType.CHAPTER,
@@ -1567,7 +1675,7 @@ class FormatterTab(QWidget):
         if self._ocr_doc is None:
             notify(self, "还没有处理前内容可载入", "info")
             return
-        self._fmt_doc = copy.deepcopy(self._ocr_doc)
+        self._fmt_doc = self._snapshot_clone_document(self._ocr_doc)
         self._refresh_editor_views()
         self._update_version(self._fmt_doc)
         self.doc_formatted.emit(self._fmt_doc)
@@ -1745,9 +1853,13 @@ class FormatterTab(QWidget):
             return
         path, _ = QFileDialog.getSaveFileName(self, "保存 JSON", "", "JSON (*.json)")
         if path:
-            with open(path, "w", encoding="utf-8") as f:
-                f.write(doc.to_json())
-            notify(self, f"已保存: {path}", "success")
+            try:
+                saved_path = export_text_result(doc, path, "json")
+            except Exception:
+                import traceback
+                show_error_dialog(self, "保存失败", traceback.format_exc())
+                return
+            notify(self, f"已保存: {saved_path}", "success")
 
     def _export_docx(self):
         """Backward-compatible DOCX-only entry point used by older plugins."""
@@ -1840,7 +1952,7 @@ class FormatterTab(QWidget):
         if token is None:
             return
 
-        base = copy.deepcopy(base)
+        base = self._snapshot_clone_document(base)
         base.metadata.pdf_text_layer_mode = self._pdf_text_layer_mode_cb.isChecked()
         base.metadata.pdf_keep_afterwords = self._pdf_keep_afterwords_cb.isChecked()
         base.metadata.preserve_ocr_layout = (
@@ -2053,7 +2165,7 @@ class FormatterTab(QWidget):
         if not self._confirm_reapply(source, [step_name], label):
             return
 
-        source = copy.deepcopy(source)
+        source = self._snapshot_clone_document(source)
         source.metadata.pdf_text_layer_mode = self._pdf_text_layer_mode_cb.isChecked()
         source.metadata.pdf_keep_afterwords = self._pdf_keep_afterwords_cb.isChecked()
         source.metadata.preserve_ocr_layout = (
@@ -2105,7 +2217,7 @@ class FormatterTab(QWidget):
                             "unit": "local",
                         }, ensure_ascii=False))
                     working = run_pipeline(
-                        copy.deepcopy(working),
+                        working.snapshot_clone(),
                         steps=missing_local_steps,
                         verbose=False,
                         progress_callback=local_progress,
@@ -2224,6 +2336,22 @@ class FormatterTab(QWidget):
             return
         self._formatter_ai_status.setText("Formatter AI 处理失败，已完成批次断点已保存，下次自动续跑" + checkpoint_note)
         show_error_dialog(self, "Formatter AI 处理失败", details)
+
+
+    def _materialize_visible_surface(self) -> None:
+        if getattr(self, "_pdf_format_view", None) is not None and self._pdf_format_view.isVisible():
+            self._materialize_pdf_preview()
+        elif self._advanced_editors_visible():
+            self._materialize_advanced_editors()
+        else:
+            self._sync_compact_preview_text()
+
+    def showEvent(self, event):
+        super().showEvent(event)
+        # ``set_doc`` is frequently called while the Formatter page is hidden.
+        # Defer the expensive surface hydration until Qt has made the page
+        # visible so ``isVisible()`` reflects the actual active workspace.
+        QTimer.singleShot(0, self._materialize_visible_surface)
 
 
 class FormatProfileDialog(QDialog):

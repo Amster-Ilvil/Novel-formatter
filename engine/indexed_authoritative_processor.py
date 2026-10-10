@@ -839,9 +839,9 @@ def apply_lossless_layout(doc: UnifiedDocument) -> tuple[UnifiedDocument, int]:
     EPUB CSS (``p.normal { text-indent: 1em }``), never by inserting full-width spaces.
     Quote repair, dash repair, punctuation normalization and fuzzy dedup are excluded.
     """
-    source = copy.deepcopy(doc)
+    source = doc.snapshot_clone()
     before = _layout_canonical_literal(source)
-    result = copy.deepcopy(source)
+    result = source.snapshot_clone()
     unwrap_count = _unwrap_internal_ocr_wraps(result)
     term_type_count = _repair_misclassified_term_dialogues(result)
     merge_count = _safe_merge_clear_wraps(result)
@@ -957,7 +957,7 @@ def _run_reconstructed_review(
             "context_before": previous,
         })
     if not expected:
-        return copy.deepcopy(doc), [], 0, 0
+        return doc.snapshot_clone(), [], 0, 0
 
     review_prompt = READABILITY_REVIEW_PROMPT if repair_mode == "readability" else RECONSTRUCTED_REVIEW_PROMPT
     review_protocol = READABILITY_REVIEW_PROTOCOL if repair_mode == "readability" else RECONSTRUCTED_REVIEW_PROTOCOL
@@ -1060,7 +1060,7 @@ def _run_reconstructed_review(
     finally:
         executor.shutdown(wait=True, cancel_futures=True)
 
-    reviewed = copy.deepcopy(doc)
+    reviewed = doc.snapshot_clone()
     by_id = {item["block_id"]: item for item in items}
     changes: list[dict] = []
     for block in reviewed.blocks:
@@ -1098,7 +1098,7 @@ def _run_reconstructed_review(
         if not reason.startswith("字符数量异常") and not reason.startswith("正文相似度过低")
     ]
     if hard_reasons:
-        fallback = copy.deepcopy(doc)
+        fallback = doc.snapshot_clone()
         fallback.add_log(
             "reconstructed_sentence_review_rollback",
             "句级 AI 复核未通过结构完整性校验，已只回滚句级复核并保留首轮纠错/排版：" + "；".join(hard_reasons),
@@ -1347,7 +1347,7 @@ def _run_problem_patch_review(provider, doc: UnifiedDocument, *, job_dir: Path, 
                          "type": block.type.value, "issues": issues, "status": "pending", "revised_text": "",
                          "returned_issues": [], "confidence": 0.0, "attempts": 0, "error": ""})
     if not expected:
-        return copy.deepcopy(doc), [], 0, 0, 0
+        return doc.snapshot_clone(), [], 0, 0, 0
     signature = _problem_signature(expected, provider, repair_mode=repair_mode)
     patch_dir = job_dir / f"problem_patch_{repair_mode}_v{PROBLEM_PATCH_PROTOCOL}_{signature[:20]}"
     patch_dir.mkdir(parents=True, exist_ok=True)
@@ -1405,7 +1405,7 @@ def _run_problem_patch_review(provider, doc: UnifiedDocument, *, job_dir: Path, 
     finally:
         executor.shutdown(wait=True, cancel_futures=True)
 
-    output=copy.deepcopy(doc); by_id={x["block_id"]:x for x in items}; changes=[]; pending_count=0; fixed_count=0
+    output=doc.snapshot_clone(); by_id={x["block_id"]:x for x in items}; changes=[]; pending_count=0; fixed_count=0
     for block in output.blocks:
         item=by_id.get(block.id)
         if not item: continue
@@ -1470,7 +1470,7 @@ def run_indexed_authoritative(
     if repair_mode not in {"strict", "readability"}:
         repair_mode = "readability"
     source = sanitize_authoritative_source(doc)
-    source = copy.deepcopy(source)
+    source = source.snapshot_clone()
     apply_conservative_ocr_fixes(source)
     remove_demonstrable_duplicate_runs(source)
     body = _body_blocks(source)
@@ -1598,7 +1598,7 @@ def run_indexed_authoritative(
     finally:
         executor.shutdown(wait=True, cancel_futures=True)
 
-    corrected = copy.deepcopy(source)
+    corrected = source.snapshot_clone()
     by_id = {item["block_id"]: item for item in items}
     changes: list[dict] = []
     for block in corrected.blocks:

@@ -29,7 +29,6 @@ class OCRProfile:
     vertical: bool
     apple_languages: tuple[str, ...]
     paddle_lang: str
-    google_language_hints: tuple[str, ...]
     compatible_engines: frozenset[str]
     allow_column_pipeline: bool
     allow_japanese_handwriting: bool
@@ -45,7 +44,6 @@ _PROFILES = {
         vertical=True,
         apple_languages=("ja-JP",),
         paddle_lang="japan",
-        google_language_hints=("ja",),
         compatible_engines=frozenset({
             "apple_vision", "windows_snipping_ocr", "paddle_ocr", "ndlocr_lite",
             "manga_48px", "hayai_ocr", "paddle_aistudio",
@@ -65,7 +63,6 @@ _PROFILES = {
         # mixed ISBN/Latin headings without enabling automatic language drift.
         apple_languages=("zh-Hans", "zh-CN", "en-US"),
         paddle_lang="ch",
-        google_language_hints=("zh-CN", "zh"),
         compatible_engines=frozenset({"apple_vision", "windows_snipping_ocr", "paddle_ocr", "paddle_aistudio"}),
         allow_column_pipeline=False,
         allow_japanese_handwriting=False,

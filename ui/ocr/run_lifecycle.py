@@ -16,12 +16,45 @@ class OCRRunLifecycleController:
         self._tab = tab
 
 
+    def _set_run_ui_state(self, state: str) -> None:
+        """Apply one authoritative idle/running/cancelling OCR UI state.
+
+        Long-running OCR state used to be reconstructed independently by the
+        start path, stop path, watchdog and terminal callbacks.  Keep the worker
+        lifecycle separate, but make every visible control consume the same
+        state so a late callback cannot leave a stale "terminating" button or
+        accidentally re-enable a second run.
+        """
+        self = self._tab
+        state = str(state or "idle").strip().lower()
+        if state not in {"idle", "running", "cancelling"}:
+            raise ValueError(f"Unsupported OCR UI task state: {state}")
+        active = state != "idle"
+        self._ocr_run_active = active
+        self.setProperty("ocrTaskState", state)
+        self._run_btn.setEnabled(not active)
+        if hasattr(self, "_handwriting_run_btn"):
+            self._handwriting_run_btn.setEnabled(not active)
+        self._pause_btn.setVisible(True)
+        self._pause_btn.setEnabled(state == "running")
+        self._pause_btn.setText("正在终止…" if state == "cancelling" else "停止 OCR")
+        stop_role = "danger" if state in {"running", "cancelling"} else "secondary"
+        if self._pause_btn.property("role") != stop_role:
+            self._pause_btn.setProperty("role", stop_role)
+            style = self._pause_btn.style()
+            style.unpolish(self._pause_btn)
+            style.polish(self._pause_btn)
+            self._pause_btn.update()
+        if state != "idle":
+            self._rerun_btn.setVisible(False)
+
+
     def _toggle_progress_display(self, enabled: bool) -> None:
         """Show/hide live OCR progress without pausing recognition."""
         self = self._tab
         if bool(enabled):
             self._progress_display_enabled_event.set()
-            running = not self._run_btn.isEnabled()
+            running = bool(getattr(self, "_ocr_run_active", False))
             if running:
                 self._progress_bar_wrap.setVisible(True)
                 self._progress_bar_text.setVisible(True)
@@ -54,10 +87,14 @@ class OCRRunLifecycleController:
                 break
         if packets:
             self._log_view.appendPlainText("\n".join(packets))
-            # Always follow the newest OCR line while a run is active.  Updating
-            # the scrollbar both now and on the next event-loop turn handles
-            # QPlainTextEdit's delayed document-layout range update.
-            if bool(getattr(self, "_ocr_run_active", False)):
+            # Follow the newest OCR line only while the user remains at the
+            # tail.  If they scroll upward to inspect earlier output, buffered
+            # appends must not yank the view back down.  Returning to the bottom
+            # re-enables following via progress_panel's scrollbar listener.
+            if (
+                bool(getattr(self, "_ocr_run_active", False))
+                and bool(getattr(self, "_ocr_log_follow_tail", True))
+            ):
                 bar = self._log_view.verticalScrollBar()
                 bar.setValue(bar.maximum())
                 QTimer.singleShot(0, lambda b=bar: b.setValue(b.maximum()))
@@ -246,15 +283,10 @@ class OCRRunLifecycleController:
         self = self._tab
         self._flush_ocr_log_buffer(force_all=True)
         self._ocr_log_flush_timer.stop()
-        self._ocr_run_active = False
+        self._ocr_run_lifecycle._set_run_ui_state("idle")
         self._review_preview_run_active = False
         self._ocr_watchdog_timer.stop()
         self._ocr_worker_thread = None
-        self._run_btn.setEnabled(True)
-        if hasattr(self, "_handwriting_run_btn"):
-            self._handwriting_run_btn.setEnabled(True)
-        self._pause_btn.setVisible(True)
-        self._pause_btn.setEnabled(False)
         self._rerun_btn.setVisible(False)
         self._progress_clock_timer.stop()
         self._overall_progress_live_state = None

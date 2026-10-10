@@ -108,7 +108,7 @@ def sync_page_manager_assets(
     """
     images = [str(Path(p)) for p in page_images]
     if not images:
-        return (copy.deepcopy(doc) if copy_document else doc), PageAssetSyncReport()
+        return (doc.snapshot_clone() if copy_document else doc), PageAssetSyncReport()
 
     # Some workflows intentionally extract text from a page whose Page Manager
     # type is still semantic rather than ``paragraph`` (for example AFTERWORD).
@@ -125,7 +125,7 @@ def sync_page_manager_assets(
         if page_no > 0:
             text_pages.add(page_no)
 
-    out = copy.deepcopy(doc) if copy_document else doc
+    out = doc.snapshot_clone() if copy_document else doc
     overrides = {int(k): v for k, v in (confirmed_overrides or {}).items()}
     signature = repr((
         tuple(images),
@@ -155,7 +155,10 @@ def sync_page_manager_assets(
             changed = True
 
     if preserve_unmanaged_pages:
-        new_pages.extend(copy.deepcopy(p) for p in out.pages if int(p.page_no) > len(images))
+        new_pages.extend(
+            PageInfo(p.page_no, p.page_type, p.image_path, p.width, p.height, p.confidence)
+            for p in out.pages if int(p.page_no) > len(images)
+        )
     out.pages = new_pages
 
     if (

@@ -1,6 +1,9 @@
 from __future__ import annotations
 
 from PySide6.QtWidgets import QLabel, QWidget, QSizePolicy
+from collections import OrderedDict
+from pathlib import Path
+
 from PySide6.QtCore import Qt, QRect, QSize, QTimer, Signal
 from PySide6.QtGui import QColor, QPainter, QPen, QPixmap, QFont, QFontMetrics
 
@@ -22,6 +25,14 @@ class OCRProofreadImageLabel(QLabel):
     def __init__(self, parent=None):
         super().__init__(parent)
         self._source_pixmap: QPixmap | None = None
+        # Sentence-review crops are revisited frequently while adjudicating.
+        # Keep only a tiny, byte-bounded LRU so back/forward navigation does not
+        # synchronously decode the same PNG again.  This is display-only cache;
+        # OCR inputs and evidence files remain untouched on disk.
+        self._pixmap_cache: OrderedDict[tuple[str, int, int], tuple[QPixmap, int]] = OrderedDict()
+        self._pixmap_cache_bytes = 0
+        self._pixmap_cache_limit_bytes = 64 * 1024 * 1024
+        self._pixmap_cache_limit_items = 8
         self._last_scaled_size = QSize()
         self._scrub_position: float | None = None
         self._column_intervals: tuple[tuple[float, float], ...] = ()
@@ -40,8 +51,41 @@ class OCRProofreadImageLabel(QLabel):
         self.setText("完成 OCR 后，右侧显示当前句对应的单列或多列原图。")
         self.setToolTip("按住鼠标左键在图片上横向拖动，可联动定位旁边的 OCR 物理列。")
 
+    @staticmethod
+    def _pixmap_cost(pixmap: QPixmap) -> int:
+        return max(0, int(pixmap.width())) * max(0, int(pixmap.height())) * 4
+
+    def _cached_pixmap(self, path: str) -> QPixmap:
+        source = str(path or "")
+        if not source:
+            return QPixmap()
+        try:
+            stat = Path(source).stat()
+            key = (source, int(stat.st_size), int(stat.st_mtime_ns))
+        except OSError:
+            key = (source, -1, -1)
+        cached = self._pixmap_cache.get(key)
+        if cached is not None:
+            self._pixmap_cache.move_to_end(key)
+            return cached[0]
+        pixmap = QPixmap(source)
+        if pixmap.isNull():
+            return pixmap
+        cost = self._pixmap_cost(pixmap)
+        if cost <= self._pixmap_cache_limit_bytes:
+            self._pixmap_cache[key] = (pixmap, cost)
+            self._pixmap_cache.move_to_end(key)
+            self._pixmap_cache_bytes += cost
+            while (
+                len(self._pixmap_cache) > self._pixmap_cache_limit_items
+                or self._pixmap_cache_bytes > self._pixmap_cache_limit_bytes
+            ):
+                _old_key, (_old_pixmap, old_cost) = self._pixmap_cache.popitem(last=False)
+                self._pixmap_cache_bytes = max(0, self._pixmap_cache_bytes - int(old_cost))
+        return pixmap
+
     def set_image_path(self, path: str) -> bool:
-        pixmap = QPixmap(str(path or ""))
+        pixmap = self._cached_pixmap(str(path or ""))
         if pixmap.isNull():
             self._source_pixmap = None
             self.clear()
@@ -218,14 +262,19 @@ class OCRVerticalColumnTextWidget(QWidget):
         font = QFont(self.font())
         font.setPointSize(max(17, font.pointSize() + 4))
         metrics = QFontMetrics(font)
-        return font, metrics, max(29, metrics.height() + 6), max(58, metrics.horizontalAdvance("国") + 26)
+        char_step = max(29, metrics.height() + 6)
+        column_step = max(58, metrics.horizontalAdvance("国") + 26)
+        return font, metrics, char_step, column_step
 
     def set_columns(self, columns):
         self._columns = [str(v or "").replace("\r", "").replace("\n", "") for v in (columns or [])] or [""]
         self._active_column_index = -1
         self.setToolTip("完整裁决文字：物理列按右→左排列，可滚动查看全部文字。")
-        _, _, step, width = self._layout_metrics()
-        self.setMinimumSize(max(200, 24 + len(self._columns) * width), max(420, 60 + max(map(len, self._columns)) * step))
+        _, _, char_step, column_step = self._layout_metrics()
+        margin_y = 22
+        max_length = max(map(len, self._columns))
+        height = max(420, margin_y * 2 + max_length * char_step + 16)
+        self.setMinimumSize(max(200, 24 + len(self._columns) * column_step), height)
         self.updateGeometry()
         self.update()
 

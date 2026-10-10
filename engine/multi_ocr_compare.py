@@ -2373,7 +2373,7 @@ def build_fused_document(
         resolved_lines.append(value)
     lines = resolved_lines
 
-    result = copy.deepcopy(primary)
+    result = primary.snapshot_clone()
     for result_block in result.blocks:
         if not isinstance(getattr(result_block, "metadata", None), dict):
             result_block.metadata = {}

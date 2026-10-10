@@ -98,15 +98,41 @@ def _learn_confusions(rows: Sequence[dict]) -> Counter[tuple[str, str]]:
 
 
 def _consensus_text(row: dict) -> str:
-    values = [_raw(value) for value in _independent_texts(row) if _raw(value)]
-    if not values:
+    # A single observation is not an OCR consensus.  Earlier code deduplicated
+    # identical texts before checking the evidence count, so one OCR engine
+    # (or two roles sharing its result) could accidentally enter the same
+    # common-mode queue as genuinely independent engines.  Require at least
+    # two distinct executed source engines when their IDs are available, and
+    # keep the model-index fallback for older packages/tests without IDs.
+    observations: dict[str, str] = {}
+    for index, item in enumerate(row.get("model_evidence", []) or []):
+        if not isinstance(item, dict) or not bool(item.get("independently_executed", True)):
+            continue
+        value = _raw(item.get("text", ""))
+        if not value or not _body(value):
+            continue
+        source = str(item.get("source_engine") or item.get("engine") or "").strip()
+        if source:
+            # Strip column transport decoration, not the underlying OCR engine.
+            identity = "engine:" + source.rsplit(":", 1)[-1]
+        else:
+            role_id = item.get("model_id")
+            if role_id is None:
+                role_id = item.get("model_index", index)
+            identity = "model:" + str(role_id)
+        previous = observations.get(identity)
+        if previous is not None and _body(previous) != _body(value):
+            # The same engine provided contradictory rows: not an agreement.
+            return ""
+        observations[identity] = value
+    if len(observations) < 2:
         return ""
-    # Common-mode audit is intentionally limited to rows where independent OCRs
-    # already agree after the compare-only Unicode normalization.
-    bodies = {_body(value) for value in values if _body(value)}
+    # Comparison-only normalization can ignore punctuation while we retain the
+    # unchanged OCR evidence for the eventual visual reviewer.
+    bodies = {_body(value) for value in observations.values()}
     if len(bodies) != 1:
         return ""
-    return values[0]
+    return next(iter(observations.values()))
 
 
 def _structural_reasons(text: str) -> list[str]:
@@ -252,6 +278,72 @@ def _lexical_candidates(
     return ranked[:max(0, int(limit))]
 
 
+def _bookwide_budget(ordered: list[dict], rows: Sequence[dict], max_total: int) -> list[dict]:
+    """Keep a bounded queue but do not starve the end of a long book.
+
+    The previous stable sort preferred low row numbers on equal risk scores:
+    with 400 pages of common quote-boundary warnings, a 128-item budget
+    could select only the first 128 pages.  This selection is deterministic,
+    covers the physical page range, and reserves room for exceptionally high
+    structural risks.  It NEVER edits the OCR text or invents image evidence.
+    """
+    limit = max(0, int(max_total))
+    if len(ordered) <= limit or limit < 2:
+        return ordered[:limit]
+    by_page: dict[int, list[dict]] = {}
+    for item in ordered:
+        index = int(item["row_index"])
+        if not (0 <= index < len(rows)):
+            return ordered[:limit]
+        try:
+            page = int(rows[index].get("page") or 0)
+        except (TypeError, ValueError):
+            page = 0
+        if page < 1:
+            # Do not fabricate location information for older book payloads.
+            return ordered[:limit]
+        by_page.setdefault(page, []).append(item)
+    if len(by_page) <= 1:
+        return ordered[:limit]
+
+    chosen: dict[int, dict] = {}
+
+    # Exceptional multi-signal structural warnings outrank normal one-signal
+    # warnings, even if they occur near the end of a book.  Do not fill this
+    # reserve with arbitrary early rows when no exceptional warnings exist.
+    strong = [item for item in ordered if float(item["score"]) >= 1020.0]
+    for item in strong[:max(1, limit // 4)]:
+        chosen[int(item["row_index"])] = item
+
+    slots = limit - len(chosen)
+    remaining = {
+        page: [item for item in items if int(item["row_index"]) not in chosen]
+        for page, items in by_page.items()
+    }
+    pages = [page for page in sorted(remaining) if remaining[page]]
+    if slots and pages:
+        if len(pages) <= slots:
+            selected_pages = pages
+        elif slots == 1:
+            selected_pages = [pages[len(pages) // 2]]
+        else:
+            # Quantiles span the entire *available* book page range.  Using
+            # sorted page positions instead of a global RNG makes the output
+            # reproducible and independent of Python hash randomisation.
+            selected_pages = [pages[(i * (len(pages) - 1)) // (slots - 1)]
+                              for i in range(slots)]
+        for page in selected_pages:
+            candidate = remaining[page][0]  # already ranked by score/index
+            chosen[int(candidate["row_index"])] = candidate
+
+    if len(chosen) < limit:
+        for item in ordered:
+            chosen.setdefault(int(item["row_index"]), item)
+            if len(chosen) == limit:
+                break
+    return sorted(chosen.values(), key=lambda item: (-float(item["score"]), int(item["row_index"])))
+
+
 def select_common_mode_risks(
     rows: Sequence[dict],
     *,
@@ -323,4 +415,4 @@ def select_common_mode_risks(
         selected.values(),
         key=lambda item: (-float(item.get("score", 0.0)), int(item.get("row_index", -1))),
     )
-    return ordered[:max(0, int(max_total))]
+    return _bookwide_budget(ordered, rows, max_total)

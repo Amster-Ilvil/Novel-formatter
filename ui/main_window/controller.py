@@ -38,10 +38,11 @@ class MainWindowControllerMixin:
         This is only an index over existing owners.  It never duplicates OCR,
         project, adjudication or export behavior.
         """
-        from core.command_catalog import CommandSpec
+        from core.command_catalog import (
+            CommandSpec, PRIMARY_NAVIGATION_SPECS, primary_navigation_shortcut_label,
+        )
         from ui.command_palette import CommandAction
 
-        mod = "⌘" if sys.platform == "darwin" else "Ctrl+"
         project_active = bool(self._tab_pages.project_manager.active_project)
 
         def nav(command_id, title, workspace, shortcut="", *, keywords=(), priority=40):
@@ -63,16 +64,19 @@ class MainWindowControllerMixin:
                 enabled=project_active,
                 disabled_reason="未选择项目" if not project_active else "",
             ),
-            nav("nav.workspace", "工作区", "workspace", f"{mod}1", keywords=("workspace", "project", "首页"), priority=10),
-            nav("nav.pages", "页面管理", "book", f"{mod}2", keywords=("pages", "page", "图片", "pdf")),
-            nav("nav.ocr", "OCR 识别", "ocr", f"{mod}3", keywords=("ocr", "识别", "模型")),
-            nav("nav.formatter", "格式处理", "format", f"{mod}4", keywords=("formatter", "正文", "排版")),
-            nav("nav.proof", "文字校对", "ocr_compare", f"{mod}5", keywords=("proof", "compare", "裁决", "ai")),
-            nav("nav.epub", "EPUB生成", "export", f"{mod}6", keywords=("epub", "export", "导出")),
-            nav("nav.settings", "设置", "system", f"{mod}7", keywords=("settings", "配置")),
-            nav("nav.pdf", "PDF 文字层", "pdf", keywords=("pdf", "text layer", "文字层"), priority=60),
-            nav("nav.image_review", "图文对照", "image_text", keywords=("image", "review", "校对", "原图"), priority=60),
         ]
+        actions.extend(
+            nav(
+                spec.command_id, spec.title, spec.workspace,
+                primary_navigation_shortcut_label(index),
+                keywords=spec.keywords, priority=spec.priority,
+            )
+            for index, spec in enumerate(PRIMARY_NAVIGATION_SPECS)
+        )
+        actions.extend((
+            nav("nav.pdf", "PDF 文字层", "pdf", keywords=("pdf", "text layer", "文字层"), priority=60),
+            nav("nav.image_text", "图文对照", "image_text", keywords=("image", "review", "校对", "原图"), priority=60),
+        ))
 
         project_tools = [
             ("project.backup", "备份项目", self._tab_pages._export_project_backup, ("backup", "zip")),
@@ -107,6 +111,9 @@ class MainWindowControllerMixin:
 
     def _on_project_changed(self, context: dict) -> None:
         data = context if isinstance(context, dict) else {}
+        # The stale-EPUB guard is scoped to one book, never carry it into the
+        # next project or block an independent PDF/Word import.
+        self._ocr_fusion_export_stale = False
         self._active_project_dir = str(data.get("path") or "")
         if hasattr(self, "_runtime_tasks") and hasattr(self, "_tab_workspace"):
             self._tab_workspace.set_runtime_task(
@@ -439,7 +446,6 @@ class MainWindowControllerMixin:
                     self._pending_project_document = None
                     self._pending_project_hydrated.clear()
                     self._pending_single_compare_result = None
-                    self._pending_image_review_document = None
                     self.statusBar().showMessage(
                         "上次多模型 OCR 中途停止；已保留断点/分段缓存，但不会把中间模型误当成正文。", 9000
                     )
@@ -449,21 +455,15 @@ class MainWindowControllerMixin:
                         # re-introduce it as a synthetic single-OCR source after
                         # project restore or workspace switching.
                         self._pending_single_compare_result = None
-                        self._pending_image_review_document = None
                         compare = self._lazy_workspace_if_loaded("ocr_compare")
                         if compare is not None:
                             compare.set_available_single_result(None)
                     else:
                         source_label = source_engine or "项目恢复 · 单模型 OCR"
-                        review_label = "项目恢复 · OCR 原文"
                         self._pending_single_compare_result = (doc, source_label)
-                        self._pending_image_review_document = (doc, review_label, True)
                         compare = self._lazy_workspace_if_loaded("ocr_compare")
-                        review = self._lazy_workspace_if_loaded("image_review")
                         if compare is not None:
                             compare.set_available_single_result(doc, source_label)
-                        if review is not None:
-                            review.set_document(doc, review_label, lazy=True)
             except Exception as exc:
                 self.statusBar().showMessage(f"项目正文恢复失败：{exc}", 8000)
 
@@ -484,9 +484,7 @@ class MainWindowControllerMixin:
         if idx == SECTION_FORMAT:
             self._ensure_project_document_hydrated("formatter")
         elif idx == SECTION_PROOF:
-            target = {0: "ocr_compare", 1: "image_review"}.get(self._proof_section.current_index())
-            if target:
-                self._ensure_project_document_hydrated(target)
+            self._ensure_project_document_hydrated("ocr_compare")
         elif idx == SECTION_EPUB:
             self._ensure_project_document_hydrated("epub")
 
@@ -504,31 +502,100 @@ class MainWindowControllerMixin:
         elif key == "ocr_compare":
             self._ensure_project_multi_ocr_hydrated()
             return
-        elif key == "image_review":
-            self._tab_ocr_image_review.set_document(doc, f"项目恢复 · {stage or 'OCR'}", lazy=False)
-            self._ensure_project_multi_ocr_hydrated()
         self._pending_project_hydrated.add(key)
 
-    def _save_project_adjudication_snapshot(self, *, reset_journal: bool = False) -> None:
-        """Write a full checkpoint at low-frequency lifecycle boundaries only."""
+    def _save_project_adjudication_snapshot(
+        self, *, reset_journal: bool = False
+    ) -> dict | None:
+        """Freeze a full adjudication checkpoint now and persist it off-thread.
+
+        A 3-model, 3518-row book produces a ~35 MB snapshot.  The GUI must
+        capture one point-in-time JSON-safe state synchronously, but content
+        addressing, gzip compression and filesystem writes are serialized in a
+        worker.  Repeated saves for the same project are latest-wins.
+
+        When ``reset_journal`` is requested we capture a byte-prefix marker and
+        remove only that prefix *after* the checkpoint is durable.  Decisions
+        appended while the worker is saving are preserved.
+        """
         manager = self._tab_pages.project_manager
         if manager.active_project is None:
-            return
+            return None
         try:
+            workspace_root = str(manager.workspace_root.resolve())
+            project_path = str(manager.active_project.resolve())
             snapshot = self._tab_ocr_compare.project_snapshot_state()
-            if snapshot:
-                manager.save_multi_ocr_snapshot(snapshot)
-                manager.save_adjudication_state({
-                    "mode": "multi",
-                    "current_row_index": snapshot.get("current_row_index", 0),
-                    "fusion_states": snapshot.get("fusion_states", []),
-                    "image_review_overrides": snapshot.get("image_review_overrides", {}),
-                    "canonical_source_decisions": snapshot.get("canonical_source_decisions", {}),
-                })
-                if reset_journal:
-                    manager.clear_adjudication_events()
+            if not snapshot:
+                return None
+            journal_marker = (
+                manager.adjudication_event_checkpoint_marker()
+                if reset_journal else None
+            )
+            adjudication_state = {
+                "mode": "multi",
+                "current_row_index": snapshot.get("current_row_index", 0),
+                "fusion_states": snapshot.get("fusion_states", []),
+                "image_review_overrides": snapshot.get("image_review_overrides", {}),
+                "canonical_source_decisions": snapshot.get("canonical_source_decisions", {}),
+            }
         except Exception as exc:
-            self.statusBar().showMessage(f"裁决状态 checkpoint 保存失败：{exc}", 8000)
+            self.statusBar().showMessage(f"裁决状态 checkpoint 准备失败：{exc}", 8000)
+            return None
+
+        key = project_path
+        with self._project_adjudication_persist_lock:
+            self._project_adjudication_persist_sequence += 1
+            token = int(self._project_adjudication_persist_sequence)
+            self._project_adjudication_persist_latest[key] = token
+
+        def is_latest() -> bool:
+            with self._project_adjudication_persist_lock:
+                return self._project_adjudication_persist_latest.get(key) == token
+
+        def worker() -> None:
+            try:
+                # One writer at a time keeps the content-addressed store and
+                # graph aliases deterministic.  A newer request may supersede
+                # this one while it waits; in that case skip all I/O.
+                with self._project_adjudication_save_lock:
+                    if not is_latest():
+                        return
+                    save_manager = ProjectWorkspaceManager(workspace_root)
+                    save_manager.open_project(project_path)
+                    save_manager.save_multi_ocr_snapshot(snapshot)
+                    if not is_latest():
+                        return
+                    save_manager.save_adjudication_state(adjudication_state)
+                    if reset_journal and journal_marker is not None and is_latest():
+                        save_manager.compact_adjudication_events_through(journal_marker)
+                    if is_latest():
+                        try:
+                            QTimer.singleShot(0, self._tab_workspace.refresh_project_state)
+                        except Exception:
+                            pass
+            except Exception as exc:
+                # Mirror the existing stage-persistence error path without ever
+                # touching Qt widgets directly from the worker thread.
+                try:
+                    QTimer.singleShot(
+                        0,
+                        lambda message=str(exc): self.statusBar().showMessage(
+                            f"裁决状态 checkpoint 保存失败：{message}", 8000
+                        ),
+                    )
+                except Exception:
+                    pass
+            finally:
+                with self._project_adjudication_persist_lock:
+                    if self._project_adjudication_persist_latest.get(key) == token:
+                        self._project_adjudication_persist_latest.pop(key, None)
+
+        threading.Thread(
+            target=worker,
+            daemon=True,
+            name=f"adjudication-checkpoint-{token}",
+        ).start()
+        return snapshot
 
     def _append_project_adjudication_event(self, payload: dict) -> None:
         """Persist one manual decision without serialising the whole OCR session."""
@@ -645,14 +712,10 @@ class MainWindowControllerMixin:
         # before deleting the OCR temp root that owns sentence-group images.
         # This ordering is important on filesystems that reject deleting open
         # files and also prevents a one-frame stale image after Clear.
-        review = self._lazy_workspace_if_loaded("image_review")
         compare = self._lazy_workspace_if_loaded("ocr_compare")
-        if review is not None:
-            review.reset_for_new_book()
         if compare is not None:
             compare.reset_for_new_book()
         self._pending_single_compare_result = None
-        self._pending_image_review_document = None
         self._pending_ocr_inputs = ()
         ClearManager.clear_ocr(tab)
 
@@ -735,9 +798,17 @@ class MainWindowControllerMixin:
         return False
 
     def eventFilter(self, watched, event):
-        """Capture file URL drops before QTextEdit/QLineEdit can turn them into text."""
+        """Capture file URL drops before QTextEdit/QLineEdit can turn them into text.
+
+        This filter is installed application-wide, so the cheap event-type gate
+        MUST run before the parent-chain ownership walk.  The previous order
+        called ``_is_own_widget`` for every paint/polish/mouse/timer event in
+        every page card and OCR control, which became a measurable UI tax on
+        book-scale projects.
+        """
         event_type = event.type()
-        if self._is_own_widget(watched) and event_type in (QEvent.DragEnter, QEvent.DragMove, QEvent.Drop, QEvent.DragLeave):
+        drag_events = (QEvent.DragEnter, QEvent.DragMove, QEvent.Drop, QEvent.DragLeave)
+        if event_type in drag_events and self._is_own_widget(watched):
             if event_type == QEvent.DragLeave:
                 self._hide_drop_overlay()
                 return False
@@ -803,15 +874,11 @@ class MainWindowControllerMixin:
             # Ordering contract: sentence-review pixmaps must release files before
             # the OCR temp store removes those exact paths. Keep this explicit
             # even though the generic workspace loop handles every other tab.
-            image_review = self._lazy_workspace_if_loaded("image_review")
             ocr_tab = self._lazy_workspace_if_loaded("ocr")
-            if image_review is not None:
-                image_review.shutdown_cleanup()
             if ocr_tab is not None:
                 ocr_tab.shutdown_cleanup()
 
             already_cleaned = {
-                id(image_review),
                 id(ocr_tab),
             }
             for tab in list(getattr(self, "_workspace_tabs", []) or []):
@@ -922,7 +989,7 @@ class MainWindowControllerMixin:
                 self._proof_section.set_current_index(0)
         if initial_section == SECTION_OCR:
             self._ocr_section.set_current_index(0)
-        elif initial_section == SECTION_PROOF and self._proof_section.current_index() > 1:
+        elif initial_section == SECTION_PROOF and self._proof_section.current_index() > 0:
             self._proof_section.set_current_index(0)
         self._goto(initial_section)
 
@@ -935,7 +1002,7 @@ class MainWindowControllerMixin:
             "ai_image": (SECTION_OCR, 2),
             "format": (SECTION_FORMAT, None),
             "ocr_compare": (SECTION_PROOF, 0),
-            "image_text": (SECTION_PROOF, 1),
+            "image_text": (SECTION_PROOF, "decision"),
             "export": (SECTION_EPUB, None),
             "system": (SECTION_SYSTEM, None),
         }
@@ -944,9 +1011,13 @@ class MainWindowControllerMixin:
         # routes do not construct an unrelated default workspace first.
         if section == SECTION_OCR and subtab is not None:
             self._ocr_section.set_current_index(subtab)
-        elif section == SECTION_PROOF and subtab is not None:
-            self._proof_section.set_current_index(subtab)
+        elif section == SECTION_PROOF:
+            self._proof_section.set_current_index(0)
         self._goto(section)
+        if section == SECTION_PROOF:
+            self._tab_ocr_compare._set_review_mode(
+                "decision" if subtab == "decision" else "full"
+            )
 
     def _on_ocr_subtab_changed(self, index: int) -> None:
         if self._tab_system.remember_subtabs_enabled():
@@ -956,116 +1027,30 @@ class MainWindowControllerMixin:
             key = {0: "ocr", 1: "pdf_text", 2: "ai_image"}.get(int(index), "ocr")
             self._workspace_coordinator.set_active((key,))
 
-    def _on_image_review_row_saved(self, payload: dict) -> None:
-        """Commit one 图文 decision and return an explicit success/failure ack."""
-        data = payload if isinstance(payload, dict) else {}
-        row_index = -1
-        try:
-            row_index = int(data.get("row_index", -1))
-        except (TypeError, ValueError, OverflowError):
-            pass
-        success = self._tab_ocr_compare.apply_image_review_update(data, refresh=False)
-        if success:
-            actual_row = self._tab_ocr_compare.current_row_index()
-            self._pending_image_review_source_row = int(actual_row)
-            message = f"已保存并同步到 OCR 对比第 {actual_row + 1} 句"
-            self._tab_ocr_image_review.notify_ocr_compare_sync_result(
-                row_index, True, message
-            )
-        else:
-            self._tab_ocr_image_review.notify_ocr_compare_sync_result(
-                row_index, False,
-                "已保存图文校对，但无法绑定 OCR 对比行；未伪报同步成功。"
-            )
-
     def _on_ocr_compare_decision_changed(self, payload: dict) -> None:
+        # One same-widget adjudication authority for full overview and image/text
+        # sentence review. Persist the event once; never echo it into a second tab.
         data = payload if isinstance(payload, dict) else {}
-        # Persist first, including decisions that originated in 图文校对.  One
-        # decision is one append-only JSONL event; the 50-100 MB OCR snapshot is
-        # not rewritten during a review streak.
         self._append_project_adjudication_event(data)
-        if str(data.get("origin", "")) == "image_review":
-            return
-        image_review_visible = bool(self._proof_section.current_index() == 1)
-        self._tab_ocr_image_review.apply_ocr_compare_decision(
-            data, refresh=image_review_visible
-        )
 
     def _on_coordinated_row_changed(self, row_index: int, source: str) -> None:
-        if str(source) == "image_review":
-            self._sync_ocr_compare_from_image_review(row_index)
-        else:
-            self._remember_ocr_compare_row(row_index)
+        self._remember_ocr_compare_row(row_index)
 
     def _remember_ocr_compare_row(self, row_index: int) -> None:
         try:
             self._pending_image_review_source_row = max(0, int(row_index))
         except (TypeError, ValueError, OverflowError):
-            return
-        if self._proof_section.current_index() == 1:
-            self._tab_ocr_image_review.jump_to_source_row(self._pending_image_review_source_row)
-
-    def _sync_ocr_compare_from_image_review(self, row_index: int) -> None:
-        if self._proof_section.current_index() != 1:
-            return
-        self._pending_image_review_source_row = max(0, int(row_index))
-        self._tab_ocr_compare.select_source_row(self._pending_image_review_source_row)
-
-    def _open_image_review_from_ocr_compare(self, row_index: int) -> None:
-        """Open the independent image workspace at the OCR comparison stable row."""
-        try:
-            row = max(0, int(row_index))
-        except (TypeError, ValueError, OverflowError):
-            row = self._tab_ocr_compare.current_row_index()
-        self._pending_image_review_source_row = row
-        self._goto(SECTION_PROOF)
-        self._proof_section.set_current_index(1)
-
-    def _load_and_sync_image_review_row(self) -> None:
-        # Capture the OCR row before lazy loading: the initial image-review
-        # render emits row 0, and must not overwrite the row the user came from.
-        row = self._tab_ocr_compare.current_row_index()
-        self._pending_image_review_source_row = max(0, int(row))
-        self._tab_ocr_image_review.set_disagreement_source_row_order(
-            self._tab_ocr_compare.disagreement_queue_row_order()
-        )
-        self._tab_ocr_image_review.ensure_document_loaded()
-        self._tab_ocr_image_review.jump_to_source_row(row)
+            pass
 
     def _on_proof_subtab_changed(self, index: int) -> None:
-        previous = int(getattr(self, "_last_proof_subtab_index", self._proof_section.current_index()))
-        index = max(0, min(1, int(index)))
-        if previous == 0 and index == 1:
-            compare = self._lazy_workspace_if_loaded("ocr_compare")
-            if compare is not None:
-                compare._commit_manual_decision_editor()
+        # Only a single hosted tab exists now. Switching between full and
+        # sentence display is performed by OCRCompareTab._set_review_mode().
         if self._stack.currentIndex() == SECTION_PROOF:
-            self._ensure_proof_subworkspace(index)
-            proof_keys = ("ocr_compare", "image_review")
-            self._workspace_coordinator.set_active((proof_keys[index],))
-            self._ensure_project_document_hydrated(proof_keys[index])
-        review = self._lazy_workspace_if_loaded("image_review")
-        if previous == 1 and index != 1 and review is not None:
-            if not review.save_pending_edit():
-                self.statusBar().showMessage("图文对照当前句保存失败；修改仍保留在编辑器中。", 7000)
-        self._last_proof_subtab_index = index
-        if self._tab_system.remember_subtabs_enabled():
-            self._ui_settings.setValue("reference_ui/proof_subtab", index)
-        if index == 0:
-            compare = self._lazy_workspace_if_loaded("ocr_compare")
+            compare = self._ensure_proof_subworkspace(0)
+            self._workspace_coordinator.set_active(("ocr_compare",))
+            self._ensure_project_document_hydrated("ocr_compare")
             if compare is not None:
-                # Single-model OCR is already authoritative enough to continue
-                # downstream, so opening OCR Compare should show it immediately.
-                # A multi-model session is intentionally left untouched until
-                # human/AI adjudication is explicitly applied.
                 QTimer.singleShot(0, compare.ensure_latest_single_result_loaded)
-            review = self._lazy_workspace_if_loaded("image_review")
-            if review is not None:
-                source_row = review.current_source_row_index()
-                if source_row >= 0:
-                    QTimer.singleShot(0, lambda row=source_row: self._tab_ocr_compare.select_source_row(row))
-        else:
-            QTimer.singleShot(0, self._load_and_sync_image_review_row)
 
     def _goto(self, idx: int):
         """六主功能区统一切换；融合页签与侧栏高亮始终同步。"""
@@ -1093,7 +1078,7 @@ class MainWindowControllerMixin:
             self._workspace_coordinator.set_active(("formatter",))
             self._ensure_project_document_hydrated("formatter")
         elif idx == SECTION_PROOF:
-            if self._proof_section.current_index() > 1:
+            if self._proof_section.current_index() > 0:
                 self._proof_section.set_current_index(0)
             self._on_proof_subtab_changed(self._proof_section.current_index())
         elif idx == SECTION_EPUB:
@@ -1166,10 +1151,10 @@ class MainWindowControllerMixin:
         try:
             workspace_root = str(manager.workspace_root.resolve())
             project_path = str(manager.active_project.resolve())
-            # Keep the immutable OCR document itself; serializing a full book can
-            # be tens of MB and belongs in the persistence worker, not the Qt
-            # completion callback.
-            document = doc
+            # Capture the exact OCR completion state now.  The user may enter
+            # compare/manual-review while compression is still queued; a private
+            # snapshot prevents later GUI edits from leaking into this stage file.
+            document = doc.snapshot_clone()
             pipeline_payload = dict(pipeline_state or {})
         except Exception as exc:
             self.statusBar().showMessage(f"单模型 OCR 后台保存准备失败：{exc}", 8000)
@@ -1195,6 +1180,11 @@ class MainWindowControllerMixin:
         def worker():
             try:
                 with self._project_stage_save_lock:
+                    # Latest request wins.  If this worker was queued behind a
+                    # newer project/stage save, never let stale state overwrite it.
+                    if not self._project_stage_save_generation.is_current(token):
+                        signals.finished.emit({"stage": "ocr", "skipped_stale": True})
+                        return
                     save_manager = ProjectWorkspaceManager(workspace_root)
                     save_manager.open_project(project_path)
                     save_manager.save_stage_document("ocr", document.to_dict())
@@ -1219,7 +1209,7 @@ class MainWindowControllerMixin:
         try:
             workspace_root = str(manager.workspace_root.resolve())
             project_path = str(manager.active_project.resolve())
-            document = doc
+            document = doc.snapshot_clone()
             pipeline_payload = dict(pipeline_state or {})
         except Exception as exc:
             self.statusBar().showMessage(f"多模型 OCR 后台保存准备失败：{exc}", 8000)
@@ -1245,6 +1235,9 @@ class MainWindowControllerMixin:
         def worker():
             try:
                 with self._project_stage_save_lock:
+                    if not self._project_stage_save_generation.is_current(token):
+                        signals.finished.emit({"stage": "ocr_auto_fusion", "skipped_stale": True})
+                        return
                     save_manager = ProjectWorkspaceManager(workspace_root)
                     save_manager.open_project(project_path)
                     if pipeline_payload:
@@ -1282,23 +1275,89 @@ class MainWindowControllerMixin:
 
         # Project persistence is outside the OCR/Formatter algorithms: every
         # published text stage is durable and page-lineage guarded, while UI
-        # workspaces are still free to keep independent editable clones.
+        # workspaces are still free to keep independent editable clones.  Disk
+        # compression/content-addressed storage is not allowed to block the Qt
+        # thread; publish the immutable in-memory snapshot first, then persist a
+        # captured copy in the background.  Same-stage writes are latest-wins,
+        # while different stages remain independent.
+        self._queue_project_stage_snapshot_save(
+            stage, stage_snapshot, record_project_run=record_project_run
+        )
+
+
+    def _queue_project_stage_snapshot_save(
+        self,
+        stage: str,
+        document: UnifiedDocument,
+        *,
+        record_project_run: bool = True,
+    ) -> None:
+        """Persist one immutable stage snapshot without blocking the GUI thread.
+
+        The destination project and document snapshot are captured before the
+        worker starts.  Repeated saves of the *same* stage use latest-wins
+        semantics, but OCR / Formatter / image-review stages never cancel each
+        other.  This mirrors mature desktop editors' one-active/latest-pending
+        save pattern without changing Novel Formatter's project schema.
+        """
         manager = getattr(getattr(self, "_tab_pages", None), "project_manager", None)
-        if manager is not None and manager.active_project is not None:
+        if manager is None or manager.active_project is None:
+            return
+        try:
+            workspace_root = str(manager.workspace_root.resolve())
+            project_path = str(manager.active_project.resolve())
+            # ``document`` is the immutable snapshot returned by
+            # WorkspaceSnapshotRegistry.publish_aliases().  Do not clone it a
+            # second time just for I/O; the worker only serializes it.
+            snapshot = document
+            metadata = getattr(snapshot, "metadata", None)
+            details = {
+                "blocks": len(getattr(snapshot, "blocks", []) or []),
+                "pages": len(getattr(snapshot, "pages", []) or []),
+                "source_engine": str(getattr(metadata, "source_engine", "") or ""),
+            }
+        except Exception as exc:
+            self.statusBar().showMessage(f"项目阶段后台保存准备失败：{exc}", 8000)
+            return
+
+        key = (project_path, str(stage or ""))
+        with self._project_stage_persist_lock:
+            self._project_stage_persist_sequence += 1
+            token = int(self._project_stage_persist_sequence)
+            self._project_stage_persist_latest[key] = token
+
+        def is_latest() -> bool:
+            with self._project_stage_persist_lock:
+                return self._project_stage_persist_latest.get(key) == token
+
+        def worker():
             try:
-                manager.save_stage_document(stage, stage_snapshot.to_dict())
-                metadata = getattr(stage_snapshot, "metadata", None)
-                if record_project_run:
-                    manager.record_run(
-                        stage,
-                        details={
-                            "blocks": len(getattr(stage_snapshot, "blocks", []) or []),
-                            "pages": len(getattr(stage_snapshot, "pages", []) or []),
-                            "source_engine": str(getattr(metadata, "source_engine", "") or ""),
-                        },
-                    )
+                with self._project_stage_save_lock:
+                    if not is_latest():
+                        return
+                    save_manager = ProjectWorkspaceManager(workspace_root)
+                    save_manager.open_project(project_path)
+                    save_manager.save_stage_document(stage, snapshot.to_dict())
+                    if record_project_run and is_latest():
+                        save_manager.record_run(stage, details=details)
             except Exception as exc:
-                self.statusBar().showMessage(f"项目阶段自动保存失败：{exc}", 8000)
+                # Status-bar work must be marshalled back to the Qt thread.
+                QTimer.singleShot(
+                    0,
+                    lambda message=str(exc): self.statusBar().showMessage(
+                        f"项目阶段后台保存失败：{message}", 8000
+                    ),
+                )
+            finally:
+                with self._project_stage_persist_lock:
+                    if self._project_stage_persist_latest.get(key) == token:
+                        self._project_stage_persist_latest.pop(key, None)
+
+        threading.Thread(
+            target=worker,
+            daemon=True,
+            name=f"project-stage-save-{stage}-{token}",
+        ).start()
 
     def _on_pages_loaded(self, images):
         def normalized(values):
@@ -1340,7 +1399,6 @@ class MainWindowControllerMixin:
                 ("pdf_text", "reset_for_new_book"),
                 ("formatter", "reset_for_new_book"),
                 ("ocr_compare", "reset_for_new_book"),
-                ("image_review", "reset_for_new_book"),
                 ("epub", "clear_doc"),
             ):
                 workspace = self._lazy_workspace_if_loaded(key)
@@ -1348,8 +1406,7 @@ class MainWindowControllerMixin:
                 if callable(reset):
                     reset()
             self._pending_single_compare_result = None
-            self._pending_image_review_document = None
-        self._active_page_image_signature = signature
+            self._active_page_image_signature = signature
         self._pending_ocr_inputs = tuple(str(value) for value in images)
         # Legacy source-contract marker; the loaded-only branch below is the
         # lazy equivalent of: self._tab_ocr.set_inputs(images)
@@ -1425,7 +1482,6 @@ class MainWindowControllerMixin:
         for index, document in enumerate(documents):
             self._snapshot_registry.publish(f"ocr_model_{index + 1}", document, clone=True)
         self._snapshot_registry.publish("ocr_auto_fusion", fused, clone=True)
-        self._tab_ocr_image_review.set_document(fused, "多模型 OCR 自动融合稿")
         row_count = len(getattr(payload.get("comparison"), "rows", []) or [])
         load_generation = self._tab_ocr_compare.prepare_large_result_load(labels, row_count)
         self._goto(SECTION_PROOF)
@@ -1446,14 +1502,24 @@ class MainWindowControllerMixin:
         """Reconnect restored OCR snapshots to image review and downstream selectors."""
         report = dict((payload or {}).get("report") or {})
         if bool(report.get("non_destructive_overlay_import", False)):
+            changes = dict(report.get("cumulative_merge_stats") or {})
+            if (int(changes.get("new_accepted_rows", 0) or 0)
+                    + int(changes.get("replaced_accepted_rows", 0) or 0)) > 0:
+                # Applying the overlay updates OCR Compare, NOT an EPUB/Formatter
+                # document already passed downstream.  Preserve that document and
+                # its edits, but refuse a stale EPUB build until Apply Whole Book.
+                self._ocr_fusion_export_stale = True
+                self.statusBar().showMessage(
+                    "已导入新裁决；EPUB 中的旧正文已过期，请在 OCR 对比点击「应用整本」后重新导出。",
+                    12000,
+                )
             # AI correction import already updated the lightweight fusion states
             # in OCR 对比.  Persist that cloud-returned adjudication immediately,
             # but do not copy model books or replace any downstream OCR source.
-            self._save_project_adjudication_snapshot(reset_journal=True)
+            snapshot = self._save_project_adjudication_snapshot(reset_journal=True) or {}
             manager = self._tab_pages.project_manager
             if manager.active_project is not None:
                 try:
-                    snapshot = self._tab_ocr_compare.project_snapshot_state()
                     manager.save_adjudication_state({
                         "mode": "multi",
                         "origin": "cloud_import",
@@ -1482,8 +1548,6 @@ class MainWindowControllerMixin:
             self._snapshot_registry.publish(f"ocr_model_{index + 1}", document, clone=True)
         if fused is not None:
             self._snapshot_registry.publish("ocr_auto_fusion", fused, clone=True)
-        if fused is not None:
-            self._tab_ocr_image_review.set_document(fused, "恢复的多模型 OCR 融合稿")
         self._save_project_adjudication_snapshot(reset_journal=True)
 
     def _on_ocr_compare_applied(self, doc):
@@ -1491,7 +1555,9 @@ class MainWindowControllerMixin:
         self._snapshot_registry.publish("ocr_multi_fusion", doc, clone=True)
         self._tab_fmt.set_doc(doc)
         self._tab_epub.set_doc(doc, "ocr")
-        self._tab_ocr_image_review.set_document(doc, "多模型 OCR 人工融合稿")
+        # Clear the stale-export gate only after the refreshed authoritative
+        # body was delivered to both downstream workspaces successfully.
+        self._ocr_fusion_export_stale = False
 
     def _on_pdf_text_done(self, doc):
         """Publish a completed selectable-PDF text layer to the normal text pipeline.
@@ -1519,7 +1585,6 @@ class MainWindowControllerMixin:
         # image OCR.  Feeding PDF text into them used to create a misleading
         # extra proofreading step and a narrow single-source preview.
         self._pending_single_compare_result = None
-        self._pending_image_review_document = None
         compare = self._lazy_workspace_if_loaded("ocr_compare")
         if compare is not None:
             compare.set_available_single_result(None)
@@ -1550,7 +1615,6 @@ class MainWindowControllerMixin:
             pipeline_state["multi_ocr"] = False
             self._persist_single_ocr_stage_async(doc, pipeline_state=pipeline_state)
 
-            self._tab_ocr_image_review.set_document(doc, "OCR 原文", lazy=True)
             source_label = source_engine or "单模型 OCR"
             self._tab_ocr_compare.set_available_single_result(doc, source_label)
             self._schedule_single_ocr_downstream_handoff(doc, source_kind)
@@ -1596,16 +1660,7 @@ class MainWindowControllerMixin:
         self._snapshot_registry.publish("ocr_single_review", doc, clone=True)
         self._tab_fmt.set_doc(doc)
         self._tab_epub.set_doc(doc, "ocr")
-        self._tab_ocr_image_review.set_document(doc, "单 OCR 校对稿")
         self._tab_ocr_compare.set_available_single_result(doc, "单 OCR 校对稿")
-
-    def _on_ocr_image_review_applied(self, doc):
-        """Publish image-review text and mirror final decisions into OCR Compare."""
-        self._tab_ocr_compare.sync_image_review_document(doc)
-        self._record_workspace_version("ocr_image_review", doc)
-        self._snapshot_registry.publish("ocr_image_review", doc, clone=True)
-        self._tab_fmt.set_doc(doc)
-        self._tab_epub.set_doc(doc, "ocr")
 
     def _on_ai_image_documents_ready(self, source_doc, translated_doc):
         """Publish AI image-book output without forcing OCR Compare/Formatter.

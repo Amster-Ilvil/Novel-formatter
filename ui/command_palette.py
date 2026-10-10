@@ -129,6 +129,25 @@ class CommandPalette(QDialog):
         else:
             self._hint.setText("没有匹配命令")
 
+    def _move_selection(self, delta: int) -> None:
+        """Move only across executable rows, skipping disabled commands.
+
+        This mirrors mature IDE command palettes: keyboard navigation should
+        never land on an action that Enter cannot execute.
+        """
+        count = self._list.count()
+        if count <= 0:
+            return
+        row = self._list.currentRow()
+        if row < 0:
+            row = 0 if delta >= 0 else count - 1
+        for step in range(1, count + 1):
+            candidate = (row + (step * (1 if delta >= 0 else -1))) % count
+            item = self._list.item(candidate)
+            if item is not None and bool(item.flags() & Qt.ItemIsEnabled):
+                self._list.setCurrentRow(candidate)
+                return
+
     def _activate_current(self) -> None:
         item = self._list.currentItem()
         if item is not None:
@@ -139,8 +158,15 @@ class CommandPalette(QDialog):
         action = self._actions.get(command_id)
         if action is None or not action.enabled:
             return
+        owner = self.parentWidget()
         self.hide()
         action.callback()
+        # A non-modal palette can remain the active/focus window after hide on
+        # some Qt platforms.  Explicitly return focus so the owner's WindowShortcut
+        # actions work immediately without requiring an extra mouse click.
+        if owner is not None:
+            owner.activateWindow()
+            owner.setFocus(Qt.ShortcutFocusReason)
 
     def keyPressEvent(self, event) -> None:
         key = event.key()
@@ -149,11 +175,7 @@ class CommandPalette(QDialog):
             event.accept()
             return
         if key in (Qt.Key_Down, Qt.Key_Up):
-            count = self._list.count()
-            if count:
-                delta = 1 if key == Qt.Key_Down else -1
-                row = self._list.currentRow()
-                self._list.setCurrentRow((max(0, row) + delta) % count)
+            self._move_selection(1 if key == Qt.Key_Down else -1)
             event.accept()
             return
         super().keyPressEvent(event)

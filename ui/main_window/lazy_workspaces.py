@@ -65,12 +65,21 @@ class LazyWorkspaceRegistry:
                 app.setProperty("nfSuspendClickableGuard", True)
             try:
                 widget = entry.factory()
+                if not isinstance(widget, QWidget):
+                    raise TypeError(f"lazy workspace {name!r} did not create QWidget")
             finally:
+                # Only QWidget construction needs the guard suspended.  Restore
+                # it before the installer runs so the newly mounted workspace
+                # behaves exactly like an eagerly-created page and later style
+                # changes are observable by the normal contrast guard.
                 if app is not None:
                     app.setProperty("nfSuspendClickableGuard", previous_guard_state)
-            if not isinstance(widget, QWidget):
-                raise TypeError(f"lazy workspace {name!r} did not create QWidget")
             entry.installer(widget)
+            try:
+                from ui.clickable_style_guard import enforce_button_contrast_tree
+                enforce_button_contrast_tree(widget)
+            except Exception:
+                pass
             entry.instance = widget
             return widget
         finally:

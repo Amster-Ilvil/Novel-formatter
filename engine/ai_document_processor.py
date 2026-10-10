@@ -22,6 +22,7 @@ from ai.redaction import redact_secrets
 from ai.token_counter import estimate_tokens
 from engine.document_versions import ai_request_payload, build_ai_document, cleanup_ai_covered_fragments
 from engine.ai_glossary import glossary_fingerprint, load_glossary, select_relevant_glossary
+from utils.atomic_io import atomic_write_text
 
 # Protocol v3 follows the same efficiency principle as AiNiee: ordered numbered text,
 # minimal repeated metadata, token-aware batching, and local reuse of unchanged content.
@@ -1127,7 +1128,7 @@ def run_ai_document(
     glossary_path: str | os.PathLike | None = None,
 ):
     """Run token-light, bounded, concurrent and order-preserving AI processing."""
-    doc = copy.deepcopy(doc)
+    doc = doc.snapshot_clone()
     payload = ai_request_payload(doc)
     mode = "correction" if mode == "correction" else "typeset"
     template = prompt_template or (CORRECTION_PROMPT if mode == "correction" else TYPESET_PROMPT)
@@ -1202,9 +1203,10 @@ def run_ai_document(
             "total_batches": len(batches),
             "updated_at": time.time(),
         }
-        tmp = checkpoint_job_dir / "manifest.json.tmp"
-        tmp.write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
-        os.replace(tmp, checkpoint_job_dir / "manifest.json")
+        atomic_write_text(
+            checkpoint_job_dir / "manifest.json",
+            json.dumps(manifest, ensure_ascii=False, indent=2),
+        )
 
     workers = _resolve_workers(provider, len(batches))
     limiter = RequestLimiter(int(kwargs.get("rpm_limit", 0) or 0), int(kwargs.get("tpm_limit", 0) or 0))
@@ -1386,8 +1388,21 @@ def run_ai_document(
                     returned=_remap_checkpoint_result(saved.get("result"), batches[index])
                     if returned is not None:
                         ordered_results[index]=returned; resumed_batches += 1
-                        save_target=checkpoint_job_dir/f"batch_{index:06d}.json"
-                        save_target.write_text(json.dumps({"version":2,"signature":checkpoint_signature,"index":index,"result":returned,"saved_at":time.time()},ensure_ascii=False,separators=(",",":")),encoding="utf-8")
+                        save_target = checkpoint_job_dir / f"batch_{index:06d}.json"
+                        atomic_write_text(
+                            save_target,
+                            json.dumps(
+                                {
+                                    "version": 2,
+                                    "signature": checkpoint_signature,
+                                    "index": index,
+                                    "result": returned,
+                                    "saved_at": time.time(),
+                                },
+                                ensure_ascii=False,
+                                separators=(",", ":"),
+                            ),
+                        )
                 except Exception: pass
 
         completed_batches = resumed_batches
@@ -1406,9 +1421,10 @@ def run_ai_document(
             "saved_at": time.time(),
         }
         target = checkpoint_job_dir / f"batch_{index:06d}.json"
-        tmp = checkpoint_job_dir / f"batch_{index:06d}.json.tmp"
-        tmp.write_text(json.dumps(payload, ensure_ascii=False, separators=(",", ":")), encoding="utf-8")
-        os.replace(tmp, target)
+        atomic_write_text(
+            target,
+            json.dumps(payload, ensure_ascii=False, separators=(",", ":")),
+        )
 
     def task(index: int, batch: dict):
         cid = str(batch.get("target_chapter_id", "chapter_001"))

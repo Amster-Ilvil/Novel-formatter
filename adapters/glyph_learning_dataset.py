@@ -33,6 +33,7 @@ import zipfile
 from PIL import Image, ImageDraw, ImageOps
 
 from adapters.unicode_safety import clean_json_value, clean_text, dumps as safe_json_dumps
+from utils.atomic_io import atomic_output_path, atomic_write_text
 from utils.safe_archive import safe_extract_zip
 
 _PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -252,13 +253,19 @@ class GlyphLearningSession:
         )
         (self.root / "README.txt").write_text(readme, encoding="utf-8")
         zip_path = self.root.with_suffix(".zip")
-        if zip_path.exists():
-            zip_path.unlink()
-        with zipfile.ZipFile(zip_path, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=6) as archive:
-            for path in sorted(self.root.rglob("*")):
-                if path.is_file():
-                    archive.write(path, path.relative_to(self.root.parent))
-        _LATEST_FILE.write_text(safe_json_dumps({"root": str(self.root), "zip": str(zip_path)}, indent=2), encoding="utf-8")
+        with atomic_output_path(zip_path, suffix=".zip.tmp") as staged_zip:
+            with zipfile.ZipFile(staged_zip, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=6) as archive:
+                for path in sorted(self.root.rglob("*")):
+                    if path.is_file():
+                        archive.write(path, path.relative_to(self.root.parent))
+            with zipfile.ZipFile(staged_zip, "r") as archive:
+                bad_member = archive.testzip()
+                if bad_member is not None:
+                    raise zipfile.BadZipFile(f"字形学习包 CRC 校验失败：{bad_member}")
+        atomic_write_text(
+            _LATEST_FILE,
+            safe_json_dumps({"root": str(self.root), "zip": str(zip_path)}, indent=2),
+        )
         # Keep only the newest 12 unpacked sessions/zips.
         sessions = sorted(_DEBUG_ROOT.glob("session-*"), key=lambda p: p.stat().st_mtime, reverse=True)
         for old in sessions[24:]:
@@ -286,7 +293,12 @@ def export_latest_session(destination: str | os.PathLike[str]) -> Path:
     if target.suffix.lower() != ".zip":
         target = target.with_suffix(".zip")
     target.parent.mkdir(parents=True, exist_ok=True)
-    shutil.copy2(source, target)
+    with atomic_output_path(target, suffix=".zip.tmp") as staged_target:
+        shutil.copy2(source, staged_target)
+        with zipfile.ZipFile(staged_target, "r") as archive:
+            bad_member = archive.testzip()
+            if bad_member is not None:
+                raise zipfile.BadZipFile(f"字形学习包 CRC 校验失败：{bad_member}")
     return target
 
 
@@ -368,10 +380,15 @@ def export_database_bundle(destination: str | os.PathLike[str], *, db=None) -> P
         database.backup_to(backup)
         rows = database.export_rows()
         (root / "samples.json").write_text(safe_json_dumps(rows, indent=2), encoding="utf-8")
-        with zipfile.ZipFile(target, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=6) as archive:
-            for item in root.rglob("*"):
-                if item.is_file():
-                    archive.write(item, item.relative_to(root.parent))
+        with atomic_output_path(target, suffix=".zip.tmp") as staged_target:
+            with zipfile.ZipFile(staged_target, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=6) as archive:
+                for item in root.rglob("*"):
+                    if item.is_file():
+                        archive.write(item, item.relative_to(root.parent))
+            with zipfile.ZipFile(staged_target, "r") as archive:
+                bad_member = archive.testzip()
+                if bad_member is not None:
+                    raise zipfile.BadZipFile(f"字形数据库包 CRC 校验失败：{bad_member}")
     return target
 
 

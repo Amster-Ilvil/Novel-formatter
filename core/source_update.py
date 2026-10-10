@@ -120,6 +120,22 @@ def read_project_version(root: str | Path) -> str:
         value = version_file.read_text(encoding="utf-8", errors="replace").strip()
         if value:
             return value
+
+    # Modern builds keep the UI-independent version in core.app_meta and the
+    # GUI imports it.  The older fallback that searched gui_pyside6.py for a
+    # literal VERSION assignment stopped working after that refactor.  Read
+    # the authoritative metadata module before retaining the legacy GUI path
+    # for old portable/source layouts.
+    app_meta = base / "core" / "app_meta.py"
+    if app_meta.is_file():
+        match = re.search(
+            r'^VERSION\s*=\s*["\']([^"\']+)["\']',
+            app_meta.read_text(encoding="utf-8", errors="replace"),
+            re.M,
+        )
+        if match:
+            return match.group(1).strip()
+
     gui = base / "gui_pyside6.py"
     if gui.is_file():
         match = re.search(r'^VERSION\s*=\s*["\']([^"\']+)["\']', gui.read_text(encoding="utf-8", errors="replace"), re.M)

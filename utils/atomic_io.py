@@ -85,6 +85,56 @@ def atomic_open(
             temp.unlink(missing_ok=True)
 
 
+
+
+@contextmanager
+def atomic_output_path(
+    path: str | os.PathLike[str],
+    *,
+    suffix: str | None = None,
+) -> Iterator[Path]:
+    """Yield a sibling temporary path and atomically replace ``path`` on success.
+
+    Use this for writers such as ``zipfile.ZipFile`` or third-party exporters
+    that require a filesystem path rather than an open file object.  The
+    temporary file lives beside the destination so ``os.replace`` remains an
+    atomic same-filesystem operation.
+    """
+    target = Path(path).expanduser()
+    target.parent.mkdir(parents=True, exist_ok=True)
+    previous_mode: int | None = None
+    try:
+        previous_mode = stat.S_IMODE(target.stat().st_mode)
+    except OSError:
+        previous_mode = None
+    temp_suffix = suffix if suffix is not None else (target.suffix + ".tmp")
+    fd, temp_name = tempfile.mkstemp(
+        prefix=f".{target.stem}.", suffix=temp_suffix, dir=target.parent
+    )
+    os.close(fd)
+    temp = Path(temp_name)
+    committed = False
+    try:
+        yield temp
+        if previous_mode is not None:
+            try:
+                os.chmod(temp, previous_mode)
+            except OSError:
+                pass
+        # Flush the finished file before publishing it.
+        try:
+            with temp.open("rb") as handle:
+                os.fsync(handle.fileno())
+        except OSError:
+            pass
+        os.replace(temp, target)
+        _sync_directory(target.parent)
+        committed = True
+    finally:
+        if not committed:
+            temp.unlink(missing_ok=True)
+
+
 def atomic_write_text(
     path: str | os.PathLike[str], text: str, *, encoding: str = "utf-8", newline: str | None = None
 ) -> Path:

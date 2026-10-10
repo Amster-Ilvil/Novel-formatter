@@ -28,7 +28,6 @@ WORKSPACE_SPECS: tuple[WorkspaceSpec, ...] = (
     WorkspaceSpec("ai_image", "ocr", consumes=("page_context",), produces=("reviewed_document",), heavy_when_hidden=True),
     WorkspaceSpec("formatter", "format", consumes=("ocr_document", "reviewed_document"), produces=("formatted_document",)),
     WorkspaceSpec("ocr_compare", "proof", consumes=("multi_ocr_session",), produces=("reviewed_document", "stable_row"), heavy_when_hidden=True),
-    WorkspaceSpec("image_review", "proof", consumes=("ocr_document", "stable_row"), produces=("reviewed_document", "stable_row"), heavy_when_hidden=True),
     WorkspaceSpec("epub", "epub", consumes=("reviewed_document", "formatted_document", "page_context"), produces=("epub",), heavy_when_hidden=True),
     WorkspaceSpec("system", "system", produces=("preferences",)),
 )

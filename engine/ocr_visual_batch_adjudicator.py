@@ -962,13 +962,21 @@ def adjudicate_visual_batches(
                 "concurrency": current_concurrency,
             })
 
-        def make_request(batch: Sequence[tuple[int, Path]], request_tag: str, depth: int = 0):
+        def make_request(
+            batch: Sequence[tuple[int, Path]],
+            request_tag: str,
+            depth: int = 0,
+            prebuilt_sheet: Path | None = None,
+        ):
             nonlocal incomplete_retries, transport_split_retries
             if cancel_check and cancel_check():
                 raise RuntimeError("AI 裁决已取消。")
             alias_to_index = {alias: idx for alias, (idx, _path) in enumerate(batch, 1)}
-            sheet_entries = [(alias, path) for alias, (_idx, path) in enumerate(batch, 1)]
-            sheet = _build_contact_sheet(sheet_entries, temp / f"sheet-{request_tag}.webp", opts)
+            if prebuilt_sheet is None:
+                sheet_entries = [(alias, path) for alias, (_idx, path) in enumerate(batch, 1)]
+                sheet = _build_contact_sheet(sheet_entries, temp / f"sheet-{request_tag}.webp", opts)
+            else:
+                sheet = prebuilt_sheet
             try:
                 if opts.transcription_first:
                     raw_transcription = invoke(TRANSCRIPTION_PROMPT, sheet, "transcription")
@@ -1022,10 +1030,21 @@ def adjudicate_visual_batches(
             wave = batches[batch_cursor:batch_cursor + current_concurrency]
             wave_base = batch_cursor
             usage_before = client.usage_snapshot() if hasattr(client, "usage_snapshot") else {}
+            # Render contact sheets before starting the worker wave. Pillow image
+            # composition can hold the GIL long enough for one worker to finish
+            # both mock/network calls before its peer reaches ``call_json``.
+            # Prebuilding keeps the concurrency limit about transport calls,
+            # which is the expensive resource the option is meant to control.
+            wave_jobs = []
+            for offset, batch in enumerate(wave):
+                request_tag = f"{wave_base + offset + 1:04d}"
+                sheet_entries = [(alias, path) for alias, (_idx, path) in enumerate(batch, 1)]
+                sheet = _build_contact_sheet(sheet_entries, temp / f"sheet-{request_tag}.webp", opts)
+                wave_jobs.append((batch, request_tag, sheet))
             with ThreadPoolExecutor(max_workers=max(1, current_concurrency), thread_name_prefix="nf-ai-adjudicate") as pool:
                 future_map = {
-                    pool.submit(make_request, batch, f"{wave_base + offset + 1:04d}"): batch
-                    for offset, batch in enumerate(wave)
+                    pool.submit(make_request, batch, request_tag, 0, sheet): batch
+                    for batch, request_tag, sheet in wave_jobs
                 }
                 for future in as_completed(future_map):
                     all_decisions.update(future.result())

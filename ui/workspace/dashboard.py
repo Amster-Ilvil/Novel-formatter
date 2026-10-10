@@ -1,10 +1,11 @@
 from __future__ import annotations
 
 from functools import partial
+from collections import OrderedDict
 import json
 from pathlib import Path
 
-from PySide6.QtCore import Qt, Signal, QTimer, QSize
+from PySide6.QtCore import Qt, Signal, QTimer, QSize, QSettings
 from PySide6.QtWidgets import (
     QProgressBar,
     QWidget, QVBoxLayout, QHBoxLayout, QGridLayout, QFrame, QLabel, QPushButton,
@@ -27,6 +28,9 @@ _STAGE_LABELS = {
     "export": "EPUB",
 }
 
+
+_RECENT_VIEW_MODE_KEY = "workspace/recent_projects_view_mode"
+
 _STATE_STYLE = {
     "done": ("已完成", SUCCESS, "#E3F5EC"),
     "active": ("可继续", ACC_TEXT, ACC_BG),
@@ -38,8 +42,8 @@ _STATE_STYLE = {
 
 def _step_btn_style(active: bool) -> str:
     if active:
-        return (f"QPushButton{{background:{ACC_FILL};color:#FFFFFF;border:none;border-radius:10px;padding:7px 12px;font-weight:700;}}"
-                f"QPushButton:hover{{background:{ACC_FILL_HOVER};}}QPushButton:disabled{{background:{TONAL};color:{SUBTLE};}}")
+        return (f"QPushButton{{background:#FFFFFF;color:{ACC_TEXT};border:1px solid {BORDER};border-radius:10px;padding:7px 12px;font-weight:700;}}"
+                f"QPushButton:hover{{background:{TONAL};border-color:{ACC};}}QPushButton:disabled{{background:{TONAL};color:{SUBTLE};}}")
     return (f"QPushButton{{background:{TONAL};color:{ACC_TEXT};border:none;border-radius:10px;padding:7px 12px;font-weight:600;}}"
             f"QPushButton:hover{{background:{TONAL_HOVER};}}QPushButton:disabled{{background:{TONAL};color:{SUBTLE};}}")
 
@@ -48,6 +52,9 @@ _HERO_BTN = (f"QPushButton{{background:{ON_HERO};color:{ON_HERO_TEXT};border:non
              f"QPushButton:disabled{{background:rgba(255,255,255,90);color:rgba(255,255,255,170);}}")
 _HERO_GHOST = ("QPushButton{background:rgba(255,255,255,46);color:#FFFFFF;border:1px solid rgba(255,255,255,90);"
                "border-radius:12px;padding:10px 18px;font-weight:600;}QPushButton:hover{background:rgba(255,255,255,80);}")
+_HERO_REFRESH = (f"QPushButton{{background:#FFFFFF;color:{ACC_TEXT};border:1px solid rgba(255,255,255,210);"
+                 "border-radius:12px;padding:10px 18px;font-weight:700;}"
+                 f"QPushButton:hover{{background:{TONAL};border-color:#FFFFFF;}}")
 
 
 def _card(title: str) -> tuple[QFrame, QVBoxLayout]:
@@ -79,11 +86,17 @@ class ProjectWorkspaceDashboard(QWidget):
         super().__init__(parent)
         self._page_manager = page_manager
         self._manager = page_manager.project_manager
+        self._ui_settings = QSettings("NovelFormatter", "NovelFormatter1")
         self._stage_widgets: dict[str, tuple[QLabel, QLabel, QPushButton]] = {}
         self._stage_nodes: dict[str, QLabel] = {}
         self._stage_boxes: dict[str, QFrame] = {}
         self._runtime_task = None
         self._project_tool_buttons: list[QPushButton] = []
+        # Recent-project previews are metadata, not live editing surfaces.  Cache
+        # the resolved first-image path by cheap filesystem identities so frequent
+        # dashboard refreshes never rescan page directories or reparse state.json.
+        self._project_thumbnail_cache: OrderedDict[str, tuple[tuple[int, ...], Path | None]] = OrderedDict()
+        self._project_thumbnail_cache_limit = 128
         # Runtime progress and project signals can arrive in bursts.  Coalesce
         # dashboard disk reads in the same spirit as debounced dynamic-page
         # observers: invisible dashboards only become dirty; visible dashboards
@@ -131,7 +144,7 @@ class ProjectWorkspaceDashboard(QWidget):
         self._resume_btn.clicked.connect(self._resume)
         hero_row.addWidget(self._resume_btn, 0, Qt.AlignVCenter)
         refresh_btn = QPushButton("刷新")
-        refresh_btn.setStyleSheet(_HERO_GHOST)
+        refresh_btn.setStyleSheet(_HERO_REFRESH)
         refresh_btn.clicked.connect(self.refresh)
         hero_row.addWidget(refresh_btn, 0, Qt.AlignVCenter)
         project_menu_btn = QToolButton()
@@ -273,8 +286,11 @@ class ProjectWorkspaceDashboard(QWidget):
         tools_layout.addStretch(1)
         lower.addWidget(tools, 2)
         root.addLayout(lower, 1)
-        self._recent_view_mode = "grid"
-        self._set_recent_view_mode("grid")
+        saved_recent_mode = str(
+            self._ui_settings.value(_RECENT_VIEW_MODE_KEY, "grid") or "grid"
+        ).strip().lower()
+        self._recent_view_mode = "list" if saved_recent_mode == "list" else "grid"
+        self._set_recent_view_mode(self._recent_view_mode, persist=False)
 
         self.refresh()
 
@@ -375,36 +391,81 @@ class ProjectWorkspaceDashboard(QWidget):
             item = QListWidgetItem("暂无项目")
             item.setFlags(item.flags() & ~Qt.ItemIsEnabled)
             self._recent.addItem(item)
-        self._set_recent_view_mode(getattr(self, "_recent_view_mode", "grid"), refresh_buttons=False)
+        self._set_recent_view_mode(getattr(self, "_recent_view_mode", "grid"), refresh_buttons=False, persist=False)
+
+    @staticmethod
+    def _thumbnail_source_identity(project: Path) -> tuple[int, ...]:
+        """Cheap invalidation token for recent-project preview discovery."""
+        values: list[int] = []
+        for path in (
+            project / "assets" / "cover",
+            project / "pages" / "state.json",
+            project / "pages" / "processed",
+            project / "pages" / "source",
+        ):
+            try:
+                stat = path.stat()
+                values.extend((int(stat.st_mtime_ns), int(stat.st_size)))
+            except OSError:
+                values.extend((0, 0))
+        return tuple(values)
 
     def _project_thumbnail_path(self, project_path: str | Path) -> Path | None:
         project = Path(project_path).expanduser()
+        cache_key = str(project.resolve())
+        identity = self._thumbnail_source_identity(project)
+        cached = self._project_thumbnail_cache.get(cache_key)
+        if cached is not None and cached[0] == identity:
+            self._project_thumbnail_cache.move_to_end(cache_key)
+            return cached[1]
+
+        result: Path | None = None
         cover_dir = project / "assets" / "cover"
         if cover_dir.is_dir():
             for candidate in sorted(cover_dir.iterdir()):
                 if candidate.suffix.lower() in {".png", ".jpg", ".jpeg", ".webp"} and candidate.is_file():
-                    return candidate
-        state_path = project / "pages" / "state.json"
-        try:
-            raw = json.loads(state_path.read_text(encoding="utf-8"))
-        except Exception:
-            raw = {}
-        for value in list(raw.get("page_images") or []):
-            candidate = Path(str(value)).expanduser()
-            if not candidate.is_absolute():
-                candidate = project / candidate
-            if candidate.is_file():
-                return candidate
-        for folder in (project / "pages" / "processed", project / "pages" / "source"):
-            if folder.is_dir():
+                    result = candidate
+                    break
+        if result is None:
+            state_path = project / "pages" / "state.json"
+            try:
+                raw = json.loads(state_path.read_text(encoding="utf-8"))
+            except Exception:
+                raw = {}
+            for value in list(raw.get("page_images") or []):
+                candidate = Path(str(value)).expanduser()
+                if not candidate.is_absolute():
+                    candidate = project / candidate
+                if candidate.is_file():
+                    result = candidate
+                    break
+        if result is None:
+            for folder in (project / "pages" / "processed", project / "pages" / "source"):
+                if not folder.is_dir():
+                    continue
                 for candidate in sorted(folder.iterdir()):
                     if candidate.suffix.lower() in {".png", ".jpg", ".jpeg", ".webp"} and candidate.is_file():
-                        return candidate
-        return None
+                        result = candidate
+                        break
+                if result is not None:
+                    break
 
-    def _set_recent_view_mode(self, mode: str, *, refresh_buttons: bool = True) -> None:
+        self._project_thumbnail_cache[cache_key] = (identity, result)
+        self._project_thumbnail_cache.move_to_end(cache_key)
+        while len(self._project_thumbnail_cache) > self._project_thumbnail_cache_limit:
+            self._project_thumbnail_cache.popitem(last=False)
+        return result
+
+    def _set_recent_view_mode(
+        self, mode: str, *, refresh_buttons: bool = True, persist: bool = True
+    ) -> None:
         mode = "list" if str(mode) == "list" else "grid"
         self._recent_view_mode = mode
+        if persist:
+            try:
+                self._ui_settings.setValue(_RECENT_VIEW_MODE_KEY, mode)
+            except Exception:
+                pass
         if refresh_buttons:
             self._recent_grid_btn.setChecked(mode == "grid")
             self._recent_list_btn.setChecked(mode == "list")

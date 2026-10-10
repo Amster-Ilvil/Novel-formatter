@@ -49,6 +49,15 @@ class AIImageProcessingTab(QWidget):
         self._elapsed_timer = QTimer(self)
         self._elapsed_timer.setInterval(1000)
         self._elapsed_timer.timeout.connect(self._update_elapsed)
+        # Large books can emit log/progress events from multiple concurrent AI
+        # batches in short bursts.  Reuse the OCR log coalescer so GUI document
+        # updates are bounded while every audit line remains preserved.
+        from core.ocr_runtime_optimizer import CoalescedLineBuffer
+        self._ai_log_buffer = CoalescedLineBuffer(max_lines=200000)
+        self._ai_log_flush_timer = QTimer(self)
+        self._ai_log_flush_timer.setInterval(80)
+        self._ai_log_flush_timer.timeout.connect(self._flush_ai_log_buffer)
+        self._last_progress_ui = 0.0
         self._settings_signature = None
         self._text_probe_state = "未测试"
         self._vision_probe_state = "未测试"
@@ -220,7 +229,7 @@ class AIImageProcessingTab(QWidget):
         self._status = QLabel("等待页面管理输入")
         self._status.setWordWrap(True); self._status.setStyleSheet(f"color:{MUTED};")
         ll.addWidget(self._status)
-        self._log = QTextEdit(); self._log.setReadOnly(True); self._log.setStyleSheet(LIGHT_PREVIEW_STYLE)
+        self._log = QPlainTextEdit(); self._log.setReadOnly(True); self._log.setStyleSheet(LIGHT_PREVIEW_STYLE)
         ll.addWidget(self._log, 1)
         split.addWidget(left)
 
@@ -503,6 +512,8 @@ class AIImageProcessingTab(QWidget):
             self._elapsed_timer.stop()
             self._run_started_at = 0.0
             self._elapsed_label.clear()
+            if hasattr(self, "_ai_log_buffer"):
+                self._flush_ai_log_buffer(force_all=True)
 
     def _start(self):
         if self._busy:
@@ -520,7 +531,8 @@ class AIImageProcessingTab(QWidget):
         self._set_busy(True)
         self._source_doc = None; self._translated_doc = None
         self._source_epub_btn.setEnabled(False); self._translation_epub_btn.setEnabled(False)
-        self._progress.setValue(0); self._log.clear(); self._preview.clear()
+        self._progress.setValue(0); self._clear_ai_log(); self._preview.clear()
+        self._last_progress_ui = 0.0
         self._status.setText("准备页面并建立省 token 的视觉请求…")
         signals = WorkerSignals(); self._signals = signals
         signals.log.connect(self._append_log)
@@ -554,10 +566,38 @@ class AIImageProcessingTab(QWidget):
             self._status.setText("正在停止；已完成请求和本地缓存会保留…")
 
     def _append_log(self, text):
-        self._log.append(str(text))
+        self._ai_log_buffer.push(text)
+        if not self._ai_log_flush_timer.isActive():
+            self._ai_log_flush_timer.start()
+
+    def _flush_ai_log_buffer(self, *, force_all: bool = False) -> None:
+        packets: list[str] = []
+        while True:
+            lines = self._ai_log_buffer.drain(max_lines=1200 if force_all else 320)
+            if not lines:
+                break
+            packets.append("\n".join(lines))
+            if not force_all:
+                break
+        if packets:
+            self._log.appendPlainText("\n".join(packets))
+            bar = self._log.verticalScrollBar()
+            bar.setValue(bar.maximum())
+        if force_all and not self._ai_log_buffer.pending():
+            self._ai_log_flush_timer.stop()
+
+    def _clear_ai_log(self) -> None:
+        self._ai_log_buffer.clear()
+        self._ai_log_flush_timer.stop()
+        self._log.clear()
 
     def _on_progress(self, current: int, total: int):
         total = max(1, int(total or 1)); current = max(0, int(current or 0))
+        now = time.monotonic()
+        final = current >= total
+        if not final and current > 1 and now - self._last_progress_ui < 0.08:
+            return
+        self._last_progress_ui = now
         self._progress.setValue(min(100, round(current * 100 / total)))
         self._status.setText(f"AI 图文处理：{current} / {total} 个正文页")
 

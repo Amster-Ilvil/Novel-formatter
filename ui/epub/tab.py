@@ -15,7 +15,7 @@ from PySide6.QtWidgets import (
     QTextBrowser, QTreeView, QFileSystemModel, QFileDialog, QMessageBox, QSizePolicy, QAbstractItemView, QMenu,
 )
 from PySide6.QtCore import Qt, Signal, QTimer, QUrl, QDir, QModelIndex
-from PySide6.QtGui import QKeySequence, QShortcut, QPixmap
+from PySide6.QtGui import QKeySequence, QShortcut, QPixmap, QTextCursor
 
 # QtWebEngine is intentionally opt-in.  In packaged macOS standalone builds
 # WebEngine can terminate the whole GUI with SIGSEGV after an EPUB build even
@@ -60,6 +60,7 @@ class EPUBTab(QWidget):
         self._preview_timer.setSingleShot(True)
         self._build_generation = 0
         self._document_generation = 0
+        self._last_validation_info: dict | None = None
         self._build_running = False
         self._project_export_dir = ""
         self._page_manager_images: tuple[str, ...] = ()
@@ -523,6 +524,10 @@ class EPUBTab(QWidget):
                 sep.setStyleSheet(f"background:{BORDER};border:none;")
                 check_box.addWidget(sep)
         check_box.addStretch(1)
+        self._validation_details_btn = QPushButton("检查结果")
+        self._validation_details_btn.setEnabled(False)
+        self._validation_details_btn.clicked.connect(self._show_validation_details)
+        check_box.addWidget(self._validation_details_btn, 0, Qt.AlignRight)
         right_compact_layout.addWidget(check_card, 1)
         compact_layout.addWidget(right_compact, 1)
 
@@ -563,6 +568,84 @@ class EPUBTab(QWidget):
         self._template_combo.currentTextChanged.connect(self._schedule_live_preview)
         self._vert_radio.toggled.connect(self._schedule_live_preview)
         self._horiz_radio.toggled.connect(self._schedule_live_preview)
+
+    def _clear_validation_report(self) -> None:
+        self._last_validation_info = None
+        button = getattr(self, "_validation_details_btn", None)
+        if button is not None:
+            button.setEnabled(False)
+
+    def _show_validation_details(self) -> None:
+        info = getattr(self, "_last_validation_info", None)
+        if not info:
+            return
+        from ui.epub.validation_report import (
+            EPUBValidationReportDialog, extract_validation_issues, format_epub_validation_report,
+        )
+        dialog = EPUBValidationReportDialog(
+            format_epub_validation_report(info), self, issues=extract_validation_issues(info),
+        )
+        dialog.location_requested.connect(self._open_validation_location)
+        dialog.exec()
+
+    def _resolve_package_member(self, member_path: str) -> Path | None:
+        root_text = str(getattr(self, "_preview_extract_dir", "") or "")
+        if not root_text:
+            return None
+        root = Path(root_text).resolve()
+        raw = str(member_path or "").strip().replace("\\", "/")
+        if "!/" in raw:
+            raw = raw.split("!/", 1)[1]
+        raw = raw.lstrip("/.")
+        if not raw:
+            return None
+        candidates = [raw]
+        marker = raw.find("EPUB/")
+        if marker > 0:
+            candidates.append(raw[marker:])
+        for relative in candidates:
+            candidate = (root / relative).resolve()
+            if root == candidate or root not in candidate.parents:
+                continue
+            if candidate.is_file():
+                return candidate
+        # Some wrappers return only a member basename.  Accept it only when the
+        # match is unique, never guess between two identically named resources.
+        name = Path(raw).name
+        matches = [path for path in root.rglob(name) if path.is_file()] if name else []
+        return matches[0] if len(matches) == 1 else None
+
+    def _open_validation_location(self, member_path: str, line: int = 0, column: int = 0) -> bool:
+        local = self._resolve_package_member(member_path)
+        model = getattr(self, "_package_model", None)
+        if local is None or model is None:
+            notify(self, f"无法在当前 EPUB 包中定位：{member_path}", "warning")
+            return False
+        index = model.index(str(local))
+        if not index.isValid():
+            notify(self, f"无法在当前 EPUB 包中定位：{member_path}", "warning")
+            return False
+        self._set_epub_compact_mode(False)
+        self._left_tabs.setCurrentIndex(1)
+        self._package_tree.setCurrentIndex(index)
+        self._package_tree.scrollTo(index, QAbstractItemView.PositionAtCenter)
+        self._on_package_tree_click(index)
+        self._switch_preview("code")
+        if int(line or 0) > 0:
+            cursor = self._code_view.textCursor()
+            cursor.movePosition(QTextCursor.Start)
+            cursor.movePosition(QTextCursor.Down, QTextCursor.MoveAnchor, max(0, int(line) - 1))
+            if int(column or 0) > 1:
+                cursor.movePosition(QTextCursor.Right, QTextCursor.MoveAnchor, int(column) - 1)
+            self._code_view.setTextCursor(cursor)
+            self._code_view.centerCursor()
+            try:
+                relative = local.relative_to(Path(self._preview_extract_dir)).as_posix()
+            except Exception:
+                relative = local.name
+            self._preview_title.setText(f"{relative} · 行 {int(line)}")
+        self._code_view.setFocus(Qt.OtherFocusReason)
+        return True
 
     def _set_epub_compact_mode(self, compact: bool) -> None:
         compact = bool(compact)
@@ -745,6 +828,7 @@ class EPUBTab(QWidget):
 
     def clear_doc(self):
         self._document_generation += 1
+        self._clear_validation_report()
         self._doc = None
         self._source_kind = ""
         self._source_label = "未选择正文"
@@ -767,6 +851,7 @@ class EPUBTab(QWidget):
 
     def set_doc(self, doc: UnifiedDocument, source_kind: str = ""):
         self._document_generation += 1
+        self._clear_validation_report()
         self._doc = doc
         if source_kind:
             self._source_kind = source_kind
@@ -1092,7 +1177,102 @@ class EPUBTab(QWidget):
         # Only fall back when the EPUB workspace has never received a document;
         # never replace an explicitly selected AI/document version.
         if doc is None and main_win is not None:
+            # A restored project document can still be pending when EPUB is
+            # entered through a shortcut or a fast workspace switch. Hydrate
+            # it before deciding that OCR/formatting has not produced text.
+            ensure_hydrated = getattr(main_win, "_ensure_project_document_hydrated", None)
+            if callable(ensure_hydrated):
+                try:
+                    ensure_hydrated("epub")
+                except Exception:
+                    pass
             doc = getattr(main_win, "_doc", None)
+
+        # Multi-model OCR intentionally stays in the comparison workspace until
+        # the user applies the fused manuscript. Importing an AI package adds
+        # decisions to that workspace without mutating raw OCR or publishing a
+        # downstream document. If EPUB is requested first, offer the existing
+        # explicit "apply whole book" action here so the user can continue the
+        # requested export without having to discover the handoff button.
+        current_stage = str(getattr(main_win, "_current_stage", "") or "") if main_win is not None else ""
+        source_kind = str(getattr(self, "_source_kind", "") or "")
+        stale_export = bool(getattr(main_win, "_ocr_fusion_export_stale", False)) if main_win is not None else False
+        if (
+            doc is not None
+            and stale_export
+            and source_kind in {"ocr", "format", "formatter", ""}
+            and source_kind != "ocr_auto_fusion"
+        ):
+            QMessageBox.warning(
+                self,
+                "正文版本已过期",
+                "刚导入的新 OCR 裁决尚未应用到当前 Formatter/EPUB 正文。为保留当前正文上的格式与手动编辑，"
+                "这里不会自动覆盖它。请回到 OCR 对比点击“应用整本”；若需要格式处理，再重新处理后生成 EPUB。",
+            )
+            return
+        unapplied_multi_fusion = bool(
+            doc is not None
+            and (
+                source_kind == "ocr_auto_fusion"
+                or (not source_kind and current_stage == "ocr_auto_fusion")
+            )
+        )
+        if (doc is None or unapplied_multi_fusion) and main_win is not None:
+            get_loaded = getattr(main_win, "_lazy_workspace_if_loaded", None)
+            compare = get_loaded("ocr_compare") if callable(get_loaded) else None
+            if (
+                compare is not None
+                and str(getattr(compare, "_mode", "")) == "multi"
+                and getattr(compare, "_comparison", None) is not None
+                and getattr(compare, "_primary_doc", None) is not None
+            ):
+                states = list(getattr(compare, "_fusion_states", []) or [])
+                comparison_rows = list(getattr(compare._comparison, "rows", []) or [])
+                if not states or len(states) != len(comparison_rows):
+                    QMessageBox.warning(
+                        self,
+                        "融合裁决状态未就绪",
+                        "当前 OCR 对比的候选状态尚未完整恢复。请回到 OCR 对比等待裁决状态载入后再生成 EPUB。",
+                    )
+                    return
+                unresolved = sum(1 for state in states if bool(getattr(state, "unresolved", False)))
+                if unresolved:
+                    QMessageBox.warning(
+                        self,
+                        "融合稿仍有待裁决内容",
+                        f"当前还有 {unresolved} 句未完成选择。请回到 OCR 对比完成裁决，再应用整本并生成 EPUB。",
+                    )
+                    return
+                answer = QMessageBox.question(
+                    self,
+                    "应用多模型融合稿",
+                    "当前多模型 OCR 和导入的 AI 裁决还保存在 OCR 对比中，尚未应用到 Formatter/EPUB。\n\n"
+                    "先将当前完整融合稿应用到 Formatter/EPUB，再继续生成吗？\n"
+                    "原始 OCR 与裁决记录会保留。",
+                    QMessageBox.Yes | QMessageBox.No,
+                    QMessageBox.Yes,
+                )
+                if answer != QMessageBox.Yes:
+                    return
+                apply_result = getattr(compare, "_apply_result", None)
+                if callable(apply_result):
+                    apply_result()
+                applied_stage = str(getattr(main_win, "_current_stage", "") or "")
+                applied_source = str(getattr(self, "_source_kind", "") or "")
+                doc = self._doc
+                if doc is None or applied_source == "ocr_auto_fusion" or applied_stage == "ocr_auto_fusion":
+                    # The comparison owner has already shown its own specific
+                    # validation error (for example, a changed alignment). Do
+                    # not fall back to the still-unapplied raw OCR snapshot.
+                    return
+            elif unapplied_multi_fusion:
+                QMessageBox.warning(
+                    self,
+                    "多模型 OCR 尚未应用",
+                    "当前正文仍是未应用的多模型 OCR 原始融合稿。请先打开 OCR 对比，"
+                    "恢复裁决状态并点击“应用整本”，再生成 EPUB；避免把未裁决的原始融合稿误导出。",
+                )
+                return
 
         # Page classifications are a lightweight independent overlay. Sync them
         # into a copy before taking the final build snapshot.
@@ -1105,10 +1285,15 @@ class EPUBTab(QWidget):
                 )
 
         if doc is None:
-            QMessageBox.warning(self, "错误", "请先完成 OCR 和格式处理")
+            QMessageBox.warning(
+                self,
+                "没有可导出的正文",
+                "当前没有可导出的正文。请在 OCR 对比中应用单 OCR/多模型融合稿，"
+                "或在 Formatter 载入并应用正文后再导出。",
+            )
             return
 
-        doc = copy.deepcopy(doc)
+        doc = doc.snapshot_clone()
 
         from utils.publication_preflight import inspect_document_for_publication
         preflight = inspect_document_for_publication(doc)
@@ -1160,6 +1345,7 @@ class EPUBTab(QWidget):
         build_generation = self._build_generation
         document_generation = self._document_generation
         self._set_build_running(True)
+        self._clear_validation_report()
 
         title = self._title_edit.text().strip() or Path(path).stem
         if not self._title_edit.text().strip():
@@ -1280,6 +1466,9 @@ class EPUBTab(QWidget):
         self._stat_labels["size"][0].setText(f"{size_kb} KB")
         self._stat_labels["status"][0].setText("✓ 完成")
         self._stat_labels["status"][0].setStyleSheet(f"font-size: 16px; font-weight: bold; color: {SUCCESS};")
+        self._last_validation_info = dict(info)
+        if getattr(self, "_validation_details_btn", None) is not None:
+            self._validation_details_btn.setEnabled(True)
         self._refresh_compact_epub_summary()
         for name, label in getattr(self, "_compact_checks", {}).items():
             if name != "EPUBCheck":
@@ -1359,4 +1548,3 @@ class EPUBTab(QWidget):
             import traceback
             print("[EPUB PREVIEW TREE ERROR]", traceback.format_exc())
             self._reset_package_browser(f"EPUB 已生成，但预览读取失败：{exc}")
-

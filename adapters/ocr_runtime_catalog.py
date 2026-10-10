@@ -238,6 +238,65 @@ def _manga_48px_effective_python() -> tuple[Path | None, str]:
     return None, ""
 
 
+def _hayai_effective_python(component_id: str = "hayai_ocr") -> tuple[Path | None, str]:
+    """Return the Python interpreter the Hayai adapter can *actually* use.
+
+    The desktop install normally uses Novel Formatter's persistent private
+    Hayai venv.  Offline/cloud bundles may deliberately pre-provision the exact
+    pinned Hayai runtime in the current interpreter instead.  The adapter has
+    supported that fast path for a while, but the GUI runtime catalog used to
+    look only for the private venv, which produced a false "需要安装 OCR 模型"
+    prompt immediately before a worker that would have started successfully.
+
+    Keep LiteRT conservative: unlike the PyTorch backend, it still requires its
+    dedicated dependency set unless the user explicitly points at a compatible
+    interpreter.
+    """
+    candidates: list[tuple[Path, str]] = []
+    explicit = os.environ.get("NOVEL_FORMATTER_HAYAI_OCR_PYTHON", "").strip()
+    if explicit:
+        candidates.append((Path(explicit).expanduser(), "explicit"))
+    if component_id == "hayai_ocr":
+        candidates.append((Path(sys.executable).resolve(), "current"))
+    private = _venv_python_path(component_id)
+    if private is not None:
+        candidates.append((private, "private"))
+
+    seen: set[str] = set()
+    for python, source in candidates:
+        key = str(python)
+        if key in seen or not python.is_file():
+            continue
+        seen.add(key)
+        if component_id == "hayai_ocr_litert":
+            marker = (
+                "import importlib.util; from importlib.metadata import version; "
+                "v=version('hayai-ocr'); t=version('transformers'); "
+                "maj,minr=(int(x) for x in t.split('+',1)[0].split('.')[:2]); "
+                f"assert v=={HAYAI_OCR_RUNTIME_VERSION!r}; assert maj==4 and minr>=49; "
+                "assert importlib.util.find_spec('ai_edge_litert') is not None"
+            )
+        else:
+            marker = (
+                "from importlib.metadata import version; "
+                "v=version('hayai-ocr'); t=version('transformers'); "
+                "maj,minr=(int(x) for x in t.split('+',1)[0].split('.')[:2]); "
+                f"assert v=={HAYAI_OCR_RUNTIME_VERSION!r}; assert maj==4 and minr>=49"
+            )
+        try:
+            proc = subprocess.run(
+                [str(python), "-c", marker],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                timeout=10,
+            )
+        except Exception:
+            continue
+        if proc.returncode == 0:
+            return python, source
+    return None, ""
+
+
 def _environment_installed(component_id: str, *, deep: bool = False) -> tuple[bool, str]:
     if component_id == "manga_48px":
         python, source = _manga_48px_effective_python()
@@ -256,6 +315,13 @@ def _environment_installed(component_id: str, *, deep: bool = False) -> tuple[bo
                 return False, f"48px 环境存在但无法导入：{detail}"
         return True, f"48px 运行环境已验证（{source}: {python}）"
     python = _venv_python_path(component_id)
+    python_source = "private"
+    if python is None and component_id in {"hayai_ocr", "hayai_ocr_litert"}:
+        # The adapter's offline/cloud fast path may intentionally use the
+        # already-provisioned current interpreter.  Prefer the traditional
+        # private venv when it exists so version-mismatch diagnostics remain
+        # precise and unchanged for normal desktop installs.
+        python, python_source = _hayai_effective_python(component_id)
     if python is None:
         return False, "未找到独立运行环境"
 
@@ -291,7 +357,10 @@ def _environment_installed(component_id: str, *, deep: bool = False) -> tuple[bo
                 f"当前项目固定要求 {HAYAI_OCR_RUNTIME_VERSION}"
             )
         if not deep:
-            return True, f"Hayai OCR {HAYAI_OCR_RUNTIME_VERSION} 运行环境已安装"
+            return True, (
+                f"Hayai OCR {HAYAI_OCR_RUNTIME_VERSION} 运行环境已安装"
+                f"（{python_source}: {python}）"
+            )
 
     markers = _PACKAGE_MARKERS.get(component_id, ())
     if markers and not all(_module_marker_exists(component_id, marker) for marker in markers):
@@ -455,6 +524,23 @@ def _hayai_processor_cache_complete(root: Path) -> bool:
         return False
     return False
 
+
+def _hayai_direct_processor_complete(root: Path) -> bool:
+    """Accept an explicitly materialized local SigLIP2 processor directory.
+
+    Cloud/offline bundles do not need to imitate Hugging Face's hashed cache
+    hierarchy.  A normal local ``from_pretrained(path, local_files_only=True)``
+    directory is equally valid and is how the validated cloud bundle stores
+    SigLIP2 next to the local Hayai model.
+    """
+    if not root.exists():
+        return False
+    try:
+        config = root / "preprocessor_config.json"
+        return config.is_file() and config.stat().st_size >= 2
+    except OSError:
+        return False
+
 def _hayai_torch_cache_complete(root: Path) -> bool:
     if not root.exists():
         return False
@@ -556,9 +642,25 @@ def _model_cache_ready(component_id: str) -> tuple[bool, str]:
         ).strip() or "JustANormalTinkerer/hayai-ocr-v2.5-nova"
         local_model = Path(model_name).expanduser()
         local_model_ready = local_model.exists() and _hayai_torch_cache_complete(local_model)
+        local_processor_candidates: list[Path] = []
+        processor_override = os.environ.get("NOVEL_FORMATTER_HAYAI_SIGLIP2_MODEL", "").strip()
+        if processor_override:
+            local_processor_candidates.append(Path(processor_override).expanduser())
+        if local_model.exists():
+            # Validated offline bundles keep the two local repositories as
+            # siblings under one runtime root.
+            local_processor_candidates.append(
+                local_model.parent / "siglip2-base-patch16-naflex-local"
+            )
+        local_processor_ready = any(
+            _hayai_direct_processor_complete(path)
+            for path in local_processor_candidates
+        )
+        if local_model_ready and local_processor_ready:
+            return True, "检测到完整本地 Hayai OCR 权重与 SigLIP2 processor"
         repo_dir = _hf_repo_dir(model_name) if not local_model.exists() else ""
         any_model_ready = bool(local_model_ready)
-        any_processor_ready = False
+        any_processor_ready = bool(local_processor_ready)
         for cache_root in cache_roots:
             processor_ready = _hayai_processor_cache_complete(cache_root)
             any_processor_ready = any_processor_ready or processor_ready
@@ -685,6 +787,8 @@ def _runtime_python_exists(component_id: str) -> bool:
     """Check the effective runtime while preserving legacy test/plugin hooks."""
     if component_id == "manga_48px":
         return _manga_48px_effective_python()[0] is not None
+    if component_id in {"hayai_ocr", "hayai_ocr_litert"}:
+        return _hayai_effective_python(component_id)[0] is not None
     return _venv_python_exists(COMPONENTS[component_id].venv_dir)
 
 

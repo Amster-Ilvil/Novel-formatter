@@ -113,7 +113,6 @@ _ENGINE_PROFILES: tuple[tuple[str, EngineProfile], ...] = (
     ("paddle_ocr", EngineProfile("paddle_ocr", 0.030, True)),
     ("paddle_structure", EngineProfile("paddle_structure", 0.040, True)),
     ("ndlocr", EngineProfile("ndlocr_lite", 0.040, True)),
-    ("google_vision", EngineProfile("google_vision", 0.040, True)),
     ("apple_vision", EngineProfile("apple_vision", 0.035, True, False)),
     # Hayai v2.1 also returns generated sequence text without calibrated token probabilities.
     # Treat its score as heuristic evidence only; cross-engine/stability gates remain authoritative.

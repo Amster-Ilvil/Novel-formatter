@@ -7,11 +7,25 @@ from pathlib import Path
 
 from PySide6.QtCore import Qt
 from PySide6.QtGui import QCursor, QImage, QImageReader
-from PySide6.QtWidgets import QDialog, QLabel, QMessageBox, QPushButton, QVBoxLayout
+from PySide6.QtWidgets import QApplication, QDialog, QLabel, QMessageBox, QPushButton, QVBoxLayout, QHBoxLayout
 
 from ui.common.styling import MUTED
 from ui.dialogs import show_error_dialog
 from ui.ocr.preview import OCRCropPreview
+from ui.localization import LANG_ZH, normalize_language, translate_text
+
+
+def _ui_language() -> str:
+    app = QApplication.instance()
+    return normalize_language(app.property("nfLanguage") if app is not None else LANG_ZH)
+
+
+def _tr_ui(value: str) -> str:
+    return translate_text(str(value or ""), _ui_language())
+
+
+def _trf_ui(template: str, **values) -> str:
+    return _tr_ui(template).format(**values)
 
 
 class OCRPreviewController:
@@ -37,23 +51,26 @@ class OCRPreviewController:
             self._live_preview_enabled_event.set()
             restored_tip = self._preview_filename_lbl.toolTip()
             for prefix in (
-                "实时预览已关闭；OCR 仍在后台正常运行。",
-                "实时预览已关闭；不会生成或刷新新的预览图。",
+                _tr_ui("实时预览已关闭；OCR 仍在后台正常运行。"),
+                _tr_ui("实时预览已关闭；不会生成或刷新新的预览图。"),
             ):
                 if restored_tip.startswith(prefix):
-                    restored_tip = restored_tip[len(prefix):]
+                    restored_tip = restored_tip[len(prefix):].lstrip("\r\n")
             self._preview_filename_lbl.setToolTip(restored_tip)
-            if "实时预览已关闭" in self._preview_filename_lbl.text():
-                self._preview_filename_lbl.setText("当前图片：等待下一张识别图片…")
+            closed_marker = _tr_ui("实时预览已关闭")
+            if closed_marker in self._preview_filename_lbl.text() or "实时预览已关闭" in self._preview_filename_lbl.text():
+                self._preview_filename_lbl.setText(_tr_ui("当前图片：等待下一张识别图片…"))
         else:
             self._live_preview_enabled_event.clear()
             # Do not erase the crop rectangle or retained history: both are
             # independent features.  Merely stop following/adding new pages.
             self._preview_follow_latest = False
             current_tip = self._preview_filename_lbl.toolTip()
-            if not current_tip.startswith("实时预览已关闭；"):
+            closed_prefix = _tr_ui("实时预览已关闭；")
+            if not current_tip.startswith(closed_prefix):
+                status_tip = _tr_ui("实时预览已关闭；OCR 仍在后台正常运行。")
                 self._preview_filename_lbl.setToolTip(
-                    "实时预览已关闭；OCR 仍在后台正常运行。" + current_tip
+                    status_tip + (("\n" + current_tip) if current_tip else "")
                 )
         self._update_preview_navigation()
 
@@ -292,13 +309,13 @@ class OCRPreviewController:
         if manual:
             self._preview_follow_latest = index == len(self._preview_items) - 1
         stage_names = {
-            "split": "分列检测",
-            "recognition": "识别完成",
-            "plain": "识别完成",
+            "split": _tr_ui("分列检测"),
+            "recognition": _tr_ui("识别完成"),
+            "plain": _tr_ui("识别完成"),
         }
         display_name = str(item.get("name") or Path(path).name)
-        stage_text = stage_names.get(str(item.get("stage") or ""), "实时预览")
-        self._preview_filename_lbl.setText(f"当前图片：{display_name}")
+        stage_text = stage_names.get(str(item.get("stage") or ""), _tr_ui("实时预览"))
+        self._preview_filename_lbl.setText(_trf_ui("当前图片：{display_name}", display_name=display_name))
         self._preview_filename_lbl.setToolTip(str(item.get("source_path") or path))
         self._preview_page_lbl.setToolTip(stage_text)
         self._update_preview_navigation()
@@ -451,7 +468,7 @@ class OCRPreviewController:
             self._preview_source_path = None
             self._active_preview_source_path = None
             self._preview.clear_preview()
-            self._preview_filename_lbl.setText("当前图片：尚未载入")
+            self._preview_filename_lbl.setText(_tr_ui("当前图片：尚未载入"))
             self._preview_filename_lbl.setToolTip("")
 
     def _load_preview_reference(self):
@@ -465,7 +482,7 @@ class OCRPreviewController:
         self._active_preview_source_path = None
         if not self._pending_inputs:
             if not self._preview_items:
-                self._preview_filename_lbl.setText("当前图片：尚未载入")
+                self._preview_filename_lbl.setText(_tr_ui("当前图片：尚未载入"))
             return
 
         image_exts = {'.png', '.jpg', '.jpeg', '.heic', '.tif', '.tiff', '.bmp', '.gif'}
@@ -494,9 +511,9 @@ class OCRPreviewController:
         if not self._preview_items:
             self._preview.set_image(self._preview_source_path)
             reference_name = Path(self._preview_source_path).name
-            self._preview_filename_lbl.setText(f"当前图片：{reference_name}")
+            self._preview_filename_lbl.setText(_trf_ui("当前图片：{display_name}", display_name=reference_name))
             self._preview_filename_lbl.setToolTip(self._preview_source_path)
-            self._preview_page_lbl.setText("输入参考图")
+            self._preview_page_lbl.setText(_tr_ui("输入参考图"))
 
 
     def _current_column_preview_context(self) -> tuple[str | None, list, str, str]:
@@ -553,10 +570,10 @@ class OCRPreviewController:
         )
         crop_rect = self._preview.get_crop_rect()
         if not source_path:
-            QMessageBox.warning(self, "无法预览", "请先选择图片或 PDF。")
+            QMessageBox.warning(self, _tr_ui("无法预览"), _tr_ui("请先选择图片或 PDF。"))
             return
         if crop_rect is None:
-            QMessageBox.warning(self, "请先固定正文区域", "请先在右侧图片上拖框选定纯正文区域，再预览分列。")
+            QMessageBox.warning(self, _tr_ui("请先固定正文区域"), _tr_ui("请先在右侧图片上拖框选定纯正文区域，再预览分列。"))
             return
         try:
             import io
@@ -603,8 +620,8 @@ class OCRPreviewController:
                 if not columns:
                     QMessageBox.warning(
                         self,
-                        "未检测到竖列",
-                        "当前固定区域没有检测到稳定竖列。请重新框选纯正文区域，或提高分列灵敏度。",
+                        _tr_ui("未检测到竖列"),
+                        _tr_ui("当前固定区域没有检测到稳定竖列。请重新框选纯正文区域，或提高分列灵敏度。"),
                     )
                     return
                 with Image.open(cropped_path) as src:
@@ -612,7 +629,7 @@ class OCRPreviewController:
                 annotated = source.copy()
                 draw = ImageDraw.Draw(annotated)
                 # Draw the two geometry layers that matter when diagnosing
-                # omissions.  Green = detector box.  Blue = the larger native-
+                # omissions.  Red = detector box.  Green = the larger native-
                 # pixel source reveal actually preserved for OCR before Ruby is
                 # blanked and recognizer-specific white context is added.
                 line_width = 1
@@ -626,7 +643,7 @@ class OCRPreviewController:
                     input_bottom = min(annotated.height - 1, int(in_bottom) - 1 + preview_outset)
                     draw.rectangle(
                         (input_left, input_top, input_right, input_bottom),
-                        outline=(22, 119, 255),
+                        outline=(34, 197, 94),
                         width=line_width,
                     )
                     det_left, det_top, det_right, det_bottom = _column_detector_preview_bounds(column)
@@ -646,7 +663,7 @@ class OCRPreviewController:
                 for index, frame_left, frame_top, frame_right, frame_bottom in column_frames:
                     draw.rectangle(
                         (frame_left, frame_top, frame_right, frame_bottom),
-                        outline=(34, 197, 94),
+                        outline=(220, 38, 38),
                         width=line_width,
                     )
                     label_text = str(index)
@@ -663,73 +680,132 @@ class OCRPreviewController:
                          label_x + label_width + 2, label_y + label_height + 1),
                         fill=(255, 255, 255),
                     )
-                    draw.text((label_x, label_y), label_text, fill=(17, 130, 68))
+                    draw.text((label_x, label_y), label_text, fill=(220, 38, 38))
                 runtime_options = self._column_runtime_options_snapshot()
                 preserve_body_pixels = bool(
                     runtime_options.get("column_preserve_body_pixels", False)
                 )
                 engine_key = str(getattr(self, "_active_adapter", "apple_vision") or "apple_vision").lower()
                 viewport_mode = _recognizer_viewport_mode(engine_key)
-                masked = _column_visibility_viewport(
-                    source,
-                    columns[0],
-                    mode=viewport_mode,
-                    preserve_body_pixels=preserve_body_pixels,
-                )
-                if engine_key == "ndlocr_lite":
-                    centered = _center_wide_column_viewport(masked, columns[0].width)
-                    mode_label = "NDLOCR 整列上下文"
-                elif engine_key in {"apple_vision", "macocr", "mac_ocr", "macos_ocr"} or str(
-                    runtime_options.get("column_isolation_mode", "mask") or "mask"
-                ).strip().lower() == "display":
-                    centered = _tighten_ink_framing(masked, columns[0].width)
-                    mode_label = "单列原像素视窗"
-                else:
-                    centered = masked
-                    mode_label = f"单列 {viewport_mode} 视窗"
-                if centered is not masked:
+                gap = max(12, round(source.width * 0.02))
+                column_preview_payloads: list[tuple[bytes, tuple[int, int], str]] = []
+                for column in columns:
+                    masked = _column_visibility_viewport(
+                        source,
+                        column,
+                        mode=viewport_mode,
+                        preserve_body_pixels=preserve_body_pixels,
+                    )
+                    if engine_key == "ndlocr_lite":
+                        centered = _center_wide_column_viewport(masked, column.width)
+                        mode_label = "NDLOCR 整列上下文"
+                    elif engine_key in {"apple_vision", "macocr", "mac_ocr", "macos_ocr"} or str(
+                        runtime_options.get("column_isolation_mode", "mask") or "mask"
+                    ).strip().lower() == "display":
+                        centered = _tighten_ink_framing(masked, column.width)
+                        mode_label = "单列原像素视窗"
+                    else:
+                        centered = masked
+                        mode_label = _trf_ui("单列 {viewport_mode} 视窗", viewport_mode=viewport_mode)
+                    if centered is not masked:
+                        masked.close()
+                        masked = centered
+                    preview = Image.new("RGB", (source.width * 2 + gap, source.height), "white")
+                    preview.paste(annotated, (0, 0))
+                    right_x = source.width + gap + max(0, (source.width - masked.width) // 2)
+                    right_y = max(0, (source.height - masked.height) // 2)
+                    preview.paste(masked, (right_x, right_y))
+                    actual_input_size = masked.size
+                    preview.thumbnail((1800, 1900), Image.Resampling.LANCZOS)
+                    data = io.BytesIO()
+                    preview.save(data, format="PNG")
+                    column_preview_payloads.append((data.getvalue(), actual_input_size, mode_label))
+                    preview.close()
                     masked.close()
-                    masked = centered
-                gap = max(12, round(source.width*0.02))
-                preview = Image.new("RGB", (source.width*2+gap, source.height), "white")
-                preview.paste(annotated,(0,0))
-                right_x = source.width + gap + max(0, (source.width - masked.width) // 2)
-                right_y = max(0, (source.height - masked.height) // 2)
-                preview.paste(masked,(right_x,right_y))
-                actual_input_size = masked.size
-                preview.thumbnail((1800,1900), Image.Resampling.LANCZOS)
-                data = io.BytesIO(); preview.save(data,format="PNG")
-                preview.close(); masked.close(); annotated.close(); source.close()
+                annotated.close()
+                source.close()
 
-            qimage = QImage.fromData(data.getvalue(), "PNG")
-            if qimage.isNull():
-                raise RuntimeError("分列预览图生成失败")
+            if not column_preview_payloads:
+                raise RuntimeError(_tr_ui("分列预览图生成失败"))
             dialog = QDialog(self)
             page_name = Path(str(source_path)).name
-            dialog.setWindowTitle(f"分列输入预览 · {page_name} · {len(columns)} 列")
+            dialog.setWindowTitle(
+                _trf_ui(
+                    "分列输入预览 · {page_name} · {column_count} 列",
+                    page_name=page_name,
+                    column_count=len(columns),
+                )
+            )
             dialog.resize(980, 760)
             layout = QVBoxLayout(dialog)
-            sync_note = (
+            sync_note = _tr_ui(
                 "已复用当前实时预览页的同一组物理列；"
-                if reused_live_columns else "当前页尚无实时分列结果，已按现有参数重新检测；"
+                if reused_live_columns
+                else "当前页尚无实时分列结果，已按现有参数重新检测；"
             )
-            info = QLabel(
-                f"页面：{page_name}。{sync_note}"
-                f"左侧绿色实线为检测框、蓝色框为 OCR 输入原像素范围，按日文阅读顺序从右到左编号，共 {len(columns)} 列；"
-                f"右侧展示当前实际输入：{mode_label}，尺寸 {actual_input_size[0]}×{actual_input_size[1]}。"
-                "蓝框之外仍可存在纯白安全槽上下文；目标正文保持原始像素，其他列与 Ruby 均被纸白色隔离。"
-            )
+            info = QLabel()
             info.setWordWrap(True)
             info.setStyleSheet(f"color: {MUTED}; padding: 6px;")
             layout.addWidget(info)
             image_label = OCRCropPreview()
             image_label.setCursor(QCursor(Qt.ArrowCursor))
             image_label.setAttribute(Qt.WA_TransparentForMouseEvents)
-            image_label.set_image_data(qimage)
             layout.addWidget(image_label, 1)
-            close_btn = QPushButton("关闭")
+
+            column_nav = QHBoxLayout()
+            column_nav.setContentsMargins(0, 0, 0, 0)
+            column_nav.setSpacing(8)
+            prev_column_btn = QPushButton(_tr_ui("← 上一列"))
+            next_column_btn = QPushButton(_tr_ui("下一列 →"))
+            column_counter = QLabel()
+            column_counter.setAlignment(Qt.AlignCenter)
+            column_counter.setStyleSheet("font-weight:700;color:#334155;")
+            column_nav.addWidget(prev_column_btn)
+            column_nav.addWidget(column_counter, 1)
+            column_nav.addWidget(next_column_btn)
+            layout.addLayout(column_nav)
+
+            current_column = [0]
+
+            def show_column(column_index: int) -> None:
+                index = max(0, min(int(column_index), len(column_preview_payloads) - 1))
+                payload, actual_input_size, mode_label = column_preview_payloads[index]
+                qimage = QImage.fromData(payload, "PNG")
+                if qimage.isNull():
+                    raise RuntimeError(_tr_ui("分列预览图生成失败"))
+                current_column[0] = index
+                image_label.set_image_data(qimage)
+                info.setText(
+                    _trf_ui(
+                        "页面：{page_name}。{sync_note}"
+                        "左侧红色实线为检测框、绿色实线为 OCR 输入原像素范围，按日文阅读顺序从右到左编号，共 {column_count} 列；"
+                        "右侧展示当前实际输入：{mode_label}，尺寸 {width}×{height}。"
+                        "绿色输入框之外仍可存在纯白安全槽上下文；目标正文保持原始像素，其他列与 Ruby 均被纸白色隔离。",
+                        page_name=page_name,
+                        sync_note=sync_note,
+                        column_count=len(columns),
+                        mode_label=_tr_ui(mode_label),
+                        width=actual_input_size[0],
+                        height=actual_input_size[1],
+                    )
+                )
+                column_counter.setText(
+                    _trf_ui(
+                        "第 {current} / {total} 列 · 右→左",
+                        current=index + 1,
+                        total=len(column_preview_payloads),
+                    )
+                )
+                prev_column_btn.setEnabled(index > 0)
+                next_column_btn.setEnabled(index + 1 < len(column_preview_payloads))
+
+            prev_column_btn.clicked.connect(lambda: show_column(current_column[0] - 1))
+            next_column_btn.clicked.connect(lambda: show_column(current_column[0] + 1))
+            show_column(0)
+
+            close_btn = QPushButton(_tr_ui("关闭"))
             close_btn.clicked.connect(dialog.accept)
             layout.addWidget(close_btn)
             dialog.exec()
         except Exception as exc:
-            show_error_dialog(self, "分列预览失败", str(exc))
+            show_error_dialog(self, _tr_ui("分列预览失败"), str(exc))

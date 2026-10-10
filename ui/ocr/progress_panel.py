@@ -2,9 +2,9 @@ from __future__ import annotations
 
 from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QGridLayout, QLabel, QPushButton,
-    QCheckBox, QSizePolicy, QProgressBar, QPlainTextEdit, QTextEdit,
+    QCheckBox, QSizePolicy, QProgressBar, QPlainTextEdit, QTextEdit, QStyle,
 )
-from PySide6.QtCore import Qt
+from PySide6.QtCore import Qt, QSize
 from PySide6.QtGui import QAction
 
 from ui.common.styling import ACC, BORDER, CARD, INK, MUTED, TONAL, LIGHT_LOG_STYLE, accent_button, make_separator
@@ -55,6 +55,19 @@ def build_ocr_progress_panel(tab, main_v):
     log_title = QLabel("OCR 日志")
     log_title.setStyleSheet(f"color: {INK}; font-size: 14px; font-weight: 700;")
     log_header.addWidget(log_title)
+
+    # When the user scrolls away from the tail, make the paused follow state
+    # visible instead of silently leaving the console behind.  The button is
+    # intentionally compact and only appears while history is being inspected.
+    self._ocr_log_resume_tail_btn = QPushButton("↓ 最新日志")
+    self._ocr_log_resume_tail_btn.setObjectName("ocrLogResumeTailButton")
+    self._ocr_log_resume_tail_btn.setProperty("role", "secondary")
+    self._ocr_log_resume_tail_btn.setMinimumHeight(28)
+    self._ocr_log_resume_tail_btn.setMaximumHeight(30)
+    self._ocr_log_resume_tail_btn.setToolTip("回到 OCR 日志底部并恢复自动跟随最新输出")
+    self._ocr_log_resume_tail_btn.setVisible(False)
+    log_header.addWidget(self._ocr_log_resume_tail_btn)
+
     self._ocr_log_collapse_action = QAction("收起日志", bottom)
     self._ocr_log_collapse_action.triggered.connect(
         lambda: self._set_ocr_log_collapsed(not getattr(self, "_ocr_log_collapsed", False))
@@ -87,7 +100,11 @@ def build_ocr_progress_panel(tab, main_v):
     log_header.addWidget(self._progress_display_cb)
 
     self._pause_btn = QPushButton("停止 OCR")
+    self._pause_btn.setObjectName("ocrStopButton")
     self._pause_btn.setProperty("role", "secondary")
+    self._pause_btn.setIcon(self.style().standardIcon(QStyle.SP_MediaStop))
+    self._pause_btn.setIconSize(QSize(15, 15))
+    self._pause_btn.setAccessibleName("停止 OCR")
     preserve_button_text(self._pause_btn)
     self._pause_btn.setMinimumWidth(112)
     self._pause_btn.setMinimumHeight(36)
@@ -141,16 +158,34 @@ def build_ocr_progress_panel(tab, main_v):
     self._log_view = QPlainTextEdit()
     self._log_view.setReadOnly(True)
     self._log_view.setStyleSheet(LIGHT_LOG_STYLE)
+    self._ocr_log_follow_tail = True
 
-    # During OCR the log follows the newest line explicitly. QPlainTextEdit's
-    # implicit append scrolling is not reliable after the user switched pages,
-    # selected text, or the document was updated in buffered batches.
+    # Follow the newest OCR line by default, but never fight a user who has
+    # intentionally scrolled upward to inspect history.  Returning to the
+    # bottom automatically re-enables tail-following.  This mirrors mature IDE
+    # / batch-OCR consoles: live by default, stable while reviewing history.
+    def _remember_ocr_log_scroll(value: int):
+        bar = self._log_view.verticalScrollBar()
+        self._ocr_log_follow_tail = bool(value >= max(0, bar.maximum() - 2))
+        self._ocr_log_resume_tail_btn.setVisible(not self._ocr_log_follow_tail)
+
+    def _resume_ocr_log_tail():
+        self._ocr_log_follow_tail = True
+        bar = self._log_view.verticalScrollBar()
+        bar.setValue(bar.maximum())
+        self._ocr_log_resume_tail_btn.setVisible(False)
+
     def _follow_ocr_log_tail():
         if not bool(getattr(self, "_ocr_run_active", False)):
             return
+        if not bool(getattr(self, "_ocr_log_follow_tail", True)):
+            return
         bar = self._log_view.verticalScrollBar()
         bar.setValue(bar.maximum())
+
+    self._log_view.verticalScrollBar().valueChanged.connect(_remember_ocr_log_scroll)
     self._log_view.textChanged.connect(_follow_ocr_log_tail)
+    self._ocr_log_resume_tail_btn.clicked.connect(_resume_ocr_log_tail)
     self._ocr_log_view_wrap = QWidget(self._ocr_log_body)
     log_view_layout = QVBoxLayout(self._ocr_log_view_wrap)
     log_view_layout.setContentsMargins(18, 0, 18, 14)

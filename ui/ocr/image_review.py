@@ -15,7 +15,7 @@ from PySide6.QtGui import QFont, QKeySequence, QShortcut, QDesktopServices, QTex
 from PySide6.QtWidgets import (
     QApplication, QWidget, QFrame, QVBoxLayout, QHBoxLayout, QGridLayout, QLabel, QPushButton,
     QToolButton, QMenu, QScrollArea, QSizePolicy, QSplitter, QTextEdit, QMessageBox,
-    QStackedWidget, QListView, QAbstractItemView,
+    QStackedWidget, QListView, QAbstractItemView, QLineEdit, QComboBox,
 )
 
 from models.document import UnifiedDocument
@@ -32,6 +32,7 @@ from ui.localized_dialogs import LocalizedMessageBox
 from ui.ocr.proofread_widgets import OCRProofreadImageLabel, OCRVerticalColumnTextWidget
 from ui.ocr.sentence_strip import SentenceStrip
 from ui.common.window_state import bind_splitter
+from ui.responsive import configure_combo
 from utils.async_generation import GenerationGuard
 
 # Preserve the GUI module's localized message-box behaviour after extraction.
@@ -40,6 +41,7 @@ QMessageBox = LocalizedMessageBox
 class _ImageReviewFusionCandidateCard(QFrame):
     """Full-width, fully visible OCR candidate used by 图文对照."""
 
+    drafted = Signal(int, str)
     chosen = Signal(int, str)
 
     def __init__(self, candidate_index: int, caption: str, text: str, *, confidence: float = 0.0, parent=None):
@@ -47,7 +49,7 @@ class _ImageReviewFusionCandidateCard(QFrame):
         self.candidate_index = int(candidate_index)
         self.candidate_text = str(text or "")
         self.setObjectName("imageReviewFusionCard")
-        self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Maximum)
         root = QVBoxLayout(self)
         root.setContentsMargins(10, 8, 10, 9)
         root.setSpacing(6)
@@ -56,21 +58,34 @@ class _ImageReviewFusionCandidateCard(QFrame):
             title += f" · {confidence:.0%}"
         self._caption = QLabel(title)
         self._caption.setWordWrap(False)
-        self._caption.setFixedHeight(24)
-        self._caption.setAlignment(Qt.AlignCenter)
+        self._caption.setFixedHeight(26)
+        self._caption.setAlignment(Qt.AlignLeft | Qt.AlignVCenter)
         self._caption.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Fixed)
         self._caption.setStyleSheet("font-size:11px;font-weight:700;color:#2559E0;")
-        root.addWidget(self._caption)
-        self._choose = QPushButton("使用此候选")
-        self._choose.setMinimumHeight(30)
+        self._draft = QPushButton("作为底稿")
+        self._draft.setMinimumHeight(28)
+        self._draft.setMaximumHeight(28)
+        self._draft.setToolTip("复制到手动编辑框；不会保存、不会跳转")
+        self._draft.clicked.connect(self._emit_drafted)
+        self._choose = QPushButton("直接采用并下一条")
+        self._choose.setMinimumHeight(28)
+        self._choose.setMaximumHeight(28)
+        self._choose.setToolTip("直接完成当前裁决并进入下一条 OCR 分歧")
         self._choose.clicked.connect(self._emit_chosen)
+        head = QHBoxLayout()
+        head.setContentsMargins(0, 0, 0, 0)
+        head.setSpacing(8)
+        head.addWidget(self._caption, 1)
+        head.addWidget(self._draft, 0)
+        head.addWidget(self._choose, 0)
+        root.addLayout(head)
         # Fully expand wrapped candidate text, as in OCR 对比.
         self._body = QTextEdit()
         self._body.setReadOnly(True)
         self._body.setAcceptRichText(True)
         self._body.setLineWrapMode(QTextEdit.WidgetWidth)
-        self._body.setMinimumSize(220, 64)
-        self._body.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        self._body.setMinimumSize(220, 54)
+        self._body.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
         self._body.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
         self._body.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
         self._body.setStyleSheet(
@@ -78,13 +93,12 @@ class _ImageReviewFusionCandidateCard(QFrame):
             "padding:8px;font-size:15px;color:#14202E;}" + EDITOR_SCROLLBAR_STYLE
         )
         root.addWidget(self._body, 1)
-        footer = QHBoxLayout()
-        footer.addStretch(1)
-        footer.addWidget(self._choose)
-        root.addLayout(footer)
         self.set_candidate(candidate_index, caption, text, confidence=confidence)
         self.set_reference_text("")
         self.set_selected(False)
+
+    def _emit_drafted(self) -> None:
+        self.drafted.emit(self.candidate_index, self.candidate_text)
 
     def _emit_chosen(self) -> None:
         self.chosen.emit(self.candidate_index, self.candidate_text)
@@ -140,11 +154,11 @@ class _ImageReviewFusionCandidateCard(QFrame):
         try:
             document = self._body.document()
             document.setTextWidth(float(max(1, self._body.viewport().width())))
-            height = max(64, int(math.ceil(document.size().height())) + 24)
+            height = max(54, int(math.ceil(document.size().height())) + 20)
             # Keep enough height for every wrapped line, while allowing the
             # candidate card's row to use the remaining comparison area.
-            if self._body.minimumHeight() != height:
-                self._body.setMinimumHeight(height)
+            if self._body.height() != height or self._body.minimumHeight() != height or self._body.maximumHeight() != height:
+                self._body.setFixedHeight(height)
         except RuntimeError:
             pass
 
@@ -152,18 +166,25 @@ class _ImageReviewFusionCandidateCard(QFrame):
         super().resizeEvent(event)
         QTimer.singleShot(0, self._fit_body_height)
 
+    def set_draft_source(self, active: bool) -> None:
+        self._draft.setText("✓ 手动编辑底稿" if active else "作为底稿")
+
     def set_selected(self, selected: bool) -> None:
         if selected:
             self.setStyleSheet(
                 "QFrame#imageReviewFusionCard{background:#E4EEFF;border:2px solid #2F6BFF;border-radius:10px;}"
             )
-            self._choose.setText("✓ 当前采用")
+            self._draft.setText("作为底稿")
+            self._draft.setEnabled(True)
+            self._choose.setText("✓ 已采用")
             self._choose.setEnabled(False)
         else:
             self.setStyleSheet(
                 "QFrame#imageReviewFusionCard{background:#F7F8FA;border:1px solid #D8DDE3;border-radius:10px;}"
             )
-            self._choose.setText("使用此候选")
+            self._draft.setText("作为底稿")
+            self._draft.setEnabled(True)
+            self._choose.setText("直接采用并下一条")
             self._choose.setEnabled(True)
 
 
@@ -176,6 +197,9 @@ class OCRImageTextReviewTab(QWidget):
     row_review_saved = Signal(object)
     # The exact MultiOcrRow index currently displayed.
     source_row_changed = Signal(int)
+    # View navigation only: return to OCR Compare's independent full overview
+    # at the same stable row.  This signal never confirms or applies a draft.
+    full_compare_requested = Signal(int)
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -232,6 +256,7 @@ class OCRImageTextReviewTab(QWidget):
         self._ocr_disagreement_indices: list[int] = []
         self._ocr_disagreement_source_indices: list[int] = []
         self._ocr_disagreement_source_row_order: tuple[int, ...] = ()
+        self._ocr_disagreement_source_order_synced = False
         self._pending_ocr_sync_rows: set[int] = set()
         self._pending_ocr_compare_decisions: dict[str, dict] = {}
         self._suppress_row_review_emit = False
@@ -286,10 +311,12 @@ class OCRImageTextReviewTab(QWidget):
         content_splitter.setChildrenCollapsible(False)
         content_splitter.setHandleWidth(REVIEW_COLUMN_GAP)
         content_splitter.setProperty("nfPreserveHandleWidth", True)
-        content_splitter.setStyleSheet("QSplitter::handle { background: transparent; }")
+        content_splitter.setStyleSheet("QSplitter::handle { background:#E3ECF7; border-radius:2px; margin:28px 1px; }")
 
         left_panel = QWidget()
         self._columns_panel = left_panel
+        left_panel.setMinimumWidth(210)
+        left_panel.setMaximumWidth(340)
         left_panel.setFixedWidth(REVIEW_LEFT_WIDTH)
         left_panel.setMinimumHeight(260)
         left_panel.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Expanding)
@@ -301,6 +328,11 @@ class OCRImageTextReviewTab(QWidget):
         columns_header = QHBoxLayout()
         columns_header.setContentsMargins(0, 0, 5, 0)
         columns_header.setSpacing(4)
+        columns_title = QLabel("OCR 竖列")
+        columns_title.setStyleSheet("font-weight: 700; font-size: 12px;")
+        columns_title.setMinimumHeight(27)
+        columns_header.addWidget(columns_title)
+        columns_header.addStretch(1)
         self._left_queue_btn = QToolButton(left_panel)
         self._left_queue_btn.setText("分歧队列")
         self._left_queue_btn.setCheckable(True)
@@ -318,17 +350,43 @@ class OCRImageTextReviewTab(QWidget):
         self._columns_state.setVisible(False)
         self._column_left_btn = QToolButton()
         self._column_left_btn.setText("←")
-        self._column_left_btn.setFixedSize(22, 27)
+        self._column_left_btn.setFixedSize(24, 27)
         self._column_left_btn.setToolTip("定位左侧物理列（⌥⇧←）")
         self._column_left_btn.clicked.connect(lambda: self._move_active_column(+1))
         columns_header.addWidget(self._column_left_btn)
         self._column_right_btn = QToolButton()
         self._column_right_btn.setText("→")
-        self._column_right_btn.setFixedSize(22, 27)
+        self._column_right_btn.setFixedSize(24, 27)
         self._column_right_btn.setToolTip("定位右侧物理列（⌥⇧→）")
         self._column_right_btn.clicked.connect(lambda: self._move_active_column(-1))
         columns_header.addWidget(self._column_right_btn)
         left_layout.addLayout(columns_header)
+        self._review_queue_filters = QWidget(left_panel)
+        queue_filters_layout = QVBoxLayout(self._review_queue_filters)
+        queue_filters_layout.setContentsMargins(0, 0, 0, 0)
+        queue_filters_layout.setSpacing(5)
+        self._review_queue_scope = QComboBox(self._review_queue_filters)
+        configure_combo(self._review_queue_scope)
+        self._review_queue_scope.addItem("全部分歧", "all")
+        self._review_queue_scope.addItem("待裁决", "pending")
+        self._review_queue_scope.addItem("三方分歧", "threeway")
+        self._review_queue_scope.addItem("空/占位符", "broken")
+        self._review_queue_scope.addItem("已修改", "changed")
+        self._review_queue_scope.addItem("已确认", "reviewed")
+        self._review_queue_scope.setMinimumHeight(27)
+        self._review_queue_scope.currentIndexChanged.connect(lambda _i: self._refresh_review_disagreement_queue())
+        queue_filters_layout.addWidget(self._review_queue_scope)
+        self._review_queue_search = QLineEdit(self._review_queue_filters)
+        self._review_queue_search.setClearButtonEnabled(True)
+        self._review_queue_search.setPlaceholderText("筛选页码 / 当前文本")
+        self._review_queue_search.setMinimumHeight(27)
+        self._review_queue_search.setStyleSheet(
+            "QLineEdit{border:1px solid #D7E3F4;border-radius:7px;padding:3px 8px;background:#FAFCFF;}"
+            "QLineEdit:focus{border-color:#4F7CFF;background:#FFFFFF;}"
+        )
+        self._review_queue_search.textChanged.connect(lambda _t: self._refresh_review_disagreement_queue())
+        queue_filters_layout.addWidget(self._review_queue_search)
+        left_layout.addWidget(self._review_queue_filters)
         self._left_review_stack = QStackedWidget(left_panel)
         self._review_disagreement_queue = QListView(self._left_review_stack)
         self._review_disagreement_queue.setUniformItemSizes(True)
@@ -347,10 +405,11 @@ class OCRImageTextReviewTab(QWidget):
         )
         self._review_disagreement_queue.setModel(self._review_disagreement_queue_model)
         self._review_disagreement_queue.clicked.connect(self._review_disagreement_item_clicked)
+        self._review_disagreement_queue.activated.connect(self._review_disagreement_item_clicked)
         self._left_review_stack.addWidget(self._review_disagreement_queue)
         self._columns_scroll = QScrollArea(self._left_review_stack)
         self._columns_scroll.setWidgetResizable(True)
-        self._columns_scroll.setAlignment(Qt.AlignLeft | Qt.AlignTop)
+        self._columns_scroll.setAlignment(Qt.AlignRight | Qt.AlignTop)
         self._columns_scroll.setFrameShape(QFrame.NoFrame)
         self._columns_scroll.setStyleSheet("QScrollArea { background: " + CARD + "; border: none; }")
         self._vertical_columns = OCRVerticalColumnTextWidget()
@@ -376,14 +435,19 @@ class OCRImageTextReviewTab(QWidget):
         image_title.setStyleSheet("font-weight: 700; font-size: 12px;")
         image_header.addWidget(image_title)
         self._image_state = QLabel("", image_card)
-        self._image_state.setStyleSheet(f"color: {MUTED}; font-size: 10px;")
+        self._image_state.setStyleSheet(f"color: {MUTED}; font-size: 9px;")
+        self._image_state.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
         self._image_state.setVisible(False)
-        self._open_preview_btn = QPushButton("用预览打开")
+        image_header.addStretch(1)
+        self._open_preview_btn = QPushButton("原尺寸查看")
         self._open_preview_btn.setFixedSize(96, 27)
         self._open_preview_btn.setToolTip("使用 macOS 预览打开当前句/列图片（⌥P）")
         self._open_preview_btn.clicked.connect(self._open_current_image_in_preview)
         image_header.addWidget(self._open_preview_btn)
         image_layout.addLayout(image_header)
+        self._image_interaction_hint = QLabel("拖动图片可定位物理列 · 蓝框=当前列 · Alt+P 原尺寸")
+        self._image_interaction_hint.setStyleSheet("color:#7B8797;font-size:8.5px;")
+        image_layout.addWidget(self._image_interaction_hint)
         self._image = OCRProofreadImageLabel()
         # The candidate comparison column needs most of the horizontal space;
         # keep enough width for a readable source crop while releasing the old
@@ -391,12 +455,7 @@ class OCRImageTextReviewTab(QWidget):
         self._image.setMinimumWidth(280)
         self._image.column_scrubbed.connect(self._scrub_image_to_column)
         image_layout.addWidget(self._image, 1)
-        self._review_right_split = QSplitter(Qt.Horizontal)
-        self._review_right_split.setChildrenCollapsible(False)
-        self._review_right_split.setHandleWidth(12)
-        self._review_right_split.setStyleSheet("QSplitter::handle { background: transparent; }")
-        self._review_right_split.addWidget(image_card)
-        right_layout.addWidget(self._review_right_split, 1)
+        right_layout.addWidget(image_card, 1)
 
         text_card = QWidget()
         text_card.setMinimumWidth(400)
@@ -412,8 +471,16 @@ class OCRImageTextReviewTab(QWidget):
         text_title.setStyleSheet("font-weight: 700; font-size: 12px;")
         text_title.setMinimumHeight(27)
         text_header.addWidget(text_title)
+        text_header.addStretch(1)
+        self._entry_status_badge = QLabel("待核对", text_card)
+        self._entry_status_badge.setAlignment(Qt.AlignCenter)
+        self._entry_status_badge.setMinimumWidth(62)
+        self._entry_status_badge.setFixedHeight(24)
+        text_header.addWidget(self._entry_status_badge)
         self._text_state = QLabel("", text_card)
-        self._text_state.setStyleSheet(f"color: {MUTED}; font-size: 10px;")
+        self._text_state.setStyleSheet(f"color: {MUTED}; font-size: 9px;")
+        self._text_state.setMaximumWidth(220)
+        self._text_state.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
         self._text_state.setVisible(False)
         text_layout.addLayout(text_header)
 
@@ -431,6 +498,10 @@ class OCRImageTextReviewTab(QWidget):
         self._fusion_candidate_title.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
         self._fusion_candidate_title.setStyleSheet("font-weight: 700; font-size: 11px;")
         candidate_box.addWidget(self._fusion_candidate_title)
+        self._fusion_candidate_detail = QLabel("红底=替换 · 橙底=增删/缺失")
+        self._fusion_candidate_detail.setWordWrap(True)
+        self._fusion_candidate_detail.setStyleSheet("color:#7B8797;font-size:8.5px;")
+        candidate_box.addWidget(self._fusion_candidate_detail)
         self._fusion_candidate_grid = QGridLayout()
         self._fusion_candidate_grid.setHorizontalSpacing(8)
         self._fusion_candidate_grid.setVerticalSpacing(8)
@@ -438,6 +509,7 @@ class OCRImageTextReviewTab(QWidget):
         self._fusion_candidate_grid.setColumnStretch(1, 1)
         self._fusion_candidate_grid.setColumnStretch(2, 1)
         candidate_box.addLayout(self._fusion_candidate_grid)
+        candidate_box.addStretch(1)
         self._fusion_candidate_scroll = QScrollArea()
         self._fusion_candidate_scroll.setWidgetResizable(True)
         self._fusion_candidate_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
@@ -481,11 +553,12 @@ class OCRImageTextReviewTab(QWidget):
         self._next_btn = QPushButton("下一句 →")
         self._next_btn.clicked.connect(self._next)
         self._next_btn.setVisible(False)  # Alt+Right and the jump menu browse all sentences.
-        self._save_btn = QPushButton("保存当前句")
+        self._save_btn = accent_button("确认裁决")
+        self._save_btn.setToolTip("确认当前手动文本并停留在本句")
         self._save_btn.clicked.connect(self._save_current)
-        self._save_btn.setVisible(False)  # 保留快捷键/兼容引用，不再占底栏。
-        self._save_next_btn = accent_button("确认并下一分歧")
-        self._save_next_btn.setToolTip("保存当前裁决并进入下一条 OCR 分歧句，自动跳过一致句（Ctrl/⌘+Return）")
+        self._save_btn.setVisible(False)
+        self._save_next_btn = accent_button("确认并下一句")
+        self._save_next_btn.setToolTip("保存当前裁决并进入下一句（Ctrl/⌘+Shift+Return）")
         self._save_next_btn.clicked.connect(self._save_and_next)
 
         self._next_judgement_btn = QPushButton("下一待判断")
@@ -521,45 +594,57 @@ class OCRImageTextReviewTab(QWidget):
         text_card.addAction(self._jump_prev_diff_action)
         text_card.addAction(self._jump_next_diff_action)
 
-        status_row = QHBoxLayout()
         self._review_summary.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
         self._review_summary.setWordWrap(True)
-        status_row.addWidget(self._review_summary, 1)
-        nav.addStretch(1)
+        nav.addWidget(self._review_summary)
         self._position_label = QLabel("第 0 / 0 句")
         self._position_label.setStyleSheet(f"color: {MUTED}; font-size: 11px;")
         self._position_label.setVisible(True)   # 当前第几句必须可见
         self._position_label.setWordWrap(True)
         self._position_label.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
-        status_row.addWidget(self._position_label, 1)
+        nav.addWidget(self._position_label)
+        nav.addStretch(1)
+        self._review_keyboard_hint = QLabel("F7 下一分歧 · Shift+F7 上一 · Alt+1…9 作底稿")
+        self._review_keyboard_hint.setStyleSheet("color:#7B8797;font-size:8.5px;")
+        self._review_keyboard_hint.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+        nav.addWidget(self._review_keyboard_hint)
         nav.addWidget(self._jump_menu_btn)
         nav.addWidget(self._prev_btn)
+        nav.addWidget(self._save_btn)
         nav.addWidget(self._save_next_btn)
-        self._apply_btn = QPushButton("✓ 应用整本校对稿")
+        self._full_compare_btn = QPushButton("显示全文")
+        self._full_compare_btn.setToolTip("返回 OCR 对比全文总览；不会自动确认当前句")
+        self._full_compare_btn.clicked.connect(self._request_full_compare)
+        nav.addWidget(self._full_compare_btn)
+        self._apply_btn = QPushButton("✓ 应用整本")
         self._apply_btn.clicked.connect(self._apply_document)
         nav.addWidget(self._apply_btn)
         self._sentence_strip = SentenceStrip(text_card)
         self._sentence_strip.jump.connect(self._jump_to_entry_index)
         text_layout.addWidget(self._sentence_strip)
-        text_layout.addLayout(status_row)
         text_layout.addLayout(nav)
 
-        self._review_right_split.addWidget(text_card)
-        self._review_right_split.setStretchFactor(0, 1)
-        self._review_right_split.setStretchFactor(1, 2)
-        self._review_right_split.setSizes([340, 680])
-        bind_splitter(self._review_right_split, "image_review_right_candidates_v2")
         image_card.setMinimumWidth(260)
-        content_splitter.addWidget(left_panel)
-        content_splitter.addWidget(right_panel)
-        content_splitter.setStretchFactor(0, 0)
-        content_splitter.setStretchFactor(1, 1)
-        content_splitter.setSizes([REVIEW_LEFT_WIDTH, 938])
-        # Compatibility alias retained for code/tests that previously reached
-        # the nested visual splitter directly.
-        self._visual_review_splitter = content_splitter
+        visual_splitter = QSplitter(Qt.Horizontal)
+        visual_splitter.setChildrenCollapsible(False)
+        visual_splitter.setHandleWidth(REVIEW_COLUMN_GAP)
+        visual_splitter.setProperty("nfPreserveHandleWidth", True)
+        visual_splitter.setStyleSheet("QSplitter::handle { background:#E3ECF7; border-radius:2px; margin:28px 1px; }")
+        visual_splitter.addWidget(right_panel)
+        visual_splitter.addWidget(left_panel)
+        visual_splitter.setSizes([780, 240])
+        visual_splitter.setStretchFactor(0, 1)
+        visual_splitter.setStretchFactor(1, 0)
+        self._review_right_split = visual_splitter
+        self._visual_review_splitter = visual_splitter
+        content_splitter.addWidget(text_card)
+        content_splitter.addWidget(visual_splitter)
+        content_splitter.setStretchFactor(0, 3)
+        content_splitter.setStretchFactor(1, 7)
+        content_splitter.setSizes([360, 840])
         self._review_content_splitter = content_splitter
         root.addWidget(content_splitter, 1)
+        bind_splitter(visual_splitter, "image_review_right_candidates_v2")
         bind_splitter(content_splitter, "image_review_content")
 
         # Historical source-contract markers retained after the Phase 22 visual
@@ -583,7 +668,7 @@ class OCRImageTextReviewTab(QWidget):
         self._next_shortcut = QShortcut(QKeySequence("Alt+Right"), self)
         self._next_shortcut.setContext(Qt.WidgetWithChildrenShortcut)
         self._next_shortcut.activated.connect(self._next)
-        self._save_next_shortcut = QShortcut(QKeySequence("Ctrl+Return"), self)
+        self._save_next_shortcut = QShortcut(QKeySequence("Ctrl+Shift+Return"), self)
         self._save_next_shortcut.setContext(Qt.WidgetWithChildrenShortcut)
         self._save_next_shortcut.activated.connect(self._save_and_next)
         self._next_judgement_shortcut = QShortcut(QKeySequence("Alt+Down"), self)
@@ -595,6 +680,22 @@ class OCRImageTextReviewTab(QWidget):
         self._next_disagreement_shortcut = QShortcut(QKeySequence("Alt+D"), self)
         self._next_disagreement_shortcut.setContext(Qt.WidgetWithChildrenShortcut)
         self._next_disagreement_shortcut.activated.connect(self._jump_next_ocr_disagreement)
+        self._next_diff_f7_shortcut = QShortcut(QKeySequence("F7"), self)
+        self._next_diff_f7_shortcut.setContext(Qt.WidgetWithChildrenShortcut)
+        self._next_diff_f7_shortcut.activated.connect(self._jump_next_ocr_disagreement)
+        self._prev_diff_f7_shortcut = QShortcut(QKeySequence("Shift+F7"), self)
+        self._prev_diff_f7_shortcut.setContext(Qt.WidgetWithChildrenShortcut)
+        self._prev_diff_f7_shortcut.activated.connect(self._jump_previous_ocr_disagreement)
+        self._candidate_choice_shortcuts = []
+        for candidate_number in range(1, 10):
+            shortcut = QShortcut(QKeySequence(f"Alt+{candidate_number}"), self)
+            shortcut.setContext(Qt.WidgetWithChildrenShortcut)
+            shortcut.activated.connect(lambda n=candidate_number: self._choose_visible_candidate_shortcut(n))
+            self._candidate_choice_shortcuts.append(shortcut)
+            direct = QShortcut(QKeySequence(f"Ctrl+Alt+{candidate_number}"), self)
+            direct.setContext(Qt.WidgetWithChildrenShortcut)
+            direct.activated.connect(lambda n=candidate_number: self._accept_visible_candidate_shortcut(n))
+            self._candidate_choice_shortcuts.append(direct)
         self._preview_shortcut = QShortcut(QKeySequence("Alt+P"), self)
         self._preview_shortcut.setContext(Qt.WidgetWithChildrenShortcut)
         self._preview_shortcut.activated.connect(self._open_current_image_in_preview)
@@ -724,6 +825,8 @@ class OCRImageTextReviewTab(QWidget):
         self._left_queue_btn.setStyleSheet(active if not columns else idle)
         self._left_columns_btn.setStyleSheet(active if columns else idle)
         self._columns_state.setVisible(columns and bool(self._columns_state.text()))
+        if hasattr(self, "_review_queue_filters"):
+            self._review_queue_filters.setVisible(not columns)
         self._column_left_btn.setVisible(columns)
         self._column_right_btn.setVisible(columns)
 
@@ -732,7 +835,12 @@ class OCRImageTextReviewTab(QWidget):
             return ""
         entry = self._entries[int(index)]
         page = "、".join(str(value) for value in entry.pages) or str(entry.page or "-")
-        status = "已确认" if entry.reviewed else ("已修改" if entry.changed else "待裁决")
+        unsaved = bool(
+            int(index) == int(getattr(self, "_index", -1))
+            and getattr(self, "_editor", None) is not None
+            and self._editor.toPlainText() != str(entry.text or "")
+        )
+        status = "未保存" if unsaved else ("已确认" if entry.reviewed else ("已修改" if entry.changed else "待裁决"))
         text = " ".join(str(entry.text or "").replace("\r", " ").replace("\n", " ").split())
         preview = text[:56] + ("…" if len(text) > 56 else "")
         return f"p{int(entry.page or 0):03d} · 第 {int(index) + 1} 句    {status}\n{preview or '—'}"
@@ -747,17 +855,59 @@ class OCRImageTextReviewTab(QWidget):
         source_indices = tuple(int(value) for value in self._ocr_disagreement_source_indices)
         ordered: list[int] = []
         seen: set[int] = set()
-        for source_row in self._ocr_disagreement_source_row_order:
-            entry_index = self._entry_index_by_source_row.get(int(source_row))
-            if entry_index is not None and entry_index in source_indices and entry_index not in seen:
-                ordered.append(entry_index)
-                seen.add(entry_index)
-        ordered.extend(index for index in source_indices if index not in seen)
+        if bool(getattr(self, "_ocr_disagreement_source_order_synced", False)):
+            # OCR 对比 owns the canonical adjudication queue.  When it publishes
+            # a queue order, 图文对照 follows the same stable-row set and order
+            # exactly; local filters below may only narrow that queue further.
+            for source_row in self._ocr_disagreement_source_row_order:
+                entry_index = self._entry_index_by_source_row.get(int(source_row))
+                if entry_index is not None and entry_index in source_indices and entry_index not in seen:
+                    ordered.append(entry_index)
+                    seen.add(entry_index)
+        else:
+            ordered.extend(source_indices)
         self._ocr_disagreement_indices = ordered
-        values = tuple(ordered)
+        total_values = tuple(ordered)
+        scope_widget = getattr(self, "_review_queue_scope", None)
+        scope = str(scope_widget.currentData() or "all") if scope_widget is not None else "all"
+        query_widget = getattr(self, "_review_queue_search", None)
+        query = str(query_widget.text() if query_widget is not None else "").strip().casefold()
+        filtered = []
+        for index in total_values:
+            entry = self._entries[index]
+            if scope == "pending" and entry.reviewed:
+                continue
+            if scope == "threeway" and len({str(value or "").strip() for value in (entry.fusion_candidate_texts or ()) if str(value or "").strip()}) < 3:
+                continue
+            if scope == "broken" and not any(
+                (not str(value or "").strip())
+                or ("□" in str(value or ""))
+                or ("�" in str(value or ""))
+                for value in (entry.fusion_candidate_texts or ())
+            ):
+                continue
+            if scope == "changed" and not entry.changed:
+                continue
+            if scope == "reviewed" and (not entry.reviewed or entry.changed):
+                continue
+            if query:
+                haystack = (
+                    self._review_disagreement_display_text(index) + " "
+                    + str(entry.text or "") + " "
+                    + " ".join(str(value) for value in (entry.pages or ())) + " "
+                    + f"p{int(entry.page or 0):03d} p{int(entry.page or 0):05d} "
+                    + " ".join(str(value) for value in (entry.column_ids or ())) + " "
+                    + " ".join(str(value or "") for value in (entry.fusion_candidate_texts or ()))
+                ).casefold()
+                if query not in haystack:
+                    continue
+            filtered.append(index)
+        values = tuple(filtered)
         self._disagreement_queue_indices = values
         self._review_disagreement_queue_model.set_rows(values)
-        self._left_queue_btn.setText(f"分歧 {len(values)}")
+        self._left_queue_btn.setText(
+            f"分歧 {len(values)}/{len(total_values)}" if len(values) != len(total_values) else f"分歧 {len(values)}"
+        )
         self._select_review_disagreement_queue_item()
 
     def set_disagreement_source_row_order(self, source_rows) -> None:
@@ -773,8 +923,10 @@ class OCRImageTextReviewTab(QWidget):
                 values.append(row)
                 seen.add(row)
         order = tuple(values)
-        if order == self._ocr_disagreement_source_row_order:
+        was_synced = bool(getattr(self, "_ocr_disagreement_source_order_synced", False))
+        if was_synced and order == self._ocr_disagreement_source_row_order:
             return
+        self._ocr_disagreement_source_order_synced = True
         self._ocr_disagreement_source_row_order = order
         if self._entries:
             self._refresh_review_disagreement_queue()
@@ -932,6 +1084,7 @@ class OCRImageTextReviewTab(QWidget):
         self._review_summary.setText(
             f"已核对 {self._reviewed_count}/{total} · 已修改 {self._changed_count}{judgement_note}{disagreement_note}"
         )
+        self._refresh_entry_status_badge()
         if hasattr(self, "_next_judgement_btn"):
             self._next_judgement_btn.setEnabled(bool(self._entries) and pending_judgement > 0)
         self._refresh_sentence_strip()
@@ -1252,6 +1405,13 @@ class OCRImageTextReviewTab(QWidget):
             self._vertical_columns.set_active_column(self._active_physical_column_index)
         changed = self._editor.toPlainText() != entry.text
         self._text_state.setText("未保存修改" if changed else ("已人工确认" if entry.reviewed else ""))
+        self._refresh_entry_status_badge(entry)
+        queue_model = getattr(self, "_review_disagreement_queue_model", None)
+        if queue_model is not None:
+            try:
+                queue_model.refresh_row(self._index)
+            except Exception:
+                pass
         if changed:
             self._source_label.setText(f"{self._source_name} · 当前句未保存")
         elif self._dirty:
@@ -1283,7 +1443,53 @@ class OCRImageTextReviewTab(QWidget):
             # The editor may be closing while a coalesced resize is pending.
             return
 
+    def _refresh_entry_status_badge(self, entry=None) -> None:
+        badge = getattr(self, "_entry_status_badge", None)
+        if badge is None:
+            return
+        entry = self._current_entry() if entry is None else entry
+        if entry is None:
+            text, bg, fg, border = "待核对", "#F3F5F7", "#667085", "#D9DEE5"
+        else:
+            unsaved = self._editor.toPlainText() != str(entry.text or "")
+            if unsaved:
+                text, bg, fg, border = "未保存", "#FFF4E5", "#9A6700", "#F5C36B"
+            elif entry.changed:
+                text, bg, fg, border = "已修改", "#E7F0FF", "#2559E0", "#B9D0F4"
+            elif entry.reviewed:
+                text, bg, fg, border = "已确认", "#EAF8EF", "#147A42", "#B9E4C9"
+            elif entry.requires_judgement:
+                text, bg, fg, border = "待裁决", "#FFF0E6", "#B54708", "#F7C89C"
+            else:
+                text, bg, fg, border = "待核对", "#F3F5F7", "#667085", "#D9DEE5"
+        badge.setText(text)
+        badge.setStyleSheet(
+            f"QLabel{{background:{bg};color:{fg};border:1px solid {border};border-radius:10px;"
+            "font-size:9px;font-weight:700;padding:2px 8px;}"
+        )
+
+    def _choose_visible_candidate_shortcut(self, number: int) -> None:
+        """Alt+1..9 stages the corresponding visible fusion candidate."""
+        target = max(0, int(number) - 1)
+        cards = [card for card in self._fusion_candidate_buttons if card.isVisible()]
+        if not 0 <= target < len(cards):
+            return
+        card = cards[target]
+        self._choose_fusion_candidate(int(card.candidate_index), str(card.candidate_text or ""))
+
+    def _accept_visible_candidate_shortcut(self, number: int) -> None:
+        """Ctrl+Alt+1..9 directly accepts and advances."""
+        target = max(0, int(number) - 1)
+        cards = [card for card in self._fusion_candidate_buttons if card.isVisible()]
+        if not 0 <= target < len(cards):
+            return
+        card = cards[target]
+        self._accept_fusion_candidate(int(card.candidate_index), str(card.candidate_text or ""))
+
     def _show_current(self) -> None:
+        entry = self._current_entry()
+        if entry is not None:
+            getattr(self, "_draft_candidate_sources", {}).pop(id(entry), None)
         getattr(self, "_external_decision_dirty_rows", set()).discard(self._index)
         entry = self._current_entry()
         if entry is None:
@@ -1297,6 +1503,7 @@ class OCRImageTextReviewTab(QWidget):
         self._editor.blockSignals(False)
         self._schedule_review_editor_fit()
         self._text_state.setText("已人工确认" if entry.reviewed else "")
+        self._refresh_entry_status_badge(entry)
         physical_count = max(
             1,
             len(entry.column_ids),
@@ -1655,10 +1862,19 @@ class OCRImageTextReviewTab(QWidget):
         reason = str(getattr(entry, "judgement_reason", "") or "")
         warnings = tuple(getattr(entry, "judgement_warnings", ()) or ())
         state = "需要判断" if getattr(entry, "requires_judgement", False) else "候选已融合"
-        detail = reason or ("；".join(warnings[:2]) if warnings else "点击候选可直接写入校对框")
-        self._fusion_candidate_title.setText(
-            f"多模型融合候选 · {state} · {detail} · 红色/橙色为与当前校对稿的字符差异"
-        )
+        reason_names = {
+            "pending_ai_review": "等待 AI / 人工裁决",
+            "multi_model_disagreement": "多模型原始结果不一致",
+            "low_confidence": "低置信候选",
+            "placeholder_or_empty": "存在空白/占位符",
+            "manual_review": "需要人工复核",
+        }
+        readable_reason = reason_names.get(reason, reason.replace("_", " ").strip()) if reason else ""
+        detail_parts = [part for part in (readable_reason, "；".join(warnings[:2])) if part]
+        if not detail_parts:
+            detail_parts.append("点击候选可直接写入当前校对稿；不会覆盖任何模型原文")
+        self._fusion_candidate_title.setText(f"候选对比 · {len(grouped)} 份 · {state}")
+        self._fusion_candidate_detail.setText(" · ".join(detail_parts) + " · 红底=替换，橙底=增删/缺失")
         try:
             selected = int(getattr(entry, "selected_candidate_index", -1))
         except (TypeError, ValueError, OverflowError):
@@ -1681,35 +1897,56 @@ class OCRImageTextReviewTab(QWidget):
                     index, f"候选{candidate_number} · {label_text}", group["text"],
                     confidence=float(group["confidence"] or 0.0), parent=self._fusion_candidate_frame,
                 )
-                card.chosen.connect(self._choose_fusion_candidate)
+                card.drafted.connect(self._choose_fusion_candidate)
+                card.chosen.connect(self._accept_fusion_candidate)
                 self._fusion_candidate_buttons.append(card)
             card.set_reference_text(reference_text)
             card.set_selected(
-                selected in group["indices"] or (selected < 0 and group["text"] == entry.text)
+                bool(getattr(entry, "reviewed", False))
+                and (selected in group["indices"] or (selected < 0 and group["text"] == entry.text))
+            )
+            baseline = getattr(self, "_draft_candidate_sources", {}).get(id(entry))
+            card.set_draft_source(
+                baseline in group["indices"] if baseline is not None else group["text"] == reference_text
             )
             row = (candidate_number - 1) // columns
             column = (candidate_number - 1) % columns
             self._fusion_candidate_grid.addWidget(card, row, column)
-            self._fusion_candidate_grid.setRowStretch(row, 1)
+            self._fusion_candidate_grid.setRowStretch(row, 0)
             card._choose.setEnabled(not self._entry_consensus_locked(entry))
             card.show()
         for column in range(4):
             self._fusion_candidate_grid.setColumnStretch(column, 1 if column < columns else 0)
 
     def _choose_fusion_candidate(self, candidate_index: int, text: str) -> None:
+        """Stage one OCR candidate as the manual-edit baseline only."""
         entry = self._current_entry()
         if entry is None or self._entry_consensus_locked(entry):
             return
-        entry.selected_candidate_index = int(candidate_index)
+        self._draft_candidate_index = int(candidate_index)
+        if not hasattr(self, "_draft_candidate_sources"):
+            self._draft_candidate_sources = {}
+        self._draft_candidate_sources[id(entry)] = int(candidate_index)
         self._editor.setPlainText(str(text or ""))
         self._editor.moveCursor(QTextCursor.End)
-        self._refresh_fusion_candidates(entry)
-        # Candidate selection is a final review decision, not merely a text-box
-        # preview. Persist and publish it immediately so the check mark in 图文
-        # and the selected fusion candidate in OCR 对比 can never diverge.
-        if not self._save_current(silent=True):
-            self._text_state.setText("候选已写入文本框，但保存失败；请检查当前句映射")
+        self._text_state.setText(
+            f"候选 {int(candidate_index) + 1} 已作为手动底稿 · 尚未完成裁决，修改后点“确认裁决”"
+        )
+        for card in self._fusion_candidate_buttons:
+            card.set_draft_source(card.candidate_index == int(candidate_index))
         self._editor.setFocus()
+
+    def _accept_fusion_candidate(self, candidate_index: int, text: str) -> None:
+        """Explicit fast-path: accept a candidate and move to next OCR disagreement."""
+        entry = self._current_entry()
+        if entry is None or self._entry_consensus_locked(entry):
+            return
+        self._editor.setPlainText(str(text or ""))
+        self._editor.moveCursor(QTextCursor.End)
+        if not self._save_current(silent=True):
+            self._text_state.setText("直接采用失败；请检查当前句映射")
+            return
+        QTimer.singleShot(0, self._jump_next_ocr_disagreement)
 
     def _jump_next_judgement(self) -> None:
         if not self._entries:
@@ -2091,20 +2328,65 @@ class OCRImageTextReviewTab(QWidget):
         resolved = bool(payload.get("resolved", False))
         if not resolved:
             was_reviewed = bool(entry.reviewed)
+            was_changed = bool(entry.changed)
+            # Undo/reopen carries the current unresolved fusion output separately
+            # from the selected-candidate text.  Restore the review copy to that
+            # value so OCR 对比 and 图文对照 cannot disagree after an undo.
+            if "current_output_text" in payload and self._review_doc is not None:
+                from engine.ocr_image_text_review import apply_review_text
+                restore_text = str(payload.get("current_output_text") or "")
+                block_indices = self._entry_indices_by_block.get(int(entry.block_index), (target,))
+                block_entries = [
+                    self._entries[index] for index in block_indices
+                    if 0 <= int(index) < len(self._entries)
+                ]
+                merged_value = "".join(
+                    restore_text if item is entry else item.text for item in block_entries
+                )
+                found, _changed = apply_review_text(
+                    self._review_doc, entry.block_id, merged_value, block_index=entry.block_index
+                )
+                if found:
+                    entry.text = restore_text
+                    from engine.multi_ocr_compare import project_fused_text_to_physical_columns
+                    physical_count = max(
+                        1, len(entry.column_ids), len(entry.regions), int(entry.column_count or 1)
+                    )
+                    entry.column_texts = tuple(project_fused_text_to_physical_columns(
+                        entry.text, entry.column_texts, column_count=physical_count,
+                    ))
+                    entry.column_count = physical_count
+                    initial_text = self._initial_text_by_key.get(entry.segment_key, entry.text)
+                    entry.changed = entry.text != initial_text
             entry.selected_candidate_index = -1
             entry.reviewed = False
             if bool(entry.requires_judgement):
                 self._pending_judgement_indices.add(int(target))
             if was_reviewed:
                 self._reviewed_count = max(0, self._reviewed_count - 1)
+            if was_changed != entry.changed:
+                self._changed_count += 1 if entry.changed else -1
+            if entry.changed:
+                self._session_dirty_keys.add(entry.segment_key)
+            else:
+                self._session_dirty_keys.discard(entry.segment_key)
+            self._dirty = bool(self._session_dirty_keys)
             if self._review_doc is not None and 0 <= entry.block_index < len(self._review_doc.blocks):
                 block = self._review_doc.blocks[entry.block_index]
                 metadata = dict(block.metadata) if isinstance(block.metadata, dict) else {}
                 reviewed_segments = dict(metadata.get("ocr_image_text_review_checked_segments") or {})
+                changed_segments = dict(metadata.get("ocr_image_text_review_changed_segments") or {})
                 reviewed_segments[entry.segment_key] = False
+                changed_segments[entry.segment_key] = bool(entry.changed)
                 metadata["ocr_image_text_review_checked_segments"] = reviewed_segments
-                groups = [dict(group) if isinstance(group, dict) else {} for group in (metadata.get("ocr_review_sentence_groups") or [])]
+                metadata["ocr_image_text_review_changed_segments"] = changed_segments
+                groups = [
+                    dict(group) if isinstance(group, dict) else {}
+                    for group in (metadata.get("ocr_review_sentence_groups") or [])
+                ]
                 if 0 <= entry.segment_index < len(groups):
+                    groups[entry.segment_index]["text"] = entry.text
+                    groups[entry.segment_index]["column_texts"] = list(entry.column_texts)
                     groups[entry.segment_index]["review_selected_candidate_index"] = -1
                     metadata["ocr_review_sentence_groups"] = groups
                 block.metadata = metadata
@@ -2188,12 +2470,16 @@ class OCRImageTextReviewTab(QWidget):
             self._show_current()
 
     def _save_and_next(self) -> None:
-        if not self._ocr_disagreement_indices:
-            self._text_state.setText("当前文档没有多模型 OCR 分歧句")
-            return
         if not self._save_current():
             return
-        self._jump_next_ocr_disagreement()
+        if self._index + 1 < len(self._entries):
+            self._index += 1
+            self._show_current()
+
+    def _request_full_compare(self) -> None:
+        entry = self._current_entry()
+        row = int(getattr(entry, "source_row_index", -1)) if entry is not None else -1
+        self.full_compare_requested.emit(row)
 
     def _apply_document(self) -> None:
         if self._review_doc is None:
@@ -2214,7 +2500,7 @@ class OCRImageTextReviewTab(QWidget):
             f"图文逐句校对：核对 {reviewed}/{len(self._entries)} 句，修改 {changed} 句",
             changed,
         )
-        self.doc_applied.emit(copy.deepcopy(self._review_doc))
+        self.doc_applied.emit(self._review_doc.snapshot_clone())
         self._dirty = False
         self._session_dirty_keys.clear()
         self._initial_text_by_key = {entry.segment_key: entry.text for entry in self._entries}

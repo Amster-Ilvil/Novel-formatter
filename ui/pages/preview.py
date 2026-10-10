@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 from pathlib import Path
+from collections import OrderedDict
+import threading
 
 from PySide6.QtWidgets import QDialog, QLabel, QPushButton, QScrollArea, QVBoxLayout, QHBoxLayout
-from PySide6.QtCore import Qt, QPoint, QTimer
-from PySide6.QtGui import QCursor, QPixmap, QImageReader
+from PySide6.QtCore import Qt, QPoint, QTimer, Signal
+from PySide6.QtGui import QCursor, QPixmap, QImage, QImageReader
 
 from ui.common.styling import MUTED, EDITOR_SCROLLBAR_STYLE
 
@@ -73,11 +75,22 @@ class _PagePreviewImageLabel(QLabel):
 class PageImagePreviewDialog(QDialog):
     """Lazy one-page-at-a-time full-resolution preview for page management."""
 
+    _prefetch_ready = Signal(str, object)
+    _PREFETCH_CACHE_COUNT = 3
+    _PREFETCH_CACHE_BYTES = 96 * 1024 * 1024
+
     def __init__(self, paths, page_index: int = 0, parent=None):
         super().__init__(parent)
         self._paths = [Path(value) for value in (paths or [])]
         self._index = max(0, min(int(page_index), max(0, len(self._paths) - 1)))
         self._original = QPixmap()
+        # High-resolution navigation keeps only the current neighbourhood.  The
+        # first page still opens immediately; adjacent pages decode as QImage in a
+        # worker and are converted to QPixmap only on the GUI thread.
+        self._prefetch_cache: OrderedDict[str, QPixmap] = OrderedDict()
+        self._prefetch_cache_bytes = 0
+        self._prefetch_pending: set[str] = set()
+        self._prefetch_ready.connect(self._on_prefetch_ready)
         self._scale = 1.0
         self._fit_mode = True
         self.setWindowTitle("页面高清预览")
@@ -124,13 +137,81 @@ class PageImagePreviewDialog(QDialog):
         root.addWidget(hint)
         self._load_current()
 
-    def _read_pixmap(self, path: Path) -> QPixmap:
+    @staticmethod
+    def _read_image(path: Path) -> QImage:
         reader = QImageReader(str(path))
         reader.setAutoTransform(True)
-        image = reader.read()
+        return reader.read()
+
+    @classmethod
+    def _pixmap_cost(cls, pixmap: QPixmap) -> int:
+        if pixmap.isNull():
+            return 0
+        return max(1, pixmap.width()) * max(1, pixmap.height()) * 4
+
+    def _cache_pixmap(self, path: str, pixmap: QPixmap) -> None:
+        if pixmap.isNull():
+            return
+        previous = self._prefetch_cache.pop(path, None)
+        if previous is not None:
+            self._prefetch_cache_bytes -= self._pixmap_cost(previous)
+        cost = self._pixmap_cost(pixmap)
+        # One unusually large page is still useful as the immediate next page, but
+        # never retain multiple giant frames beyond the byte budget.
+        self._prefetch_cache[path] = pixmap
+        self._prefetch_cache_bytes += cost
+        self._prefetch_cache.move_to_end(path)
+        while len(self._prefetch_cache) > self._PREFETCH_CACHE_COUNT or (
+            self._prefetch_cache_bytes > self._PREFETCH_CACHE_BYTES and len(self._prefetch_cache) > 1
+        ):
+            _key, removed = self._prefetch_cache.popitem(last=False)
+            self._prefetch_cache_bytes -= self._pixmap_cost(removed)
+
+    def _read_pixmap(self, path: Path) -> QPixmap:
+        key = str(path)
+        cached = self._prefetch_cache.get(key)
+        if cached is not None:
+            self._prefetch_cache.move_to_end(key)
+            return cached
+        image = self._read_image(path)
         if image.isNull():
             return QPixmap()
-        return QPixmap.fromImage(image)
+        pixmap = QPixmap.fromImage(image)
+        self._cache_pixmap(key, pixmap)
+        return pixmap
+
+    def _schedule_adjacent_prefetch(self) -> None:
+        targets: list[Path] = []
+        for index in (self._index - 1, self._index + 1):
+            if not (0 <= index < len(self._paths)):
+                continue
+            path = self._paths[index]
+            key = str(path)
+            if key in self._prefetch_cache or key in self._prefetch_pending:
+                continue
+            self._prefetch_pending.add(key)
+            targets.append(path)
+        if not targets:
+            return
+
+        signal = self._prefetch_ready
+        def worker(items=tuple(targets)):
+            for path in items:
+                image = self._read_image(path)
+                try:
+                    signal.emit(str(path), image)
+                except RuntimeError:
+                    return
+
+        threading.Thread(target=worker, daemon=True, name="page-preview-prefetch").start()
+
+    def _on_prefetch_ready(self, path: str, image: object) -> None:
+        self._prefetch_pending.discard(str(path))
+        if not isinstance(image, QImage) or image.isNull():
+            return
+        if not any(str(item) == str(path) for item in self._paths):
+            return
+        self._cache_pixmap(str(path), QPixmap.fromImage(image))
 
     def _load_current(self):
         if not self._paths:
@@ -154,6 +235,7 @@ class PageImagePreviewDialog(QDialog):
             f"第 {self._index + 1}/{len(self._paths)} 页 · {size_text} · {path.name}"
         )
         self.setWindowTitle(f"页面高清预览 · 第 {self._index + 1} 页 · {path.name}")
+        self._schedule_adjacent_prefetch()
 
     def _apply_scale(self):
         if self._original.isNull():

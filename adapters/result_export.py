@@ -13,6 +13,7 @@ import re
 from typing import Iterable
 
 from models.document import Block, BlockType, UnifiedDocument
+from utils.atomic_io import atomic_write_text
 
 
 FORMAT_EXTENSIONS: dict[str, str] = {
@@ -138,13 +139,7 @@ def export_text_result(doc: UnifiedDocument, output_path: str, fmt: str) -> str:
     else:
         payload = document_to_plain_text(doc)
 
-    # Atomic replacement prevents a cancelled/crashed save from leaving a
-    # half-written user file.
-    temp_path = target.with_name(f".{target.name}.tmp")
-    try:
-        temp_path.write_text(payload, encoding="utf-8")
-        temp_path.replace(target)
-    finally:
-        if temp_path.exists():
-            temp_path.unlink(missing_ok=True)
+    # Crash-safe same-filesystem replacement; the final path is published only
+    # after the payload has been flushed successfully.
+    atomic_write_text(target, payload, encoding="utf-8")
     return str(target)

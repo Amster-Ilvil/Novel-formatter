@@ -20,7 +20,6 @@ RECOGNITION_ENGINES = {
     "manga_48px": "48px AR OCR",
     "ndlocr_lite": "NDLOCR-Lite",
     "paddle_ocr": "PaddleOCR",
-    "google_vision": "Google Vision API",
 }
 
 
@@ -209,13 +208,6 @@ class ReusableRecognitionSession:
                 engine_options=self.options,
             ).__enter__()
             self._session_kind = "manga_48px"
-        elif engine == "manga_ocr":
-            from adapters.manga_ocr_adapter import MangaOcrSession
-            self._session = MangaOcrSession(
-                cancel_check=self.cancel_check,
-                verbose=self.verbose,
-            ).__enter__()
-            self._session_kind = "manga_ocr"
         elif engine == "ndlocr_lite":
             from adapters.ndlocr_lite_adapter import NDLOcrLiteSession
             self._session = NDLOcrLiteSession(
@@ -277,7 +269,7 @@ class ReusableRecognitionSession:
             yield from session.iter_recognize(paths)
             return
 
-        if self._session_kind in {"hayai", "manga_48px", "manga_ocr"} and self._session is not None:
+        if self._session_kind in {"hayai", "manga_48px"} and self._session is not None:
             results = self._session.recognize(paths, input_metadata=metadata)
             for path in paths:
                 text, confidence, error = results.get(path, ("", 0.0, "识字进程未返回该区域"))
@@ -285,7 +277,7 @@ class ReusableRecognitionSession:
                     yield path, None, str(error)
                 else:
                     yield path, _simple_result_blocks(
-                        text, confidence, heuristic=self._session_kind in {"hayai", "manga_ocr"}
+                        text, confidence, heuristic=self._session_kind == "hayai"
                     ), None
             return
 
@@ -353,13 +345,6 @@ def recognizer_iterator(
             engine_options=options, input_metadata=input_metadata,
         )
         return
-    if engine == "manga_ocr":
-        from adapters.manga_ocr_adapter import recognize_crops
-        yield from recognize_crops(
-            image_paths, manifest_path, cancel_check=cancel_check, verbose=verbose,
-            input_metadata=input_metadata,
-        )
-        return
     if engine == "ndlocr_lite":
         from adapters.ndlocr_lite_adapter import _run_worker
         yield from _run_worker(image_paths, cancel_check=cancel_check, verbose=verbose)
@@ -378,25 +363,5 @@ def recognizer_iterator(
             model_source=str(options.get("model_source") or "auto"),
             vl_backend=str(options.get("vl_backend") or "auto"),
         )
-        return
-    if engine == "google_vision":
-        from adapters.google_vision_adapter import _annotate_image, DEFAULT_ENDPOINT
-        api_key = str(options.get("api_key") or os.environ.get("GOOGLE_CLOUD_VISION_API_KEY", "")).strip()
-        if not api_key:
-            raise ValueError("请填写 Google Cloud Vision API Key，或设置 GOOGLE_CLOUD_VISION_API_KEY。")
-        raw_hints = options.get("language_hints") or ""
-        hints = ([part.strip() for part in raw_hints.replace(";", ",").split(",") if part.strip()]
-                 if isinstance(raw_hints, str)
-                 else [str(part).strip() for part in raw_hints if str(part).strip()])
-        endpoint = str(options.get("endpoint") or DEFAULT_ENDPOINT)
-        for image_path in image_paths:
-            if cancel_check is not None and cancel_check():
-                break
-            try:
-                yield image_path, _annotate_image(
-                    image_path, api_key=api_key, language_hints=hints, endpoint=endpoint
-                ), None
-            except Exception as exc:
-                yield image_path, None, str(exc)
         return
     raise ValueError(f"不支持的识字引擎: {engine}")

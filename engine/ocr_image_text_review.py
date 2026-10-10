@@ -785,7 +785,7 @@ def apply_review_text(
 
 
 def clone_for_review(doc: UnifiedDocument) -> UnifiedDocument:
-    return copy.deepcopy(doc)
+    return doc.snapshot_clone()
 
 
 def _paper_colour(image: Image.Image) -> tuple[int, int, int]:
@@ -1138,7 +1138,7 @@ def render_review_image(entry: OCRReviewEntry, output_path: str | Path) -> str:
 
 
 def build_comparison_reference_entry(doc, row, *, fallback_page_images=None):
-    """Resolve one comparison row using its immutable primary-block lineage.
+    """Resolve one comparison row using stable sentence/column lineage.
 
     This works on a small shallow document view and does not regenerate OCR or
     synthesize an image from candidate text. Ambiguous legacy rows use their
@@ -1149,7 +1149,35 @@ def build_comparison_reference_entry(doc, row, *, fallback_page_images=None):
     indices = tuple(getattr(row, "primary_block_indices", ()) or ())
     if not indices and getattr(row, "primary_block_index", None) is not None:
         indices = (row.primary_block_index,)
-    blocks = [doc.blocks[int(i)] for i in indices if 0 <= int(i) < len(doc.blocks)]
+    ids = tuple(str(value) for value in (getattr(row, "column_ids", ()) or ()))
+    sentence_id = str(getattr(row, "sentence_group_id", "") or "")
+    sentence_matches = []
+    column_matches = []
+    for block_index, block in enumerate(doc.blocks):
+        meta = block.metadata if isinstance(getattr(block, "metadata", None), dict) else {}
+        groups = meta.get("ocr_review_sentence_groups") or []
+        if isinstance(groups, dict):
+            groups = [groups]
+        groups = [group for group in groups if isinstance(group, dict)]
+        if sentence_id and any(str(group.get("sentence_group_id", "") or "") == sentence_id for group in groups):
+            sentence_matches.append((block_index, block))
+        block_ids = set()
+        for values in (meta.get("source_column_ids"), meta.get("multi_ocr_column_ids"), meta.get("column_id")):
+            block_ids.update([values] if isinstance(values, str) else (values or []))
+        for group in groups:
+            values = group.get("column_ids") or []
+            block_ids.update([values] if isinstance(values, str) else values)
+        for region in meta.get("ocr_review_regions") or []:
+            if isinstance(region, dict):
+                block_ids.add(str(region.get("column_id", "") or ""))
+        if ids and block_ids.intersection(ids):
+            column_matches.append((block_index, block))
+    # Comparison indices belong to the primary OCR document. Fused documents
+    # can split/insert blocks, so their numeric positions are not interchangeable.
+    matched = sentence_matches or column_matches
+    if not matched and not ids and not sentence_id:
+        matched = [(int(i), doc.blocks[int(i)]) for i in indices if 0 <= int(i) < len(doc.blocks)]
+    blocks = [block for _, block in matched]
     if not blocks:
         return None
     view = copy.copy(doc)
@@ -1157,10 +1185,15 @@ def build_comparison_reference_entry(doc, row, *, fallback_page_images=None):
     entries = build_review_entries(view, fallback_page_images=fallback_page_images)
     if not entries:
         return None
-    exact = next((entry for entry in entries if entry.source_row_index == int(row.index)), None)
+    for entry in entries:
+        entry.block_index = matched[entry.block_index][0]
+    exact = next((entry for entry in entries if sentence_id and entry.sentence_group_id == sentence_id
+                  and (not ids or entry.column_ids == ids)), None)
+    if exact is None:
+        exact = next((entry for entry in entries if entry.source_row_index == int(row.index)
+                      and (not ids or entry.column_ids == ids)), None)
     if exact is not None:
         return exact
-    ids = tuple(str(value) for value in (getattr(row, "column_ids", ()) or ()))
     if ids:
         regions_by_id = {}
         for entry in entries:
@@ -1170,7 +1203,7 @@ def build_comparison_reference_entry(doc, row, *, fallback_page_images=None):
                     regions_by_id.setdefault(column_id, region)
         if all(column_id in regions_by_id for column_id in ids):
             return OCRReviewEntry(
-                block_id=str(blocks[0].id), block_index=int(indices[0]),
+                block_id=str(blocks[0].id), block_index=matched[0][0],
                 text=str(row.output_text or ""), page=int(row.page or 0),
                 column_ids=ids, column_count=len(ids),
                 regions=[copy.deepcopy(regions_by_id[column_id]) for column_id in ids],

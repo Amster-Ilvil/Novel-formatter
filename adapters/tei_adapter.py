@@ -28,6 +28,7 @@ from typing import Iterable
 import xml.etree.ElementTree as ET
 
 from models.document import Block, BlockType, BoundingBox, PageInfo, TocEntry, UnifiedDocument
+from utils.atomic_io import atomic_write_text
 
 TEI_NS = "http://www.tei-c.org/ns/1.0"
 NF_NS = "urn:novel-formatter:tei:1.0"
@@ -535,12 +536,7 @@ def export_tei(doc: UnifiedDocument, output_path: str | Path, *, include_snapsho
         target = target.with_suffix(".xml")
     target.parent.mkdir(parents=True, exist_ok=True)
     payload = document_to_tei(doc, include_snapshot=include_snapshot)
-    temp = target.with_name(f".{target.name}.tmp")
-    try:
-        temp.write_text(payload, encoding="utf-8")
-        temp.replace(target)
-    finally:
-        temp.unlink(missing_ok=True)
+    atomic_write_text(target, payload, encoding="utf-8")
     return str(target)
 
 

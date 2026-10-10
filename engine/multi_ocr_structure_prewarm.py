@@ -258,7 +258,7 @@ def page_document_to_shared_sentences(
     a page-role model (NDLOCR-Lite by default) run exactly once per page while
     still becoming authoritative sentence/column structure for later roles.
     """
-    result = copy.deepcopy(page_document)
+    result = page_document.snapshot_clone()
     result.blocks = []
     result.metadata = copy.deepcopy(page_document.metadata)
     result.metadata.source_engine = f"{page_document.metadata.source_engine or 'page_ocr'}+shared_geometry"

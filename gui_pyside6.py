@@ -3,7 +3,7 @@
 """
 Novel Formatter 2.0 — PySide6 GUI
 七个主功能区：工作区 / 页面管理 / OCR 识别 / 格式处理 / 文字校对 / EPUB生成 / 设置。
-九个原业务工作区通过顶部页签融合，macOS 简约风格，完整功能保留。
+OCR/PDF 仍使用紧凑模式切换；文字校对由全文总览与图文对照在页内互切，macOS 简约风格，完整功能保留。
 
 用法: python3 gui_pyside6.py
 依赖: pip3 install PySide6 pillow
@@ -86,7 +86,6 @@ from ui.ocr.compare_publication import OCRComparePublicationService
 from ui.ocr.compare_gpt_adjudication import OCRCompareGPTAdjudicationController
 from ui.ocr.compare_batch import OCRCompareBatchService
 from ui.ocr.compare_history import OCRCompareAdjudicationHistoryService
-from ui.ocr.image_review import _ImageReviewFusionCandidateCard, OCRImageTextReviewTab
 from ui.pages.types import PAGE_TYPES, TYPE_LABEL, TYPE_COLOR
 from ui.pages.preview import PageImagePreviewDialog
 from ui.pages.tab import PageManagerTab
@@ -313,6 +312,9 @@ class OCRTab(QWidget):
     single_ocr_invalidated = Signal()
     review_preview_boxes_ready = Signal(str, object)
     run_log_event = Signal(object)
+    # Bulk AI/import passes need one durable project checkpoint without writing
+    # thousands of per-row journal events.
+    adjudication_checkpoint_requested = Signal()
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -474,7 +476,13 @@ class OCRTab(QWidget):
         self._apply_ocr_mode_ui(initial=True)
         self._highlight_adapter(self._active_adapter)
         self._vision_backend_widget.setVisible(self._active_adapter == "apple_vision")
-        self._on_vision_backend_changed()
+        # Apple backend probing imports the native/live-text backend registry.
+        # _select_adapter already performs it when Apple OCR is actually active;
+        # avoid a second unconditional probe when the default engine is Hayai.
+        if self._active_adapter == "apple_vision":
+            self._on_vision_backend_changed()
+        else:
+            self._update_shortcut_widget_visibility()
         self._refresh_ocr_runtime_status(show_dialog=False, deep=False)
 
     def _current_ocr_mode(self) -> str:
@@ -842,8 +850,9 @@ class OCRTab(QWidget):
             "review2": str(state.get("multi_role_review2", "") or ""),
             "review3": str(state.get("multi_role_review3", "") or ""),
         }
+        valid_role_engines = {str(item[0]) for item in OCR_ADAPTERS if bool(item[5])}
         for _role, _engine in tuple(role_state.items()):
-            if _engine in {"yomitoku"}:
+            if _engine and _engine not in valid_role_engines:
                 role_state[_role] = ""
         role_schema = int(state.get("multi_role_schema", 0) or 0)
         if role_schema < 1:
@@ -1074,9 +1083,10 @@ class OCRTab(QWidget):
             )
         self._update_paddle_aistudio_option_state()
         requested_engine = str(state.get("active_adapter") or "apple_vision")
-        # Google Vision was retired from the interactive OCR workspace.  Old
-        # per-mode settings must not resurrect a hidden engine after upgrade.
-        if requested_engine in {"google_vision", "yomitoku", "manga_ocr"}:
+        # Persisted settings may reference engines removed from the current
+        # catalog.  Never resurrect a hidden/removed engine after upgrade.
+        catalog_engine_ids = {str(item[0]) for item in OCR_ADAPTERS if bool(item[5])}
+        if requested_engine not in catalog_engine_ids:
             requested_engine = "apple_vision"
         self._select_adapter(requested_engine, True, None)
         self._update_multi_ocr_option_state()
@@ -1447,7 +1457,8 @@ class OCRTab(QWidget):
         return [value for value in values if value]
 
     def _on_multi_ocr_role_changed(self, *_args) -> None:
-        self._refresh_multi_ocr_role_choices()
+        # One state update performs the capability refresh.  Older builds did
+        # both explicitly, so every combo change walked all role items twice.
         self._update_multi_ocr_option_state()
 
     def _on_multi_ocr_toggled(self, checked: bool) -> None:
@@ -1525,7 +1536,12 @@ class OCRTab(QWidget):
         multi_enabled = bool(
             hasattr(self, "_multi_ocr_check") and self._multi_ocr_check.isChecked()
         )
-        self._refresh_multi_ocr_role_choices()
+        # Capability imports include the column OCR stack.  Multi-model is OFF
+        # on the ordinary single-model path, so do not import/walk that stack
+        # merely to construct the OCR page.  The first enable or role change
+        # refreshes it before the controls become actionable.
+        if multi_enabled:
+            self._refresh_multi_ocr_role_choices()
         combos = getattr(self, "_multi_role_combos", {}) or {}
         for combo in combos.values():
             if combo is not None:
@@ -2512,8 +2528,7 @@ class OCRTab(QWidget):
                     "event": "cancelling", "session_id": session_id,
                     "message": "OCR 无活动超时，正在终止并保存可恢复断点",
                 })
-            self._pause_btn.setEnabled(False)
-            self._pause_btn.setText("正在终止…")
+            self._ocr_run_lifecycle._set_run_ui_state("cancelling")
             self._log_view.appendPlainText(
                 f"\n🛑 OCR 连续 {int(idle)} 秒无活动，已触发整次任务保护并终止外部识别进程。"
             )
@@ -2533,8 +2548,7 @@ class OCRTab(QWidget):
             })
         self._ocr_watchdog_timer.stop()
         self._progress_clock_timer.stop()
-        self._pause_btn.setEnabled(False)
-        self._pause_btn.setText("正在终止…")
+        self._ocr_run_lifecycle._set_run_ui_state("cancelling")
         if self._progress_display_is_enabled():
             self._phase_progress_lbl.setVisible(True)
             self._phase_progress_lbl.setText("当前：正在终止 OCR，不再派发新任务…")
@@ -2544,8 +2558,6 @@ class OCRTab(QWidget):
         )
 
     def _engine_label(self, engine_id: str) -> str:
-        if str(engine_id or "") == "manga_ocr":
-            return "Manga OCR"
         return next((item[1] for item in OCR_ADAPTERS if item[0] == engine_id), engine_id)
 
     def _selected_single_ocr_engine(self) -> str:
@@ -3117,12 +3129,14 @@ class OCRCompareTab(OCRCompareViewMixin, QWidget):
     # Keep the disagreement queue in 图文对照 in the same order as OCR 对比.
     disagreement_queue_order_changed = Signal(object)
     # Request the existing independent image/text workspace at the same stable row.
-    image_review_requested = Signal(int)
     # Successful/failed external package exports are persisted in project Run History.
     package_exported = Signal(object)
     # Long-running in-app adjudication shares the same project/runtime lifecycle
     # contract as OCR without moving worker ownership into MainWindow.
     run_log_event = Signal(object)
+    # Bulk AI/import passes need one durable project checkpoint without writing
+    # thousands of per-row journal events.
+    adjudication_checkpoint_requested = Signal()
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -3139,6 +3153,9 @@ class OCRCompareTab(OCRCompareViewMixin, QWidget):
         self._suspended_multi_state: dict | None = None
         self._comparison = None
         self._primary_doc: UnifiedDocument | None = None
+        # Pixel/source evidence may live on the fused document even though
+        # OCR candidate text must remain attached to immutable model documents.
+        self._reference_doc: UnifiedDocument | None = None
         # Ruby is a locked structural overlay produced on the worker's initial
         # fused document.  Keep that immutable overlay available because the
         # review page rebuilds a fresh fused document when the user clicks Apply.
@@ -3174,7 +3191,13 @@ class OCRCompareTab(OCRCompareViewMixin, QWidget):
         self._resolved_history_group = "all"
         self._single_card_enabled = False
         self._single_card_preview_row = -1
-        self._review_mode = "decision"
+        self._review_mode = "full"
+        # Presentation-only full-book reader; never enters persisted OCR state.
+        self._full_only_enabled = False
+        self._full_only_refresh_timer = QTimer(self)
+        self._full_only_refresh_timer.setSingleShot(True)
+        self._full_only_refresh_timer.setInterval(180)
+        self._full_only_refresh_timer.timeout.connect(self._refresh_full_only_text)
         self._decision_queue_signature: tuple = ()
         self._syncing_decision_queue = False
         self._decision_queue_model: DecisionQueueListModel | None = None
@@ -3239,6 +3262,17 @@ class OCRCompareTab(OCRCompareViewMixin, QWidget):
         self._next_sentence_shortcut = QShortcut(QKeySequence("Alt+Right"), self)
         self._next_sentence_shortcut.setContext(Qt.WidgetWithChildrenShortcut)
         self._next_sentence_shortcut.activated.connect(self._jump_next_sentence)
+        # Standard diff-editor navigation, kept in addition to the historical F8
+        # shortcut so existing muscle memory is not broken.
+        self._next_diff_f7_shortcut = QShortcut(QKeySequence("F7"), self)
+        self._next_diff_f7_shortcut.setContext(Qt.WidgetWithChildrenShortcut)
+        self._next_diff_f7_shortcut.activated.connect(self._jump_next_group)
+        self._prev_diff_f7_shortcut = QShortcut(QKeySequence("Shift+F7"), self)
+        self._prev_diff_f7_shortcut.setContext(Qt.WidgetWithChildrenShortcut)
+        self._prev_diff_f7_shortcut.activated.connect(self._jump_previous_group)
+        self._image_evidence_shortcut = QShortcut(QKeySequence("Alt+I"), self)
+        self._image_evidence_shortcut.setContext(Qt.WidgetWithChildrenShortcut)
+        self._image_evidence_shortcut.activated.connect(self._request_image_review)
         # High-throughput manual review: Alt+1…Alt+6 remains available for
         # legacy sessions, but only panels for actually loaded OCR sources are
         # shown. Empty model boxes are never displayed.
@@ -3337,6 +3371,7 @@ class OCRCompareTab(OCRCompareViewMixin, QWidget):
             "labels": list(self._labels),
             "comparison": self._comparison,
             "primary_doc": self._primary_doc,
+            "reference_doc": self._reference_doc,
             "initial_payload": self._initial_payload,
             "ruby_overlay_doc": self._ruby_overlay_doc,
             "fusion_states": self._fusion_states,
@@ -3363,6 +3398,7 @@ class OCRCompareTab(OCRCompareViewMixin, QWidget):
         self._labels = list(state.get("labels") or [])
         self._comparison = state.get("comparison")
         self._primary_doc = state.get("primary_doc")
+        self._reference_doc = state.get("reference_doc") or self._primary_doc
         self._initial_payload = state.get("initial_payload")
         self._ruby_overlay_doc = state.get("ruby_overlay_doc")
         self._fusion_states = list(state.get("fusion_states") or [])
@@ -3403,7 +3439,7 @@ class OCRCompareTab(OCRCompareViewMixin, QWidget):
             self._loading_text = False
         self._set_source_labels_for_mode()
         self._source_area.setVisible(bool(self._documents))
-        self._workspace_title.setText("OCR 对比 · 逐句裁决")
+        self._workspace_title.setText("OCR 对比 · 全文总览")
         # clear() disables the switch.  A suspended multi-model session must
         # explicitly restore its review controls together with its documents.
         self._sync_review_mode_controls()
@@ -3434,7 +3470,7 @@ class OCRCompareTab(OCRCompareViewMixin, QWidget):
         self._import_ai_repair_result_btn.setEnabled(True)
         self._ai_adjudicate_btn.setEnabled(not self._ai_import_busy)
         self._import_ai_package_btn.setEnabled(True)
-        self._apply_btn.setText("✓ 应用融合稿")
+        self._apply_btn.setText("✓ 应用整本")
         self._apply_btn.setEnabled(True)
         self._suspended_multi_state = None
         self._render_fusion_window(self._current_row_index, force=True)
@@ -3479,6 +3515,7 @@ class OCRCompareTab(OCRCompareViewMixin, QWidget):
         self._single_doc = doc
         self._single_original_doc = doc
         self._primary_doc = doc
+        self._reference_doc = doc
         self._documents = [doc]
         self._labels = [str(label or getattr(doc.metadata, "source_engine", "") or "单模型 OCR")]
         self._loaded_single_generation = (
@@ -3623,6 +3660,10 @@ class OCRCompareTab(OCRCompareViewMixin, QWidget):
         )
         self._ruby_overlay_doc = fused_doc if ruby_enabled else None
         self._primary_doc = self._documents[0] if self._documents else None
+        # The fused document carries immutable page/column image lineage used
+        # by OCR Compare's read-only evidence card.  Keep it separate from the
+        # raw model documents so displaying pixels can never rewrite OCR text.
+        self._reference_doc = fused_doc if fused_doc is not None else self._primary_doc
         # External AI Studio evidence belongs to one concrete OCR comparison
         # session. Loading a new comparison invalidates the previous imports.
         self._targeted_retry_local_report = payload.get("targeted_retry_local_report")
@@ -3672,13 +3713,13 @@ class OCRCompareTab(OCRCompareViewMixin, QWidget):
         self._set_source_labels_for_mode()
         self._source_area.setVisible(bool(self._documents))
         self._sources_dirty = False
-        self._workspace_title.setText("OCR 对比 · 逐句裁决")
+        self._workspace_title.setText("OCR 对比 · 全文总览")
         self._sync_review_mode_controls()
         self._choose_label.setVisible(True)
         self._row_state.setVisible(True)
         self._result_panel.setVisible(True)
         self._result_title.setText("融合结果（真正一致与两模型共同候选均自动保留；真正分歧需裁决）")
-        self._apply_btn.setText("✓ 应用融合稿")
+        self._apply_btn.setText("✓ 应用整本")
         self._single_export_btn.setEnabled(False)
         self._export_ai_package_btn.setEnabled(True)
         self._export_source_correction_btn.setEnabled(True)
@@ -3694,7 +3735,7 @@ class OCRCompareTab(OCRCompareViewMixin, QWidget):
         else:
             self._rebuild_fusion_rows(auto_choose=False)
         self._apply_targeted_retry_local_report(self._targeted_retry_local_report)
-        self._set_review_mode("decision", force=True)
+        self._set_review_mode("full", force=True)
         self._refresh_source_highlights()
         self._summary.setText(
             f"模型：{' · '.join(self._labels)}。{self._comparison.summary} "
@@ -3851,6 +3892,11 @@ class OCRCompareTab(OCRCompareViewMixin, QWidget):
                 str(value) for value in (getattr(row, "column_ids", ()) or ()) if str(value)
             ],
             "resolved": candidate is not None,
+            # Always expose the current fusion output as a read-only mirror.
+            # When undo/reopen clears selected_index, 图文对照 needs this value
+            # to restore its review copy instead of keeping the previously
+            # confirmed human text.  Raw OCR model documents are untouched.
+            "current_output_text": str(state.output_text() or ""),
             "text": str(getattr(candidate, "text", "") or "") if candidate is not None else "",
             "delete_intentionally": bool(
                 getattr(candidate, "delete_intentionally", False)
@@ -3882,7 +3928,8 @@ class OCRCompareTab(OCRCompareViewMixin, QWidget):
         """
         origin = str(getattr(state, "selection_origin", "") or "")
         current = str(state.output_text() or "").strip()
-        if origin.startswith("human_") and state.selected_index is not None:
+        selected_index = getattr(state, "selected_index", None)
+        if origin.startswith("human_") and selected_index is not None:
             return current
         try:
             row = self._comparison.rows[int(row_index)]
@@ -3910,57 +3957,205 @@ class OCRCompareTab(OCRCompareViewMixin, QWidget):
             and bool(self._fusion_states)
             and 0 <= int(getattr(self, "_current_row_index", -1)) < len(self._fusion_states)
         )
+        row_index = int(getattr(self, "_current_row_index", -1))
+        drafts = getattr(self, "_manual_decision_drafts", {})
+        draft_sources = getattr(self, "_manual_decision_draft_sources", {})
         self._manual_decision_syncing = True
         try:
             editor.setEnabled(bool(valid))
-            locked = bool(valid and len(self._documents) >= 2 and not self._comparison.rows[int(self._current_row_index)].is_conflict)
+            locked = bool(
+                valid and len(self._documents) >= 2
+                and not self._comparison.rows[row_index].is_conflict
+            )
             editor.setReadOnly(locked)
             value = ""
             if valid:
-                row_index = int(self._current_row_index)
                 state = self._fusion_states[row_index]
-                value = self._manual_decision_seed_text(state, row_index)
+                value = str(drafts.get(row_index, self._manual_decision_seed_text(state, row_index)) or "")
             if editor.toPlainText() != value:
                 editor.setPlainText(value)
         finally:
             self._manual_decision_syncing = False
+        self._schedule_manual_decision_editor_fit()
+
+        widget = getattr(self, "_fusion_widgets", {}).get(row_index)
+        if widget is not None and valid:
+            baseline = getattr(self, "_manual_decision_draft_candidates", {}).get(row_index)
+            for index, card in enumerate(widget._cards):
+                card.set_draft_source(index == baseline if baseline is not None else card.editor.toPlainText() == value)
+
+        state_label = getattr(self, "_manual_decision_state", None)
+        if state_label is not None:
+            if not valid:
+                state_label.setText("草稿区 · 当前没有可裁决的多模型句")
+            elif locked:
+                state_label.setText("多模型结果一致 · 当前句只读，无需人工裁决")
+            elif row_index in drafts:
+                source = str(draft_sources.get(row_index, "手动草稿") or "手动草稿")
+                state_label.setText(f"未确认草稿 · {source} · 只有点“确认裁决”才会写入融合结果")
+            else:
+                state = self._fusion_states[row_index]
+                origin = str(getattr(state, "selection_origin", "") or "")
+                if origin == "human_manual_edit" and getattr(state, "selected_index", None) is not None:
+                    state_label.setText("已确认人工裁决 · 可继续修改，修改后需再次确认")
+                else:
+                    state_label.setText("草稿区 · 选择候选“作为底稿”或直接输入；不会自动提交")
+
+    def _refresh_manual_draft_queue_row(self, row_index: int) -> None:
+        model = getattr(self, "_decision_queue_model", None)
+        if model is not None:
+            try:
+                model.refresh_row(int(row_index))
+            except Exception:
+                pass
+        refresh_stats = getattr(self, "_refresh_decision_queue_stats", None)
+        if callable(refresh_stats):
+            refresh_stats()
+
+    def _schedule_manual_decision_editor_fit(self) -> None:
+        timer = getattr(self, "_manual_decision_fit_timer", None)
+        if timer is not None:
+            timer.start(0)
+
+    def _fit_manual_decision_editor_height(self) -> None:
+        editor = getattr(self, "_manual_decision_editor", None)
+        if editor is None:
+            return
+        try:
+            document = editor.document()
+            usable_width = max(1, editor.viewport().width() - 4)
+            document.setTextWidth(float(usable_width))
+            layout = document.documentLayout()
+            block = document.begin()
+            content_height = 0.0
+            while block.isValid():
+                content_height += layout.blockBoundingRect(block).height()
+                block = block.next()
+            content_height = int(math.ceil(content_height + document.documentMargin() * 2))
+            chrome = max(0, editor.height() - editor.viewport().height())
+            line_guard = max(16, editor.fontMetrics().lineSpacing())
+            target = max(68, min(168, content_height + chrome + line_guard))
+            if editor.height() != target:
+                editor.setFixedHeight(target)
+        except RuntimeError:
+            return
+
+    def _stage_manual_candidate(
+        self, row_index: int, candidate_index: int, text: str, label: str = "候选"
+    ) -> None:
+        if self._mode != "multi" or self._comparison is None or not self._fusion_states:
+            return
+        try:
+            row_index = int(row_index)
+            candidate_index = int(candidate_index)
+        except (TypeError, ValueError, OverflowError):
+            return
+        if not 0 <= row_index < len(self._fusion_states):
+            return
+        if row_index != int(getattr(self, "_current_row_index", -1)):
+            self._select_row(row_index)
+        if len(self._documents) >= 2 and not self._comparison.rows[row_index].is_conflict:
+            return
+        value = str(text or "")
+        self._manual_decision_drafts[row_index] = value
+        if not hasattr(self, "_manual_decision_draft_candidates"):
+            self._manual_decision_draft_candidates = {}
+        self._manual_decision_draft_candidates[row_index] = candidate_index
+        source = str(label or f"候选{candidate_index + 1}")
+        self._manual_decision_draft_sources[row_index] = f"底稿：{source}"
+        self._refresh_manual_draft_queue_row(row_index)
+        editor = getattr(self, "_manual_decision_editor", None)
+        if editor is not None:
+            self._manual_decision_syncing = True
+            try:
+                editor.setPlainText(value)
+                editor.moveCursor(QTextCursor.End)
+            finally:
+                self._manual_decision_syncing = False
+            editor.setFocus()
+        state_label = getattr(self, "_manual_decision_state", None)
+        if state_label is not None:
+            state_label.setText(
+                f"未确认草稿 · 底稿：{source} · 可继续修改；不会跳转，也不会改变模型原文"
+            )
+        self._summary.setText(
+            f"第 {row_index + 1} 句已将 {source} 作为手动底稿；修改完成后点“确认裁决”。"
+        )
+
+        self._sync_manual_decision_editor()
+
+    def _discard_manual_decision_draft(self) -> None:
+        row_index = int(getattr(self, "_current_row_index", -1))
+        getattr(self, "_manual_decision_drafts", {}).pop(row_index, None)
+        getattr(self, "_manual_decision_draft_sources", {}).pop(row_index, None)
+        getattr(self, "_manual_decision_draft_candidates", {}).pop(row_index, None)
+        self._refresh_manual_draft_queue_row(row_index)
+        timer = getattr(self, "_manual_decision_commit_timer", None)
+        if timer is not None and timer.isActive():
+            timer.stop()
+        self._sync_manual_decision_editor()
+        if self._comparison is not None and 0 <= row_index < len(self._fusion_states):
+            self._summary.setText(f"已放弃第 {row_index + 1} 句未确认草稿；现有裁决结果未改变。")
 
     def _manual_decision_text_changed(self) -> None:
         if bool(getattr(self, "_manual_decision_syncing", False)):
             return
         timer = getattr(self, "_manual_decision_commit_timer", None)
-        if timer is not None:
-            timer.start()
-
-    def _commit_manual_decision_editor(self) -> None:
-        editor = getattr(self, "_manual_decision_editor", None)
-        if editor is None or bool(getattr(self, "_manual_decision_syncing", False)):
-            return
+        if timer is not None and timer.isActive():
+            timer.stop()
         if self._mode != "multi" or self._comparison is None or not self._fusion_states:
             return
         row_index = int(getattr(self, "_current_row_index", -1))
         if not 0 <= row_index < len(self._fusion_states):
             return
+        editor = getattr(self, "_manual_decision_editor", None)
+        if editor is None:
+            return
+        self._manual_decision_drafts[row_index] = editor.toPlainText()
+        self._manual_decision_draft_sources.setdefault(row_index, "自由手动编辑")
+        self._refresh_manual_draft_queue_row(row_index)
+        self._schedule_manual_decision_editor_fit()
+        state_label = getattr(self, "_manual_decision_state", None)
+        if state_label is not None:
+            source = str(self._manual_decision_draft_sources.get(row_index, "手动草稿") or "手动草稿")
+            state_label.setText(f"未确认草稿 · {source} · 点击“确认裁决”提交，切换页面不会自动提交")
+
+    def _commit_manual_decision_editor(self) -> bool:
+        editor = getattr(self, "_manual_decision_editor", None)
+        if editor is None or bool(getattr(self, "_manual_decision_syncing", False)):
+            return False
+        if self._mode != "multi" or self._comparison is None or not self._fusion_states:
+            return False
+        row_index = int(getattr(self, "_current_row_index", -1))
+        if not 0 <= row_index < len(self._fusion_states):
+            return False
         if len(self._documents) >= 2 and not self._comparison.rows[row_index].is_conflict:
-            return
-        text = editor.toPlainText().strip()
-        if not text:
-            return
+            return False
+        text = editor.toPlainText().replace("\r\n", "\n").replace("\r", "\n").strip("\n")
         state = self._fusion_states[row_index]
-        if state.output_text().strip() == text and str(getattr(state, "selection_origin", "") or "") == "human_manual_edit":
-            return
+        if (
+            state.output_text().strip("\n") == text
+            and str(getattr(state, "selection_origin", "") or "") == "human_manual_edit"
+            and row_index not in getattr(self, "_manual_decision_drafts", {})
+        ):
+            return True
+
+        history = getattr(self, "_history_service", None)
+        if history is not None:
+            history.prepare_resolution(row_index, -1)
         from engine.ocr_compare_view_model import upsert_external_candidate
         selected = upsert_external_candidate(
             state, text,
             display_label="人工手动编辑",
             select=True,
-            reason="OCR 对比手动编辑；原始 OCR 模型候选保持不变。",
+            reason="OCR 对比手动编辑；候选只作为底稿，原始 OCR 模型候选保持不变。",
             confidence=1.0,
+            allow_empty=True,
             force_role_candidate=True,
             selection_origin="human_manual_edit",
         )
         if selected is None:
-            return
+            return False
         state.requires_confirmation = False
         self._sync_canonical_authority_from_states([row_index])
         self._publish_fusion_decision(row_index, origin="ocr_compare")
@@ -3971,13 +4166,27 @@ class OCRCompareTab(OCRCompareViewMixin, QWidget):
             else sum(1 for item in self._fusion_states if item.unresolved)
         )
         self._update_unresolved_summary(refresh_queue=False, known_unresolved=remaining_pending)
+        if history is not None:
+            history.commit_resolution(row_index)
+        getattr(self, "_manual_decision_drafts", {}).pop(row_index, None)
+        getattr(self, "_manual_decision_draft_sources", {}).pop(row_index, None)
         self._render_fusion_window(row_index, force=True)
         self._row_state.setText(
             f"当前句：{row_index + 1}/{len(self._comparison.rows)} · 人工编辑 · 已确定"
         )
         self._summary.setText(
-            f"第 {row_index + 1} 句已保存为人工手动编辑候选；所有 OCR 模型原文保持不变。"
+            f"第 {row_index + 1} 句已确认人工裁决；所有 OCR 模型原文保持不变。"
         )
+        state_label = getattr(self, "_manual_decision_state", None)
+        if state_label is not None:
+            state_label.setText("✓ 已确认人工裁决 · 如继续修改，需要再次点确认")
+        return True
+
+    def _commit_manual_decision_and_next(self) -> None:
+        row_index = int(getattr(self, "_current_row_index", -1))
+        if not self._commit_manual_decision_editor():
+            return
+        QTimer.singleShot(0, lambda: self._jump_next_group_from(row_index))
 
     def apply_image_review_update(self, payload: dict, *, refresh: bool = True) -> bool:
         """Publish one 图文对照 sentence as the selected final fusion candidate.
@@ -4254,6 +4463,7 @@ class OCRCompareTab(OCRCompareViewMixin, QWidget):
                 self._single_original_doc = self._single_doc
             self._single_doc = normalized_doc
             self._primary_doc = normalized_doc
+            self._reference_doc = normalized_doc
             self._documents = [normalized_doc]
             self._loading_text = True
             try:
@@ -5065,6 +5275,9 @@ class OCRCompareTab(OCRCompareViewMixin, QWidget):
             self._prev_group_btn.setEnabled(bool(history_rows) if self._show_resolved_history else unresolved > 0)
         if hasattr(self, "_next_group_btn"):
             self._next_group_btn.setEnabled(bool(history_rows) if self._show_resolved_history else unresolved > 0)
+        if getattr(self, "_full_only_enabled", False) and getattr(self, "_review_mode", "") == "full":
+            # Coalesce large AI import batches; do not rebuild a book per row.
+            self._full_only_refresh_timer.start()
         if hasattr(self, "_sync_compact_compare_controls"):
             self._sync_compact_compare_controls()
 
@@ -5200,10 +5413,6 @@ class MainWindow(MainWindowControllerMixin, QMainWindow):
         return self._lazy_workspaces.get("ocr_compare")
 
     @property
-    def _tab_ocr_image_review(self):
-        return self._lazy_workspaces.get("image_review")
-
-    @property
     def _tab_epub(self):
         return self._lazy_workspaces.get("epub")
 
@@ -5329,32 +5538,15 @@ class MainWindow(MainWindowControllerMixin, QMainWindow):
             lambda row: self._workspace_coordinator.publish_stable_row(row, "ocr_compare")
         )
         tab.fusion_decision_changed.connect(self._on_ocr_compare_decision_changed)
-        tab.disagreement_queue_order_changed.connect(
-            self._tab_ocr_image_review.set_disagreement_source_row_order
-        )
-        tab.image_review_requested.connect(self._open_image_review_from_ocr_compare)
         tab.package_exported.connect(self._on_package_exported)
         tab.run_log_event.connect(self._on_compare_run_log_event)
+        tab.adjudication_checkpoint_requested.connect(
+            lambda: self._save_project_adjudication_snapshot(reset_journal=True)
+        )
         pending = getattr(self, "_pending_single_compare_result", None)
         if pending is not None:
             doc, label = pending
             tab.set_available_single_result(doc, label)
-
-    def _install_image_review_workspace(self, tab: OCRImageTextReviewTab) -> None:
-        self._replace_reference_tab(self._proof_section, 1, tab, "图文对照")
-        self._register_loaded_workspace("image_review", tab)
-        tab.set_page_image_provider(
-            lambda: list(getattr(self._tab_pages, "page_images", []) or [])
-        )
-        tab.doc_applied.connect(self._on_ocr_image_review_applied)
-        tab.row_review_saved.connect(self._on_image_review_row_saved)
-        tab.source_row_changed.connect(
-            lambda row: self._workspace_coordinator.publish_stable_row(row, "image_review")
-        )
-        pending = getattr(self, "_pending_image_review_document", None)
-        if pending is not None:
-            doc, label, lazy = pending
-            tab.set_document(doc, label, lazy=bool(lazy))
 
     def _install_epub_workspace(self, tab: EPUBTab) -> None:
         self._replace_main_section(SECTION_EPUB, tab)
@@ -5389,8 +5581,9 @@ class MainWindow(MainWindowControllerMixin, QMainWindow):
         return self._lazy_workspaces.get(key)
 
     def _ensure_proof_subworkspace(self, index: int) -> QWidget:
-        key = "image_review" if int(index) == 1 else "ocr_compare"
-        return self._lazy_workspaces.get(key)
+        # The old second image_review widget was removed: both modes are inside
+        # one OCRCompareTab, so project/candidate state remains single-source.
+        return self._lazy_workspaces.get("ocr_compare")
 
     def __init__(self):
         super().__init__()
@@ -5414,6 +5607,20 @@ class MainWindow(MainWindowControllerMixin, QMainWindow):
         self._project_stage_save_lock = threading.Lock()
         self._project_stage_save_generation = GenerationGuard()
         self._project_stage_save_signal_refs: dict[int, WorkerSignals] = {}
+        # Project snapshots are low-frequency but potentially large.  Keep
+        # persistence off the GUI thread and make same-stage writes latest-wins
+        # without allowing one stage (e.g. Formatter) to cancel another
+        # (e.g. OCR/Image Review).
+        self._project_stage_persist_lock = threading.Lock()
+        self._project_stage_persist_sequence = 0
+        self._project_stage_persist_latest: dict[tuple[str, str], int] = {}
+        # Full multi-OCR adjudication checkpoints are ~35 MB on a 3-model book.
+        # Freeze the live state on the GUI thread, but serialize/compress it on a
+        # dedicated worker.  Same-project requests are latest-wins.
+        self._project_adjudication_save_lock = threading.Lock()
+        self._project_adjudication_persist_lock = threading.Lock()
+        self._project_adjudication_persist_sequence = 0
+        self._project_adjudication_persist_latest: dict[str, int] = {}
         self._project_restore_signal_refs: dict[int, WorkerSignals] = {}
         self._pending_project_document: tuple[str, UnifiedDocument] | None = None
         self._pending_project_hydrated: set[str] = set()
@@ -5423,7 +5630,6 @@ class MainWindow(MainWindowControllerMixin, QMainWindow):
         self._pending_ocr_inputs: tuple[str, ...] = ()
         self._pending_ocr_pipeline_state: dict = {}
         self._pending_single_compare_result = None
-        self._pending_image_review_document = None
         self._pending_project_export_dir = None
         self._pending_project_package_dir = None
         self._lazy_workspaces = LazyWorkspaceRegistry()
@@ -5466,7 +5672,6 @@ class MainWindow(MainWindowControllerMixin, QMainWindow):
         self._pdf_placeholder = self._lazy_placeholder("PDF 文字层")
         self._fmt_placeholder = self._lazy_placeholder("格式处理")
         self._compare_placeholder = self._lazy_placeholder("OCR 对比")
-        self._review_placeholder = self._lazy_placeholder("图文对照")
         self._epub_placeholder = self._lazy_placeholder("EPUB生成")
 
         self._ocr_section = ReferenceSectionHost([
@@ -5479,15 +5684,12 @@ class MainWindow(MainWindowControllerMixin, QMainWindow):
         self._ocr_section._segment_bar.setStyleSheet(
             f"QWidget#referenceSegmentBar{{background:{CARD};border:none;}}"
         )
-        # Source-contract marker retained for existing architecture tests:
-        # self._proof_section = ReferenceSectionHost([
-        #     ("OCR 对比", self._tab_ocr_compare),
-        #     ("图文对照", self._tab_ocr_image_review),
-        # ])
+        # One native review workspace; no dead 42px top tab strip and no old
+        # independently loaded ImageReview widget. The compact command bar in
+        # OCRCompareTab switches full overview ↔ original sentence reviewer.
         self._proof_section = ReferenceSectionHost([
-            ("OCR 对比", self._compare_placeholder),
-            ("图文对照", self._review_placeholder),
-        ])
+            ("文字校对", self._compare_placeholder),
+        ], show_segment_bar=False)
 
         self._workspace_tabs = [self._tab_pages]
         for key, workspace in (
@@ -5518,7 +5720,6 @@ class MainWindow(MainWindowControllerMixin, QMainWindow):
         self._lazy_workspaces.register("pdf_text", PdfTextLayerTab, self._install_pdf_text_workspace)
         self._lazy_workspaces.register("formatter", FormatterTab, self._install_formatter_workspace)
         self._lazy_workspaces.register("ocr_compare", OCRCompareTab, self._install_compare_workspace)
-        self._lazy_workspaces.register("image_review", OCRImageTextReviewTab, self._install_image_review_workspace)
         self._lazy_workspaces.register("epub", EPUBTab, self._install_epub_workspace)
 
         self._ocr_section.current_changed.connect(self._on_ocr_subtab_changed)
@@ -5592,14 +5793,20 @@ class MainWindow(MainWindowControllerMixin, QMainWindow):
             try:
                 prepared = (payload or {}).get("prepared")
                 events = list((payload or {}).get("events") or [])
-                if prepared and self._tab_ocr_compare.restore_project_snapshot({}, prepared=prepared):
-                    replayed = self._tab_ocr_compare.apply_project_adjudication_events(events)
-                    self._pending_project_multi_restore = None
-                    self._pending_project_hydrated.add("ocr_compare")
-                    suffix = f"；增量恢复 {replayed} 条裁决" if replayed else ""
-                    self.statusBar().showMessage(f"OCR 对比与裁决状态已按需恢复{suffix}", 6000)
-                    if self._stack.currentIndex() == SECTION_PROOF and self._proof_section.current_index() == 1:
-                        QTimer.singleShot(0, self._load_and_sync_image_review_row)
+                if not prepared:
+                    self.statusBar().showMessage("未找到有效的 OCR 对比快照；原裁决状态未被覆盖。", 10000)
+                    return
+                if not self._tab_ocr_compare.restore_project_snapshot({}, prepared=prepared):
+                    self.statusBar().showMessage(
+                        "OCR 裁决快照恢复未完成：融合状态校验或界面载入失败，请查看工作区日志。",
+                        10000,
+                    )
+                    return
+                replayed = self._tab_ocr_compare.apply_project_adjudication_events(events)
+                self._pending_project_multi_restore = None
+                self._pending_project_hydrated.add("ocr_compare")
+                suffix = f"；增量恢复 {replayed} 条裁决" if replayed else ""
+                self.statusBar().showMessage(f"OCR 对比与裁决状态已按需恢复{suffix}", 6000)
             except Exception as exc:
                 self.statusBar().showMessage(f"OCR 裁决状态未恢复：{exc}", 10000)
 

@@ -471,7 +471,7 @@ def _is_ocr_column_document(doc: UnifiedDocument) -> bool:
     source = str(getattr(doc.metadata, "source_engine", "") or "").lower()
     known = (
         "ocr", "vision", "ndlocr", "paddle", "manga",
-        "google_vision", "hybrid",
+        "hybrid",
     )
     if any(token in source for token in known):
         return True
@@ -714,7 +714,7 @@ def reflow_columns_into_sentences(
     """
     if callable(cancel_check) and cancel_check():
         raise InterruptedError("OCR 已停止")
-    result = copy.deepcopy(doc)
+    result = doc.snapshot_clone()
     if callable(cancel_check) and cancel_check():
         raise InterruptedError("OCR 已停止")
     if bool(getattr(result.metadata, "column_sentence_reflow_applied", False)):

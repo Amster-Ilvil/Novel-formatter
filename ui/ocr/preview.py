@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import math
+from collections import OrderedDict
+from pathlib import Path
 
 from PySide6.QtWidgets import QLabel, QFrame, QRubberBand
 from PySide6.QtCore import Qt, QRect, QPoint
@@ -35,6 +37,13 @@ class OCRCropPreview(QLabel):
         self.setCursor(QCursor(Qt.CrossCursor))
 
         self._orig_pixmap: QPixmap | None = None
+        # Retained OCR preview snapshots are PNGs and may be revisited many times
+        # with ←/→ while a run is still active.  Keep only the nearest few decoded
+        # pixmaps; live OCR frames still arrive as background-decoded QImage.
+        self._history_pixmap_cache: OrderedDict[tuple[str, int, int], tuple[QPixmap, int]] = OrderedDict()
+        self._history_pixmap_cache_bytes = 0
+        self._history_pixmap_cache_limit_items = 3
+        self._history_pixmap_cache_limit_bytes = 128 * 1024 * 1024
         self._scaled_source_size: tuple[int, int] | None = None
         self._source_display_offset: tuple[float, float] = (0.0, 0.0)
         self._rect_norm: tuple[float, float, float, float] | None = None
@@ -54,7 +63,7 @@ class OCRCropPreview(QLabel):
         self._column_overlays: list[QFrame] = []
         self._column_labels: list[QLabel] = []
         # Final native-pixel OCR reveal boxes are deliberately separate from
-        # detector boxes: red marks detected columns, blue marks source pixels
+        # detector boxes: red marks detected columns, green marks source pixels
         # preserved for OCR before Ruby is blanked and white context is added.
         self._input_rects_norm: list[tuple[float, float, float, float]] = []
         self._input_overlays: list[QFrame] = []
@@ -65,6 +74,40 @@ class OCRCropPreview(QLabel):
         # explicitly enabled the per-character review controls.
         self._character_rects_norm: list[tuple[float, float, float, float]] = []
         self._character_overlays: list[QFrame] = []
+
+
+    @staticmethod
+    def _pixmap_cost(pixmap: QPixmap) -> int:
+        return max(0, int(pixmap.width())) * max(0, int(pixmap.height())) * 4
+
+    def _load_cached_history_pixmap(self, path: str) -> QPixmap:
+        source = str(path or "")
+        if not source:
+            return QPixmap()
+        try:
+            stat = Path(source).stat()
+            key = (source, int(stat.st_size), int(stat.st_mtime_ns))
+        except OSError:
+            key = (source, -1, -1)
+        cached = self._history_pixmap_cache.get(key)
+        if cached is not None:
+            self._history_pixmap_cache.move_to_end(key)
+            return cached[0]
+        pixmap = QPixmap(source)
+        if pixmap.isNull():
+            return pixmap
+        cost = self._pixmap_cost(pixmap)
+        if cost <= self._history_pixmap_cache_limit_bytes:
+            self._history_pixmap_cache[key] = (pixmap, cost)
+            self._history_pixmap_cache.move_to_end(key)
+            self._history_pixmap_cache_bytes += cost
+            while (
+                len(self._history_pixmap_cache) > self._history_pixmap_cache_limit_items
+                or self._history_pixmap_cache_bytes > self._history_pixmap_cache_limit_bytes
+            ):
+                _old_key, (_old_pixmap, old_cost) = self._history_pixmap_cache.popitem(last=False)
+                self._history_pixmap_cache_bytes = max(0, self._history_pixmap_cache_bytes - int(old_cost))
+        return pixmap
 
     def _clear_column_overlays(self):
         self._column_rects_norm = []
@@ -163,8 +206,8 @@ class OCRCropPreview(QLabel):
             self._input_rects_norm.append((left, top, right, bottom))
             overlay = QFrame(self)
             overlay.setStyleSheet(
-                "background: rgba(22,119,255,3); "
-                "border: 2px solid rgb(22,119,255); border-radius: 2px;"
+                "background: rgba(34,197,94,3); "
+                "border: 2px solid rgb(34,197,94); border-radius: 2px;"
             )
             overlay.setAttribute(Qt.WA_TransparentForMouseEvents)
             self._input_overlays.append(overlay)
@@ -196,7 +239,7 @@ class OCRCropPreview(QLabel):
         self._update_character_overlay_geometry()
 
     def set_image(self, path: str):
-        pm = QPixmap(path)
+        pm = self._load_cached_history_pixmap(path)
         if pm.isNull():
             return
         self._orig_pixmap = pm
@@ -211,7 +254,7 @@ class OCRCropPreview(QLabel):
         self, path: str, column_rects, character_rects=None, input_rects=None
     ):
         """Load a retained page with detector, OCR-input and character boxes."""
-        pm = QPixmap(path)
+        pm = self._load_cached_history_pixmap(path)
         if pm.isNull():
             return False
         self._orig_pixmap = pm

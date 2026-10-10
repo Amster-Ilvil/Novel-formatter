@@ -11,7 +11,7 @@ from datetime import datetime
 import json
 from pathlib import Path
 
-from PySide6.QtCore import Qt, QUrl
+from PySide6.QtCore import Qt, QTimer, QUrl
 from PySide6.QtGui import QDesktopServices
 from PySide6.QtWidgets import (
     QAbstractItemView,
@@ -23,6 +23,7 @@ from PySide6.QtWidgets import (
     QHeaderView,
     QInputDialog,
     QLabel,
+    QLineEdit,
     QMessageBox,
     QPushButton,
     QPlainTextEdit,
@@ -123,6 +124,18 @@ class ProjectRunLogDialog(QDialog):
         self._stage_combo.addItem("全部", "")
         self._stage_combo.currentIndexChanged.connect(self._apply_filters)
         toolbar.addWidget(self._stage_combo)
+
+        toolbar.addWidget(QLabel("搜索"))
+        self._search_edit = QLineEdit()
+        self._search_edit.setPlaceholderText("搜索运行 ID、阶段、摘要或错误…")
+        self._search_edit.setClearButtonEnabled(True)
+        self._search_edit.setMinimumWidth(230)
+        self._search_timer = QTimer(self)
+        self._search_timer.setSingleShot(True)
+        self._search_timer.setInterval(120)
+        self._search_timer.timeout.connect(self._apply_filters)
+        self._search_edit.textChanged.connect(self._schedule_search)
+        toolbar.addWidget(self._search_edit, 1)
         toolbar.addStretch(1)
 
         refresh = QPushButton("刷新")
@@ -215,14 +228,40 @@ class ProjectRunLogDialog(QDialog):
         self._stage_combo.blockSignals(False)
         self._apply_filters()
 
+    def _schedule_search(self, _text: str = "") -> None:
+        self._search_timer.start()
+
+    @staticmethod
+    def _matches_query(row: dict, query: str) -> bool:
+        needle = str(query or "").strip().casefold()
+        if not needle:
+            return True
+        stage = str(row.get("stage") or "")
+        status = str(row.get("status") or "")
+        haystack = "\n".join((
+            str(row.get("run_id") or ""),
+            str(row.get("started_at") or row.get("timestamp") or ""),
+            stage,
+            _stage_label(stage),
+            status,
+            _STATUS_LABELS.get(status, status),
+            str(row.get("summary") or ""),
+            str(row.get("error_message") or ""),
+        )).casefold()
+        return needle in haystack
+
     def _apply_filters(self, _index: int = 0) -> None:
+        selected_run_id = self._selected_run_id()
         status = str(self._status_combo.currentData() or "")
         stage = str(self._stage_combo.currentData() or "")
+        query = self._search_edit.text()
         rows = [
             row for row in self._rows
             if (not status or str(row.get("status") or "") == status)
             and (not stage or str(row.get("stage") or "") == stage)
+            and self._matches_query(row, query)
         ]
+        self._table.blockSignals(True)
         self._table.setRowCount(len(rows))
         for row_index, row in enumerate(rows):
             values = [
@@ -245,8 +284,18 @@ class ProjectRunLogDialog(QDialog):
             f"显示 {len(rows)} / {len(self._rows)} 条运行记录 · 失败 {errors} · 运行中 {running}"
         )
         if rows:
-            self._table.selectRow(0)
+            target_row = 0
+            if selected_run_id:
+                for row_index in range(self._table.rowCount()):
+                    item = self._table.item(row_index, 0)
+                    if item and str(item.data(Qt.UserRole) or "") == selected_run_id:
+                        target_row = row_index
+                        break
+            self._table.selectRow(target_row)
+            self._table.blockSignals(False)
+            self._show_selected()
         else:
+            self._table.blockSignals(False)
             self._detail.clear()
 
     def _selected_run_id(self) -> str:

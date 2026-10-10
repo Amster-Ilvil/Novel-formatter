@@ -22,6 +22,8 @@ import uuid
 import urllib.parse
 import urllib.request
 import zipfile
+import sys
+import importlib.metadata as importlib_metadata
 from pathlib import Path
 from utils.safe_archive import safe_extract_zip
 from utils.apple_silicon_runtime import is_m6, profile, recommended_cpu_threads
@@ -372,8 +374,80 @@ def _download_source(verbose: bool = True) -> Path:
     )
 
 
+def _explicit_local_source() -> Path | None:
+    """Return a caller-provisioned NDLOCR source tree without touching network.
+
+    Cloud QA and offline desktop installations may ship the pinned upstream source
+    separately from the large ONNX weights.  Accept either the repository root
+    (containing ``src/ocr.py``) or a direct ``src`` directory.
+    """
+    raw = os.environ.get("NOVEL_FORMATTER_NDLOCR_SOURCE_DIR", "").strip()
+    if not raw:
+        return None
+    path = Path(raw).expanduser().resolve()
+    if (path / "ocr.py").is_file() and (path / "config").is_dir():
+        path = path.parent
+    if not (path / "src" / "ocr.py").is_file():
+        raise RuntimeError(
+            "NOVEL_FORMATTER_NDLOCR_SOURCE_DIR 无效：缺少 src/ocr.py。"
+            "离线模式不会改为联网下载。"
+        )
+    if not (path / "src" / "config" / "NDLmoji.yaml").is_file():
+        raise RuntimeError(
+            "NOVEL_FORMATTER_NDLOCR_SOURCE_DIR 不完整：缺少 src/config/NDLmoji.yaml。"
+        )
+    return path
+
+
+def _current_interpreter_ready() -> bool:
+    """Verify the current process can run NDLOCR without creating a private venv."""
+    try:
+        import cv2  # noqa: F401
+        import numpy  # noqa: F401
+        import onnxruntime  # noqa: F401
+        import yaml  # noqa: F401
+        from PIL import Image  # noqa: F401
+        # Cloud/offline acceptance intentionally pins ORT.  Desktop installs may
+        # use another compatible 1.x build, so fail only on an unusable major.
+        major = int(str(importlib_metadata.version("onnxruntime")).split(".", 1)[0])
+        return major == 1
+    except Exception:
+        return False
+
+
 def setup_venv(verbose: bool = True) -> tuple[Path, Path]:
-    source = _download_source(verbose=verbose)
+    # Prefer a fully provisioned local source + current interpreter.  This is the
+    # NDLOCR equivalent of Hayai's offline fast path: clicking OCR must never
+    # silently clone GitHub, create a venv or invoke pip when the required
+    # runtime has already been supplied by the installer/cloud harness.
+    local_source = _explicit_local_source()
+    offline = any(os.environ.get(flag, "").strip().lower() in {"1", "true", "yes"}
+                  for flag in ("HF_HUB_OFFLINE", "TRANSFORMERS_OFFLINE", "NOVEL_FORMATTER_OCR_OFFLINE"))
+    if offline and local_source is None:
+        raise RuntimeError(
+            "NDLOCR-Lite 离线模型权重已存在，但官方 src/config 源码未安装。"
+            "请设置 NOVEL_FORMATTER_NDLOCR_SOURCE_DIR 指向包含 src/ocr.py 的固定源码树；"
+            "本次不会尝试联网下载。"
+        )
+    explicit_python = os.environ.get("NOVEL_FORMATTER_NDLOCR_PYTHON", "").strip()
+    if explicit_python:
+        candidate = Path(explicit_python).expanduser().resolve()
+        if not candidate.is_file():
+            raise RuntimeError(f"NOVEL_FORMATTER_NDLOCR_PYTHON 不存在：{candidate}")
+        source = local_source or _download_source(verbose=verbose)
+        return candidate, source
+    if local_source is not None and _current_interpreter_ready():
+        return Path(sys.executable).resolve(), local_source
+    if offline:
+        raise RuntimeError(
+            "NDLOCR-Lite 官方源码已找到，但当前 Python 缺少运行依赖；"
+            "离线模式拒绝通过 pip 安装，请先提供固定版本离线依赖。"
+        )
+
+    # Normal online desktop installation keeps the existing managed-runtime
+    # behaviour.  Offline callers can fail closed by supplying a source path; an
+    # incomplete local source never falls through to an unexpected download.
+    source = local_source or _download_source(verbose=verbose)
     requirements = source / "requirements.txt"
     python = ensure_venv(
         VENV_DIR,

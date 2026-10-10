@@ -3,6 +3,11 @@ from __future__ import annotations
 import copy
 from pathlib import Path
 
+try:
+    import orjson as _orjson
+except Exception:  # pragma: no cover - optional acceleration
+    _orjson = None
+
 from models.document import UnifiedDocument
 
 
@@ -31,17 +36,52 @@ class OCRCompareProjectStateService:
 
     @staticmethod
     def jsonable(value):
-        from dataclasses import asdict, is_dataclass
-        if is_dataclass(value):
-            return OCRCompareProjectStateService.jsonable(asdict(value))
-        if isinstance(value, dict):
-            return {str(k): OCRCompareProjectStateService.jsonable(v) for k, v in value.items()}
-        if isinstance(value, (list, tuple, set)):
-            return [OCRCompareProjectStateService.jsonable(v) for v in value]
+        """Convert a snapshot value to detached JSON-safe primitives.
+
+        Multi-model project checkpoints can contain more than a million scalar
+        values.  Use orjson's native dataclass/container traversal when available;
+        the fallback keeps the same exact data model without ``asdict``'s second
+        recursive deep-copy pass.
+        """
+        if _orjson is not None:
+            def default(obj):
+                if isinstance(obj, Path):
+                    return str(obj)
+                if isinstance(obj, set):
+                    return list(obj)
+                # Historical project snapshots stringify unsupported extension
+                # objects instead of failing the whole checkpoint.
+                return str(obj)
+            try:
+                return _orjson.loads(
+                    _orjson.dumps(
+                        value,
+                        option=_orjson.OPT_SERIALIZE_DATACLASS,
+                        default=default,
+                    )
+                )
+            except (TypeError, ValueError, OverflowError):
+                pass
+
+        if value is None or isinstance(value, (str, int, float, bool)):
+            return value
         if isinstance(value, Path):
             return str(value)
-        if isinstance(value, (str, int, float, bool)) or value is None:
-            return value
+        if isinstance(value, dict):
+            return {
+                str(k): OCRCompareProjectStateService.jsonable(v)
+                for k, v in value.items()
+            }
+        if isinstance(value, (list, tuple, set)):
+            return [OCRCompareProjectStateService.jsonable(v) for v in value]
+        from dataclasses import fields, is_dataclass
+        if is_dataclass(value):
+            return {
+                field.name: OCRCompareProjectStateService.jsonable(
+                    getattr(value, field.name)
+                )
+                for field in fields(value)
+            }
         return str(value)
 
     def snapshot_state(self) -> dict:
@@ -96,7 +136,7 @@ class OCRCompareProjectStateService:
         restored_states = []
         for item in list(data.get("fusion_states") or []):
             if not isinstance(item, dict):
-                continue
+                raise ValueError("OCR 裁决快照含损坏的融合行，拒绝部分恢复。")
             payload = dict(item)
             raw_candidates = list(payload.pop("candidates", []) or [])
             candidates = [
@@ -104,6 +144,21 @@ class OCRCompareProjectStateService:
                 for candidate in raw_candidates if isinstance(candidate, dict)
             ]
             restored_states.append(FusionDecisionState(candidates=candidates, **payload))
+        # A torn checkpoint must not silently fall back to freshly generated
+        # automatic selections while claiming that the previous adjudication was
+        # restored.  A legacy snapshot with *no* fusion_states key may still be
+        # rebuilt by set_results; an explicitly stored array is authoritative.
+        if "fusion_states" in data and len(restored_states) != len(comparison.rows):
+            raise ValueError(
+                f"OCR 裁决快照行数不匹配：融合 {len(restored_states)}、"
+                f"对齐 {len(comparison.rows)}；未覆盖当前会话。"
+            )
+        for index, state in enumerate(restored_states):
+            if int(state.row_index) != index:
+                raise ValueError(f"OCR 裁决快照第 {index + 1} 行身份错位，拒绝恢复。")
+            selected = state.selected_index
+            if selected is not None and not 0 <= int(selected) < len(state.candidates):
+                raise ValueError(f"OCR 裁决快照第 {index + 1} 行候选索引越界，拒绝恢复。")
         raw_decisions = data.get("canonical_source_decisions") or []
         if isinstance(raw_decisions, dict):
             decision_items = [item for item in raw_decisions.values() if isinstance(item, dict)]
@@ -141,6 +196,8 @@ class OCRCompareProjectStateService:
             comparison = state.get("comparison")
             ruby_doc = state.get("ruby_doc")
             restored_states = list(state.get("fusion_states") or [])
+            if restored_states and len(restored_states) != len(comparison.rows):
+                return False
             tab.set_results({
                 "documents": documents,
                 "labels": labels,

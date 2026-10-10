@@ -29,6 +29,7 @@ from collections import Counter, defaultdict
 from datetime import datetime, timezone
 from difflib import SequenceMatcher
 from pathlib import Path
+from utils.atomic_io import atomic_output_path
 from typing import Any, Iterable, Sequence
 
 from engine import ai_repair_epub as repair
@@ -1080,16 +1081,23 @@ def _write_jsonl(path: Path, rows: Iterable[dict]) -> None:
 
 
 def _zip_folder(folder: Path, target: Path) -> None:
-    with zipfile.ZipFile(target, "w") as archive:
-        for path in sorted(folder.rglob("*")):
-            if not path.is_file():
-                continue
-            relative = path.relative_to(folder).as_posix()
-            suffix = path.suffix.lower()
-            if suffix in {".png", ".jpg", ".jpeg", ".webp", ".epub", ".gif"}:
-                archive.write(path, relative, compress_type=zipfile.ZIP_STORED)
-            else:
-                archive.write(path, relative, compress_type=zipfile.ZIP_DEFLATED, compresslevel=9)
+    with atomic_output_path(target) as staged:
+        with zipfile.ZipFile(staged, "w") as archive:
+            for path in sorted(folder.rglob("*")):
+                if not path.is_file():
+                    continue
+                relative = path.relative_to(folder).as_posix()
+                suffix = path.suffix.lower()
+                if suffix in {".png", ".jpg", ".jpeg", ".webp", ".epub", ".gif"}:
+                    archive.write(path, relative, compress_type=zipfile.ZIP_STORED)
+                else:
+                    archive.write(path, relative, compress_type=zipfile.ZIP_DEFLATED, compresslevel=9)
+        # Never publish a half-written AI package.  Validate the completed
+        # central directory/CRC before the atomic replace becomes visible.
+        with zipfile.ZipFile(staged, "r") as check:
+            bad = check.testzip()
+            if bad:
+                raise RuntimeError(f"AI package ZIP CRC failed: {bad}")
 
 
 def export_ai_disagreement_package_v4(

@@ -187,7 +187,8 @@ def _load_runtime(root: Path):
         raise RuntimeError(f"NDLOCR-Lite 导入失败: {exc}") from exc
 
     try:
-        model_dir = src / "model"
+        override_model_dir = os.environ.get("NOVEL_FORMATTER_CLOUD_NDL_MODEL_DIR", "").strip()
+        model_dir = Path(override_model_dir).expanduser().resolve() if override_model_dir else (src / "model")
         config_dir = src / "config"
         ns = SimpleNamespace(
             det_weights=str(_pick_model(model_dir, "det")),

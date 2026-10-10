@@ -217,11 +217,19 @@ class NoWhiteClickableGuard(QObject):
             return False
 
         if isinstance(watched, QAbstractButton):
+            # Show/Polish fire repeatedly while complex workspaces are being
+            # inserted. Once a control has passed the guard, those events do
+            # not need another palette/QSS rewrite. Style/property changes are
+            # still revalidated so runtime theme and role changes remain safe.
+            already_ready = watched.property("nfContrastGuardReady") is True
+            if already_ready and event.type() in {QEvent.Type.Show, QEvent.Type.Polish, QEvent.Type.EnabledChange}:
+                return False
             if watched.property("nfNoWhiteClickable") is not True:
                 watched.setProperty("nfNoWhiteClickable", True)
             _sanitize_local_stylesheet(watched)
             if isinstance(watched, QPushButton):
                 _ensure_push_button_contrast(watched)
+            watched.setProperty("nfContrastGuardReady", True)
         elif isinstance(watched, QTabBar):
             if watched.property("nfNoWhiteClickable") is not True:
                 watched.setProperty("nfNoWhiteClickable", True)
@@ -231,11 +239,9 @@ class NoWhiteClickableGuard(QObject):
                 watched.setProperty("nfClickable", True)
             _sanitize_local_stylesheet(watched)
 
-        # Child controls of complex dialogs may be created at the end of the
-        # current event.  Queue a second pass, but only for the watched widget;
-        # this avoids expensive whole-window rescans and event storms.
-        if event.type() in {QEvent.Type.Show, QEvent.Type.Polish}:
-            QTimer.singleShot(0, lambda w=watched: self._safe_sanitize(w))
+        # Every runtime-created child receives its own Show/Polish event, so a
+        # queued second pass for the parent is redundant and creates hundreds
+        # of zero-timeout callbacks during OCR/page construction.
         return False
 
     @staticmethod

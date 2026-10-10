@@ -264,7 +264,7 @@ def clean_metadata_blocks(doc: UnifiedDocument) -> UnifiedDocument:
     单页内重复（OCR 把同一标题读了两三遍）不算跨页页眉，交给 remove_duplicates
     的模糊去重处理。
     """
-    doc = copy.deepcopy(doc)
+    doc = doc.snapshot_clone()
 
     # PDF 文字层直读在提取阶段就已经用坐标位置（页面底部 20%）精确判定过
     # 页码并跳过了，这里"文字整行都是数字"这条粗糙的兜底规则对它来说既没
@@ -404,7 +404,7 @@ def split_embedded_chapter_titles(doc: UnifiedDocument) -> UnifiedDocument:
     只在 pdf_text_layer/epub_import 来源生效，理由同 strip_boilerplate_matter
     ——这是精确文本来源特有的按列/按标签合并伪影，不是 OCR 噪声的性质。
     """
-    doc = copy.deepcopy(doc)
+    doc = doc.snapshot_clone()
 
     if doc.metadata.source_engine not in ("pdf_text_layer", "epub_import"):
         doc.add_log("split_embedded_chapter_titles", "跳过（仅对 PDF 文字层直读/EPUB 导入来源生效）", 0)
@@ -491,7 +491,7 @@ def strip_chapter_notes(doc: UnifiedDocument) -> UnifiedDocument:
     只在 pdf_text_layer/epub_import 来源生效，理由同 strip_boilerplate_matter
     （OCR 来源的噪声性质不同，不该套用同一套规则）。
     """
-    doc = copy.deepcopy(doc)
+    doc = doc.snapshot_clone()
 
     if doc.metadata.source_engine not in ("pdf_text_layer", "epub_import"):
         doc.add_log("strip_chapter_notes", "跳过（仅对 PDF 文字层直读/EPUB 导入来源生效）", 0)
@@ -694,7 +694,7 @@ def _non_text_page_numbers(doc: UnifiedDocument) -> set[int]:
 
 def merge_cross_page_sentences(doc: UnifiedDocument) -> UnifiedDocument:
     """仅合并相邻文本页的上一页最后正文块和下一页第一正文块。"""
-    doc = copy.deepcopy(doc)
+    doc = doc.snapshot_clone()
     pages = _get_page_text_blocks(doc.blocks)
     non_text_pages = _non_text_page_numbers(doc)
     if not pages:
@@ -808,7 +808,7 @@ def merge_cross_page_sentences_layout_safe(doc: UnifiedDocument) -> UnifiedDocum
     不删除 Block，不改变页码、坐标、顺序、图片锚点或其它结构信息。
     已清空的来源块始终作为分页边界占位符，后续执行不会越过它误吞下一段。
     """
-    doc = copy.deepcopy(doc)
+    doc = doc.snapshot_clone()
     pages = _get_page_layout_text_blocks(doc.blocks)
     non_text_pages = _non_text_page_numbers(doc)
     if not pages:
@@ -951,7 +951,7 @@ def merge_overlapping_blocks(doc: UnifiedDocument) -> UnifiedDocument:
     精确消费 left 的后缀 / right 的前缀重叠，避免 merge_broken_sentences 直接
     相加后生成“最初は…最初は…”一类嵌套重复。
     """
-    doc = copy.deepcopy(doc)
+    doc = doc.snapshot_clone()
     text_types = {BlockType.PARAGRAPH, BlockType.DIALOGUE, BlockType.RUBY}
     result: list[Block] = []
     merged = 0
@@ -1110,7 +1110,7 @@ def merge_broken_sentences(doc: UnifiedDocument) -> UnifiedDocument:
     「/」）。之前这里只认 PARAGRAPH，对白被切开后就再也合不回去，
     还会被后面的 fix_dash_artifacts 步骤把孤立的「误判成破折号。
     """
-    doc = copy.deepcopy(doc)
+    doc = doc.snapshot_clone()
 
     # PDF 文字层直读的分页是从 PDF 本身精确拿到的，句子/对白跨页断开是
     # 常态（版面排到页底就换页，跟句子说没说完没关系）。OCR 文档也允许
@@ -1262,7 +1262,7 @@ def _remove_repeated_block_runs(doc: UnifiedDocument) -> tuple[UnifiedDocument, 
     total prose.  Titles and image boundaries stop a run, preventing chapter or
     asset structure from being swallowed.
     """
-    out = copy.deepcopy(doc)
+    out = doc.snapshot_clone()
     blocks = out.blocks
     text_types = {BlockType.PARAGRAPH, BlockType.DIALOGUE, BlockType.RUBY}
     removed = 0
@@ -1309,7 +1309,7 @@ def _remove_repeated_block_runs(doc: UnifiedDocument) -> tuple[UnifiedDocument, 
 
 def remove_semantic_duplicates(doc: UnifiedDocument) -> UnifiedDocument:
     """仅在近邻窗口内删除语义重复块，优先保留更完整、更自然的版本。"""
-    doc = copy.deepcopy(doc)
+    doc = doc.snapshot_clone()
     text_types = {BlockType.PARAGRAPH, BlockType.RUBY}
     result: list[Block] = []
     removed = 0
@@ -1431,9 +1431,9 @@ def fix_ocr_dash_artifacts(doc: UnifiedDocument) -> UnifiedDocument:
     规则会把落单的「当成误读的破折号删掉，反而把好端端的引号改错了。
     """
     if is_pdf_text_layer_mode_enabled(doc):
-        return copy.deepcopy(doc)
+        return doc.snapshot_clone()
 
-    doc = copy.deepcopy(doc)
+    doc = doc.snapshot_clone()
 
     text_types = {BlockType.PARAGRAPH, BlockType.DIALOGUE, BlockType.CHAPTER, BlockType.SECTION}
     fixed_count = 0
@@ -1616,7 +1616,7 @@ def repair_short_dialogue_closing_quotes(doc: UnifiedDocument) -> UnifiedDocumen
         - 不把普通日文段落仅因“看起来像日文”就吞进对白；
         - 已由旧版错误提前补上的」也可在确认续句后撤销并重新放到正确位置。
     """
-    doc = copy.deepcopy(doc)
+    doc = doc.snapshot_clone()
     pdf_text_mode = is_pdf_text_layer_mode_enabled(doc)
     repaired = 0
     merged = 0
@@ -1793,7 +1793,7 @@ def restore_dialogue_breaks(doc: UnifiedDocument) -> UnifiedDocument:
 
     只拆「」对白，不拆『』术语引用；普通段落里的句中术语引用会保留原样。
     """
-    doc = copy.deepcopy(doc)
+    doc = doc.snapshot_clone()
     dialogue_re = re.compile(r"「[^」]*」", re.DOTALL)
     split_count = 0
     result: list[Block] = []
@@ -1897,7 +1897,7 @@ def restore_indents_and_breaks(doc: UnifiedDocument) -> UnifiedDocument:
     - DIALOGUE 不添加缩进
     - 检测分节符号行（◆※☆★●○＊等）→ SECTION 类型
     """
-    doc = copy.deepcopy(doc)
+    doc = doc.snapshot_clone()
 
     indent_count = 0
     section_count = 0
@@ -1930,7 +1930,7 @@ def recover_ruby(doc: UnifiedDocument) -> UnifiedDocument:
     ｜漢字《よみ》 → 内部标记 漢字|よみ
     同时将含有 ruby 标注的 block 标记为 RUBY 类型。
     """
-    doc = copy.deepcopy(doc)
+    doc = doc.snapshot_clone()
 
     ruby_count = 0
     TEXT_TYPES = {BlockType.PARAGRAPH, BlockType.DIALOGUE}
@@ -1978,7 +1978,7 @@ def detect_chapters(doc: UnifiedDocument) -> UnifiedDocument:
     （去重后）的候选标题，同一页出现 ≥2 个不同候选时，整页都当作疑似
     目录/索引页处理，不提升为章节（留作普通段落）。
     """
-    doc = copy.deepcopy(doc)
+    doc = doc.snapshot_clone()
 
     suspect_pages = _detect_toc_like_pages(doc)
 
@@ -2099,7 +2099,7 @@ def strip_boilerplate_matter(doc: UnifiedDocument) -> UnifiedDocument:
     另一种性质（认错字，不是整段乱序夹带站点样板），不该套用同一套规则去删，
     所以 OCR 来源直接跳过，不做任何删除，保证不影响 OCR 流程。
     """
-    doc = copy.deepcopy(doc)
+    doc = doc.snapshot_clone()
 
     if doc.metadata.source_engine not in ("pdf_text_layer", "epub_import"):
         doc.add_log("strip_boilerplate_matter", "跳过（仅对 PDF 文字层直读/EPUB 导入来源生效）", 0)
@@ -2170,7 +2170,7 @@ def remove_orphan_closing_quotes(doc: UnifiedDocument) -> UnifiedDocument:
     开引号，就把闭引号接回前块；否则直接删除。EPUB Builder 还会做一次
     最终防御过滤，保证旧工程直接导出时也不会重新出现。
     """
-    doc = copy.deepcopy(doc)
+    doc = doc.snapshot_clone()
     pairs = {"」": "「", "』": "『"}
     text_types = {BlockType.PARAGRAPH, BlockType.DIALOGUE, BlockType.RUBY}
     result: list[Block] = []
@@ -2218,7 +2218,7 @@ def normalize_punctuation(doc: UnifiedDocument) -> UnifiedDocument:
 
     from engine.char_normalizer import normalize_ocr_codepoints
 
-    doc = copy.deepcopy(doc)
+    doc = doc.snapshot_clone()
     fixed_count = 0
     codepoint_counts: dict[str, int] = {}
 

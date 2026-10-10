@@ -54,6 +54,11 @@ class OCRCompareSourceCorrectionService:
         if busy:
             self._source_correction_progress.setValue(0)
             self._source_correction_progress.setFormat("准备 OCR 裁决任务…")
+            self._set_compare_task_progress(
+                True, value=0, text="准备 OCR 裁决任务…", indeterminate=False
+            )
+        elif not self._ai_import_busy:
+            self._set_compare_task_progress(False)
         workspace_enabled = not self._source_correction_lock_workspace and not self._ai_import_busy
         self._source_area.setEnabled(workspace_enabled)
         self._result_panel.setEnabled(workspace_enabled)
@@ -69,6 +74,9 @@ class OCRCompareSourceCorrectionService:
         value = min(99, int(current * 100 / total))
         self._source_correction_progress.setValue(value)
         self._source_correction_progress.setFormat(f"{stage} {current}/{total}")
+        self._set_compare_task_progress(
+            True, value=value, text=f"{stage} {current}/{total}", indeterminate=False
+        )
         self._source_correction_state.setText(str(stage or "OCR 裁决任务进行中…"))
         self._summary.setText(f"{stage}：{current}/{total}。任务在后台执行，窗口仍可响应。")
 
@@ -171,8 +179,10 @@ class OCRCompareSourceCorrectionService:
             return
         report = dict(result)
         self._source_correction_export_report = report
-        self._set_source_correction_busy(False)
         self._source_correction_progress.setValue(100)
+        self._source_correction_progress.setFormat("导出 AI 裁决包完成")
+        self._set_compare_task_progress(True, value=100, text="导出 AI 裁决包完成")
+        self._set_source_correction_busy(False)
         self._source_correction_state.setText(
             f"已导出 · 复审既有 AI 结果 {report.get('prior_decision_review_rows', 0)} · "
             f"共同候选待核验 {report.get('editable_provisional_rows', 0)} / {report.get('provisional_consensus_rows', 0)} · "
@@ -635,8 +645,10 @@ class OCRCompareSourceCorrectionService:
         }
         report["cumulative_import_history"] = copy.deepcopy(self._source_correction_import_history)
         self._last_source_correction_report = report
-        self._set_source_correction_busy(False)
         self._source_correction_progress.setValue(100)
+        self._source_correction_progress.setFormat("导入 AI 裁决包完成")
+        self._set_compare_task_progress(True, value=100, text="导入 AI 裁决包完成")
+        self._set_source_correction_busy(False)
         unresolved_decisions = int(report.get("unresolved_canonical_decisions", 0) or 0)
         resumed_locked = int(report.get("prefilled_resolved_decisions", 0) or 0)
         proposed_cells = int(report.get("proposed_model_cells", 0) or 0)

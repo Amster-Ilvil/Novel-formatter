@@ -21,17 +21,21 @@ from ui.design.metrics import OCR_LEFT_WIDTH, OCR_LEFT_MIN, OCR_LEFT_MAX, OCR_EN
 
 
 def _build_reference_engine_panel(self, ocr_adapters):
-    """Build the compact engine view from the supplied Phase-20 reference UI.
+    """Expose the real engine controls directly, without duplicate proxy rows.
 
-    The real controls stay alive in a hidden advanced container.  The visible
-    switches below are synchronized proxies, so this changes presentation only
-    and does not create a second OCR configuration path.
+    Older revisions mirrored four live checkboxes into a second compact panel
+    and also created hidden engine cards.  That duplicated QObject trees, signal
+    traffic and style-polish work while the user had already asked for the
+    advanced settings to be visible by default.  Keep the original controls as
+    the single source of truth and retain only tiny compatibility placeholders
+    for third-party code that introspects the historical attributes.
     """
     legacy = QWidget()
     legacy.setObjectName("ocrAdvancedEngineSettings")
     legacy_layout = QVBoxLayout(legacy)
     legacy_layout.setContentsMargins(0, 0, 0, 0)
     legacy_layout.setSpacing(5)
+
     def _adopt_layout_widgets(item):
         widget = item.widget()
         if widget is not None:
@@ -47,107 +51,30 @@ def _build_reference_engine_panel(self, ocr_adapters):
         _adopt_layout_widgets(item)
         legacy_layout.addItem(item)
 
-    compact = QFrame()
-    compact.setObjectName("ocrReferenceEnginePanel")
-    compact.setStyleSheet(
-        f"QFrame#ocrReferenceEnginePanel{{background:{CARD};border:none;border-radius:12px;}}"
-    )
-    box = QVBoxLayout(compact)
-    box.setContentsMargins(4, 4, 4, 8)
-    box.setSpacing(0)
-
-    proxy_rows = [
-        ("多模型 OCR 融合", self._multi_ocr_check),
-        ("智能路由", self._multi_smart_router_check),
-        ("物理分列", self._column_split_check),
-        ("整句重识别", self._column_sentence_context_reocr_check),
-    ]
-    self._reference_engine_toggle_proxies = []
-    for label_text, source in proxy_rows:
-        row = QWidget()
-        row.setObjectName("ocrReferenceToggleRow")
-        row.setFixedHeight(36)
-        row.setStyleSheet(
-            f"QWidget#ocrReferenceToggleRow{{background:{CARD};border:none;border-bottom:1px solid {BORDER};}}"
-            "QLabel{background:transparent;border:none;}"
-        )
-        rl = QHBoxLayout(row)
-        rl.setContentsMargins(10, 8, 8, 8)
-        rl.setSpacing(8)
-        label = QLabel(label_text)
-        label.setStyleSheet(f"color:{INK};font-size:11px;font-weight:600;border:none;")
-        rl.addWidget(label, 1)
-        proxy = DesignSwitch()
-        proxy.setChecked(source.isChecked())
-        proxy.setCursor(QCursor(Qt.PointingHandCursor))
-        proxy.setToolTip(source.toolTip())
-        def _from_proxy(checked, source=source, proxy=proxy):
-            if source.isEnabled():
-                source.setChecked(bool(checked))
-            else:
-                proxy.setChecked(source.isChecked())
-        proxy.toggled.connect(_from_proxy)
-        def _sync_proxy(checked, proxy=proxy):
-            blocked = proxy.blockSignals(True)
-            proxy.setChecked(bool(checked))
-            proxy.blockSignals(blocked)
-            proxy.set_progress(1.0 if checked else 0.0)
-        source.toggled.connect(_sync_proxy)
-        rl.addWidget(proxy, 0, Qt.AlignRight | Qt.AlignVCenter)
-        box.addWidget(row)
-        self._reference_engine_toggle_proxies.append((proxy, source))
-
-    # Engine identity already lives in the top combobox, so the old Hayai/NDL
-    # cards are kept only as hidden compatibility proxies for plugins/tests.
-    # They are never inserted into the visible layout.
-    def _hidden_engine_card(engine_id: str, title: str) -> QPushButton:
-        card = QPushButton(title, compact)
-        card.setObjectName("ocrReferenceEngineCard")
-        card.setCheckable(True)
-        idx = self._adapter_combo.findData(engine_id)
-        card.setEnabled(idx >= 0)
-        if idx >= 0:
-            card.clicked.connect(lambda _checked=False, idx=idx: self._adapter_combo.setCurrentIndex(idx))
-        card.hide()
-        return card
-
-    self._reference_engine_cards = {
-        "hayai_ocr": _hidden_engine_card("hayai_ocr", "Hayai OCR"),
-        "ndlocr_lite": _hidden_engine_card("ndlocr_lite", "NDLOCR-Lite"),
-    }
-
-    def _sync_hidden_engine_cards(*_args):
-        active = str(self._adapter_combo.currentData() or "")
-        for engine_id, card in self._reference_engine_cards.items():
-            blocked = card.blockSignals(True)
-            card.setChecked(engine_id == active)
-            card.blockSignals(blocked)
-    self._adapter_combo.currentIndexChanged.connect(_sync_hidden_engine_cards)
-    _sync_hidden_engine_cards()
-
-
-    # Advanced engine controls are now part of the normal page.  The old
-    # “更多设置” disclosure created a second visual state and hid commonly used
-    # controls, so the UI keeps one always-expanded configuration surface.
     legacy.setVisible(True)
     self._ocr_settings_tabs.setMinimumHeight(620)
     self._ocr_settings_tabs.setMaximumHeight(16777215)
 
-    # Retain hidden compatibility attributes for older plugins/workspaces that
-    # introspect these names; they no longer control visibility.
+    # Compatibility-only objects are intentionally not inserted into layouts.
+    compact = QWidget(legacy)
+    compact.setObjectName("ocrReferenceEnginePanelCompat")
+    compact.hide()
+    self._reference_engine_toggle_proxies = []
+    self._reference_engine_cards = {}
+
+    # Compatibility-only handle.  Keep it parentless so it remains naturally
+    # hidden without hiding a real feature entry point in the visible settings
+    # hierarchy.  The advanced controls themselves are already expanded above.
     advanced = QPushButton()
     advanced.setObjectName("ocrAdvancedEngineToggleCompat")
     advanced.setCheckable(True)
     advanced.setChecked(True)
-    # Compatibility-only control: intentionally not inserted into any layout.
-    # The removed “更多设置” entry therefore stays absent without hiding a live feature entry.
-    advanced_action = QAction(compact)
+    advanced_action = QAction(legacy)
     advanced_action.setCheckable(True)
     advanced_action.setChecked(True)
     advanced_action.setVisible(False)
     self._reference_engine_advanced_action = advanced_action
 
-    self._engine_settings_layout.addWidget(compact)
     self._engine_settings_layout.addWidget(legacy)
     self._engine_settings_layout.addStretch(1)
     self._reference_engine_compact = compact
@@ -166,7 +93,7 @@ def build_ocr_model_settings(tab, top_row, ocr_adapters):
     left_container.setObjectName("ocrSettingsColumn")
     left_container.setFixedWidth(OCR_LEFT_WIDTH)
     left_container.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Expanding)
-    left_container.setStyleSheet(
+    left_container.setStyleSheet(f"background: {CARD};"
         f"QWidget#ocrSettingsColumn{{background:{CARD};border-right:1px solid {BORDER};}}"
     )
     left_outer = QVBoxLayout(left_container)
@@ -310,36 +237,17 @@ def build_ocr_model_settings(tab, top_row, ocr_adapters):
     ll.addWidget(settings_tabs_host)
 
     self._adapter_cards: dict[str, QWidget] = {}
-    for aid, name, badge_text, color, desc, enabled in ocr_adapters:
+    for aid, _name, _badge_text, _color, _desc, enabled in ocr_adapters:
         if not adapter_available_on_current_platform(aid):
             continue
+        # The visible engine selector is the authoritative UI.  Keep one bare
+        # hidden QWidget for compatibility with _highlight_adapter/plugins; the
+        # previous hidden cards each created multiple labels/layouts that were
+        # never shown but still paid full construction and polish cost.
         card = QWidget()
-        card.setCursor(QCursor(Qt.PointingHandCursor))
-        card.setStyleSheet(
-            f"background: {CLICKABLE_BG}; border: 1px solid #E2E5E9; border-radius: 12px; margin: 4px 10px;")
-        cl = QVBoxLayout(card)
-        cl.setContentsMargins(10, 8, 10, 8)
-        top_line = QHBoxLayout()
-        dot = ColorSwatch(color)
-        top_line.addWidget(dot)
-        nlbl = QLabel(name)
-        nlbl.setStyleSheet(f"font-weight: bold; font-size: 12px;")
-        top_line.addWidget(nlbl)
-        top_line.addStretch()
-        top_line.addWidget(make_badge(badge_text, color if enabled else "#8C8B84"))
-        cl.addLayout(top_line)
-        dl = QLabel(desc)
-        dl.setStyleSheet(f"color: {MUTED}; font-size: 11px;")
-        dl.setWordWrap(True)
-        cl.addWidget(dl)
-        if not enabled:
-            na = QLabel("即将支持")
-            na.setStyleSheet(f"color: #5F7189; font-size: 10px; font-style: italic;")
-            na.setAlignment(Qt.AlignRight)
-            cl.addWidget(na)
-        card.mousePressEvent = partial(self._select_adapter, aid, enabled)
-        # 保留卡片对象以兼容原高亮/插件调用，但不再把全部卡片同时显示。
-        card.setVisible(False)
+        card.setObjectName(f"ocrAdapterCompat_{aid}")
+        card.setEnabled(bool(enabled))
+        card.hide()
         self._adapter_cards[aid] = card
 
     self._adapter_combo.currentIndexChanged.connect(self._select_adapter_from_combo)
@@ -410,11 +318,6 @@ def build_ocr_model_settings(tab, top_row, ocr_adapters):
         for engine_id, engine_name, _badge, _color, _desc, enabled in ocr_adapters:
             if enabled and adapter_available_on_current_platform(engine_id):
                 combo.addItem(engine_name, engine_id)
-        # Manga OCR is deliberately review-only: it must never become a normal
-        # single/page/full-column primary model. Its 224x224 recognizer is fed
-        # short blocks derived only from disagreement physical columns.
-        if role.startswith("review"):
-            combo.addItem("Manga OCR", "manga_ocr")
         configure_combo(combo)
         combo.setEnabled(False)
         combo.setProperty("multi_ocr_role", role)
@@ -959,7 +862,7 @@ def build_ocr_model_settings(tab, top_row, ocr_adapters):
     self._column_smart_crop_check.setChecked(True)
     self._column_smart_crop_check.setToolTip(
         "只从正文可见层裁掉确定为空白的外侧画布并保留安全边距，文字像素不缩放、不锐化。"
-        "Apple/NDL/Paddle/Google Vision 保留较宽纸白上下文；"
+        "Apple/NDL/Paddle 保留较宽纸白上下文；"
         "Hayai/48px 使用紧凑白底视窗。无论哪一种，相邻列与 Ruby 都不会重新进入正文 OCR。"
     )
     self._column_smart_crop_check.toggled.connect(self._on_column_cleanup_control_changed)

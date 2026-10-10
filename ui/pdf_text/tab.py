@@ -1,10 +1,11 @@
 from __future__ import annotations
 
 import threading
+import time
 from pathlib import Path
 
 from PySide6.QtWidgets import QFrame, QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton, QPlainTextEdit, QProgressBar, QFileDialog, QMessageBox, QSizePolicy, QCheckBox
-from PySide6.QtCore import Qt, Signal
+from PySide6.QtCore import Qt, Signal, QTimer
 
 from utils.async_generation import GenerationGuard
 from ui.responsive import preserve_button_text
@@ -32,10 +33,16 @@ class PdfTextLayerTab(QWidget):
         self._pending_pdf: str | None = None
         self._extract_generation = GenerationGuard()
         self._extract_running = False
+        self._extract_cancel_event = threading.Event()
         self._page_manager_context_provider = None
         self._page_manager_context: dict = {}
         self._last_extracted_doc = None
         self._last_extracted_pdf: str | None = None
+        from core.ocr_runtime_optimizer import CoalescedLineBuffer
+        self._pdf_log_buffer = CoalescedLineBuffer(max_lines=200000)
+        self._pdf_log_flush_timer = QTimer(self)
+        self._pdf_log_flush_timer.setInterval(80)
+        self._pdf_log_flush_timer.timeout.connect(self._flush_pdf_log_buffer)
         self._build()
 
     def _build(self):
@@ -289,14 +296,42 @@ class PdfTextLayerTab(QWidget):
             self._page_manager_status.setText(f"页面管理：无法开始 · {reason}")
         return context
 
+    def _append_pdf_log(self, line: object) -> None:
+        self._pdf_log_buffer.push(line)
+        if not self._pdf_log_flush_timer.isActive():
+            self._pdf_log_flush_timer.start()
+
+    def _flush_pdf_log_buffer(self, *, force_all: bool = False) -> None:
+        packets: list[str] = []
+        while True:
+            lines = self._pdf_log_buffer.drain(max_lines=1200 if force_all else 320)
+            if not lines:
+                break
+            packets.append("\n".join(lines))
+            if not force_all:
+                break
+        if packets:
+            self._log_view.appendPlainText("\n".join(packets))
+            bar = self._log_view.verticalScrollBar()
+            bar.setValue(bar.maximum())
+        if force_all and not self._pdf_log_buffer.pending():
+            self._pdf_log_flush_timer.stop()
+
+    def _clear_pdf_log(self) -> None:
+        self._pdf_log_buffer.clear()
+        self._pdf_log_flush_timer.stop()
+        self._log_view.clear()
+
     def reset_for_new_book(self):
         """Detach the PDF extraction workspace from a previous book/session."""
         self._extract_generation.invalidate()
+        self._extract_cancel_event.set()
         self._extract_running = False
         self._pending_pdf = None
         self._last_extracted_doc = None
         self._last_extracted_pdf = None
         self._run_btn.setEnabled(True)
+        self._run_btn.setText("▶  开始提取")
         if hasattr(self, "_review_btn"):
             self._review_btn.setEnabled(False)
         if hasattr(self, "_repair_import_btn"):
@@ -306,17 +341,25 @@ class PdfTextLayerTab(QWidget):
         self._refresh_page_manager_context()
         self._prog.setVisible(False)
         self._progress_lbl.setVisible(False)
-        self._log_view.clear()
+        self._clear_pdf_log()
 
     def shutdown_cleanup(self) -> None:
         self._extract_generation.invalidate()
+        self._extract_cancel_event.set()
         self._extract_running = False
+        self._pdf_log_flush_timer.stop()
+        self._pdf_log_buffer.clear()
 
     def _extract_is_current(self, token: int) -> bool:
         return self._extract_generation.is_current(token)
 
     def _run_extract(self):
         if self._extract_running:
+            self._extract_cancel_event.set()
+            self._run_btn.setEnabled(False)
+            self._run_btn.setText("正在停止…")
+            self._progress_lbl.setText("正在停止…")
+            self._append_pdf_log("⏹ 已请求停止；将在当前物理页处理结束后退出。")
             return
         context = self._refresh_page_manager_context()
         if not bool(context.get("matched")) or not self._pending_pdf:
@@ -346,6 +389,8 @@ class PdfTextLayerTab(QWidget):
         split_mode = "auto" if self._stacked_pages_check.isChecked() else "off"
         token = self._extract_generation.begin()
         self._extract_running = True
+        self._extract_cancel_event = threading.Event()
+        cancel_event = self._extract_cancel_event
 
         self._log_view.clear()
         if page_overrides:
@@ -353,25 +398,35 @@ class PdfTextLayerTab(QWidget):
             preview = "、".join(str(v) for v in skipped[:18])
             if len(skipped) > 18:
                 preview += "…"
-            self._log_view.appendPlainText(
+            self._append_pdf_log(
                 f"📑 页面管理：应用 {len(page_overrides)} 个已确认页类型；非正文跳过 {len(skipped)} 页"
                 + (f"（{preview}）" if preview else "")
             )
         elif page_manager_enabled:
             reason = str(context_snapshot.get("reason") or "未找到与当前 PDF 对应的页面管理标记")
-            self._log_view.appendPlainText(f"📑 页面管理：未应用标记 · {reason}")
+            self._append_pdf_log(f"📑 页面管理：未应用标记 · {reason}")
         else:
-            self._log_view.appendPlainText("📑 页面管理：本次已关闭")
-        self._run_btn.setEnabled(False)
+            self._append_pdf_log("📑 页面管理：本次已关闭")
+        self._run_btn.setEnabled(True)
+        self._run_btn.setText("■  停止提取")
         self._prog.setVisible(True)
         self._prog.setRange(0, 1)
         self._prog.setValue(0)
         self._progress_lbl.setVisible(True)
         self._progress_lbl.setText("准备中…")
 
+        progress_state = {"last_emit": 0.0}
+
         def on_progress(current, total, label):
-            signals.progress.emit(current, total)
-            signals.log.emit(f"  [{current:3d}/{total}] {label}")
+            # Keep the complete per-page audit trail, but write it to the Qt
+            # document in coalesced batches.  Visual progress is rate-limited so
+            # 1k+ page PDFs do not enqueue thousands of redundant repaint events.
+            self._pdf_log_buffer.push(f"  [{current:3d}/{total}] {label}")
+            now = time.monotonic()
+            final = int(current) >= int(total)
+            if final or int(current) <= 1 or now - progress_state["last_emit"] >= 0.08:
+                progress_state["last_emit"] = now
+                signals.progress.emit(current, total)
 
         def worker():
             try:
@@ -381,6 +436,7 @@ class PdfTextLayerTab(QWidget):
                 doc = extract_pdf_text_layer(
                     pdf_path, page_overrides=page_overrides, verbose=False,
                     progress_callback=on_progress, split_stacked_pages=split_mode,
+                    cancel_check=cancel_event.is_set,
                 )
                 doc.metadata.pdf_text_page_manager_report = {
                     "enabled": page_manager_enabled,
@@ -392,6 +448,8 @@ class PdfTextLayerTab(QWidget):
                     "reason": str(context_snapshot.get("reason") or ""),
                 }
                 signals.finished.emit(doc)
+            except InterruptedError:
+                signals.finished.emit({"pdf_text_cancelled": True})
             except Exception:
                 import traceback
                 signals.error.emit(traceback.format_exc())
@@ -399,7 +457,7 @@ class PdfTextLayerTab(QWidget):
         signals = self._signals = WorkerSignals()
         signals.finished.connect(lambda doc, t=token: self._on_done(doc, t))
         signals.error.connect(lambda msg, t=token: self._on_error(msg, t))
-        signals.log.connect(lambda line, t=token: self._log_view.appendPlainText(line) if self._extract_is_current(t) else None)
+        signals.log.connect(lambda line, t=token: self._append_pdf_log(line) if self._extract_is_current(t) else None)
         signals.progress.connect(lambda current, total, t=token: self._on_progress(current, total, t))
         threading.Thread(target=worker, daemon=True).start()
 
@@ -421,7 +479,7 @@ class PdfTextLayerTab(QWidget):
             output += ".zip"
         self._review_btn.setEnabled(False)
         self._review_btn.setText("正在导出复核包…")
-        self._log_view.appendPlainText(f"\n🔎 正在导出 {replacement_count} 个损坏字形的局部视觉复核包…")
+        self._append_pdf_log(f"\n🔎 正在导出 {replacement_count} 个损坏字形的局部视觉复核包…")
 
         signals = WorkerSignals()
         self._review_signals = signals
@@ -446,7 +504,7 @@ class PdfTextLayerTab(QWidget):
                 detail = f"{count} 个损坏位置 → {units} 个字形组"
             else:
                 detail = f"{count} 个损坏字形"
-            self._log_view.appendPlainText(f"✅ GPT 复核包已导出：{detail} · {output}")
+            self._append_pdf_log(f"✅ GPT 复核包已导出：{detail} · {output}")
             notify(
                 self,
                 f"已导出 {detail}。\nGPT 只需要看红框局部字形，不必重新识别整本。",
@@ -516,13 +574,19 @@ class PdfTextLayerTab(QWidget):
         if not self._extract_is_current(token):
             return False
         self._extract_running = False
+        self._flush_pdf_log_buffer(force_all=True)
         self._run_btn.setEnabled(True)
+        self._run_btn.setText("▶  开始提取")
         self._prog.setVisible(False)
         self._progress_lbl.setVisible(False)
         return True
 
     def _on_done(self, doc, token: int):
         if not self._finish_extract(token):
+            return
+        if isinstance(doc, dict) and doc.get("pdf_text_cancelled"):
+            self._append_pdf_log("⏹ PDF 文字层提取已停止；未发布半成品，之前的完成结果保持不变。")
+            self._flush_pdf_log_buffer(force_all=True)
             return
         logical_pages = int(getattr(doc.metadata, "pdf_text_logical_page_count", len(doc.pages)) or len(doc.pages))
         physical_pages = int(getattr(doc.metadata, "pdf_text_physical_page_count", logical_pages) or logical_pages)

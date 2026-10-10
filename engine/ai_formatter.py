@@ -10,7 +10,7 @@ from models.document import UnifiedDocument
 
 def ai_correction_step(doc: UnifiedDocument):
     """可选 AI 校正步骤。始终返回独立文档；未配置时安全跳过并记录原因。"""
-    result = copy.deepcopy(doc)
+    result = doc.snapshot_clone()
     if os.environ.get("NOVEL_FORMATTER_AI_ENABLED", "0") != "1":
         result.add_log("ai_correction", "AI 未启用，跳过校正", 0)
         return result

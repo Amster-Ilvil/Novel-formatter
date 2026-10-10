@@ -1599,7 +1599,7 @@ def _write_stable_text_map(path: Path, records: Sequence[dict], *, compact: bool
 
 def _deduplicated_structure_document(package: dict, stable_records: Sequence[dict], assets_manifest: dict) -> dict:
     """Keep deterministic structure while storing editable text in one map."""
-    structure = copy.deepcopy(package.get("structure_document") or {})
+    structure = roundtrip._json_detached(package.get("structure_document") or {})
     by_block_id: dict[str, list[str]] = defaultdict(list)
     by_block_index: dict[int, list[str]] = defaultdict(list)
     for record in stable_records:
@@ -1675,7 +1675,7 @@ def _deduplicated_structure_document(package: dict, stable_records: Sequence[dic
 
 
 def _deduplicated_format_manifest(package: dict, assets_manifest: dict) -> dict:
-    manifest = copy.deepcopy(package.get("format_manifest") or {})
+    manifest = roundtrip._json_detached(package.get("format_manifest") or {})
     source_to_asset: dict[str, dict] = {}
     for asset in assets_manifest.get("assets", []):
         for source in asset.get("source_records") or []:
@@ -3396,13 +3396,15 @@ def export_ai_publication_bundle_v2(
     evidence is opt-in and may add structure/Ruby evidence, but can never replace
     proposed_text silently.
     """
-    source_package = copy.deepcopy(package)
-    package = copy.deepcopy(package)
+    # Roundtrip packages are canonical JSON data.  Use the fast detached JSON
+    # path instead of recursively deepcopying a 20-30 MB package several times.
+    source_package = roundtrip._json_detached(package)
+    package = roundtrip._json_detached(package)
     package_mode = "forensic" if str(package_mode or "forensic").strip().lower() in {"forensic", "full", "complete"} else "compact"
     compact_mode = package_mode == "compact"
     for key in ("publication_reference", "reference_epub", "publication_reference_epub"):
         package.pop(key, None)
-    reference_package = copy.deepcopy(package)
+    reference_package = roundtrip._json_detached(package)
     reference_path = Path(publication_reference_path).expanduser() if publication_reference_path else None
     if include_publication_reference:
         if not reference_path or not reference_path.is_file() or reference_path.suffix.lower() != ".epub":

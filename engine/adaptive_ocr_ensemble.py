@@ -154,8 +154,6 @@ def model_family(label: str) -> str:
         return "apple_vision"
     if "paddle" in value:
         return "paddle_recognizer"
-    if "google" in value:
-        return "google_vision"
     if "tesseract" in value:
         return "tesseract"
     return "generic:" + (value or "unknown")

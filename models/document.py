@@ -496,6 +496,92 @@ class UnifiedDocument:
     def image_blocks(self) -> list[Block]:
         return [b for b in self.blocks if b.type == BlockType.IMAGE_REF]
 
+    def snapshot_clone(self) -> UnifiedDocument:
+        """Return an exact, detached in-memory snapshot of this document.
+
+        Generic ``copy.deepcopy`` spends most of its time recursively visiting the
+        thousands of tiny dataclass/dict/list nodes in a book.  A document has a
+        known typed shape, so clone the scalar/dataclass fields directly and deep
+        copy only the JSON-shaped extension payloads in one batch.  This preserves
+        exact floating-point confidence values (unlike a persistence round-trip,
+        which intentionally rounds some fields) while keeping metadata, block
+        metadata and processing logs fully independent.
+
+        ``repo`` and ``commit_id`` are history pointers rather than content and are
+        intentionally shared exactly like ``rollback_to_commit``/Formatter snapshots.
+        """
+        standard_fields = {
+            "metadata", "pages", "blocks", "toc", "processing_log", "repo", "commit_id"
+        }
+        extras = {
+            "metadata": self.metadata.__dict__,
+            "block_metadata": [block.metadata for block in self.blocks],
+            "processing_log": self.processing_log,
+            # Preserve forward-compatible document-level extension fields too.
+            # TEI import, for example, attaches ``tei_import_report`` directly to
+            # UnifiedDocument rather than Metadata.
+            "document_extras": {
+                key: value for key, value in self.__dict__.items()
+                if key not in standard_fields
+            },
+        }
+        try:
+            if _orjson is not None:
+                detached = _orjson.loads(_orjson.dumps(extras))
+            else:
+                detached = json.loads(json.dumps(extras, ensure_ascii=False))
+        except Exception:
+            # Dynamic extension fields are expected to be JSON-safe because they
+            # are persisted by ``to_dict``.  Keep a defensive fallback for third-
+            # party adapters that temporarily attach richer Python objects.
+            import copy as _copy
+            detached = _copy.deepcopy(extras)
+
+        metadata = Metadata()
+        for key, value in dict(detached.get("metadata") or {}).items():
+            if isinstance(key, str) and key:
+                setattr(metadata, key, value)
+
+        pages = [
+            PageInfo(
+                page_no=page.page_no, page_type=page.page_type,
+                image_path=page.image_path, width=page.width, height=page.height,
+                confidence=page.confidence,
+            )
+            for page in self.pages
+        ]
+        block_metadata = list(detached.get("block_metadata") or [])
+        blocks: list[Block] = []
+        for index, block in enumerate(self.blocks):
+            bbox = None
+            if block.bbox is not None:
+                bbox = BoundingBox(block.bbox.x, block.bbox.y, block.bbox.w, block.bbox.h)
+            metadata_value = (
+                block_metadata[index]
+                if index < len(block_metadata) and isinstance(block_metadata[index], dict)
+                else {}
+            )
+            blocks.append(Block(
+                type=block.type, text=block.text, page=block.page, bbox=bbox,
+                reading_order=block.reading_order, page_index=block.page_index,
+                page_number=block.page_number, order_in_page=block.order_in_page,
+                text_direction=block.text_direction, source_format=block.source_format,
+                metadata=metadata_value, id=block.id, confidence=block.confidence,
+                ocr_raw=block.ocr_raw, modified_by=block.modified_by,
+                image_path=block.image_path, image_anchor=block.image_anchor,
+                chapter_index=block.chapter_index,
+            ))
+        toc = [TocEntry(item.title, item.chapter_index, item.block_index) for item in self.toc]
+        cloned = UnifiedDocument(
+            metadata=metadata, pages=pages, blocks=blocks, toc=toc,
+            processing_log=list(detached.get("processing_log") or []),
+            repo=self.repo, commit_id=self.commit_id,
+        )
+        for key, value in dict(detached.get("document_extras") or {}).items():
+            if isinstance(key, str) and key and key not in standard_fields:
+                setattr(cloned, key, value)
+        return cloned
+
     def to_dict(self) -> dict:
         """
         内容快照，不含版本控制元信息（repo/commit_id 是"指针"，不是内容的一部分——

@@ -924,7 +924,7 @@ def restore_pdf_dialogue_columns(doc: UnifiedDocument, *, inplace: bool = False)
     - doubled/tripled simultaneous speech remains one complete dialogue block;
     - no character, punctuation, or quote glyph is added or removed.
     """
-    out = doc if inplace else copy.deepcopy(doc)
+    out = doc if inplace else doc.snapshot_clone()
     result: list[Block] = []
     split_dialogues = 0
     split_narrations = 0
@@ -1074,7 +1074,7 @@ def _set_source_guard(doc: UnifiedDocument) -> None:
 
 def prepare_pdf_text_layer(doc: UnifiedDocument, *, inplace: bool = False) -> UnifiedDocument:
     """Preserve source, classify structure, and reconstruct physical columns."""
-    out = doc if inplace else copy.deepcopy(doc)
+    out = doc if inplace else doc.snapshot_clone()
     changed = 0
     markers = 0
     afterwords = 0
@@ -1180,7 +1180,7 @@ def prepare_pdf_text_layer(doc: UnifiedDocument, *, inplace: bool = False) -> Un
 
 def clean_pdf_text_metadata(doc: UnifiedDocument) -> UnifiedDocument:
     """PDF-safe metadata cleanup: never delete short top/bottom continuation tails."""
-    out = copy.deepcopy(doc)
+    out = doc.snapshot_clone()
     before = len(out.blocks)
     out.blocks = [block for block in out.blocks if block.type != BlockType.HEADER_FOOTER]
     removed = before - len(out.blocks)
@@ -1204,7 +1204,7 @@ def _bbox_overlap_ratio(a: BoundingBox | None, b: BoundingBox | None) -> float:
 
 def remove_pdf_coordinate_duplicates(doc: UnifiedDocument, *, inplace: bool = False) -> UnifiedDocument:
     """Remove only exact same-page text whose bounding boxes overlap strongly."""
-    out = doc if inplace else copy.deepcopy(doc)
+    out = doc if inplace else doc.snapshot_clone()
     result: list[Block] = []
     removed = 0
     for block in out.blocks:
@@ -1229,7 +1229,7 @@ def remove_pdf_coordinate_duplicates(doc: UnifiedDocument, *, inplace: bool = Fa
 
 
 def skip_pdf_overlap_merge(doc: UnifiedDocument) -> UnifiedDocument:
-    out = copy.deepcopy(doc)
+    out = doc.snapshot_clone()
     out.add_log("merge_overlaps", "PDF文字层已在无损预处理阶段接续物理列；跳过可能吞字的模糊重叠合并", 0)
     return out
 
@@ -1249,7 +1249,7 @@ def _strip_named_pdf_chapter_notes(doc: UnifiedDocument, *, inplace: bool = Fals
     This handles multi-page author notes while retaining the black-magic safety
     rule that uncertain next-page text is preserved rather than guessed away.
     """
-    out = doc if inplace else copy.deepcopy(doc)
+    out = doc if inplace else doc.snapshot_clone()
     blocks = list(out.blocks)
     result: list[Block] = []
     removed = 0
@@ -1372,7 +1372,7 @@ def _remove_explicit_retired_duplicate_sections(doc: UnifiedDocument, *, inplace
     segment starts, its body is skipped through subsequent retired chapters;
     the run stops at the next non-retired named note or non-retired chapter.
     """
-    out = doc if inplace else copy.deepcopy(doc)
+    out = doc if inplace else doc.snapshot_clone()
     result: list[Block] = []
     removed_blocks = 0
     removed_counts: Counter[str] = Counter()
@@ -1437,7 +1437,7 @@ def _remove_explicit_retired_duplicate_sections(doc: UnifiedDocument, *, inplace
 
 def _dedupe_repeated_pdf_section_headers(doc: UnifiedDocument, *, inplace: bool = False) -> tuple[UnifiedDocument, int, Counter[str]]:
     """Keep one structural copy of a repeated ``第X章...`` page header."""
-    out = doc if inplace else copy.deepcopy(doc)
+    out = doc if inplace else doc.snapshot_clone()
     counts = Counter(
         _text(block) for block in out.blocks
         if PDF_REPEATED_SECTION_RE.fullmatch(_text(block))
@@ -1475,7 +1475,7 @@ def _dedupe_repeated_pdf_section_headers(doc: UnifiedDocument, *, inplace: bool 
 def preserve_pdf_afterwords(doc: UnifiedDocument, *, inplace: bool = False) -> UnifiedDocument:
     """Keep author prefaces/afterwords unless the explicit PDF option is disabled."""
     if bool(getattr(doc.metadata, "pdf_keep_afterwords", True)):
-        out = doc if inplace else copy.deepcopy(doc)
+        out = doc if inplace else doc.snapshot_clone()
         out.add_log("strip_chapter_notes", "PDF文字层：保留作者前书/后记（可在界面关闭）", 0)
         return out
     # Two PDFNovels generations exist in the wild.  Older exports use numeric
@@ -1511,7 +1511,7 @@ def _strip_pdfnovels_generated_front_matter(doc: UnifiedDocument, *, inplace: bo
     then remove only the generated prefix before ``序章``/``プロローグ`` or the
     first live chapter.
     """
-    out = doc if inplace else copy.deepcopy(doc)
+    out = doc if inplace else doc.snapshot_clone()
     texts = [_text(block) for block in out.blocks]
     signature = any("pdfnovels.net" in text or "タテ書き小説ネット" in text for text in texts[:80])
     labels = {"【小説タイトル】", "【Ｎコード】", "【作者名】", "【あらすじ】"}
@@ -1578,7 +1578,7 @@ def _strip_pdfnovels_generated_back_matter(
     so once the heading is proven on the terminal physical page we remove the
     *whole page*, not only blocks after the heading.
     """
-    out = doc if inplace else copy.deepcopy(doc)
+    out = doc if inplace else doc.snapshot_clone()
     if not source_signature or not out.blocks:
         return out, 0, Counter()
 
@@ -1626,7 +1626,7 @@ def preserve_pdf_boilerplate(doc: UnifiedDocument, *, inplace: bool = False) -> 
     if remove_generated:
         out, front_removed, removed_counts = _strip_pdfnovels_generated_front_matter(doc, inplace=inplace)
     else:
-        out, front_removed, removed_counts = (doc if inplace else copy.deepcopy(doc)), 0, Counter()
+        out, front_removed, removed_counts = (doc if inplace else doc.snapshot_clone()), 0, Counter()
     out, back_removed, back_counts = _strip_pdfnovels_generated_back_matter(
         out, source_signature=source_signature, inplace=True
     )
@@ -1659,7 +1659,7 @@ def preserve_pdf_boilerplate(doc: UnifiedDocument, *, inplace: bool = False) -> 
 
 def normalize_pdf_text_punctuation(doc: UnifiedDocument, *, inplace: bool = False) -> UnifiedDocument:
     """Whitespace-only PDF normalisation; preserve ellipsis and original wording."""
-    out = doc if inplace else copy.deepcopy(doc)
+    out = doc if inplace else doc.snapshot_clone()
     changed = 0
     for block in out.blocks:
         if block.type not in _TEXT_TYPES:
@@ -1676,7 +1676,7 @@ def normalize_pdf_text_punctuation(doc: UnifiedDocument, *, inplace: bool = Fals
 
 
 def preserve_pdf_orphan_quotes(doc: UnifiedDocument) -> UnifiedDocument:
-    out = copy.deepcopy(doc)
+    out = doc.snapshot_clone()
     blocks, repaired = _repair_orphan_quote_boundaries(out.blocks)
     unresolved = 0
     for block in blocks:
@@ -1694,13 +1694,13 @@ def preserve_pdf_orphan_quotes(doc: UnifiedDocument) -> UnifiedDocument:
 
 
 def skip_pdf_cross_page_merge(doc: UnifiedDocument) -> UnifiedDocument:
-    out = copy.deepcopy(doc)
+    out = doc.snapshot_clone()
     out.add_log("cross_page_merge", "PDF文字层已在无损预处理阶段跨页接续；跳过通用跨页推断", 0)
     return out
 
 
 def skip_pdf_dialogue_auto_close(doc: UnifiedDocument) -> UnifiedDocument:
-    out = copy.deepcopy(doc)
+    out = doc.snapshot_clone()
     flagged = 0
     for block in out.blocks:
         if block.type not in _JOINABLE_TYPES:
@@ -1718,7 +1718,7 @@ def skip_pdf_dialogue_auto_close(doc: UnifiedDocument) -> UnifiedDocument:
 
 
 def skip_pdf_sentence_merge(doc: UnifiedDocument) -> UnifiedDocument:
-    out = copy.deepcopy(doc)
+    out = doc.snapshot_clone()
     out.add_log("merge_sentences", "PDF文字层物理列已先行接回；跳过普通OCR短块/接续词推断", 0)
     return out
 
@@ -1727,7 +1727,7 @@ def skip_pdf_sentence_merge(doc: UnifiedDocument) -> UnifiedDocument:
 
 def restore_pdf_indents(doc: UnifiedDocument, *, inplace: bool = False) -> UnifiedDocument:
     """Add visual paragraph indents without merging scene markers or neighbours."""
-    out = doc if inplace else copy.deepcopy(doc)
+    out = doc if inplace else doc.snapshot_clone()
     changed = 0
     for block in out.blocks:
         if block.type != BlockType.PARAGRAPH or _is_structural_block(block):
@@ -1787,7 +1787,7 @@ def _restore_pdf_chapter_structure(doc: UnifiedDocument) -> tuple[UnifiedDocumen
     the episode title is not suppressed as a fake TOC page merely because two
     structure labels occur on that page.
     """
-    out = copy.deepcopy(doc)
+    out = doc.snapshot_clone()
     adjusted = 0
     pairs = {("序章", "プロローグ"), ("終章", "エピローグ")}
     for index, block in enumerate(out.blocks[:-1]):
@@ -1819,7 +1819,7 @@ def _defer_pdf_chapter_detection_to_ai(doc: UnifiedDocument, *, inplace: bool = 
     pass.  Preserve their provenance as metadata, demote them to ordinary text,
     clear chapter indexes/TOC, and let AI make the final structural decision.
     """
-    out = doc if inplace else copy.deepcopy(doc)
+    out = doc if inplace else doc.snapshot_clone()
     candidates = 0
     for block in out.blocks:
         if block.type == BlockType.CHAPTER:
@@ -1838,7 +1838,7 @@ def _defer_pdf_chapter_detection_to_ai(doc: UnifiedDocument, *, inplace: bool = 
 
 def finalize_pdf_text_layer(doc: UnifiedDocument, *, inplace: bool = False) -> UnifiedDocument:
     """Finish PDF geometry/text cleanup, defer chapter/TOC detection, verify coverage."""
-    out = doc if inplace else copy.deepcopy(doc)
+    out = doc if inplace else doc.snapshot_clone()
     blocks, simultaneous = _repair_simultaneous_speech(out.blocks)
     blocks, orphan = _repair_orphan_quote_boundaries(blocks)
     # Lexical/semantic anomaly heuristics belong to the AI review stage.  The

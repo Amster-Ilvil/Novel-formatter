@@ -79,18 +79,8 @@ _PROFILES: dict[str, OcrEngineProfile] = {
         min_canvas_height_ratio=3.50,
         notes="Tight source column with blank end-context; recognizer performs rotate/48px normalization.",
     ),
-    "manga_ocr": OcrEngineProfile(
-        "manga_ocr", "manga-ocr-short-block-review-v1", "column", "short_block", "mps_model",
-        0.20, 0.14, 8, 6,
-        min_canvas_height_ratio=2.0,
-        notes="Review-only: split disputed physical columns into short vertical blocks before fixed 224x224 OCR.",
-    ),
     "paddle_ocr": OcrEngineProfile(
         "paddle_ocr", "paddle-context-v1", "column", "context", "onnx_model",
-        0.70, 0.40, 16, 12,
-    ),
-    "google_vision": OcrEngineProfile(
-        "google_vision", "layout-context-v1", "column", "context", "remote_model",
         0.70, 0.40, 16, 12,
     ),
 }

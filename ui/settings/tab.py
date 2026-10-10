@@ -12,6 +12,7 @@ import tempfile
 import threading
 from pathlib import Path
 
+from core.command_catalog import PRIMARY_NAVIGATION_SPECS, primary_navigation_shortcut_label
 from PySide6.QtCore import Qt, Signal, QSettings, QUrl
 from PySide6.QtGui import QDesktopServices
 from PySide6.QtWidgets import (
@@ -704,7 +705,7 @@ class SystemSettingsTab(QWidget):
         self._overview_ocr_card = overview_card("OCR 模型", "已就绪", "本地引擎与运行环境", ocr_rows, 1)
         self._overview_device_card = overview_card("计算设备", "自动", "自动检测加速设备", device_rows, 2)
         self._overview_interface_card = overview_card("界面", "当前", "主题与语言", self._overview_interface_rows, 0)
-        self._overview_ai_card = overview_card("AI 裁决", "可用", "GPT 共识裁决服务", ai_rows, 1)
+        self._overview_ai_card = overview_card("AI 裁决", "可用", "多 Provider 出版级裁决", ai_rows, 1)
         grid.addWidget(self._overview_ocr_card, 0, 0)
         grid.addWidget(self._overview_device_card, 0, 1)
         grid.addWidget(self._overview_interface_card, 1, 0)
@@ -1131,15 +1132,9 @@ class SystemSettingsTab(QWidget):
         grid.setVerticalSpacing(8)
         mod = "⌘" if sys.platform == "darwin" else "Ctrl+"
         rows = [
-            ("工作区", f"{mod}1"),
-            ("页面管理", f"{mod}2"),
-            ("OCR 识别", f"{mod}3"),
-            ("格式处理", f"{mod}4"),
-            ("文字校对", f"{mod}5"),
-            ("EPUB生成", f"{mod}6"),
-            ("设置", f"{mod}7"),
+            *[(spec.title, primary_navigation_shortcut_label(index))
+              for index, spec in enumerate(PRIMARY_NAVIGATION_SPECS)],
             ("命令面板", f"{mod}K"),
-            ("保存当前校对", "Ctrl + Enter"),
             ("上一句 / 下一句", "Ctrl + ↑ / ↓"),
             ("上一列 / 下一列", "Ctrl + ← / →"),
             ("OCR 预览上一页 / 下一页", "Option + ← / →"),

@@ -35,6 +35,210 @@ from ui.pages.preview import PageImagePreviewDialog
 from ui.pages.types import PAGE_TYPES, TYPE_COLOR, TYPE_LABEL
 
 
+
+_STRONG_PAGE_TYPE_PATTERNS = (
+    ("cover", re.compile(r"(?:^|[_\-\s])(cover|frontcover|front_cover)(?:$|[_\-\s])", re.I)),
+    ("colophon", re.compile(r"(?:^|[_\-\s])(colophon|copyright|okuduke|okuzuke)(?:$|[_\-\s])", re.I)),
+    ("toc_page", re.compile(r"(?:^|[_\-\s])(toc|contents|tableofcontents)(?:$|[_\-\s])", re.I)),
+    ("title_page", re.compile(r"(?:^|[_\-\s])(title|titlepage|title_page)(?:$|[_\-\s])", re.I)),
+    ("afterword", re.compile(r"(?:^|[_\-\s])(afterword|atogaki)(?:$|[_\-\s])", re.I)),
+    ("illustration", re.compile(r"(?:^|[_\-\s])(illustration|illus|insert)(?:$|[_\-\s])", re.I)),
+)
+
+
+def _strong_filename_page_type(
+    path: str | Path, page_no: int, *, trust_img_marker: bool = False
+) -> str | None:
+    """Return only page types that are safe to trust without manual confirmation.
+
+    The importer deliberately avoids visual/text-density guessing.  Strong,
+    source-authored filename markers are deterministic and survive book-scale
+    imports without sending obvious cover/illustration assets into OCR.  Generic
+    names and ``*_txt`` pages remain conservative body suggestions.
+    """
+    source = Path(path)
+    stem = source.stem.casefold()
+    for page_type, pattern in _STRONG_PAGE_TYPE_PATTERNS:
+        if pattern.search(stem):
+            return page_type
+    # Common page-export convention used by Novel Formatter and several scanners:
+    # *_img is an image-only asset while *_txt is an OCR/body page.  The first
+    # image-only physical page is the book cover; later image-only pages are
+    # illustrations.  This rule is intentionally filename-only, not heuristic.
+    if trust_img_marker and re.search(r"(?:^|[_\-])img(?:$|[_\-])", stem):
+        return "cover" if int(page_no) == 1 else "illustration"
+    return None
+
+
+def _uses_txt_img_export_convention(paths) -> bool:
+    """Trust ``*_img`` only when the same batch also contains ``*_txt`` pages.
+
+    Some scanners append ``img`` to every page filename; treating those as
+    illustrations would suppress the entire book from OCR.  Novel Formatter's
+    established export convention is mixed ``*_txt`` body pages plus ``*_img``
+    image-only assets, so require both markers before promoting ``*_img`` to a
+    trusted non-body classification.
+    """
+    stems = [Path(value).stem.casefold() for value in (paths or [])]
+    has_txt = any(re.search(r"(?:^|[_\-])txt(?:$|[_\-])", stem) for stem in stems)
+    has_img = any(re.search(r"(?:^|[_\-])img(?:$|[_\-])", stem) for stem in stems)
+    return bool(has_txt and has_img)
+
+
+def _default_import_page_types(paths) -> tuple[dict[int, str], set[int]]:
+    """New imports start entirely as body pages; recognition is opt-in.
+
+    The returned suggested set prevents these unreviewed defaults from being
+    mistaken for user-confirmed classifications by downstream OCR admission.
+    Stored project page state is deliberately not routed through this helper.
+    """
+    count = len(paths or [])
+    return ({page_no: "paragraph" for page_no in range(1, count + 1)},
+            set(range(1, count + 1)))
+
+
+def _propose_filename_page_types(
+    paths, current_types: dict[int, str], suggested_pages: set[int]
+) -> tuple[dict[int, str], set[int], tuple[int, ...]]:
+    """Apply explicitly requested filename tags to unconfirmed pages only.
+
+    Never overwrite an earlier manual tag / restored trusted classification.
+    A strong filename classification becomes trusted; generic body pages
+    remain suggestions so that OCR will not silently skip them.
+    """
+    new_types = dict(current_types)
+    unconfirmed = set(suggested_pages)
+    changed = []
+    trust_img = _uses_txt_img_export_convention(paths)
+    for page_no, path in enumerate(paths, start=1):
+        if page_no not in unconfirmed:
+            continue
+        proposed = _strong_filename_page_type(
+            path, page_no, trust_img_marker=trust_img
+        )
+        if proposed is None:
+            new_types[page_no] = "paragraph"
+            continue
+        if new_types.get(page_no) != proposed:
+            changed.append(page_no)
+        new_types[page_no] = proposed
+        unconfirmed.discard(page_no)
+    return new_types, unconfirmed, tuple(changed)
+
+
+class _PageThumbnailCard(QWidget):
+    """Single self-painted page card.
+
+    Older builds created a QWidget + three QLabel children for every page. A
+    400-page novel therefore added ~1,600 QWidgets and triggered thousands of
+    style/polish events.  This card paints thumbnail, page number, type badge,
+    hover and selection itself while preserving the same mouse/context-menu API.
+    """
+
+    CARD_W = 148
+    CARD_H = 218
+    IMAGE_W = 126
+    IMAGE_H = 168
+
+    def __init__(self, page_no: int, page_type: str, parent=None):
+        super().__init__(parent)
+        self._page_no = int(page_no)
+        self._page_type = str(page_type or "unknown")
+        self._pixmap: QPixmap | None = None
+        self._placeholder = f"第 {self._page_no} 页"
+        self._selected = False
+        self._hover = False
+        self.setFixedSize(self.CARD_W, self.CARD_H)
+        self.setMouseTracking(True)
+        self.setAttribute(Qt.WidgetAttribute.WA_Hover, True)
+
+    def set_selected(self, selected: bool) -> None:
+        selected = bool(selected)
+        if selected != self._selected:
+            self._selected = selected
+            self.update()
+
+    def set_page_type(self, page_type: str) -> None:
+        value = str(page_type or "unknown")
+        if value != self._page_type:
+            self._page_type = value
+            self.update()
+
+    # Compatibility with the old QLabel-based async thumbnail loader.
+    def setPixmap(self, pixmap: QPixmap) -> None:  # noqa: N802
+        self._pixmap = pixmap
+        self._placeholder = ""
+        self.update()
+
+    def setText(self, text: str) -> None:  # noqa: N802
+        self._placeholder = str(text or "")
+        if self._placeholder:
+            self._pixmap = None
+        self.update()
+
+    def enterEvent(self, event):
+        self._hover = True
+        self.update()
+        super().enterEvent(event)
+
+    def leaveEvent(self, event):
+        self._hover = False
+        self.update()
+        super().leaveEvent(event)
+
+    def paintEvent(self, event):
+        del event
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+
+        outer = self.rect().adjusted(1, 1, -1, -1)
+        painter.setPen(QPen(QColor("#B8D1F1" if self._hover else "#D5E4F7"), 1))
+        painter.setBrush(QColor("#FAFAFB" if self._hover else CARD))
+        painter.drawRoundedRect(outer, 14, 14)
+
+        image_rect = QRect(11, 11, self.IMAGE_W, self.IMAGE_H)
+        painter.setPen(QPen(QColor(BORDER), 1))
+        painter.setBrush(QColor("#F3EEDF"))
+        painter.drawRoundedRect(image_rect, 9, 9)
+
+        if self._pixmap is not None and not self._pixmap.isNull():
+            pix = self._pixmap
+            x = image_rect.x() + max(0, (image_rect.width() - pix.width()) // 2)
+            y = image_rect.y() + max(0, (image_rect.height() - pix.height()) // 2)
+            painter.drawPixmap(x, y, pix)
+        elif self._placeholder:
+            painter.setPen(QColor(MUTED))
+            painter.drawText(image_rect.adjusted(5, 5, -5, -5), Qt.AlignmentFlag.AlignCenter, self._placeholder)
+
+        if self._selected:
+            painter.setPen(QPen(QColor(ACC), 2))
+            painter.setBrush(Qt.BrushStyle.NoBrush)
+            painter.drawRoundedRect(image_rect.adjusted(1, 1, -1, -1), 9, 9)
+
+        footer_y = 190
+        font = painter.font()
+        font.setPointSizeF(max(8.0, font.pointSizeF() - 1.0 if font.pointSizeF() > 0 else 9.0))
+        font.setBold(True)
+        painter.setFont(font)
+        painter.setPen(QColor(INK))
+        painter.drawText(QRect(11, footer_y, 52, 20), Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft, f"p{self._page_no:03d}")
+
+        color = TYPE_COLOR.get(self._page_type, "#AAA")
+        compact_color = {
+            "cover": "#3478F6",
+            "illustration": "#7894B8",
+            "color_illus": "#7894B8",
+            "paragraph": "#17A46B",
+        }.get(self._page_type, color)
+        label = TYPE_LABEL.get(self._page_type, "?")
+        badge_w = min(78, max(32, painter.fontMetrics().horizontalAdvance(label) + 14))
+        badge_rect = QRect(self.width() - 11 - badge_w, footer_y + 1, badge_w, 18)
+        painter.setPen(Qt.PenStyle.NoPen)
+        painter.setBrush(QColor(blend(compact_color, 0.14, "#FFFFFF")))
+        painter.drawRoundedRect(badge_rect, 9, 9)
+        painter.setPen(QColor(compact_color))
+        painter.drawText(badge_rect, Qt.AlignmentFlag.AlignCenter, label)
+
 class _PageThumbnailLabel(QLabel):
     """Paint selection without re-polishing Qt fonts on every mouse click."""
 
@@ -73,6 +277,9 @@ class PageManagerTab(QWidget):
         # 跟 page_overrides 分开跟踪，因为下游 OCR 的"跳过识别"逻辑只应该
         # 信任真人确认过的标注，不能被这里图省事打的默认建议误伤（见
         # _finish_load 的详细说明）。
+        # All newly imported pages are unconfirmed body suggestions. Only a
+        # manual tag or an explicit "更多 → 自动标记页面类型" action can make
+        # a strong filename classification trusted and skippable by OCR.
         self._auto_suggested: set[int] = set()
         self.selected_pages: set[int] = set()
         self.thumb_cache: OrderedDict[str, QPixmap] = OrderedDict()
@@ -205,6 +412,12 @@ class PageManagerTab(QWidget):
         more_menu.addAction("打开文件夹…", self._open_folder)
         more_menu.addAction("刷新当前来源", self._refresh_current_source)
         more_menu.addSeparator()
+        self._page_auto_tag_action = more_menu.addAction(
+            "自动标记页面类型", self._auto_tag_page_types
+        )
+        self._page_auto_tag_action.setToolTip(
+            "仅在点击后按文件名标记封面、插图等；保留已确认的人工标记"
+        )
         more_menu.addAction("扫描件优化", self._open_scan_preprocess_dialog)
         self._scan_restore_action = more_menu.addAction("恢复优化前", self._restore_scan_preprocess)
         self._scan_restore_action.setEnabled(False)
@@ -1251,8 +1464,7 @@ class PageManagerTab(QWidget):
                     manager.open_project(project_path)
                     durable_images = manager.persist_page_images(images)
                     count = len(durable_images)
-                    overrides = {index: "paragraph" for index in range(1, count + 1)}
-                    auto_suggested = set(overrides)
+                    overrides, auto_suggested = _default_import_page_types(images)
                     if pending_pdf_source:
                         pdf_sources = [pending_pdf_source]
                         page_map = {index: index for index in range(1, count + 1)}
@@ -1356,12 +1568,14 @@ class PageManagerTab(QWidget):
             self._original_pdf_sources = [str(Path(self._pending_pdf_source_for_load).expanduser())]
             self._pdf_physical_page_map = {index: index for index in range(1, len(self.page_images) + 1)}
             self._pending_pdf_source_for_load = ""
+            # Rendered PDF page filenames carry no reliable semantic type. Keep
+            # them as conservative body suggestions until the user confirms.
             self.page_overrides = {index: "paragraph" for index in range(1, len(self.page_images) + 1)}
             self._auto_suggested = set(self.page_overrides)
         else:
-            # 默认全部当正文页；需要封面/插图时可在页面管理里手动改。
-            self.page_overrides = {index: "paragraph" for index in range(1, len(self.page_images) + 1)}
-            self._auto_suggested = set(self.page_overrides)
+            self.page_overrides, self._auto_suggested = _default_import_page_types(
+                self.page_images
+            )
         self.selected_pages.clear()
         self.thumb_cache.clear()
         self._count_lbl.setText(f"{len(images)} 页")
@@ -1466,72 +1680,23 @@ class PageManagerTab(QWidget):
         self._visible_thumb_timer.start()
 
     def _add_thumbnail_card(self, path: Path, page_no: int, index: int, columns: int) -> None:
-        cell_width, image_width, image_height = 148, 126, 168
         ptype = self._ptype(page_no)
-        color = TYPE_COLOR.get(ptype, "#AAA")
-        compact_color = {
-            "cover": "#3478F6",
-            "illustration": "#7894B8",
-            "color_illus": "#7894B8",
-            "paragraph": "#17A46B",
-        }.get(ptype, color)
-        label = TYPE_LABEL.get(ptype, "?")
-
-        cell = QWidget()
-        cell.setObjectName("pageThumbClickable")
-        cell.setStyleSheet(
-            f"QWidget#pageThumbClickable {{ background:{CARD}; border:1px solid #D5E4F7; border-radius:14px; }}"
-            "QWidget#pageThumbClickable:hover { background:#FAFAFB; border-color:#B8D1F1; }"
-        )
-        cell.setFixedSize(cell_width, 218)
-        cell_layout = QVBoxLayout(cell)
-        cell_layout.setContentsMargins(10, 10, 10, 8)
-        cell_layout.setSpacing(7)
-
-        image_frame = _PageThumbnailLabel()
-        image_frame.setFixedSize(image_width, image_height)
-        image_frame.setAlignment(Qt.AlignCenter)
-        image_frame.setStyleSheet(
-            f"background:#F3EEDF;border:1px solid {BORDER};border-radius:9px;"
-        )
-        image_frame.set_selected(page_no in self.selected_pages)
+        cell = _PageThumbnailCard(page_no, ptype)
         key = str(path)
         if path.exists():
             cached = self._thumb_cache_get(key)
             if cached is not None:
-                image_frame.setPixmap(cached)
+                cell.setPixmap(cached)
             else:
-                image_frame.setText(f"第 {page_no} 页")
-                self._thumb_labels[key] = image_frame
+                cell.setText(f"第 {page_no} 页")
+                self._thumb_labels[key] = cell
         else:
-            image_frame.setText(f"第 {page_no} 页")
-            image_frame.setStyleSheet(
-                image_frame.styleSheet() + "color:#666;font-size:12px;"
-            )
-        self._page_frames[page_no] = image_frame
-        cell_layout.addWidget(image_frame)
+            cell.setText("无法预览")
 
-        footer = QHBoxLayout()
-        footer.setContentsMargins(0, 0, 0, 0)
-        footer.setSpacing(6)
-        page_label = QLabel(f"p{page_no:03d}")
-        page_label.setStyleSheet(f"color:{INK};font-size:10px;font-weight:700;")
-        footer.addWidget(page_label)
-        footer.addStretch(1)
-
-        tag = QLabel(label)
-        tag.setFixedHeight(18)
-        tag.setContentsMargins(7, 0, 7, 0)
-        tag.setAlignment(Qt.AlignCenter)
-        tag_bg = blend(compact_color, 0.14, "#FFFFFF")
-        tag.setStyleSheet(
-            f"background:{tag_bg};color:{compact_color};border-radius:9px;"
-            "font-size:9px;font-weight:700;"
-        )
-        self._page_type_labels[page_no] = tag
-        footer.addWidget(tag)
-        cell_layout.addLayout(footer)
-
+        # Compatibility maps now point to the same single painted widget.
+        self._page_frames[page_no] = cell
+        self._page_type_labels[page_no] = cell
+        cell.set_selected(page_no in self.selected_pages)
         cell.setProperty("page_no", page_no)
         cell.mousePressEvent = partial(self._on_thumb_click, page_no)
         cell.mouseDoubleClickEvent = partial(self._on_thumb_double_click, page_no)
@@ -1672,7 +1837,11 @@ class PageManagerTab(QWidget):
                 y = label.mapTo(self._grid_widget, QPoint(0, 0)).y()
                 if y + label.height() < top - margin or y > bottom + margin:
                     continue
-                self._enqueue_thumb(key, label.width() - 4, label.height() - 4)
+                self._enqueue_thumb(
+                    key,
+                    _PageThumbnailCard.IMAGE_W,
+                    _PageThumbnailCard.IMAGE_H,
+                )
             except RuntimeError:
                 self._thumb_labels.pop(key, None)
 
@@ -1872,15 +2041,35 @@ class PageManagerTab(QWidget):
             if tag is None:
                 continue
             ptype = self._ptype(page_no)
-            tag.setText(TYPE_LABEL.get(ptype, "?"))
-            color = TYPE_COLOR.get(ptype, "#AAA")
-            tag_bg = blend(color, 0.14, "#FFFFFF")
-            tag.setStyleSheet(
-                f"background:{tag_bg};color:{color};border-radius:11px;"
-                "font-size:10px;font-weight:700;"
-            )
+            if hasattr(tag, "set_page_type"):
+                tag.set_page_type(ptype)
+            else:
+                tag.setText(TYPE_LABEL.get(ptype, "?"))
+                color = TYPE_COLOR.get(ptype, "#AAA")
+                tag_bg = blend(color, 0.14, "#FFFFFF")
+                tag.setStyleSheet(
+                    f"background:{tag_bg};color:{color};border-radius:11px;"
+                    "font-size:10px;font-weight:700;"
+                )
         self._update_counts()
         self._update_stat_bar()
+
+    def _auto_tag_page_types(self) -> None:
+        """Explicit, conservative auto-tag; never changes page image sources."""
+        if not self.page_images:
+            notify(self, "请先导入页面，再使用自动标记。", "info")
+            return
+        updated, suggestions, changed = _propose_filename_page_types(
+            self.page_images, self.page_overrides, self._auto_suggested
+        )
+        self.page_overrides = updated
+        self._auto_suggested = suggestions
+        self._refresh_page_type_styles(changed)
+        # Trusted status can change even if the visual badge does not; persist
+        # and notify downstream consumers of the refreshed OCR admission policy.
+        self._persist_project_page_state(classification_only=True)
+        self.types_changed.emit()
+        notify(self, f"自动标记完成：{len(changed)} 页调整了类型，其余保持原标记。", "info")
 
     def _batch_tag(self, ttype):
         if not self.selected_pages:

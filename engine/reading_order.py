@@ -253,9 +253,9 @@ def restore_reading_order(doc: UnifiedDocument) -> UnifiedDocument:
     more precise character-coordinate ordering pass of its own.
     """
     if doc.metadata.source_engine == "pdf_text_layer":
-        return copy.deepcopy(doc)
+        return doc.snapshot_clone()
 
-    doc = copy.deepcopy(doc)
+    doc = doc.snapshot_clone()
     sortable_types = {BlockType.PARAGRAPH, BlockType.DIALOGUE}
     pages: dict[int, list[Block]] = defaultdict(list)
     for block in doc.blocks:

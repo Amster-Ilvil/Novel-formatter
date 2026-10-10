@@ -402,7 +402,7 @@ def comparison_keys_for_texts(texts: Iterable[str]) -> list[str]:
 
 def normalize_document_copy(document):
     """Return a deep-copied document with only non-deleting repairs applied."""
-    result = copy.deepcopy(document)
+    result = document.snapshot_clone() if hasattr(document, "snapshot_clone") else copy.deepcopy(document)
     total = OCRUnicodeNormalizationReport()
     for block in getattr(result, "blocks", []) or []:
         if not hasattr(block, "text"):

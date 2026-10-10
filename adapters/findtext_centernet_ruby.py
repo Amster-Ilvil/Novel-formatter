@@ -4223,7 +4223,7 @@ def extract_ruby_overlay(document: UnifiedDocument | dict | None) -> dict:
     if document is None:
         return {"schema": "novel_formatter.ruby_overlay.v1", "blocks": [], "document_metadata": {}}
     if isinstance(document, dict) and str(document.get("schema", "")).startswith("novel_formatter.ruby_overlay."):
-        copied = copy.deepcopy(document)
+        copied = document.snapshot_clone() if hasattr(document, "snapshot_clone") else copy.deepcopy(document)
         enabled = bool((copied.get("document_metadata") or {}).get("ruby_preservation_enabled"))
         if not enabled:
             return {"schema": "novel_formatter.ruby_overlay.v1", "blocks": [], "document_metadata": {}}

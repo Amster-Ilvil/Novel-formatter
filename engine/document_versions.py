@@ -218,7 +218,7 @@ class DocumentVersionStore:
 
     def set(self, kind: str, doc: UnifiedDocument, parent: str = "", changes=None, autosave=True):
         if kind not in self.FILES: raise ValueError(f"Unknown document version: {kind}")
-        cloned = copy.deepcopy(doc)
+        cloned = doc.snapshot_clone()
         old = self.info.get(kind)
         rev = (old.revision + 1) if old else 1
         stamp = time.strftime("%Y-%m-%dT%H:%M:%S%z")
@@ -230,7 +230,7 @@ class DocumentVersionStore:
 
     def get(self, kind: str) -> Optional[UnifiedDocument]:
         doc = self.documents.get(kind)
-        return copy.deepcopy(doc) if doc else None
+        return doc.snapshot_clone() if doc else None
 
     def clear(self, kind: str, delete_disk: bool = True):
         """Clear one version without affecting the other document version."""

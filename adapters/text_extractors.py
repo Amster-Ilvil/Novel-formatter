@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 """
 Text Extractor —— 把各种格式的"高质量文本来源"统一转成 Paragraph 列表，
-供 engine/alignment_v2.py 跟 OCR 结果对齐。
+供 OCR/Formatter/外部文档流程提取统一段落。
 
 docx / epub / json 已经有对应的 adapter 能转成 UnifiedDocument（docx_adapter /
 epub_adapter / UnifiedDocument.from_json 本身），这里直接复用，不重新写一遍
