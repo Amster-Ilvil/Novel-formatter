@@ -152,6 +152,18 @@ OCR 模型权重、缓存、虚拟环境、日志、数据库和用户输出不�
 
 第三方项目、模型和资源仍适用其各自许可证；本仓库不重新发布 OCR 模型权重。
 
+## Star History
+
+<p align="center">
+  <a href="https://www.star-history.com/?type=date&repos=Amster-Ilvil%2FNovel-formatter">
+    <picture>
+      <source media="(prefers-color-scheme: dark)" srcset="https://api.star-history.com/svg?repos=Amster-Ilvil/Novel-formatter&type=Date&theme=dark">
+      <source media="(prefers-color-scheme: light)" srcset="https://api.star-history.com/svg?repos=Amster-Ilvil/Novel-formatter&type=Date">
+      <img alt="Novel Formatter Star History Chart" src="https://api.star-history.com/svg?repos=Amster-Ilvil/Novel-formatter&type=Date" width="800">
+    </picture>
+  </a>
+</p>
+
 ## 用途与许可
 
 本项目原创代码与文档以 [MIT License](LICENSE) 开源，可在遵守许可证的前提下用于个人、学习、研究或商业用途。
