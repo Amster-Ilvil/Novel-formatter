@@ -203,7 +203,7 @@ def build(
         proofs.append(proof)
         accepted_jobs.append({"task_id": task_id, "slot": slot, "proof": asdict(proof)})
         slots_by_job[(task_id, ai, bi)] = slot
-        proofs_by_position[proof.physical_key] = (proof, job)
+        proofs_by_position.setdefault(proof.physical_key, (proof, job))
     groups, duplicates = exact_glyph_groups(proofs)
     templates = make_template(groups, proofs_by_position, slots_by_job)
     decisions = []
@@ -262,7 +262,11 @@ def build(
     (out_dir / "GROUPS_UNAPPROVED.json").write_text(
         json.dumps(groups, ensure_ascii=False, indent=2), encoding="utf-8"
     )
-    (out_dir / "GROUP_DECISIONS_TEMPLATE.json").write_text(
+    # Never overwrite the reviewed decision file when re-running in-place.
+    template_path = out_dir / "GROUP_DECISIONS_TEMPLATE.json"
+    if decisions_path is not None and decisions_path.resolve() == template_path.resolve():
+        template_path = out_dir / "GROUP_DECISIONS_TEMPLATE_NEW.json"
+    template_path.write_text(
         json.dumps(templates, ensure_ascii=False, indent=2), encoding="utf-8"
     )
     summary = summarize_batch(proofs, groups)
@@ -274,6 +278,8 @@ def build(
         "duplicate_physical_crop_count": len(duplicates),
         "full_answer_draft_count": len(answers),
         "partial_answer_task_count": len(partial),
+        "approved_group_decision_count": sum(d.get("approved") is True for d in decisions),
+        "proposed_slot_count": sum(p.get("status") == "suggested" for p in proposals),
         "all_outputs_read_only": True,
         "model_or_network_calls": 0,
         "note": "Draft text is NOT a V5 AI_IMPORT file; manually review before import.",
