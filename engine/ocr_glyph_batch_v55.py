@@ -60,6 +60,7 @@ class GlyphProof:
     size: tuple[int, int]
     ink_ratio: float
     center_ink_ratio: float
+    position_verified: bool = False
 
     @property
     def physical_key(self) -> tuple[str, str, str, tuple[int, int, int, int]]:
@@ -78,6 +79,7 @@ def make_glyph_proof(
     column_id: str,
     box: Sequence[int],
     ink_threshold: int = 205,
+    position_verified: bool = False,
 ) -> GlyphProof:
     """Hash the actual full source image AND the exact unresized crop pixels.
 
@@ -116,6 +118,7 @@ def make_glyph_proof(
         box=bounds, pixels_sha256=sha256_bytes(data),
         size=(width, height), ink_ratio=round(ratio, 6),
         center_ink_ratio=round(center_ratio, 6),
+        position_verified=bool(position_verified),
     )
 
 
@@ -243,12 +246,22 @@ def _review_choice(
     """One approved group decision never overrides conflicting local context."""
     if decision.get("approved") is not True:
         return None, "not_approved"
+    if not proof.position_verified:
+        return None, "physical_position_not_verified"
     if decision.get("glyph_key") != proof.glyph_key:
         return None, "glyph_proof_changed"
     if slot.get("task_id") != proof.task_id:
         return None, "task_proof_mismatch"
     if slot.get("candidate_sha256") != decision.get("candidate_sha256_by_task", {}).get(proof.task_id):
         return None, "ocr_candidates_changed"
+    binding = decision.get("proof_by_task", {}).get(proof.task_id)
+    if not isinstance(binding, dict):
+        return None, "no_physical_provenance_binding"
+    if (binding.get("source_sha256") != proof.source_sha256
+        or binding.get("page_id") != proof.page_id
+        or binding.get("column_id") != proof.column_id
+        or tuple(binding.get("box", ())) != proof.box):
+        return None, "physical_provenance_changed"
     if proof.task_id in decision.get("exceptions", ()):
         return None, "exception"
     choice = decision.get("character")
