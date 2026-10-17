@@ -82,6 +82,8 @@ def locate_target_by_verified_anchors(
         anchors = {int(i): str(c) for i, c in verified_cell_labels.items()}
     except (ValueError, TypeError):
         return {"ok": False, "reason": "invalid_anchors"}
+    if min_anchors < 2:
+        return {"ok": False, "reason": "unsafe_min_anchors"}
     if len(anchors) < min_anchors:
         return {"ok": False, "reason": "insufficient_independent_visual_anchors"}
     if any(i < 0 or i >= m or len(ch) != 1 for i, ch in anchors.items()):
@@ -91,6 +93,21 @@ def locate_target_by_verified_anchors(
     best = f[n][m]
     if best >= _INF:
         return {"ok": False, "reason": "alignment_unavailable"}
+
+    # Supplying a verified label is not sufficient: an optimal alignment
+    # might skip that physical cell. Require every anchor to be consumed
+    # as a matching character on EVERY globally optimal path.
+    for cell in sorted(anchors):
+        can_skip_anchor = any(
+            f[i][cell] < _INF and b[i][cell + 1] < _INF
+            and f[i][cell] + _GAP + b[i][cell + 1] == best
+            for i in range(n + 1)
+        )
+        if can_skip_anchor:
+            return {
+                "ok": False, "reason": "verified_visual_anchor_not_honored",
+                "anchor_cell": cell,
+            }
 
     # Edges, not a single arbitrarily chosen traceback, establish uniqueness.
     candidates = []
