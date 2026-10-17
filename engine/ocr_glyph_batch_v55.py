@@ -255,6 +255,14 @@ def _review_choice(
         return None, "task_proof_mismatch"
     if slot.get("candidate_sha256") != decision.get("candidate_sha256_by_task", {}).get(proof.task_id):
         return None, "ocr_candidates_changed"
+    # A full-sentence candidate digest cannot identify WHICH disagreement slot
+    # the reviewer inspected. Bind both offsets and both original codepoints.
+    slot_binding = decision.get("slot_by_task", {}).get(proof.task_id)
+    if not isinstance(slot_binding, Mapping):
+        return None, "no_reviewed_slot_binding"
+    if any(slot_binding.get(key) != slot.get(key) for key in
+           ("a_index", "b_index", "a", "b")):
+        return None, "reviewed_slot_binding_changed"
     binding = decision.get("proof_by_task", {}).get(proof.task_id)
     if not isinstance(binding, dict):
         return None, "no_physical_provenance_binding"
@@ -273,11 +281,19 @@ def _review_choice(
             return None, "same_shape_different_unicode_requires_editorial_policy"
     if len(str(decision.get("review_note", "")).strip()) < 12:
         return None, "review_note_too_short"
-    if proof.physical_key in [
-        (str(x["source_sha256"]), str(x["page_id"]), str(x["column_id"]), tuple(x["box"]))
-        for x in decision.get("excluded_physical_positions", ())
-    ]:
-        return None, "physical_position_excluded"
+    exclusions = decision.get("excluded_physical_positions", ())
+    if not isinstance(exclusions, (list, tuple)):
+        return None, "invalid_excluded_position"
+    for exclusion in exclusions:
+        if (not isinstance(exclusion, Mapping)
+            or not isinstance(exclusion.get("box"), (list, tuple))
+            or len(exclusion["box"]) != 4):
+            return None, "invalid_excluded_position"
+        # The physical key is (source SHA, bbox), not the four-field
+        # provenance tuple. Labels must not bypass a physical exclusion.
+        excluded_key = (str(exclusion.get("source_sha256", "")), tuple(exclusion["box"]))
+        if excluded_key == proof.physical_key:
+            return None, "physical_position_excluded"
     # Review scope can be restricted to explicitly checked task IDs.
     allowed = decision.get("allowed_task_ids")
     if allowed is None and decision.get("all_contexts_reviewed") is not True:
