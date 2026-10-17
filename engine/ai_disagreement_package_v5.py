@@ -1381,6 +1381,34 @@ def export_ai_disagreement_package_v5(
         (folder / "00_INSTRUCTIONS.md").write_text(_instructions(), encoding="utf-8")
         (folder / "02_consensus_summary.json").write_bytes(_json_bytes(summary))
         _write_jsonl(folder / "03_conflict_items.jsonl", conflicts)
+        # V5.5: review-only, immutable per-character difference hints.
+        # These are TEXT offsets, NOT independently verified source-image boxes.
+        from engine.ocr_glyph_batch_v55 import make_substitution_slots
+        glyph_review_slots = []
+        for conflict in conflicts:
+            source_candidates = [
+                str(c.get("raw_text", c.get("text", "")) or "")
+                for c in (conflict.get("candidates") or [])
+                if isinstance(c, dict)
+            ]
+            if len(source_candidates) < 2:
+                continue
+            first_two = (conflict.get("candidates") or [])[:2]
+            first_two_independent = all(
+                isinstance(c, dict) and c.get("independently_executed") is True
+                for c in first_two
+            )
+            for hint in make_substitution_slots(conflict["item_id"], source_candidates):
+                hint.update({
+                    "page": conflict.get("page"),
+                    "source_bbox": conflict.get("source_bbox"),
+                    "first_two_independently_executed": first_two_independent,
+                    "position_verified": False,
+                    "requires_physical_column_image": True,
+                    "never_auto_apply": True,
+                })
+                glyph_review_slots.append(hint)
+        _write_jsonl(folder / "07_glyph_review_slots_UNVERIFIED.jsonl", glyph_review_slots)
         _write_jsonl(folder / "04_all_items_index.jsonl", records)
         (folder / "05_terms.json").write_bytes(_json_bytes(_terms_payload(records)))
         (folder / "06_disagreement_report.html").write_text(
@@ -1419,6 +1447,7 @@ def export_ai_disagreement_package_v5(
                 "all_items": "04_all_items_index.jsonl",
                 "terms": "05_terms.json",
                 "human_report": "06_disagreement_report.html",
+                "glyph_review_slots_unverified": "07_glyph_review_slots_UNVERIFIED.jsonl",
                 "source_multi_model_ocr": "source/full_multi_model_ocr.json",
                 "skeleton_epub": "framework/structure_skeleton.epub",
                 "decision_template": "decisions.template.json",
