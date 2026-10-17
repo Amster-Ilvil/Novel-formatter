@@ -50,6 +50,22 @@ class AnchoredGlyphAlignmentTest(unittest.TestCase):
         self.assertFalse(got["ok"])
         self.assertEqual(got["reason"], "seeded_or_reused_ocr_is_not_an_independent_vote")
 
+    def test_verified_anchor_cannot_be_skipped_by_optimal_alignment(self):
+        got = locate_target_by_verified_anchors(
+            "魔目だ。", cell_count=4, target_index=1,
+            verified_cell_labels={0: "魔", 2: "Z", 3: "。"},
+        )
+        self.assertFalse(got["ok"])
+        self.assertEqual(got["reason"], "verified_visual_anchor_not_honored")
+
+    def test_caller_cannot_lower_two_anchor_safety_floor(self):
+        got = locate_target_by_verified_anchors(
+            "魔目だ。", cell_count=4, target_index=1,
+            verified_cell_labels={}, min_anchors=0,
+        )
+        self.assertFalse(got["ok"])
+        self.assertEqual(got["reason"], "unsafe_min_anchors")
+
     def test_visual_anchor_must_not_be_the_target(self):
         got = locate_target_by_verified_anchors(
             "魔目だ。", cell_count=4, target_index=1,
