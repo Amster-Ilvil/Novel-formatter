@@ -102,6 +102,43 @@ class V53BridgeTest(unittest.TestCase):
         self.assertEqual(report["editable_conflict_task_count"], 0)
         self.assertEqual(report["matched_v53_slot_count"], 0)
 
+    def test_stale_candidate_digest_rejected_before_image_probing(self):
+        converted = self.root / "stale-in"
+        convert(self.zip_path, self.audit_path, converted)
+        jobs_path = converted / "GLYPH_JOBS_NEED_COORDINATES.jsonl"
+        jobs = read_jsonl(jobs_path)
+        jobs[0]["candidate_sha256"] = "obsolete-candidates"
+        jobs_path.write_text(
+            "".join(json.dumps(job, ensure_ascii=False) + "\n" for job in jobs),
+            encoding="utf-8",
+        )
+        result = build(
+            conflicts_path=converted / "V5_EDITABLE_CONFLICTS.jsonl",
+            jobs_path=jobs_path,
+            out_dir=self.root / "stale-review",
+        )
+        rejected = read_jsonl(self.root / "stale-review" / "GLYPH_REJECTED_JOBS.jsonl")
+        self.assertEqual(result["accepted_glyph_job_count"], 0)
+        self.assertEqual(rejected[0]["reason"], "missing_or_stale_job_candidate_sha256")
+
+    def test_missing_candidate_digest_rejected(self):
+        converted = self.root / "missing-in"
+        convert(self.zip_path, self.audit_path, converted)
+        jobs_path = converted / "GLYPH_JOBS_NEED_COORDINATES.jsonl"
+        jobs = read_jsonl(jobs_path)
+        del jobs[0]["candidate_sha256"]
+        jobs_path.write_text(
+            "".join(json.dumps(job, ensure_ascii=False) + "\n" for job in jobs),
+            encoding="utf-8",
+        )
+        build(
+            conflicts_path=converted / "V5_EDITABLE_CONFLICTS.jsonl",
+            jobs_path=jobs_path,
+            out_dir=self.root / "missing-review",
+        )
+        rejected = read_jsonl(self.root / "missing-review" / "GLYPH_REJECTED_JOBS.jsonl")
+        self.assertEqual(rejected[0]["reason"], "missing_or_stale_job_candidate_sha256")
+
     def test_unverified_jobs_cannot_generate_answers(self):
         converted = self.root / "out"
         convert(self.zip_path, self.audit_path, converted)
