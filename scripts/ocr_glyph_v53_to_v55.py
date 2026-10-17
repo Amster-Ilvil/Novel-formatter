@@ -24,6 +24,7 @@ import argparse
 from collections import Counter
 import csv
 import json
+import re
 from pathlib import Path
 import sys
 import zipfile
@@ -104,8 +105,10 @@ def convert(package_path: Path, audit_path: Path, out: Path) -> dict:
     jobs: list[dict] = []
     rejected: list[dict] = []
     statuses: Counter[str] = Counter()
+    audit_rows = 0
     with audit_path.open("r", encoding="utf-8-sig", newline="") as handle:
         for row in csv.DictReader(handle):
+            audit_rows += 1
             task = str(row.get("task_id") or "").strip()
             try:
                 index = int(row["offset_a"])
@@ -154,8 +157,18 @@ def convert(package_path: Path, audit_path: Path, out: Path) -> dict:
     write_jsonl(out / "V5_EDITABLE_CONFLICTS.jsonl", conflicts)
     write_jsonl(out / "GLYPH_JOBS_NEED_COORDINATES.jsonl", jobs)
     write_jsonl(out / "REJECTED_OR_CHANGED_SLOTS.jsonl", rejected)
+    declared_match = re.fullmatch(r"(\d+)_slot_audit\.csv", audit_path.name, flags=re.I)
+    declared_count = int(declared_match.group(1)) if declared_match else None
     summary = {
         "source_v5_entry": name,
+        "audit_row_count": audit_rows,
+        "audit_filename_declared_slot_count": declared_count,
+        "audit_filename_count_matches": (
+            audit_rows == declared_count if declared_count is not None else None
+        ),
+        "audit_input_may_be_truncated": bool(
+            declared_count is not None and audit_rows < declared_count
+        ),
         "source_v5_task_count": len(tasks),
         "editable_conflict_task_count": len(conflicts),
         "matched_v53_slot_count": len(jobs),
