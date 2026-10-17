@@ -127,6 +127,17 @@ def make_template(
                 proof.task_id: slot["candidate_sha256"]
                 for proof, slot, _job in member_data
             },
+            # Avoid a same-task, same-sentence hash authorizing the wrong
+            # single-character difference elsewhere in that sentence.
+            "slot_by_task": {
+                proof.task_id: {
+                    "a_index": slot["a_index"],
+                    "b_index": slot["b_index"],
+                    "a": slot["a"],
+                    "b": slot["b"],
+                }
+                for proof, slot, _job in member_data
+            },
             "proof_by_task": {
                 proof.task_id: _proof_binding(proof)
                 for proof, _slot, _job in member_data
@@ -187,6 +198,14 @@ def build(
         )
         if slot is None:
             rejected_jobs.append({"row": row_no, "task_id": task_id, "reason": "slot_not_in_immutable_ocr_candidates"})
+            continue
+        # A coordinate-review job must be tied to the CURRENT immutable
+        # candidates. Never silently accept a stale V5.3/V5.4 handoff.
+        if job.get("candidate_sha256") != slot["candidate_sha256"]:
+            rejected_jobs.append({"row": row_no, "task_id": task_id, "reason": "missing_or_stale_job_candidate_sha256"})
+            continue
+        if any(key in job and job[key] != slot[key] for key in ("a", "b")):
+            rejected_jobs.append({"row": row_no, "task_id": task_id, "reason": "stale_job_character_pair"})
             continue
         try:
             proof = make_glyph_proof(
