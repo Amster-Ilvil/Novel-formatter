@@ -10,6 +10,8 @@
 - V5.4 的 67 张原始分列输入可用于重新核实字符格，并不是 67 次已完成的新 48px 识别。
 - 本版本从原 V5 的候选文本重新提取替换位置，不相信旧记录的字符索引。
 - 相同原图和坐标被引用多次，不算多个独立重复字形。
+- 一条已审核的单字建议必须逐任务绑定 candidate_sha256 和具体 a_index/b_index/a/b；旧的缺少 slot_by_task 的审核文件应重新生成，不能自动沿用。
+- excluded_physical_positions 按原图 SHA + 像素框匹配，不允许伪造页号/列号绕过排除。
 - 组级审核完成后，只能输出整句草稿；不得直接标记 AI_IMPORT 已通过。
 
 ## 文件
@@ -19,9 +21,9 @@
 3. engine/ocr_glyph_grid_alignment_v55.py — 漏字或多字情况下的动态对齐；验证两个独立 OCR 都指向同一格。
 4. scripts/ocr_glyph_v53_to_v55.py — 原 V5 ZIP 与 V5.3 审计的转换器。
 5. scripts/ocr_glyph_batch_v55.py — 字形审核模板、审核结果应用及只读草稿输出。
-6. tests/test_ocr_glyph_batch_v55.py — 24 个针对性测试。
-7. tests/test_ocr_glyph_v53_bridge.py — 7 个转换及异常保护测试。
-8. tests/test_ocr_glyph_grid_alignment_v55.py — 8 个动态对齐测试。
+6. tests/test_ocr_glyph_batch_v55.py — 28 个针对性测试。
+7. tests/test_ocr_glyph_v53_bridge.py — 10 个转换及异常保护测试。
+8. tests/test_ocr_glyph_grid_alignment_v55.py — 10 个动态对齐测试。
 
 参考项目：[Kraken OCR](https://github.com/mittagessen/kraken) 的字符位置设计、
 [Calamari OCR](https://github.com/Calamari-OCR/calamari) 的序列对齐思路，以及
@@ -44,12 +46,13 @@
 - V5_EDITABLE_CONFLICTS.jsonl — 可用的原始文字分歧任务。
 - GLYPH_JOBS_NEED_COORDINATES.jsonl — 字位审核任务，但缺坐标。
 - REJECTED_OR_CHANGED_SLOTS.jsonl — V5.3 的旧偏移与原 V5 候选不匹配者。
-- SUMMARY_NEEDS_ORIGINAL_BBOX.json — 可核查的实际数量。
+- SUMMARY_NEEDS_ORIGINAL_BBOX.json — 可核查的实际数量，并包含 audit_row_count、audit_filename_declared_slot_count、audit_filename_count_matches、audit_input_may_be_truncated。
 
 特别注意：转换器会让所有转换出的 box 保持空数组，image_path 为空，
 position_verified 为 false。这不是 BUG，而是旧 V5.3 CSV 缺少可靠坐标的证明。
 任何开发者都不能凭 source_page、col_id、像素 SHA 或 anchor_score
-擅自为旧任务填入原图 bbox。
+擅自为旧任务填入原图 bbox。即使文件名叫 1036_slot_audit.csv，
+也必须检查实际 CSV 行数；历史样本可能只有 1000 条，而不是 1036 条。
 
 **2. 用真实图片与邻字锚点定位：**
 
@@ -93,6 +96,7 @@ position_verified 为 false。这不是 BUG，而是旧 V5.3 CSV 缺少可靠坐
 - 分别对两个实际执行过的 OCR 候选计算所有最低代价对齐。
 - 只有目标在所有最优对齐中唯一落于同一物理字格，才保留候选。
 - OCR seeded/reused 文本不能算独立第二票。
+- 每个视觉锚点必须在所有最优路径上被真实匹配，不能被 DP 以空格跳过。
 - 字格对齐只建议坐标；不能凭对齐直接推出 Unicode 正字。
 - 对「ニ／二」一类同形 Unicode 歧义，必须额外提供整书编辑规范。
 
@@ -102,7 +106,7 @@ position_verified 为 false。这不是 BUG，而是旧 V5.3 CSV 缺少可靠坐
     python -m unittest discover -s tests -p 'test_ocr_glyph_v53_bridge.py' -v
     python -m unittest discover -s tests -p 'test_ocr_glyph_grid_alignment_v55.py' -v
 
-共 24 + 7 + 8 = 39 个已编写的针对性测试。**代码已提交不等于测试 PASS。**
+共 28 + 10 + 10 = 48 个已编写的针对性测试。**代码已提交不等于测试 PASS。**
 本窗口执行容器持续报错，所以尚未成功运行以上测试，也没有重新得到
 整书真实覆盖率。不要将以前的 506 / 1036 字位、51 组、421 个候选
 算成当前 V5.5 的已完成批量裁决。
