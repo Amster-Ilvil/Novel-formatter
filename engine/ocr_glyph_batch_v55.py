@@ -63,8 +63,9 @@ class GlyphProof:
     position_verified: bool = False
 
     @property
-    def physical_key(self) -> tuple[str, str, str, tuple[int, int, int, int]]:
-        return (self.source_sha256, self.page_id, self.column_id, self.box)
+    def physical_key(self) -> tuple[str, tuple[int, int, int, int]]:
+        # Labels alone never make reused image bytes independent physical evidence.
+        return (self.source_sha256, self.box)
 
     @property
     def glyph_key(self) -> str:
@@ -279,6 +280,8 @@ def _review_choice(
         return None, "physical_position_excluded"
     # Review scope can be restricted to explicitly checked task IDs.
     allowed = decision.get("allowed_task_ids")
+    if allowed is None and decision.get("all_contexts_reviewed") is not True:
+        return None, "group_context_review_missing"
     if allowed is not None and proof.task_id not in allowed:
         return None, "context_not_reviewed"
     return choice, "approved_exact_glyph"
@@ -311,6 +314,10 @@ def compose_complete_sentence(
     if len(texts) < 2:
         return {"task_id": task_id, "complete": False, "reason": "need_two_raw_candidates"}
     a, b = str(texts[0]), str(texts[1])
+    if a == b:
+        return {"task_id": task_id, "complete": False, "reason": "no_editable_conflict_in_first_two_models"}
+    if any(str(t) not in (a, b) for t in texts[2:]):
+        return {"task_id": task_id, "complete": False, "reason": "independent_third_candidate_needs_its_own_alignment"}
     fingerprint = candidate_digest(texts)
     by_position: dict[tuple[int, int], Mapping[str, Any]] = {}
     for item in suggestions:
@@ -353,7 +360,7 @@ def compose_complete_sentence(
 def summarize_batch(proofs: Sequence[GlyphProof], groups: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
     unique = {p.physical_key for p in proofs}
     grouped = {(
-        str(p["source_sha256"]), str(p["page_id"]), str(p["column_id"]), tuple(p["box"])
+        str(p["source_sha256"]), tuple(p["box"])
     ) for group in groups for p in group["members"]}
     return {
         "schema": SCHEMA,
