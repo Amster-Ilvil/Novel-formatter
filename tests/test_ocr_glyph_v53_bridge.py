@@ -69,6 +69,15 @@ class V53BridgeTest(unittest.TestCase):
         self.assertEqual(data[0]["image_path"], "")
         self.assertEqual(data[0]["v53_group_id"], "V53G003")
 
+    def test_named_audit_row_count_mismatch_is_reported(self):
+        # The fixture is named 1036_slot_audit.csv but contains only two rows.
+        # This deliberately mimics an incomplete exported audit.
+        summary = convert(self.zip_path, self.audit_path, self.root / "row-count")
+        self.assertEqual(summary["audit_row_count"], 2)
+        self.assertEqual(summary["audit_filename_declared_slot_count"], 1036)
+        self.assertFalse(summary["audit_filename_count_matches"])
+        self.assertTrue(summary["audit_input_may_be_truncated"])
+
     def test_mismatched_v53_candidate_pair_is_not_used(self):
         self.write_audit([{
             "task_id": "T00001", "offset_a": "1", "pair": "王¦上",
