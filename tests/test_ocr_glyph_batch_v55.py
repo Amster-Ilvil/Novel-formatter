@@ -56,6 +56,12 @@ class V55GlyphBatchSafety(unittest.TestCase):
             "candidate_sha256_by_task": {
                 proof.task_id: slot["candidate_sha256"],
             },
+            "slot_by_task": {
+                proof.task_id: {
+                    "a_index": slot["a_index"], "b_index": slot["b_index"],
+                    "a": slot["a"], "b": slot["b"],
+                },
+            },
             "proof_by_task": {
                 proof.task_id: {
                     "source_sha256": proof.source_sha256,
@@ -178,6 +184,42 @@ class V55GlyphBatchSafety(unittest.TestCase):
         self.assertEqual(propose_slot(slot, proof, d)["reason"], "same_shape_different_unicode_requires_editorial_policy")
         d["codepoint_policy"] = "explicit_book_editorial"
         self.assertEqual(propose_slot(slot, proof, d)["status"], "suggested")
+
+    def test_physical_position_exclusion_blocks_even_with_different_labels(self):
+        proof = self.proof()
+        slot = make_substitution_slots("T01", ["魔上", "魔王"])[0]
+        d = self.decision(proof, slot)
+        d["excluded_physical_positions"] = [{
+            "source_sha256": proof.source_sha256,
+            "page_id": "forged_page_label",
+            "column_id": "forged_column_label",
+            "box": list(proof.box),
+        }]
+        self.assertEqual(propose_slot(slot, proof, d)["reason"], "physical_position_excluded")
+
+    def test_malformed_exclusion_is_fail_closed(self):
+        proof = self.proof()
+        slot = make_substitution_slots("T01", ["魔上", "魔王"])[0]
+        d = self.decision(proof, slot)
+        d["excluded_physical_positions"] = [{"source_sha256": proof.source_sha256, "box": None}]
+        self.assertEqual(propose_slot(slot, proof, d)["reason"], "invalid_excluded_position")
+
+    def test_candidate_digest_does_not_authorize_a_different_slot(self):
+        proof = self.proof()
+        slots = make_substitution_slots("T01", ["日上だ。", "目王だ。"])
+        self.assertEqual(len(slots), 2)
+        d = self.decision(proof, slots[0], char="目")
+        self.assertEqual(
+            propose_slot(slots[1], proof, d)["reason"],
+            "reviewed_slot_binding_changed",
+        )
+
+    def test_slot_binding_must_be_present(self):
+        proof = self.proof()
+        slot = make_substitution_slots("T01", ["魔上", "魔王"])[0]
+        d = self.decision(proof, slot)
+        del d["slot_by_task"]
+        self.assertEqual(propose_slot(slot, proof, d)["reason"], "no_reviewed_slot_binding")
 
     def test_context_exception_blocks_reuse(self):
         proof = self.proof()
