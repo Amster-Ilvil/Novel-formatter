@@ -118,6 +118,8 @@ def main(argv=None) -> int:
         help="CSS 模板（默认: denki = 電撃文庫），仅用于 EPUB 输出",
     )
     parser.add_argument("--vertical", action="store_true", help="竖排模式（默认横排）")
+    parser.add_argument("--ltr", action="store_true",
+                        help="导出 EPUB 前转换为从左到右横排版式（Convert to left-to-right horizontal layout）")
     parser.add_argument("--output-word", metavar="PATH",
                         help="额外生成一份 Word (.docx)，供人工校对/进一步编辑用")
 
@@ -157,6 +159,7 @@ def main(argv=None) -> int:
             ("--isbn", args.isbn), ("--volume", args.volume), ("--repo", args.repo),
             ("--output-word", args.output_word), ("--save-json", args.save_json),
             ("--save-formatted-json", args.save_formatted_json),
+            ("--ltr", args.ltr),
         ):
             if value:
                 unsupported.append(flag)
@@ -302,6 +305,7 @@ def main(argv=None) -> int:
         css_template=args.template,
         vertical=args.vertical,
         verbose=verbose,
+        text_direction="ltr" if args.ltr else "keep",
     )
 
     # ── 可选：额外生成 Word ───────────────────────────────────────────────────

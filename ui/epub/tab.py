@@ -10,7 +10,7 @@ from pathlib import Path
 from typing import Optional
 
 from PySide6.QtWidgets import (
-    QApplication, QWidget, QVBoxLayout, QHBoxLayout, QGridLayout, QFormLayout, QFrame, QLabel, QPushButton, QComboBox,
+    QApplication, QWidget, QVBoxLayout, QHBoxLayout, QGridLayout, QFormLayout, QFrame, QLabel, QPushButton, QComboBox, QCheckBox,
     QLineEdit, QListWidget, QPlainTextEdit, QProgressBar, QRadioButton, QStackedWidget, QTabWidget,
     QTextBrowser, QTreeView, QFileSystemModel, QFileDialog, QMessageBox, QSizePolicy, QAbstractItemView, QMenu,
 )
@@ -204,6 +204,10 @@ class EPUBTab(QWidget):
         self._horiz_radio.setChecked(True)
         mr.addWidget(self._vert_radio)
         mr.addWidget(self._horiz_radio)
+        # Session-scoped like the vertical radios; not reset on document load.
+        self._ltr_check = QCheckBox("转换为从左到右横排版式")
+        self._ltr_check.setToolTip("导出前将竖排转为从左到右横排：横排 CSS、ltr 翻页、竖排标点改为横排字形")
+        mr.addWidget(self._ltr_check)
         mr.addStretch()
         fl.addRow("排版:", mode_row)
 
@@ -568,6 +572,7 @@ class EPUBTab(QWidget):
         self._template_combo.currentTextChanged.connect(self._schedule_live_preview)
         self._vert_radio.toggled.connect(self._schedule_live_preview)
         self._horiz_radio.toggled.connect(self._schedule_live_preview)
+        self._ltr_check.toggled.connect(self._schedule_live_preview)
 
     def _clear_validation_report(self) -> None:
         self._last_validation_info = None
@@ -902,7 +907,7 @@ class EPUBTab(QWidget):
         self._refresh_document_summary()
 
     def _update_pills(self):
-        mode = "竖排" if self._vert_radio.isChecked() else "横排"
+        mode = "竖排" if self._vert_radio.isChecked() and not self._ltr_check.isChecked() else "横排"
         self._pills["mode"].setText(f"↕ {mode}")
         self._pills["source"].setText(f"🧾 {self._source_label}")
         if not self._doc:
@@ -1030,8 +1035,12 @@ class EPUBTab(QWidget):
                 custom_css = profile.css if profile else None
             css, _source = resolve_epub_css(self._doc, template, custom_css)
             css += "\nbody{padding:2em;} section{max-width:48em;margin:auto;}"
-            if not self._vert_radio.isChecked():
+            convert_ltr = self._ltr_check.isChecked()
+            if not self._vert_radio.isChecked() or convert_ltr:
                 css = re.sub(r"(?i)(?:-epub-)?writing-mode\s*:\s*[^;}]*(?:;)?", "", css)
+            if convert_ltr:
+                from builder.text_direction import convert_css_to_ltr
+                css = convert_css_to_ltr(css)
 
             pieces = []
             text_count = 0
@@ -1056,6 +1065,9 @@ class EPUBTab(QWidget):
                 f"<title>{safe_title}</title><style>{css}</style></head><body>"
                 f"<section><h1>{safe_title}</h1>{byline}{''.join(pieces)}</section></body></html>"
             )
+            if convert_ltr:
+                from builder.text_direction import convert_xhtml_to_ltr
+                html_text = convert_xhtml_to_ltr(html_text)
             self._set_preview_html(html_text)
         except Exception as exc:
             self._set_preview_html(f"<html><body><pre>实时预览失败：{exc}</pre></body></html>")
@@ -1364,6 +1376,7 @@ class EPUBTab(QWidget):
 
         template = self._template_combo.currentText()
         vertical = self._vert_radio.isChecked()
+        convert_ltr = self._ltr_check.isChecked()
 
         def worker():
             try:
@@ -1377,7 +1390,8 @@ class EPUBTab(QWidget):
                 buf = io.StringIO()
                 with contextlib.redirect_stdout(buf):
                     build_epub(doc, output_path=path, css_template=template,
-                              vertical=vertical, verbose=True, custom_css=custom_css)
+                              vertical=vertical, verbose=True, custom_css=custom_css,
+                              text_direction="ltr" if convert_ltr else "keep")
                 ai_css_path = ""
                 if (getattr(doc.metadata,"ai_processing_mode","") == "typeset"
                         and bool(getattr(doc.metadata,"ai_layout_locked",False))
@@ -1390,7 +1404,7 @@ class EPUBTab(QWidget):
                 # every build.  Structural failures are fatal; warnings are
                 # surfaced together with epubcheck in the completion dialog.
                 from utils.epub_quality_gate import validate_epub_quality
-                quality_gate = validate_epub_quality(path, expect_vertical=vertical)
+                quality_gate = validate_epub_quality(path, expect_vertical=vertical and not convert_ltr)
                 if not quality_gate.valid:
                     detail = "\n".join(quality_gate.errors[:20])
                     raise RuntimeError(

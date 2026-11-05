@@ -41,6 +41,13 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 from models.document import UnifiedDocument, Block, BlockType
 from utils.atomic_io import atomic_write_text
 from engine.illustration_spread import detect_likely_illustration_spreads
+from builder.text_direction import (
+    TextDirectionMode,
+    coerce_text_direction,
+    convert_css_to_ltr,
+    convert_xhtml_to_ltr,
+    has_vertical_writing_mode,
+)
 
 def _workspace_for_output(output_path: str) -> Path:
     out = Path(output_path).expanduser()
@@ -685,6 +692,7 @@ def build_epub(
     custom_css: str | None = None,
     preserve_image_bytes: bool = False,
     include_nav_in_spine: bool = False,
+    text_direction: TextDirectionMode | str = TextDirectionMode.KEEP,
 ) -> None:
     """
     从 UnifiedDocument 生成 EPUB3 文件。
@@ -697,7 +705,20 @@ def build_epub(
     custom_css: 传入时优先于 css_template——用于 Format Profile（从参考 EPUB 学习
     /手写的自定义排版），此时 css_template 只在 custom_css 为空时才生效。
     include_nav_in_spine: 兼容极少数旧阅读器；默认 False，避免目录被当作正文翻到。
+
+    text_direction: ``KEEP`` (default) reproduces the historical output.  ``LTR``
+    converts the publication to horizontal left-to-right before packaging:
+    vertical CSS rules are replaced by ``ltr_stylesheet()``, every XHTML page goes
+    through ``convert_xhtml_to_ltr`` (``dir="ltr"``, no tate-chu-yoko, horizontal
+    punctuation forms), and the spine uses ``page-progression-direction="ltr"``.
+    Page and chapter order is never reversed: the source is already in reading
+    order.  Only auto-detected double-page illustration pairs of a vertical
+    source are reordered (see the spread section below).  With ``vertical=False``
+    the only difference is the explicit ``dir="ltr"``.
     """
+    direction = coerce_text_direction(text_direction)
+    ltr = direction is TextDirectionMode.LTR
+    convert_vertical = ltr and vertical
     out = Path(output_path)
     tmp = out.parent / f"_epub_tmp_{out.stem}"
     tmp.mkdir(parents=True, exist_ok=True)
@@ -782,7 +803,16 @@ ruby rt { ruby-position: over; -webkit-ruby-position: before; }
             css_content,
         )
 
+    if ltr and (vertical or has_vertical_writing_mode(css_content)):
+        # Vertical declarations are replaced at generation time instead of
+        # being overridden with !important.
+        css_content = convert_css_to_ltr(css_content)
+
     (oebps / "styles" / "style.css").write_text(css_content, encoding="utf-8")
+
+    def _wrap_page(page_title: str, body: str) -> str:
+        page = _xhtml_wrap(page_title, body, lang=lang)
+        return convert_xhtml_to_ltr(page) if ltr else page
 
     # ── 处理封面图片 ─────────────────────────────────────────────────────────
     cover_page = next((p for p in doc.pages if p.page_type == BlockType.COVER), None)
@@ -848,13 +878,32 @@ ruby rt { ruby-position: over; -webkit-ruby-position: before; }
         auto_spreads = detect_likely_illustration_spreads(doc)
     except Exception:
         auto_spreads = []
+    # ``detect_likely_illustration_spreads`` measures the seam of a Japanese
+    # (right-to-left) book: ``pair.first`` is the right-hand half of the artwork
+    # and ``pair.second`` the left-hand half.  When a vertical source is
+    # converted to LTR, readers pair spine items left→right, so the two halves
+    # swap places in the spine: the left half comes first with
+    # ``page-spread-left`` and the right half follows with ``page-spread-right``.
+    # Nothing else is reordered.  Pairs carrying an explicit ``page_spread`` hint
+    # are left exactly as the metadata says.
+    swap_pairs: list[tuple[int, int]] = []
     for pair in auto_spreads:
-        if vertical:
+        if convert_vertical:
+            first, second = pair.first_block_index, pair.second_block_index
+            if first in spread_by_block or second in spread_by_block:
+                continue
+            spread_by_block[first] = "right"
+            spread_by_block[second] = "left"
+            swap_pairs.append((first, second))
+        elif vertical:
             spread_by_block.setdefault(pair.first_block_index, "right")
             spread_by_block.setdefault(pair.second_block_index, "left")
         else:
             spread_by_block.setdefault(pair.first_block_index, "left")
             spread_by_block.setdefault(pair.second_block_index, "right")
+    export_blocks = list(doc.blocks)
+    for first, second in swap_pairs:
+        export_blocks[first], export_blocks[second] = export_blocks[second], export_blocks[first]
     if verbose and auto_spreads:
         print(f"  🖼️  跨页插图：检测到 {len(auto_spreads)} 组高置信度見開き，仅写入 page-spread 提示，不拼图")
 
@@ -864,7 +913,7 @@ ruby rt { ruby-position: over; -webkit-ruby-position: before; }
     current_title = FRONT_MATTER_TITLE
     current_blocks: list[Block] = []
 
-    for b in doc.blocks:
+    for b in export_blocks:
         if b.type == BlockType.IMAGE_REF:
             current_blocks.append(b)
             continue
@@ -913,7 +962,7 @@ ruby rt { ruby-position: over; -webkit-ruby-position: before; }
     # 封面页
     if cover_img_href:
         cover_body = f'  <div class="cover-page" epub:type="cover">\n    <img src="../{cover_img_href}" alt="{_esc(title)}"/>\n  </div>'
-        xhtml = _xhtml_wrap(title, cover_body, lang=lang)
+        xhtml = _wrap_page(title, cover_body)
         fname = "content/cover.xhtml"
         (oebps / fname).write_text(xhtml, encoding="utf-8")
         content_files.append(("cover-page", fname, "表紙", False))
@@ -944,7 +993,7 @@ ruby rt { ruby-position: over; -webkit-ruby-position: before; }
             frag_id = ch_id if fragment_idx == 1 else f"{ch_id}_p{fragment_idx}"
             body = f'  <section epub:type="chapter">\n' + "".join(lines) + "  </section>"
             frag_title = ch_title if is_first else f"{ch_title}（続き）"
-            xhtml = _xhtml_wrap(frag_title, body, lang=lang)
+            xhtml = _wrap_page(frag_title, body)
             fname = f"content/{frag_id}.xhtml"
             (oebps / fname).write_text(xhtml, encoding="utf-8")
             # 前书桶不是真正的章节标题，哪怕是它的第一个片段也不该进目录——
@@ -972,7 +1021,7 @@ ruby rt { ruby-position: over; -webkit-ruby-position: before; }
                         f'    <img src="../{img_href}" alt="{_esc(alt_text)}"/>\n'
                         f'  </div>'
                     )
-                    illus_xhtml = _xhtml_wrap(alt_text, illus_body, lang=lang)
+                    illus_xhtml = _wrap_page(alt_text, illus_body)
                     illus_fname = f"content/{ch_id}_illus_{img_id}.xhtml"
                     (oebps / illus_fname).write_text(illus_xhtml, encoding="utf-8")
                     illus_fid = f"{ch_id}-{img_id}"
@@ -995,7 +1044,8 @@ ruby rt { ruby-position: over; -webkit-ruby-position: before; }
                     # Ruby switch gates only findtext side-channel metadata on
                     # ordinary prose blocks.
                     allow_ruby=(ruby_export_enabled or export_block.type == BlockType.RUBY),
-                    vertical=vertical,
+                    # LTR output never emits tate-chu-yoko spans.
+                    vertical=vertical and not ltr,
                     ruby_fallback=True,
                 )
                 lines.append(xhtml_piece)
@@ -1066,7 +1116,7 @@ ruby rt { ruby-position: over; -webkit-ruby-position: before; }
         </ol>
       </nav>
     """)
-    nav_xhtml = _xhtml_wrap(labels["toc"], nav_body, lang=lang)
+    nav_xhtml = _wrap_page(labels["toc"], nav_body)
     (oebps / "content" / "nav.xhtml").write_text(nav_xhtml, encoding="utf-8")
 
     # EPUB2-compatible NCX fallback. EPUB3 readers use nav.xhtml, while older
@@ -1149,8 +1199,8 @@ ruby rt { ruby-position: over; -webkit-ruby-position: before; }
     if content_spread:
         cover_meta += '\n    <meta property="rendition:spread">auto</meta>'
 
-    # 竖排日文书从右往左翻页；横排则是常规从左往右翻页
-    page_direction = "rtl" if vertical else "ltr"
+    # 竖排日文书从右往左翻页；横排则是常规从左往右翻页。LTR 转换强制 ltr。
+    page_direction = "rtl" if vertical and not ltr else "ltr"
     modified = datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
 
     # 和 _xhtml_wrap 同样的坑：manifest_lines/spine_lines/cover_meta 都是多行、
@@ -1305,6 +1355,8 @@ if __name__ == "__main__":
         help=f"CSS 模板（默认: {DEFAULT_TEMPLATE}）",
     )
     parser.add_argument("--vertical", action="store_true", help="竖排模式（默认横排）")
+    parser.add_argument("--ltr", action="store_true",
+                        help="Convert to left-to-right (horizontal) layout before export")
     parser.add_argument("--quiet", "-q", action="store_true")
     args = parser.parse_args()
 
@@ -1317,4 +1369,5 @@ if __name__ == "__main__":
         css_template=args.template,
         vertical=args.vertical,
         verbose=not args.quiet,
+        text_direction=TextDirectionMode.LTR if args.ltr else TextDirectionMode.KEEP,
     )

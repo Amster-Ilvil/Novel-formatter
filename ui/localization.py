@@ -3145,6 +3145,16 @@ _EXACT_JA.update({
     "当前文档不是 PDF 文字层结果": "現在の文書はPDFテキストレイヤー結果ではありません。",
 })
 
+# EPUB export: optional left-to-right horizontal conversion.
+_EXACT_EN.update({
+    "转换为从左到右横排版式": "Convert to left-to-right (horizontal) layout",
+    "导出前将竖排转为从左到右横排：横排 CSS、ltr 翻页、竖排标点改为横排字形": "Before export, convert vertical layout to horizontal LTR: horizontal CSS, ltr page progression, vertical punctuation forms replaced",
+})
+_EXACT_JA.update({
+    "转换为从左到右横排版式": "左から右への横書きレイアウトに変換",
+    "导出前将竖排转为从左到右横排：横排 CSS、ltr 翻页、竖排标点改为横排字形": "出力前に縦書きを左から右の横書きへ変換します：横書きCSS、ltrページ送り、縦書き用句読点を横書き字形へ置換",
+})
+
 def translate_text(text: str | None, language: str) -> str:
     """Translate UI chrome only; unknown strings remain exactly unchanged."""
     source = "" if text is None else str(text)
