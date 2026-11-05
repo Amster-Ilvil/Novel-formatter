@@ -17,7 +17,7 @@ from utils.paddle_importer import import_paddle_json, import_paddle_md
 from ui.common.signals import WorkerSignals
 from ui.common.toast import notify
 from ui.interface_preferences import THEME_LIGHT, manager_for
-from ui.localization import LANG_ZH
+from ui.localization import DEFAULT_LANGUAGE
 from ui.localized_dialogs import LocalizedFileDialog, LocalizedMessageBox
 from ui.navigation.sidebar import (
     SECTION_WORKSPACE, SECTION_PAGE, SECTION_OCR, SECTION_FORMAT,
@@ -954,7 +954,7 @@ class MainWindowControllerMixin:
             manager = manager_for()
             if manager is not None:
                 manager.apply_preferences(
-                    language=str(prefs.get("language") or LANG_ZH),
+                    language=str(prefs.get("language") or DEFAULT_LANGUAGE),
                     theme=str(prefs.get("appearance") or THEME_LIGHT),
                 )
         if hasattr(self, "_tab_system"):

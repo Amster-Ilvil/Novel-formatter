@@ -1,13 +1,14 @@
 """Source collection in ``ui/pages/import_sources.py``.
 
 The module is loaded straight from its file path so that ``ui/__init__.py``
-(and therefore PySide6, which is not installed in the test venv) is never
-imported.
+(and therefore PySide6) is never imported.  The "no Qt" check runs in a clean
+subprocess so it does not depend on which other tests already imported Qt.
 """
 from __future__ import annotations
 
 import importlib.util
 import io
+import subprocess
 import sys
 import zipfile
 from pathlib import Path
@@ -61,7 +62,20 @@ def source_folder(tmp_path: Path) -> Path:
 
 def test_loading_module_does_not_pull_qt(import_sources: ModuleType) -> None:
     assert callable(import_sources.folder_sources)
-    assert not any(name == "PySide6" or name.startswith("PySide6.") for name in sys.modules)
+    probe = (
+        "import importlib.util, sys\n"
+        f"spec = importlib.util.spec_from_file_location('_nf_probe', {str(_MODULE_PATH)!r})\n"
+        "module = importlib.util.module_from_spec(spec)\n"
+        "spec.loader.exec_module(module)\n"
+        "assert callable(module.folder_sources)\n"
+        "print(any(n == 'PySide6' or n.startswith('PySide6.') for n in sys.modules))\n"
+    )
+    result = subprocess.run(
+        [sys.executable, "-c", probe], capture_output=True, text=True, check=False,
+        cwd=str(_MODULE_PATH.parent.parent.parent),
+    )
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip() == "False"
 
 
 def test_new_suffixes_are_known_sources(import_sources: ModuleType) -> None:

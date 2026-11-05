@@ -14,6 +14,9 @@ LANG_ZH = "zh_CN"
 LANG_JA = "ja_JP"
 LANG_EN = "en_US"
 SUPPORTED_LANGUAGES = (LANG_ZH, LANG_JA, LANG_EN)
+# Language used when no preference has been saved yet (fresh install) or the
+# stored value is unknown.  A saved supported value always wins.
+DEFAULT_LANGUAGE = LANG_EN
 
 LANGUAGE_LABELS = {
     LANG_ZH: "简体中文",
@@ -2971,9 +2974,21 @@ _PATTERNS = {
 }
 
 
+# Page Manager filter chips: "<label> <count>" (ui/pages/tab.py).
+_FILTER_COUNT = re.compile(r"^(全部|正文|插图|封面) (\d+)$")
+_FILTER_COUNT_LABELS = {
+    LANG_EN: {"全部": "All", "正文": "Body", "插图": "Illustrations", "封面": "Cover"},
+    LANG_JA: {"全部": "すべて", "正文": "本文", "插图": "挿絵", "封面": "表紙"},
+}
+for _lang, _labels in _FILTER_COUNT_LABELS.items():
+    _PATTERNS.get(_lang).append(
+        (_FILTER_COUNT, lambda m, labels=_labels: f"{labels.get(m.group(1), m.group(1))} {m.group(2)}")
+    )
+
+
 def normalize_language(value: str | None) -> str:
     value = str(value or "").strip()
-    return value if value in SUPPORTED_LANGUAGES else LANG_ZH
+    return value if value in SUPPORTED_LANGUAGES else DEFAULT_LANGUAGE
 
 
 
@@ -5009,3 +5024,91 @@ for _key, _value in {
 }.items():
     _EXACT_JA.setdefault(_key, _value)
 del _key, _value
+
+
+# Audit-driven gap catalog (tools/i18n_audit.py).  Exact entries extend the
+# exact maps without overriding hand-written ones; placeholder keys become
+# anchored templates behind one CJK-gated matcher per language, so English or
+# empty text never scans the template list.
+from ui.localization_audit_catalog import AUDIT_CATALOG as _AUDIT_CATALOG  # noqa: E402
+
+TEMPLATE_PLACEHOLDER = re.compile(r"\{…\}|\{[A-Za-z_]\w*\}|\{\}|%(?:[(][A-Za-z_]\w*[)])?[sd]")
+_ANONYMOUS_PLACEHOLDERS = frozenset({"{…}", "{}", "%s", "%d"})
+_ADJACENT_SLOTS = re.compile(r"(?:\{…\}){2,}")
+_TEMPLATE_GATE = re.compile(r"[\u3040-\u30ff\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff]")
+
+
+def template_placeholders(text: str) -> list[str]:
+    """Placeholder tokens of a catalog template, in order (testing helper)."""
+    return TEMPLATE_PLACEHOLDER.findall(str(text))
+
+
+def _compile_template(key: str):
+    parts: list[str] = []
+    tokens: list[str] = []
+    pos = 0
+    for match in TEMPLATE_PLACEHOLDER.finditer(key):
+        parts.append(re.escape(key[pos:match.start()]))
+        parts.append("(.*?)")
+        tokens.append(match.group(0))
+        pos = match.end()
+    parts.append(re.escape(key[pos:]))
+    return re.compile("".join(parts) + r"\Z", re.S), tuple(tokens)
+
+
+class _TemplateMatcher:
+    """Pattern-like ``_PATTERNS`` entry: the first matching audit template wins."""
+
+    def __init__(self, language: str):
+        self.language = language
+        self.entries: list[tuple[re.Pattern, tuple[str, ...], str]] = []
+
+    def add(self, key: str, target: str) -> None:
+        # Runs of adjacent f-string slots carry no separator to anchor on; one
+        # group per run keeps matching linear instead of exponential.
+        pattern, tokens = _compile_template(_ADJACENT_SLOTS.sub("{…}", key))
+        self.entries.append((pattern, tokens, _ADJACENT_SLOTS.sub("{…}", target)))
+
+    def match(self, source: str):
+        if not _TEMPLATE_GATE.search(source):
+            return None
+        for pattern, tokens, target in self.entries:
+            found = pattern.match(source)
+            if found is not None:
+                return found, tokens, target
+        return None
+
+    def render(self, hit) -> str:
+        found, tokens, target = hit
+        values = found.groups()
+        anonymous = iter(v for tok, v in zip(tokens, values) if tok in _ANONYMOUS_PLACEHOLDERS)
+        named = {tok: v for tok, v in zip(tokens, values) if tok not in _ANONYMOUS_PLACEHOLDERS}
+
+        def fill(token_match):
+            token = token_match.group(0)
+            if token in _ANONYMOUS_PLACEHOLDERS:
+                raw = next(anonymous, "")
+            else:
+                raw = named.get(token, token)
+            return translate_text(raw, self.language)
+
+        return TEMPLATE_PLACEHOLDER.sub(fill, target)
+
+
+def _register_audit_catalog() -> None:
+    matchers = {LANG_EN: _TemplateMatcher(LANG_EN), LANG_JA: _TemplateMatcher(LANG_JA)}
+    exact_maps = {LANG_EN: _EXACT_EN, LANG_JA: _EXACT_JA}
+    for key, (english, japanese) in _AUDIT_CATALOG.items():
+        templated = TEMPLATE_PLACEHOLDER.search(key) is not None
+        for language, target in ((LANG_EN, english), (LANG_JA, japanese)):
+            if not target:
+                continue
+            if templated:
+                matchers[language].add(key, target)
+            else:
+                exact_maps[language].setdefault(key, target)
+    for language, matcher in matchers.items():
+        _PATTERNS.setdefault(language, []).append((matcher, matcher.render))
+
+
+_register_audit_catalog()

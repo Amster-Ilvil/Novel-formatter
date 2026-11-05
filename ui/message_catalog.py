@@ -10,7 +10,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 
-from ui.localization import LANG_EN, LANG_JA, LANG_ZH, normalize_language
+from ui.localization import DEFAULT_LANGUAGE, LANG_EN, LANG_JA, LANG_ZH, normalize_language
 
 
 _MESSAGES: dict[str, Mapping[str, str]] = {
@@ -82,7 +82,7 @@ _MESSAGES: dict[str, Mapping[str, str]] = {
 }
 
 
-def format_message(key: str, language: str = LANG_ZH, /, **values: object) -> str:
+def format_message(key: str, language: str = DEFAULT_LANGUAGE, /, **values: object) -> str:
     """Format a localized message by stable key.
 
     All values are interpolated *after* language selection.  Missing keys or

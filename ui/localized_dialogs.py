@@ -14,18 +14,19 @@ from PySide6.QtWidgets import (
     QMessageBox as _QMessageBox,
     QInputDialog as _QInputDialog,
     QColorDialog as _QColorDialog,
+    QPlainTextEdit as _QPlainTextEdit,
 )
 
 from ui.dialog_localization import translate_dialog_text
-from ui.localization import LANG_ZH, normalize_language
+from ui.localization import DEFAULT_LANGUAGE, normalize_language
 from ui.message_catalog import format_message
 
 
 def current_ui_language() -> str:
     app = QApplication.instance()
     if app is None:
-        return LANG_ZH
-    return normalize_language(str(app.property("nfLanguage") or LANG_ZH))
+        return DEFAULT_LANGUAGE
+    return normalize_language(str(app.property("nfLanguage") or DEFAULT_LANGUAGE))
 
 
 def _tr(value):
@@ -151,3 +152,20 @@ class LocalizedColorDialog(_QColorDialog):
     def getColor(*args, **kwargs):
         args, kwargs = _translated_call_args(args, kwargs, text_indices=(2,), text_keys=("title",))
         return _QColorDialog.getColor(*args, **kwargs)
+
+
+class LocalizedLogView(_QPlainTextEdit):
+    """Read-only log pane that localizes known UI status lines on append.
+
+    Translation happens once, when a line is written, through the same dialog
+    layer as message boxes: complete known lines/templates are localized and
+    every unknown line (paths, OCR/document text, tracebacks, model output) is
+    kept byte-for-byte.  Lines already written are not re-translated after a
+    later language switch.
+    """
+
+    def appendPlainText(self, text):
+        super().appendPlainText(_tr(text))
+
+    def setPlainText(self, text):
+        super().setPlainText(_tr(text))

@@ -28,7 +28,7 @@ from ui.common.signals import WorkerSignals
 from ui.common.toast import notify
 from ui.common.styling import LIGHT_LOG_STYLE, CARD, BORDER, INK, MUTED, accent_button, wrap_in_card
 from ui.interface_preferences import THEME_LIGHT, THEME_DARK, manager_for
-from ui.localization import LANG_ZH, LANG_JA, LANG_EN
+from ui.localization import LANG_ZH, LANG_JA, LANG_EN, DEFAULT_LANGUAGE, LANGUAGE_LABELS, normalize_language
 from ui.localized_dialogs import LocalizedFileDialog, LocalizedMessageBox, ui_message
 from ui.navigation.sidebar import (
     REFERENCE_SECTION_ITEMS, SECTION_WORKSPACE, SECTION_PAGE, SECTION_SYSTEM,
@@ -697,9 +697,10 @@ class SystemSettingsTab(QWidget):
             ("设备", f"{platform.system() or '系统'} · {machine}"),
             ("显存策略", "自动"),
         ]
+        saved_language = normalize_language(str(self._settings.value(self.LANGUAGE_KEY, DEFAULT_LANGUAGE)))
         self._overview_interface_rows = [
             ("主题", "跟随系统"),
-            ("语言", "简体中文"),
+            ("语言", LANGUAGE_LABELS.get(saved_language, LANGUAGE_LABELS.get(DEFAULT_LANGUAGE, "English"))),
         ]
         ai_rows = [
             ("服务", "按需调用"),
@@ -760,9 +761,9 @@ class SystemSettingsTab(QWidget):
         # Language names stay self-identifying in every locale; itemData is the
         # stable setting value used by the runtime manager.
         self._language_combo.setProperty("nfNoTranslateItems", True)
+        self._language_combo.addItem("English", LANG_EN)
         self._language_combo.addItem("简体中文", LANG_ZH)
         self._language_combo.addItem("日本語", LANG_JA)
-        self._language_combo.addItem("English", LANG_EN)
         self._appearance_combo = NoWheelComboBox()
         self._appearance_combo.addItem("浅色", THEME_LIGHT)
         self._appearance_combo.addItem("深色", THEME_DARK)
@@ -1502,7 +1503,7 @@ class SystemSettingsTab(QWidget):
         )
         self._set_combo_data(
             self._language_combo,
-            str(self._settings.value(self.LANGUAGE_KEY, LANG_ZH)),
+            str(self._settings.value(self.LANGUAGE_KEY, DEFAULT_LANGUAGE)),
         )
         self._set_combo_data(
             self._appearance_combo,
@@ -1554,7 +1555,7 @@ class SystemSettingsTab(QWidget):
             "remember_subtabs": self._remember_subtabs_cb.isChecked(),
             "default_section": int(self._default_section_combo.currentData() or 0),
             "start_maximized": self._start_maximized_cb.isChecked(),
-            "language": str(self._language_combo.currentData() or LANG_ZH),
+            "language": str(self._language_combo.currentData() or DEFAULT_LANGUAGE),
             "appearance": str(self._appearance_combo.currentData() or THEME_LIGHT),
             "ocr_engine": str(self._ocr_engine_combo.currentData() or "apple_vision"),
             "ocr_settings_tab": int(self._ocr_settings_tab_combo.currentData() or 0),
@@ -1592,7 +1593,7 @@ class SystemSettingsTab(QWidget):
         self._restore_workspace_cb.setChecked(False)
         self._remember_subtabs_cb.setChecked(True)
         self._start_maximized_cb.setChecked(False)
-        self._set_combo_data(self._language_combo, LANG_ZH)
+        self._set_combo_data(self._language_combo, DEFAULT_LANGUAGE)
         self._set_combo_data(self._appearance_combo, THEME_LIGHT)
         self._set_combo_data(self._default_section_combo, SECTION_PAGE)
         self._set_combo_data(self._ocr_engine_combo, "apple_vision")
@@ -1611,7 +1612,7 @@ class SystemSettingsTab(QWidget):
         if manager is None or not hasattr(self, "_language_combo"):
             return
         manager.apply_preferences(
-            language=str(self._language_combo.currentData() or LANG_ZH),
+            language=str(self._language_combo.currentData() or DEFAULT_LANGUAGE),
             theme=str(self._appearance_combo.currentData() or THEME_LIGHT),
         )
 

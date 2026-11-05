@@ -828,7 +828,7 @@ ruby rt { ruby-position: over; -webkit-ruby-position: before; }
         cover_img_id   = "cover-img"
         cover_img_href = f"images/{filename}"
         if verbose:
-            print(f"  🖼️  封面: {src.name}")
+            print(f"  🖼️  Cover: {src.name}")
 
     # ── 处理所有图片 ─────────────────────────────────────────────────────────
     # block_index → (img_id, href_in_epub)
@@ -845,7 +845,7 @@ ruby rt { ruby-position: over; -webkit-ruby-position: before; }
         src = Path(b.image_path)
         if not src.exists():
             if verbose:
-                print(f"  ⚠️ 插图文件不存在，已跳过: {src}")
+                print(f"  ⚠️ Illustration file not found, skipped: {src}")
             continue
         # 只跳过“实际被选作 EPUB 封面”的那一张。页面管理有时会把
         # 卷首彩页、扉页等连续多页都标为 cover；旧逻辑因此把第 2～N 张
@@ -905,7 +905,7 @@ ruby rt { ruby-position: over; -webkit-ruby-position: before; }
     for first, second in swap_pairs:
         export_blocks[first], export_blocks[second] = export_blocks[second], export_blocks[first]
     if verbose and auto_spreads:
-        print(f"  🖼️  跨页插图：检测到 {len(auto_spreads)} 组高置信度見開き，仅写入 page-spread 提示，不拼图")
+        print(f"  🖼️  Spread illustrations: detected {len(auto_spreads)} high-confidence spread(s); only page-spread hints are written, images are not stitched")
 
     # ── 将 blocks 分组为章节 ─────────────────────────────────────────────────
     # chapter 0 = 书前（序言之前的内容）
@@ -949,7 +949,7 @@ ruby rt { ruby-position: over; -webkit-ruby-position: before; }
     while chapters and chapters[-1][0] != FRONT_MATTER_TITLE and not _has_substantive_chapter_content(chapters[-1][1]):
         removed_title, _ = chapters.pop()
         if verbose:
-            print(f"  ⚠️ 跳过末尾空章节: {removed_title}")
+            print(f"  ⚠️ Skipped empty trailing chapter: {removed_title}")
 
     # ── 生成每章 XHTML ───────────────────────────────────────────────────────
     # (id, href, title, in_toc) —— in_toc=False 的条目（插图页、章节续篇）
@@ -1057,7 +1057,7 @@ ruby rt { ruby-position: over; -webkit-ruby-position: before; }
             nav_insert_index = len(content_files)
 
         if verbose and chapter_has_content:
-            print(f"  📄 章节: {ch_title[:30]}  ({fragment_idx} 个文字片段)")
+            print(f"  📄 Chapter: {ch_title[:30]}  ({fragment_idx} text fragment(s))")
 
     # ── nav.xhtml（TOC）────────────────────────────────────────────────────
     # 只列出真正的章节起始页，插图页/续篇片段不占目录条目（但仍在 spine 里，翻页能翻到）
@@ -1329,7 +1329,7 @@ ruby rt { ruby-position: over; -webkit-ruby-position: before; }
         if companion is not None and companion_css is not None:
             atomic_write_text(companion, companion_css)
             if verbose:
-                print(f"  🎨 AI 排版 CSS: {companion.name}")
+                print(f"  🎨 AI layout CSS: {companion.name}")
     finally:
         staged_out.unlink(missing_ok=True)
 
@@ -1338,23 +1338,23 @@ ruby rt { ruby-position: over; -webkit-ruby-position: before; }
 
     if verbose:
         size_kb = out.stat().st_size // 1024
-        print(f"\n✅  EPUB 已生成: {out}  ({size_kb} KB)")
-        print(f"    章节: {len(chapters)}，图片: {illus_idx}，内容文件: {len(content_files)}")
+        print(f"\n✅  EPUB built: {out}  ({size_kb} KB)")
+        print(f"    Chapters: {len(chapters)}, images: {illus_idx}, content files: {len(content_files)}")
 
 
 # ── CLI ───────────────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="UnifiedDocument → EPUB3")
-    parser.add_argument("input_json",   help="Formatter 输出的 JSON")
-    parser.add_argument("output_epub",  help="输出 EPUB 路径")
+    parser.add_argument("input_json",   help="JSON produced by Formatter")
+    parser.add_argument("output_epub",  help="output EPUB path")
     parser.add_argument(
         "--template", "-t",
         choices=list(CSS_TEMPLATES.keys()),
         default=DEFAULT_TEMPLATE,
-        help=f"CSS 模板（默认: {DEFAULT_TEMPLATE}）",
+        help=f"CSS template (default: {DEFAULT_TEMPLATE})",
     )
-    parser.add_argument("--vertical", action="store_true", help="竖排模式（默认横排）")
+    parser.add_argument("--vertical", action="store_true", help="vertical mode (default: horizontal)")
     parser.add_argument("--ltr", action="store_true",
                         help="Convert to left-to-right (horizontal) layout before export")
     parser.add_argument("--quiet", "-q", action="store_true")
