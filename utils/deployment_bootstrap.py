@@ -456,7 +456,9 @@ def _hayai_ocr_ready() -> bool:
 
 
 def _manga_48px_ready() -> bool:
-    cache = ROOT / ".model-cache" / "manga-48px-ar"
+    from adapters.manga_48px_runtime import default_cache_dir
+
+    cache = default_cache_dir()
     try:
         return (cache / "ocr_ar_48px.ckpt").stat().st_size == 204_290_192 and (cache / "alphabet-all-v7.txt").stat().st_size >= 1_000
     except OSError:
@@ -509,15 +511,17 @@ def _install_manga_48px(progress_callback: ProgressCallback | None) -> Component
     if _manga_48px_ready():
         return ComponentResult("manga_48px", "ready", "已安装固定兼容权重；未检查更新")
     _emit(progress_callback, "model", 0, 1, "准备 48px AR OCR 依赖和固定兼容权重")
-    from adapters.manga_48px_adapter import MODEL_CACHE, setup_venv
+    from adapters.manga_48px_adapter import setup_venv
     from adapters.manga_48px_runtime import (
         DEFAULT_DICT_URLS,
         DEFAULT_MODEL_URLS,
         DICT_SHA256,
         MODEL_SHA256,
         MODEL_SIZE,
+        default_cache_dir,
         ensure_runtime_files,
     )
+    from utils.model_manager import user_requested_download
 
     setup_venv(verbose=True)
     temporary_environment: dict[str, str] = {}
@@ -574,7 +578,8 @@ def _install_manga_48px(progress_callback: ProgressCallback | None) -> Component
     previous = {name: os.environ.get(name) for name in temporary_environment}
     try:
         os.environ.update(temporary_environment)
-        ensure_runtime_files(Path(MODEL_CACHE), progress_callback=progress_callback)
+        with user_requested_download():
+            ensure_runtime_files(default_cache_dir(), progress_callback=progress_callback)
     finally:
         for name, value in previous.items():
             if value is None:

@@ -29,7 +29,7 @@ from ui.common.toast import notify
 from ui.common.styling import LIGHT_LOG_STYLE, CARD, BORDER, INK, MUTED, accent_button, wrap_in_card
 from ui.interface_preferences import THEME_LIGHT, THEME_DARK, manager_for
 from ui.localization import LANG_ZH, LANG_JA, LANG_EN
-from ui.localized_dialogs import LocalizedMessageBox, ui_message
+from ui.localized_dialogs import LocalizedFileDialog, LocalizedMessageBox, ui_message
 from ui.navigation.sidebar import (
     REFERENCE_SECTION_ITEMS, SECTION_WORKSPACE, SECTION_PAGE, SECTION_SYSTEM,
 )
@@ -444,6 +444,9 @@ class SystemSettingsTab(QWidget):
     OCR_REVIEW_DEFAULT_CLOSED_MIGRATION_KEY = "ocr/review_default_closed_v2"
     OCR_REVIEW_PANEL_OPEN_MIGRATION_KEY = "ocr/review_panel_open_default_v3"
     OCR_ENGINE_TAB_STARTUP_MIGRATION_KEY = "ocr/engine_tab_startup_migration_v1"
+
+    MODELS_DIR_KEY = "models/local_dir"
+    MODELS_AUTO_DOWNLOAD_KEY = "models/auto_download"
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -888,6 +891,26 @@ class SystemSettingsTab(QWidget):
         ai_btn.clicked.connect(lambda: AISettingsDialog(self).exec())
         ai_box.addWidget(ai_btn, 0, Qt.AlignLeft)
         layout.addWidget(ai_card)
+
+        storage_card, storage_box = self._make_card(
+            "本地模型文件夹",
+            "OCR 模型下载、校验和查找的位置。留空则使用默认位置；已安装在旧位置的模型会继续使用。",
+        )
+        models_dir_row = QHBoxLayout()
+        self._models_dir_edit = QLineEdit()
+        self._models_dir_edit.setPlaceholderText(self._default_models_dir_text())
+        models_dir_row.addWidget(self._models_dir_edit, 1)
+        choose_models_dir = QPushButton("选择文件夹…")
+        choose_models_dir.clicked.connect(self._choose_models_dir)
+        models_dir_row.addWidget(choose_models_dir)
+        reset_models_dir = QPushButton("恢复默认")
+        reset_models_dir.clicked.connect(self._reset_models_dir)
+        models_dir_row.addWidget(reset_models_dir)
+        storage_box.addLayout(models_dir_row)
+        self._models_auto_download_cb = QCheckBox("需要时自动下载模型")
+        self._models_auto_download_cb.setChecked(True)
+        storage_box.addWidget(self._models_auto_download_cb)
+        layout.addWidget(storage_card)
 
         model_card, model_box = self._make_card(
             "OCR 模型更新（仅手动）",
@@ -1509,6 +1532,11 @@ class SystemSettingsTab(QWidget):
         self._ocr_progress_default_cb.setChecked(
             self._settings.value(self.OCR_PROGRESS_DEFAULT_KEY, True, type=bool)
         )
+        self._models_dir_edit.setText(str(self._settings.value(self.MODELS_DIR_KEY, "") or ""))
+        self._models_auto_download_cb.setChecked(
+            self._settings.value(self.MODELS_AUTO_DOWNLOAD_KEY, True, type=bool)
+        )
+        self._apply_model_preferences()
 
     @staticmethod
     def _set_combo_data(combo: QComboBox, value) -> None:
@@ -1534,6 +1562,8 @@ class SystemSettingsTab(QWidget):
             "ocr_review_expanded": self._ocr_review_expanded_cb.isChecked(),
             "ocr_preview_default": self._ocr_preview_default_cb.isChecked(),
             "ocr_progress_default": self._ocr_progress_default_cb.isChecked(),
+            "models_dir": self._models_dir_edit.text().strip(),
+            "models_auto_download": self._models_auto_download_cb.isChecked(),
         }
 
     def _save(self, _checked=False, *, show_message: bool = True) -> None:
@@ -1550,6 +1580,9 @@ class SystemSettingsTab(QWidget):
         self._settings.setValue(self.OCR_REVIEW_EXPANDED_KEY, prefs["ocr_review_expanded"])
         self._settings.setValue(self.OCR_PREVIEW_DEFAULT_KEY, prefs["ocr_preview_default"])
         self._settings.setValue(self.OCR_PROGRESS_DEFAULT_KEY, prefs["ocr_progress_default"])
+        self._settings.setValue(self.MODELS_DIR_KEY, prefs["models_dir"])
+        self._settings.setValue(self.MODELS_AUTO_DOWNLOAD_KEY, prefs["models_auto_download"])
+        self._apply_model_preferences()
         self._settings.sync()
         self.settings_changed.emit(dict(prefs))
         if show_message:
@@ -1568,6 +1601,8 @@ class SystemSettingsTab(QWidget):
         self._ocr_review_expanded_cb.setChecked(True)
         self._ocr_preview_default_cb.setChecked(True)
         self._ocr_progress_default_cb.setChecked(True)
+        self._models_dir_edit.clear()
+        self._models_auto_download_cb.setChecked(True)
         self._save(show_message=True)
 
     def _preview_interface_preferences(self, _index=0) -> None:
@@ -1615,6 +1650,31 @@ class SystemSettingsTab(QWidget):
 
     def start_maximized_enabled(self) -> bool:
         return self._settings.value(self.START_MAXIMIZED_KEY, False, type=bool)
+
+    @staticmethod
+    def _default_models_dir_text() -> str:
+        from utils import model_manager
+
+        legacy = model_manager.LEGACY_MODELS_DIR
+        return str(legacy if legacy.is_dir() else model_manager.default_platform_models_dir())
+
+    def _choose_models_dir(self, _checked=False) -> None:
+        start = self._models_dir_edit.text().strip() or self._default_models_dir_text()
+        path = LocalizedFileDialog.getExistingDirectory(self, "选择本地模型文件夹", start)
+        if path:
+            self._models_dir_edit.setText(path)
+
+    def _reset_models_dir(self, _checked=False) -> None:
+        self._models_dir_edit.clear()
+
+    def _apply_model_preferences(self) -> None:
+        """Apply models folder / auto-download to this process and OCR workers."""
+        from utils import model_manager
+
+        model_manager.configure(
+            models_dir=self._models_dir_edit.text().strip() or None,
+            auto_download=self._models_auto_download_cb.isChecked(),
+        )
 
     def _open_ocr_model_updates(self, _checked=False) -> None:
         OCRModelUpdateDialog(self).exec()

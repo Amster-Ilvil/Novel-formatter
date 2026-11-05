@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import os
+from pathlib import Path
 
 PADDLE_OCR_VERSION = "PP-OCRv6"
 PADDLE_DETECTION_MODEL = "PP-OCRv6_medium_det"
@@ -62,6 +63,23 @@ def paddle_model_source_attempts(preferred: str | None = "auto") -> tuple[str, .
     return tuple(dict.fromkeys(ordered))
 
 
+def paddle_models_cache_home() -> Path | None:
+    """PaddleX cache root inside an explicitly configured models folder.
+
+    PaddleX downloads and caches models itself (``PADDLE_PDX_CACHE_HOME``,
+    default ``~/.paddlex``).  We only redirect it when the user chose a models
+    folder in Settings or via ``NOVEL_FORMATTER_MODELS_DIR``; otherwise existing
+    ``~/.paddlex`` installations keep working without a re-download.
+    """
+    try:
+        from utils.model_manager import explicit_models_dir_configured, resolve_models_dir
+    except ImportError:
+        return None
+    if not explicit_models_dir_configured():
+        return None
+    return resolve_models_dir() / "paddlex"
+
+
 def paddle_source_environment(source: str | None, base: dict[str, str] | None = None) -> dict[str, str]:
     env = dict(base or os.environ)
     normalized = normalize_paddle_model_source(source)
@@ -71,6 +89,9 @@ def paddle_source_environment(source: str | None, base: dict[str, str] | None = 
         env["PADDLE_PDX_MODEL_SOURCE"] = normalized
     # Avoid noisy telemetry/progress bars corrupting the JSONL stdout protocol.
     env.setdefault("HF_HUB_DISABLE_PROGRESS_BARS", "1")
+    paddle_home = paddle_models_cache_home()
+    if paddle_home is not None:
+        env.setdefault("PADDLE_PDX_CACHE_HOME", str(paddle_home))
     return env
 
 

@@ -4973,3 +4973,39 @@ _EXACT_JA.update({
     "显示/隐藏右侧实时预览中的红色实线检测框": "リアルタイムプレビューの赤い実線検出枠を表示/非表示",
     "显示/隐藏右侧实时预览中的绿色实线 OCR 输入原像素框": "リアルタイムプレビューの緑の実線OCR入力原画素枠を表示/非表示",
 })
+
+
+# Unified model manager (Settings > OCR: local models folder, auto-download, progress dialog).
+for _key, _value in {
+    "本地模型文件夹": "Local models folder",
+    "OCR 模型下载、校验和查找的位置。留空则使用默认位置；已安装在旧位置的模型会继续使用。": "Where OCR models are downloaded, verified and looked up. Leave empty to use the default location; models already installed in the old location keep working.",
+    "选择文件夹…": "Choose Folder…",
+    "恢复默认": "Reset to Default",
+    "需要时自动下载模型": "Download models automatically when needed",
+    "选择本地模型文件夹": "Choose Local Models Folder",
+    "下载 OCR 模型": "Download OCR Models",
+    "正在准备模型下载…": "Preparing model download…",
+    "正在下载模型": "Downloading model",
+    "模型已下载并通过校验。": "Model downloaded and verified.",
+    "模型下载失败": "Model download failed",
+    "模型下载已取消。": "Model download cancelled.",
+    "取消": "Cancel",
+}.items():
+    _EXACT_EN.setdefault(_key, _value)
+for _key, _value in {
+    "本地模型文件夹": "ローカルモデルフォルダ",
+    "OCR 模型下载、校验和查找的位置。留空则使用默认位置；已安装在旧位置的模型会继续使用。": "OCRモデルのダウンロード・検証・検索先です。空欄なら既定の場所を使用し、旧来の場所にインストール済みのモデルは引き続き使用されます。",
+    "选择文件夹…": "フォルダを選択…",
+    "恢复默认": "既定に戻す",
+    "需要时自动下载模型": "必要に応じてモデルを自動ダウンロード",
+    "选择本地模型文件夹": "ローカルモデルフォルダを選択",
+    "下载 OCR 模型": "OCRモデルをダウンロード",
+    "正在准备模型下载…": "モデルのダウンロードを準備中…",
+    "正在下载模型": "モデルをダウンロード中",
+    "模型已下载并通过校验。": "モデルをダウンロードし、検証しました。",
+    "模型下载失败": "モデルのダウンロードに失敗しました",
+    "模型下载已取消。": "モデルのダウンロードをキャンセルしました。",
+    "取消": "キャンセル",
+}.items():
+    _EXACT_JA.setdefault(_key, _value)
+del _key, _value

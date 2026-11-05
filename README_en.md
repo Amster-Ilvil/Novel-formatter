@@ -170,3 +170,25 @@ Third-party projects, models, and resources have their own licenses. No OCR mode
 The project's original code and documentation are made available under the [MIT License](LICENSE) for personal, educational, research, and commercial use, subject to its terms.
 
 Third-party OCR engines, models, dependencies, and platform capabilities remain governed by their respective licenses and terms. See [ACKNOWLEDGEMENTS.md](ACKNOWLEDGEMENTS.md) for full credits.
+
+## Model cache and automatic downloads
+
+Downloadable OCR weights are handled by `utils/model_manager.py`: local cache check, download with progress,
+SHA-256 (and, where upstream publishes it, SHA-384) verification, then use. Partial downloads stay in `*.part`
+files and resume via HTTP `Range`; a corrupt file never remains under its final name.
+
+Models folder priority: **Settings > OCR > Local models folder** (or `run.py --models-dir PATH`) >
+`NOVEL_FORMATTER_MODELS_DIR` > existing project `.model-cache/` > per-user cache
+(`~/Library/Caches/Novel-formatter/models`, `%LOCALAPPDATA%\\Novel-formatter\\models`,
+`$XDG_CACHE_HOME/novel-formatter/models` or `~/.cache/novel-formatter/models`).
+Models already installed in the old locations are found first and are not downloaded again.
+
+"Download models automatically when needed" is on by default; turn it off (or pass `run.py --no-download`,
+or set `NOVEL_FORMATTER_MODEL_AUTO_DOWNLOAD=0`) to get an error that names the URL and target folder instead.
+
+| Engine | Files | Hash |
+|---|---|---|
+| 48px AR | `ocr_ar_48px.ckpt`, `alphabet-all-v7.txt` | SHA-256 (existing code) |
+| OpenVINO handwriting | `.xml`, `.bin`, `kondate_nakayosi.txt` | SHA-384 upstream + SHA-256 pinned 2026-11-05 |
+| NDLOCR-Lite | `src/model/*.onnx` (shipped with the pinned source tag) | none upstream: size/presence and Git LFS pointer check only |
+| PaddleOCR | managed by PaddleX itself | redirected to `<models folder>/paddlex` via `PADDLE_PDX_CACHE_HOME` only when a models folder is set explicitly |

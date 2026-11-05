@@ -175,3 +175,16 @@ OCR 模型权重、缓存、虚拟环境、日志、数据库和用户输出不�
 本项目原创代码与文档以 [MIT License](LICENSE) 开源，可在遵守许可证的前提下用于个人、学习、研究或商业用途。
 
 第三方 OCR、模型、依赖和平台能力仍适用其各自许可证与使用条款；完整致谢见 [ACKNOWLEDGEMENTS.md](ACKNOWLEDGEMENTS.md)。
+
+## 模型缓存与自动下载
+
+可下载的 OCR 权重统一由 `utils/model_manager.py` 管理：先检查本地缓存，再带进度下载，校验 SHA-256（上游提供时同时校验 SHA-384）后使用。
+未完成的下载保存在 `*.part` 并通过 HTTP `Range` 断点续传；损坏文件不会以最终文件名保留。
+
+模型文件夹优先级：**系统设置 > OCR > 本地模型文件夹**（或 `run.py --models-dir PATH`）> `NOVEL_FORMATTER_MODELS_DIR` >
+已存在的项目 `.model-cache/` > 用户缓存目录（macOS `~/Library/Caches/Novel-formatter/models`，Windows `%LOCALAPPDATA%\\Novel-formatter\\models`，
+Linux `$XDG_CACHE_HOME/novel-formatter/models` 或 `~/.cache/novel-formatter/models`）。旧位置中已安装的模型会优先使用，不会重复下载。
+
+“需要时自动下载模型”默认开启；关闭后（或 `run.py --no-download`、`NOVEL_FORMATTER_MODEL_AUTO_DOWNLOAD=0`）缺少模型时会提示下载地址和目标文件夹。
+NDLOCR-Lite 的 ONNX 模型随固定源码标签一起提供，上游没有发布哈希，因此只检查存在性、大小和 Git LFS 指针；PaddleOCR 模型由 PaddleX 自行下载，
+仅在明确设置模型文件夹时通过 `PADDLE_PDX_CACHE_HOME` 指向 `<模型文件夹>/paddlex`。

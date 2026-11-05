@@ -300,7 +300,9 @@ def _ndlocr_local_revision() -> str:
 
 
 def _manga_48px_local_revision() -> tuple[str, bool, str]:
-    cache = ROOT / ".model-cache" / "manga-48px-ar"
+    from adapters.manga_48px_runtime import default_cache_dir
+
+    cache = default_cache_dir()
     model = cache / "ocr_ar_48px.ckpt"
     dictionary = cache / "alphabet-all-v7.txt"
     runtime = ROOT / "adapters" / "manga_48px_runtime.py"
@@ -668,12 +670,14 @@ def _update_manga_48px(
         HF_REVISION,
         MODEL_SHA256,
         MODEL_SIZE,
+        default_cache_dir,
         ensure_runtime_files,
     )
+    from utils.model_manager import user_requested_download
 
-    cache_parent = ROOT / ".model-cache"
+    live = default_cache_dir()
+    cache_parent = live.parent
     cache_parent.mkdir(parents=True, exist_ok=True)
-    live = cache_parent / "manga-48px-ar"
     stage = cache_parent / f".manga-48px-ar.update-{uuid.uuid4().hex}"
     seed = cache_parent / f".manga-48px-ar.windows-seed-{uuid.uuid4().hex}"
     backup: Path | None = None
@@ -714,7 +718,7 @@ def _update_manga_48px(
                 "NOVEL_FORMATTER_MANGA_48PX_MODEL_FILE": str(model_seed),
                 "NOVEL_FORMATTER_MANGA_48PX_DICT_FILE": str(dict_seed),
             }
-            with _temporary_environment(environment):
+            with _temporary_environment(environment), user_requested_download():
                 ensure_runtime_files(
                     stage,
                     progress_callback=progress_callback,
@@ -722,11 +726,12 @@ def _update_manga_48px(
                 )
         else:
             _emit(progress_callback, "prepare", 0, 1, "下载并校验 48px AR 兼容权重")
-            ensure_runtime_files(
-                stage,
-                progress_callback=progress_callback,
-                cancel_check=cancel_check,
-            )
+            with user_requested_download():
+                ensure_runtime_files(
+                    stage,
+                    progress_callback=progress_callback,
+                    cancel_check=cancel_check,
+                )
         if _cancelled(cancel_check):
             raise ModelUpdateCancelled("用户取消 48px AR 模型更新")
         _emit(progress_callback, "replace", 0, 1, "原子替换 48px AR 模型目录")

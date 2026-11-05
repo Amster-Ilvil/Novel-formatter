@@ -136,8 +136,19 @@ def main(argv=None) -> int:
                         help="关闭实时预览/临时裁剪预览输出")
 
     parser.add_argument("--quiet", "-q", action="store_true")
+    parser.add_argument("--models-dir", metavar="PATH", default=None,
+                        help="本地模型文件夹（优先于 NOVEL_FORMATTER_MODELS_DIR），用于查找/下载 OCR 模型")
+    parser.add_argument("--no-download", action="store_true",
+                        help="禁止自动下载模型；缺少模型时报错并提示手动放置位置")
 
     args = parser.parse_args(argv)
+    if args.models_dir or args.no_download:
+        from utils.model_manager import configure as configure_models
+        # Mirrored into env vars so OCR worker subprocesses use the same settings.
+        configure_models(
+            models_dir=args.models_dir,
+            auto_download=False if args.no_download else None,
+        )
 
     input_path = Path(args.input).expanduser()
     if not input_path.exists():

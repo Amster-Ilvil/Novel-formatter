@@ -53,3 +53,11 @@ dist/
 # IDE metadata
 .idea/
 .vscode/
+
+# Model manager: partial downloads, lock files, verification markers and the
+# legacy repo-local OpenVINO model folder (models/ itself holds source code)
+*.part
+.*.lock
+*.verified
+.verified
+models/handwriting_openvino/

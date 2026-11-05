@@ -598,7 +598,9 @@ def _model_cache_ready(component_id: str) -> tuple[bool, str]:
         ready = source_ready and bool(backend)
         return (True, f"检测到完整 findtextCenterNet {backend} 上游运行时") if ready else (False, "环境已安装，但 findtextCenterNet Ruby 源码/后端/linedetect 尚未准备完整")
     if component_id == "manga_48px":
-        cache = ROOT / ".model-cache" / "manga-48px-ar"
+        from adapters.manga_48px_runtime import default_cache_dir
+
+        cache = default_cache_dir()
         model = cache / "ocr_ar_48px.ckpt"
         dictionary = cache / "alphabet-all-v7.txt"
         part = cache / "ocr_ar_48px.ckpt.part"
@@ -688,7 +690,11 @@ def _model_cache_ready(component_id: str) -> tuple[bool, str]:
         return (True, "检测到 NDLOCR-Lite ONNX 模型") if len(models) >= 4 else (False, "环境已安装，但 NDLOCR-Lite ONNX 模型不完整")
 
     if component_id.startswith("paddle"):
+        from adapters.paddle_ocr_models import paddle_models_cache_home
+
+        configured_paddle_home = paddle_models_cache_home()
         roots = [
+            *((configured_paddle_home / "official_models",) if configured_paddle_home else ()),
             home / ".paddlex" / "official_models",
             home / ".paddleocr",
             home / ".cache" / "paddle",
@@ -1032,3 +1038,20 @@ def installed_local_recognition_engines() -> list[str]:
     except Exception:
         pass
     return installed
+
+
+def managed_model_requirements(component_ids) -> list:
+    """``(model_id, target_dir)`` pairs handled by utils.model_manager.
+
+    Only engines whose weights go through the unified model manager are listed;
+    engines with their own downloader (PaddleX, Hugging Face, NDLOCR source tree)
+    keep using their existing installation flow.
+    """
+    ids = set(component_ids or ())
+    requirements: list = []
+    if "manga_48px" in ids:
+        from adapters.manga_48px_runtime import MODEL_ID_CHECKPOINT, MODEL_ID_DICTIONARY, default_cache_dir
+
+        cache = default_cache_dir()
+        requirements.extend(((MODEL_ID_CHECKPOINT, cache), (MODEL_ID_DICTIONARY, cache)))
+    return requirements

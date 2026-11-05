@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import argparse
 import base64
+import dataclasses
 import hashlib
 import importlib.util
 import json
@@ -84,8 +85,74 @@ MODEL_SHA256 = "29daa46d080818bb4ab239a518a88338cbccff8f901bef8c9db191a7cb97671d
 DICT_SHA256 = "f5722368146aa0fbcc9f4726866e4efc3203318ebb66c811d8cbbe915576538a"
 MODEL_SIZE = 204_290_192
 
+# Registry ids in utils.model_manager (single source of truth for paths/hashes).
+MODEL_ID_CHECKPOINT = "manga_48px.checkpoint"
+MODEL_ID_DICTIONARY = "manga_48px.dictionary"
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
+
 ProgressCallback = Callable[[str, int, int, str], None]
 CancelCheck = Callable[[], bool]
+
+
+def _model_manager_module():
+    """Import utils.model_manager also when run as a standalone worker script."""
+    try:
+        from utils import model_manager
+    except ModuleNotFoundError:
+        if str(PROJECT_ROOT) not in sys.path:
+            sys.path.insert(0, str(PROJECT_ROOT))
+        from utils import model_manager
+    return model_manager
+
+
+def default_cache_dir() -> Path:
+    """Directory holding the 48px weights, dictionary and pinned upstream source.
+
+    ``NOVEL_FORMATTER_CLOUD_48PX_CACHE`` wins; otherwise an existing complete
+    installation (configured models folder or the legacy ``.model-cache``) is
+    reused, and new installs go to the configured models folder.
+    """
+    override = str(os.environ.get("NOVEL_FORMATTER_CLOUD_48PX_CACHE", "") or "").strip()
+    if override:
+        return Path(override).expanduser()
+    model_manager = _model_manager_module()
+    manager = model_manager.default_manager()
+    spec = model_manager.get_spec(MODEL_ID_CHECKPOINT)
+    target = manager.target_dir(spec)
+    for candidate in [target] + [PROJECT_ROOT / item for item in spec.legacy_dirs]:
+        try:
+            if (candidate / spec.filename).stat().st_size == MODEL_SIZE:
+                return candidate
+        except OSError:
+            continue
+    return target
+
+
+def _model_spec(
+    destination: Path,
+    urls: Iterable[str],
+    *,
+    sha256: str,
+    minimum_size: int,
+    expected_size: int,
+    label: str,
+):
+    model_manager = _model_manager_module()
+    for model_id in (MODEL_ID_CHECKPOINT, MODEL_ID_DICTIONARY):
+        spec = model_manager.get_spec(model_id)
+        if spec.filename == destination.name:
+            return dataclasses.replace(spec, urls=tuple(urls), sha256=sha256 or spec.sha256, label=label)
+    return model_manager.ModelSpec(
+        model_id=f"manga_48px.{destination.name}",
+        engine="manga_48px",
+        urls=tuple(urls),
+        filename=destination.name,
+        sha256=sha256 or None,
+        size=expected_size or None,
+        hash_source="existing-code",
+        min_size=max(1, int(minimum_size)),
+        label=label,
+    )
 
 
 class DownloadCancelled(RuntimeError):
@@ -342,23 +409,22 @@ def _download_one_curl(
 def _seed_from_local(
     destination: Path,
     *,
+    spec,
     env_name: str,
-    sha256: str,
-    minimum_size: int,
-    expected_size: int,
     label: str,
     progress_callback: ProgressCallback | None,
 ) -> bool:
     """Import a manually downloaded official file after cryptographic checks."""
-    project_root = destination.parent.parent.parent
+    model_manager = _model_manager_module()
+    manager = model_manager.default_manager()
     candidates: list[Path] = []
     configured = str(os.environ.get(env_name, "") or "").strip()
     if configured:
         candidates.append(Path(configured).expanduser())
     candidates.extend(
         [
-            project_root / destination.name,
-            project_root / "models" / destination.name,
+            PROJECT_ROOT / destination.name,
+            PROJECT_ROOT / "models" / destination.name,
             Path.home() / "Downloads" / destination.name,
             Path.home() / "Desktop" / destination.name,
         ]
@@ -373,18 +439,13 @@ def _seed_from_local(
             if not candidate.is_file() or candidate.resolve() == destination.resolve():
                 continue
             size = candidate.stat().st_size
-            if size < minimum_size or (expected_size and size != expected_size):
+            if size < spec.min_size or (spec.size is not None and size != spec.size):
                 continue
             _emit(progress_callback, "verify", 0, 1, f"发现本地 {label} · 正在校验")
-            if sha256 and _sha256(candidate) != sha256:
-                continue
-            destination.parent.mkdir(parents=True, exist_ok=True)
-            temp = destination.with_name(destination.name + ".importing")
-            shutil.copy2(candidate, temp)
-            os.replace(temp, destination)
+            manager.import_file(spec, candidate, target_dir=destination.parent)
             _emit(progress_callback, "verify", 1, 1, f"已导入本地 {label}")
             return True
-        except OSError:
+        except (OSError, model_manager.ModelError):
             continue
     return False
 
@@ -399,19 +460,31 @@ def _download(
     progress_callback: ProgressCallback | None = None,
     cancel_check: CancelCheck | None = None,
 ) -> Path:
+    """Locate/verify/download one file through utils.model_manager.
+
+    The manager handles the cache check, ``.verified`` marker, resumable
+    download, hashing and atomic replacement.  System curl stays as a
+    fallback transport for machines where Python TLS cannot connect.
+    """
     destination.parent.mkdir(parents=True, exist_ok=True)
-    if destination.exists() and destination.stat().st_size >= minimum_size:
-        _emit(
-            progress_callback,
-            "verify",
-            0,
-            1,
-            f"正在校验已存在的 {label}",
-        )
-        if not sha256 or _sha256(destination) == sha256:
+    url_list = [urls] if isinstance(urls, str) else [str(item) for item in urls]
+    url_list = [item for item in url_list if item]
+    model_manager = _model_manager_module()
+    manager = model_manager.default_manager()
+    spec = _model_spec(
+        destination,
+        url_list,
+        sha256=sha256,
+        minimum_size=minimum_size,
+        expected_size=expected_size,
+        label=label,
+    )
+    target_dir = destination.parent
+    if destination.exists():
+        _emit(progress_callback, "verify", 0, 1, f"正在校验已存在的 {label}")
+        if manager.spec_status(spec, target_dir=target_dir) is model_manager.ModelStatus.READY:
             _emit(progress_callback, "verify", 1, 1, f"{label} 已完整下载并通过校验")
             return destination
-        destination.unlink(missing_ok=True)
 
     local_env = (
         "NOVEL_FORMATTER_MANGA_48PX_MODEL_FILE"
@@ -420,72 +493,75 @@ def _download(
     )
     if _seed_from_local(
         destination,
+        spec=spec,
         env_name=local_env,
-        sha256=sha256,
-        minimum_size=minimum_size,
-        expected_size=expected_size,
         label=label,
         progress_callback=progress_callback,
     ):
         return destination
 
-    url_list = [urls] if isinstance(urls, str) else [str(item) for item in urls]
-    url_list = [item for item in url_list if item]
     if not url_list:
         raise RuntimeError(f"{label} 没有可用下载地址")
 
+    origin = _origin_label(next(iter(url_list)))
+
+    def on_progress(done: int, total: int | None) -> None:
+        _emit(progress_callback, "download", done, total or expected_size, f"{label} · {origin}")
+
     part_path = destination.with_name(destination.name + ".part")
     errors: list[str] = []
+    try:
+        return manager.ensure_spec(
+            spec,
+            target_dir=target_dir,
+            progress_callback=on_progress,
+            cancel_check=cancel_check,
+        )
+    except model_manager.ModelCancelledError as exc:
+        raise DownloadCancelled(str(exc)) from exc
+    except (model_manager.ModelNetworkError, model_manager.ModelDownloadError) as exc:
+        if not shutil.which("curl"):
+            raise
+        errors.append(f"Python HTTPS: {exc}")
+
     for url in url_list:
-        transports = [("Python HTTPS", _download_one)]
-        if shutil.which("curl"):
-            transports.append(("系统 curl", _download_one_curl))
-        for transport_name, transport in transports:
-            try:
-                _emit(
-                    progress_callback,
-                    "connect",
-                    part_path.stat().st_size if part_path.exists() else 0,
-                    expected_size,
-                    f"准备下载 {label} · {_origin_label(url)} · {transport_name}",
-                )
-                transport(
-                    url,
-                    part_path,
-                    label=label,
-                    expected_size=expected_size,
-                    progress_callback=progress_callback,
-                    cancel_check=cancel_check,
-                )
-                if part_path.stat().st_size < minimum_size:
-                    raise RuntimeError(
-                        f"下载文件过小：{part_path.stat().st_size} bytes"
-                    )
-                if expected_size and part_path.stat().st_size != expected_size:
-                    raise RuntimeError(
-                        f"下载大小不完整：{part_path.stat().st_size}/{expected_size} bytes"
-                    )
-                _emit(progress_callback, "verify", 0, 1, f"正在校验 {label} SHA-256")
-                if sha256 and _sha256(part_path) != sha256:
-                    # A checksum mismatch is not resumable; start clean on the
-                    # next official origin.
-                    part_path.unlink(missing_ok=True)
-                    raise RuntimeError("SHA-256 校验失败")
-                os.replace(part_path, destination)
-                _emit(progress_callback, "verify", 1, 1, f"{label} 校验完成")
-                return destination
-            except DownloadCancelled:
-                raise
-            except Exception as exc:
-                errors.append(f"{_origin_label(url)}·{transport_name}: {exc}")
-                _emit(
-                    progress_callback,
-                    "retry",
-                    part_path.stat().st_size if part_path.exists() else 0,
-                    expected_size,
-                    f"{label} 下载失败，正在切换下载通道：{exc}",
-                )
-                time.sleep(0.35)
+        try:
+            _emit(
+                progress_callback,
+                "connect",
+                part_path.stat().st_size if part_path.exists() else 0,
+                expected_size,
+                f"准备下载 {label} · {_origin_label(url)} · 系统 curl",
+            )
+            _download_one_curl(
+                url,
+                part_path,
+                label=label,
+                expected_size=expected_size,
+                progress_callback=progress_callback,
+                cancel_check=cancel_check,
+            )
+            _emit(progress_callback, "verify", 0, 1, f"正在校验 {label} SHA-256")
+            manager.import_file(spec, part_path, target_dir=target_dir, move=True)
+            _emit(progress_callback, "verify", 1, 1, f"{label} 校验完成")
+            return destination
+        except DownloadCancelled:
+            part_path.unlink(missing_ok=True)
+            raise
+        except model_manager.ModelIntegrityError as exc:
+            # A checksum mismatch is not resumable; start clean on the next origin.
+            part_path.unlink(missing_ok=True)
+            errors.append(f"{_origin_label(url)}·系统 curl: {exc}")
+        except Exception as exc:
+            errors.append(f"{_origin_label(url)}·系统 curl: {exc}")
+            _emit(
+                progress_callback,
+                "retry",
+                part_path.stat().st_size if part_path.exists() else 0,
+                expected_size,
+                f"{label} 下载失败，正在切换下载通道：{exc}",
+            )
+            time.sleep(0.35)
 
     attempted = "\n".join(f"- {item}" for item in errors[-8:])
     raise RuntimeError(
