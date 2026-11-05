@@ -15,9 +15,9 @@ _EN = {
 "选择图片文件夹":"Choose Image Folder",
 "选择包含图片或 PDF 的文件夹":"Choose Folder Containing Images or PDFs",
 "选择图片或 PDF（可多选）":"Choose Images or PDF (multiple selection allowed)",
-"图片和PDF (*.png *.jpg *.jpeg *.heic *.tif *.tiff *.bmp *.gif *.pdf);;所有文件 (*)":"Images and PDF (*.png *.jpg *.jpeg *.heic *.tif *.tiff *.bmp *.gif *.pdf);;All Files (*)",
+"图片和PDF (*.png *.jpg *.jpeg *.heic *.tif *.tiff *.bmp *.gif *.pdf);;所有文件 (*)":"Images and PDF (*.png *.jpg *.jpeg *.heic *.tif *.tiff *.bmp *.gif *.pdf *.webp *.cbz *.cbr *.zip *.rar);;All Files (*)",
 "删除页面":"Delete Pages",
-"图片和PDF (*.png *.jpg *.jpeg *.heic *.tif *.tiff *.bmp *.gif *.pdf)":"Images and PDF (*.png *.jpg *.jpeg *.heic *.tif *.tiff *.bmp *.gif *.pdf)",
+"图片和PDF (*.png *.jpg *.jpeg *.heic *.tif *.tiff *.bmp *.gif *.pdf)":"Images and PDF (*.png *.jpg *.jpeg *.heic *.tif *.tiff *.bmp *.gif *.pdf *.webp *.cbz *.cbr *.zip *.rar)",
 "重复执行确认":"Confirm Re-run",
 "文本框有未应用修改":"Text boxes contain unapplied edits",
 "处理前/处理后文本框里有尚未写回文档模型的修改。\n\n选择「Yes」会先应用编辑再继续；选择「No」会丢弃文本框临时修改并重新按文档模型刷新；选择「Cancel」取消当前操作。":"The Before/After text boxes contain edits that have not been written back to the document model.\n\nChoose Yes to apply the edits before continuing; No to discard the temporary edits and refresh from the document model; Cancel to cancel this operation.",
@@ -129,9 +129,9 @@ _JA = {
 "选择图片文件夹":"画像フォルダを選択",
 "选择包含图片或 PDF 的文件夹":"画像またはPDFを含むフォルダーを選択",
 "选择图片或 PDF（可多选）":"画像またはPDFを選択（複数選択可）",
-"图片和PDF (*.png *.jpg *.jpeg *.heic *.tif *.tiff *.bmp *.gif *.pdf);;所有文件 (*)":"画像とPDF (*.png *.jpg *.jpeg *.heic *.tif *.tiff *.bmp *.gif *.pdf);;すべてのファイル (*)",
+"图片和PDF (*.png *.jpg *.jpeg *.heic *.tif *.tiff *.bmp *.gif *.pdf);;所有文件 (*)":"画像とPDF (*.png *.jpg *.jpeg *.heic *.tif *.tiff *.bmp *.gif *.pdf *.webp *.cbz *.cbr *.zip *.rar);;すべてのファイル (*)",
 "删除页面":"ページを削除",
-"图片和PDF (*.png *.jpg *.jpeg *.heic *.tif *.tiff *.bmp *.gif *.pdf)":"画像とPDF (*.png *.jpg *.jpeg *.heic *.tif *.tiff *.bmp *.gif *.pdf)",
+"图片和PDF (*.png *.jpg *.jpeg *.heic *.tif *.tiff *.bmp *.gif *.pdf)":"画像とPDF (*.png *.jpg *.jpeg *.heic *.tif *.tiff *.bmp *.gif *.pdf *.webp *.cbz *.cbr *.zip *.rar)",
 "重复执行确认":"再実行の確認",
 "文本框有未应用修改":"未適用の編集があります",
 "处理前/处理后文本框里有尚未写回文档模型的修改。\n\n选择「Yes」会先应用编辑再继续；选择「No」会丢弃文本框临时修改并重新按文档模型刷新；选择「Cancel」取消当前操作。":"処理前/処理後テキスト欄に、まだ文書モデルへ書き戻していない編集があります。\n\n「Yes」は編集を適用して続行、「No」は一時編集を破棄して文書モデルから再読込、「Cancel」は操作を中止します。",
@@ -238,6 +238,18 @@ _JA = {
 "当前 PaddleOCR 环境和模型已经完成初始化。现在可以直接开始 OCR；后续不会重复下载已缓存的模型。":"PaddleOCR環境とモデルの初期化が完了しました。すぐOCRを開始でき、キャッシュ済みモデルを再ダウンロードしません。",
 }
 
+# The Chinese source strings double as lookup keys for _EN/_JA and are shown
+# verbatim to zh users.  Keys stay frozen; _ZH supplies updated zh display text.
+_IMAGE_PDF_PATTERNS = "*.png *.jpg *.jpeg *.heic *.tif *.tiff *.bmp *.gif *.pdf"
+_IMAGE_PDF_ARCHIVE_PATTERNS = _IMAGE_PDF_PATTERNS + " *.webp *.cbz *.cbr *.zip *.rar"
+_ZH = {
+    key: key.replace(_IMAGE_PDF_PATTERNS, _IMAGE_PDF_ARCHIVE_PATTERNS)
+    for key in (
+        f"图片和PDF ({_IMAGE_PDF_PATTERNS});;所有文件 (*)",
+        f"图片和PDF ({_IMAGE_PDF_PATTERNS})",
+    )
+}
+
 
 # AI image-processing dialogs are explicit offline chrome; user content/errors
 # remain untranslated by the dialog localization layer.
@@ -285,8 +297,10 @@ def translate_dialog_text(text: str | None, language: str) -> str:
     """
     source = "" if text is None else str(text)
     language = normalize_language(language)
-    if language == LANG_ZH or not source:
+    if not source:
         return source
+    if language == LANG_ZH:
+        return _ZH.get(source, source)
 
     whole = _translate_dialog_atom(source, language)
     if whole != source or "\n" not in source:

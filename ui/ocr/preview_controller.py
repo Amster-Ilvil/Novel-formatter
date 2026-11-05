@@ -485,7 +485,8 @@ class OCRPreviewController:
                 self._preview_filename_lbl.setText(_tr_ui("当前图片：尚未载入"))
             return
 
-        image_exts = {'.png', '.jpg', '.jpeg', '.heic', '.tif', '.tiff', '.bmp', '.gif'}
+        # Filters expand_inputs() output (page images); archives/PDFs are already expanded there.
+        image_exts = {'.png', '.jpg', '.jpeg', '.heic', '.tif', '.tiff', '.bmp', '.gif', '.webp'}
         try:
             from adapters.pdf_input import expand_inputs, natural_sort_key
             work_dir = (self._pending_inputs[0] if Path(self._pending_inputs[0]).is_dir()
