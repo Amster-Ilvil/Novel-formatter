@@ -6248,8 +6248,9 @@ class _RecognizerSession:
     def __exit__(self, exc_type, exc, tb):
         lease, self._lease = self._lease, None
         if lease is not None:
-            # Cached runtimes stay loaded for the next job; the lease discards
-            # them instead when this pass ended with an exception.
+            # Cached runtimes stay loaded for the next job.  The lease keeps
+            # them after Stop (cancellation exceptions) and discards them after
+            # any other exception or when the worker died.
             self._hayai = self._manga48 = self._persistent = self._jsonl_persistent = None
             return bool(lease.__exit__(exc_type, exc, tb))
         if self._hayai is not None:

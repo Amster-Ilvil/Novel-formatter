@@ -61,3 +61,7 @@ dist/
 *.verified
 .verified
 models/handwriting_openvino/
+
+# Pipeline benchmark artifacts (tools/bench_pipeline.py); the PDF is regenerated deterministically.
+*.prof
+tests/fixtures/bench/

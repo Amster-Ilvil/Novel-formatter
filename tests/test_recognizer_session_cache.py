@@ -172,3 +172,69 @@ def test_scanline_components_match_brute_force_flood_fill():
     masks.append(spiral)
     for mask in masks:
         assert as_tuples(_scanline_connected_ink_components(mask)) == brute_force_components(mask)
+
+
+def _lease_raising(cache, loader, exc):
+    with pytest.raises(type(exc)):
+        with cache.lease(KEY_A, loader) as session:
+            raise exc
+    return session
+
+
+def test_cancelled_lease_keeps_session_and_real_error_reloads():
+    from core.ocr_runtime_optimizer import OcrCancelled
+
+    closed, calls = [], []
+    cache = RecognizerSessionCache(2, is_alive=lambda session: not session.dead)
+    loader = make_loader("s", closed, calls)
+    first = _lease_raising(cache, loader, OcrCancelled("stop"))
+    with cache.lease(KEY_A, loader) as second:
+        assert second is first
+    assert calls == ["s"]
+    assert closed == []
+    assert cache.metrics()["cancel_reuses"] == 1
+
+    _lease_raising(cache, loader, RuntimeError("worker crashed"))
+    assert closed == ["s"]
+    with cache.lease(KEY_A, loader) as third:
+        assert third is not first
+    assert calls == ["s", "s"]
+
+
+def test_process_cancelled_and_wrapped_stop_are_cancellations():
+    from adapters.recognizer_session_cache import is_cancellation
+    from adapters.subprocess_watchdog import ProcessCancelled
+
+    closed, calls = [], []
+    cache = RecognizerSessionCache(2, is_alive=lambda session: not session.dead)
+    loader = make_loader("p", closed, calls)
+    first = _lease_raising(cache, loader, ProcessCancelled("stop"))
+    try:
+        raise RuntimeError("helper failed") from InterruptedError("stop")
+    except RuntimeError as wrapped:
+        assert is_cancellation(wrapped)
+        _lease_raising(cache, loader, wrapped)
+    with cache.lease(KEY_A, loader) as again:
+        assert again is first
+    assert calls == ["p"]
+    assert not is_cancellation(RuntimeError("plain"))
+    assert not is_cancellation(None)
+
+
+def test_cancel_with_dead_worker_or_opt_out_reloads():
+    closed, calls = [], []
+    cache = RecognizerSessionCache(2, is_alive=lambda session: not session.dead)
+    loader = make_loader("d", closed, calls)
+    with pytest.raises(InterruptedError):
+        with cache.lease(KEY_A, loader) as session:
+            session.dead = True
+            raise InterruptedError("stop killed the worker")
+    assert closed == ["d"]
+    with cache.lease(KEY_A, loader) as fresh:
+        fresh.discard_on_cancel = True
+        opted_out = fresh
+    assert calls == ["d", "d"]
+    _lease_raising(cache, loader, InterruptedError("stop"))
+    with cache.lease(KEY_A, loader) as reloaded:
+        assert reloaded is not opted_out
+    assert calls == ["d", "d", "d"]

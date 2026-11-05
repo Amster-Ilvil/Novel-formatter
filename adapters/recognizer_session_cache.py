@@ -20,8 +20,16 @@ Guarantees:
   thread share the session, so recursive passes cannot dead-lock;
 * ``cancel_check``/``verbose`` are rebound on every lease, so a reused worker
   obeys the *current* job's Stop button;
-* dead workers are reloaded, and a lease that ends with an exception discards
-  the session (fail closed);
+* dead workers are reloaded, and a lease that ends with a real exception
+  discards the session (fail closed);
+* Stop is not a failure: a lease that ends with a cancellation exception
+  (:class:`InterruptedError`, which includes ``OcrCancelled``, or
+  ``ProcessCancelled``) keeps the session when its worker is still alive.
+  Every bundled engine is consistent after Stop: JSON-line workers either
+  match responses by ``request_id`` or are terminated by the watchdog (then the
+  liveness check reloads them), and the Apple Vision backends recreate their
+  helper client on the next request.  A session class can opt out with a
+  truthy ``discard_on_cancel`` attribute;
 * :func:`invalidate_recognizer_sessions` closes sessions explicitly, e.g. when
   the models folder or the default engine changes in Settings.
 """
@@ -176,6 +184,29 @@ def rebind_session(session: Any, *, cancel_check=None, verbose: bool | None = No
             pass
 
 
+def _cancellation_types() -> tuple[type[BaseException], ...]:
+    types: list[type[BaseException]] = [InterruptedError]
+    try:
+        from adapters.subprocess_watchdog import ProcessCancelled
+
+        types.append(ProcessCancelled)
+    except Exception:
+        pass
+    return tuple(types)
+
+
+def is_cancellation(exc: BaseException | None) -> bool:
+    """True when ``exc`` (or an explicit ``raise ... from`` cause) is a Stop."""
+    cancel_types = _cancellation_types()
+    seen = 0
+    while exc is not None and seen < 8:
+        if isinstance(exc, cancel_types):
+            return True
+        exc = exc.__cause__
+        seen += 1
+    return False
+
+
 def _capacity_from_env() -> int:
     raw = str(os.environ.get(ENV_CACHE_SIZE, "") or "").strip()
     if not raw:
@@ -211,7 +242,7 @@ class RecognizerSessionCache:
         self._is_alive = is_alive
         self._guard = threading.RLock()
         self._entries: OrderedDict[SessionKey, _Entry] = OrderedDict()
-        self._stats = {"hits": 0, "loads": 0, "evictions": 0, "invalidations": 0}
+        self._stats = {"hits": 0, "loads": 0, "evictions": 0, "invalidations": 0, "cancel_reuses": 0}
 
     @property
     def capacity(self) -> int:
@@ -315,8 +346,8 @@ class RecognizerSessionCache:
             if rebind is not None:
                 rebind(entry.session)
             yield entry.session
-        except BaseException:
-            failed = True
+        except BaseException as exc:
+            failed = not self._reusable_after_cancel(entry.session, exc)
             raise
         finally:
             entry.owner = None
@@ -326,6 +357,18 @@ class RecognizerSessionCache:
                 self._discard(entry)
 
     # -- eviction / invalidation ------------------------------------------
+
+    def _reusable_after_cancel(self, session: Any, exc: BaseException) -> bool:
+        if not is_cancellation(exc) or getattr(session, "discard_on_cancel", False):
+            return False
+        try:
+            alive = bool(self._is_alive(session))
+        except Exception:
+            alive = False
+        if alive:
+            with self._guard:
+                self._stats["cancel_reuses"] += 1
+        return alive
 
     def _discard(self, entry: _Entry) -> None:
         with self._guard:
@@ -406,6 +449,7 @@ __all__ = [
     "close_session",
     "default_session_cache",
     "invalidate_recognizer_sessions",
+    "is_cancellation",
     "model_location",
     "options_fingerprint",
     "rebind_session",
