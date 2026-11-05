@@ -483,6 +483,18 @@ def measure(name: str, fn: Callable[[Any], Any], setup: Callable[[], Any] | None
     }, result
 
 
+def _prepare_workers(repo: Path) -> int:
+    """Column-preparation pool size used by stage (c) (no env override exists)."""
+    if str(repo) not in sys.path:
+        sys.path.insert(0, str(repo))
+    try:
+        from utils.apple_silicon_runtime import recommended_prepare_workers
+        limit = int(recommended_prepare_workers())
+    except Exception:
+        limit = 4
+    return min(max(1, limit), max(1, os.cpu_count() or 2))
+
+
 def _git_head(repo: Path) -> str:
     try:
         return subprocess.run(["git", "-C", str(repo), "rev-parse", "--short", "HEAD"],
@@ -598,7 +610,7 @@ def run_benchmark(args: argparse.Namespace) -> dict:
             "text_pages": len(text_pages),
             "dpi": dpi,
             "runs": args.runs,
-            "workers_env": os.environ.get("NOVEL_FORMATTER_WORKERS", "default"),
+            "prepare_workers": _prepare_workers(repo),
             "engine": "stub recognizer via column_ocr_adapter._recognizer_iterator "
                       "(Apple Vision unavailable: tools/apple_vision_helper/AppleVisionOCRHelper.swift "
                       "missing and no cached helper binary); the stub bypasses the recognizer session cache",
@@ -827,7 +839,8 @@ def format_table(report: dict) -> str:
     meta = report["meta"]
     lines = [
         f"{meta['label']} @ {meta['git_head']}  pages={meta['pages_total']} (text {meta['text_pages']})  "
-        f"dpi={meta['dpi']}  cpu={meta['cpu_count']}  workers={meta['workers_env']}  runs={meta['runs']}",
+        f"dpi={meta['dpi']}  cpu={meta['cpu_count']}  "
+        f"prepare_workers={meta.get('prepare_workers', meta.get('workers_env', '?'))}  runs={meta['runs']}",
         f"engine: {meta['engine']}",
         f"{'stage':<40} {'cold, s':>10} {'warm median, s':>15}",
     ]
@@ -923,7 +936,7 @@ def main(argv: list[str] | None = None) -> int:
                            "git_head": _git_head(Path(args.repo).resolve()), "pdf": str(pdf),
                            "pdf_origin": origin, "dpi": int(args.dpi), "runs": args.runs,
                            "cpu_count": os.cpu_count(), "platform": platform.platform(),
-                           "workers_env": os.environ.get("NOVEL_FORMATTER_WORKERS", "default")},
+                           "prepare_workers": _prepare_workers(Path(args.repo).resolve())},
                   "stages": {}, "outputs": {}}
     else:
         report = run_benchmark(args)
