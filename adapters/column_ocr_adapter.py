@@ -1972,6 +1972,12 @@ def _scanline_connected_ink_components(mask: Image.Image) -> list[_InkComponent]
     OpenCV, SciPy, or NumPy are not installed.  A row-run union/find algorithm is
     substantially faster than a per-pixel Python flood fill and keeps memory
     proportional to the number of printed-ink runs rather than page pixels.
+
+    Single pass: a run that continues exactly one label of the previous row
+    reuses that label (no new set, no union), and bounding boxes/areas are
+    accumulated per label while scanning and merged on union.  Components are
+    returned in the order of their first run in scan order (row, then column),
+    matching the original two-pass implementation exactly.
     """
     binary = mask.convert("L").point(lambda value: 255 if value else 0, mode="L")
     try:
@@ -1983,95 +1989,109 @@ def _scanline_connected_ink_components(mask: Image.Image) -> list[_InkComponent]
         if binary is not mask:
             binary.close()
 
+    # Per-label union/find state and component statistics.
     parent: list[int] = []
     rank: list[int] = []
-    runs: list[tuple[int, int, int, int]] = []  # y, x_start, x_end(exclusive), id
-
-    def make_set() -> int:
-        ident = len(parent)
-        parent.append(ident)
-        rank.append(0)
-        return ident
-
-    def find(value: int) -> int:
-        root = value
-        while parent[root] != root:
-            root = parent[root]
-        while parent[value] != value:
-            next_value = parent[value]
-            parent[value] = root
-            value = next_value
-        return root
-
-    def union(left: int, right: int) -> None:
-        root_left = find(left)
-        root_right = find(right)
-        if root_left == root_right:
-            return
-        if rank[root_left] < rank[root_right]:
-            root_left, root_right = root_right, root_left
-        parent[root_right] = root_left
-        if rank[root_left] == rank[root_right]:
-            rank[root_left] += 1
-
-    previous: list[tuple[int, int, int]] = []  # x_start, x_end, id
+    lefts: list[int] = []
+    tops: list[int] = []
+    rights: list[int] = []
+    bottoms: list[int] = []
+    areas: list[int] = []
+    firsts: list[int] = []
+    find_byte = raw.find
     ink = b"\xff"
     paper = b"\x00"
+    run_serial = 0
+
+    previous_starts: list[int] = []
+    previous_ends: list[int] = []
+    previous_labels: list[int] = []
     for y in range(height):
-        row = raw[y * width:(y + 1) * width]
-        current: list[tuple[int, int, int]] = []
-        cursor = 0
-        while cursor < width:
-            x_start = row.find(ink, cursor)
+        offset = y * width
+        limit = offset + width
+        current_starts: list[int] = []
+        current_ends: list[int] = []
+        current_labels: list[int] = []
+        previous_count = len(previous_labels)
+        previous_index = 0
+        bottom = y + 1
+        cursor = offset
+        while cursor < limit:
+            x_start = find_byte(ink, cursor, limit)
             if x_start < 0:
                 break
-            x_end = row.find(paper, x_start)
+            x_end = find_byte(paper, x_start, limit)
             if x_end < 0:
-                x_end = width
-            ident = make_set()
-            current.append((x_start, x_end, ident))
-            runs.append((y, x_start, x_end, ident))
+                x_end = limit
             cursor = x_end + 1
+            x_start -= offset
+            x_end -= offset
 
-        # Two sorted run lists can be joined in linear time.  End coordinates are
-        # exclusive; equality therefore represents a one-pixel diagonal contact
-        # and belongs to the same 8-connected printed glyph.
-        previous_index = 0
-        for x_start, x_end, ident in current:
-            while (
-                previous_index < len(previous)
-                and previous[previous_index][1] < x_start
-            ):
+            # End coordinates are exclusive; equality therefore represents a
+            # one-pixel diagonal contact and belongs to the same 8-connected glyph.
+            while previous_index < previous_count and previous_ends[previous_index] < x_start:
                 previous_index += 1
+            label = -1
             probe = previous_index
-            while probe < len(previous) and previous[probe][0] <= x_end:
-                prev_start, prev_end, prev_ident = previous[probe]
-                if prev_end >= x_start and x_end >= prev_start:
-                    union(ident, prev_ident)
+            while probe < previous_count and previous_starts[probe] <= x_end:
+                root = previous_labels[probe]
+                while parent[root] != root:
+                    root = parent[root]
+                node = previous_labels[probe]
+                while parent[node] != root:
+                    parent[node], node = root, parent[node]
+                if label < 0:
+                    label = root
+                elif root != label:
+                    if rank[label] < rank[root]:
+                        label, root = root, label
+                    parent[root] = label
+                    if rank[label] == rank[root]:
+                        rank[label] += 1
+                    if lefts[root] < lefts[label]:
+                        lefts[label] = lefts[root]
+                    if tops[root] < tops[label]:
+                        tops[label] = tops[root]
+                    if rights[root] > rights[label]:
+                        rights[label] = rights[root]
+                    if bottoms[root] > bottoms[label]:
+                        bottoms[label] = bottoms[root]
+                    areas[label] += areas[root]
+                    if firsts[root] < firsts[label]:
+                        firsts[label] = firsts[root]
                 probe += 1
-        previous = current
+            # The probe may have advanced past runs that the next current run can
+            # still touch, so only the skip pointer (previous_index) is kept.
 
-    if not runs:
-        return []
+            if label < 0:
+                label = len(parent)
+                parent.append(label)
+                rank.append(0)
+                lefts.append(x_start)
+                tops.append(y)
+                rights.append(x_end)
+                bottoms.append(bottom)
+                areas.append(x_end - x_start)
+                firsts.append(run_serial)
+            else:
+                if x_start < lefts[label]:
+                    lefts[label] = x_start
+                if x_end > rights[label]:
+                    rights[label] = x_end
+                bottoms[label] = bottom
+                areas[label] += x_end - x_start
+            run_serial += 1
+            current_starts.append(x_start)
+            current_ends.append(x_end)
+            current_labels.append(label)
+        previous_starts, previous_ends, previous_labels = current_starts, current_ends, current_labels
 
-    aggregated: dict[int, list[int]] = {}
-    for y, x_start, x_end, ident in runs:
-        root = find(ident)
-        area = max(0, x_end - x_start)
-        current = aggregated.get(root)
-        if current is None:
-            aggregated[root] = [x_start, y, x_end, y + 1, area]
-        else:
-            current[0] = min(current[0], x_start)
-            current[1] = min(current[1], y)
-            current[2] = max(current[2], x_end)
-            current[3] = max(current[3], y + 1)
-            current[4] += area
-
+    roots = [label for label in range(len(parent)) if parent[label] == label]
+    roots.sort(key=firsts.__getitem__)
     return [
-        _InkComponent(left, top, right, bottom, area)
-        for left, top, right, bottom, area in aggregated.values()
-        if right > left and bottom > top and area > 0
+        _InkComponent(lefts[root], tops[root], rights[root], bottoms[root], areas[root])
+        for root in roots
+        if rights[root] > lefts[root] and bottoms[root] > tops[root] and areas[root] > 0
     ]
 
 
@@ -6035,6 +6055,7 @@ class _RecognizerSession:
         self._persistent = None
         self._jsonl_persistent = None
         self._serial = 0
+        self._lease = None
 
     def __enter__(self):
         if self.engine == "hayai_ocr":
@@ -6043,52 +6064,74 @@ class _RecognizerSession:
             if existing is not None:
                 self._hayai = existing
                 self._retained_session = True
-            else:
+                # The holder outlives one job; follow the current Stop button.
+                self._rebind(existing)
+            elif holder is not None:
                 from adapters.hayai_ocr_adapter import HayaiOcrSession
                 self._hayai = HayaiOcrSession(
                     engine_options=self.engine_options, cancel_check=self.cancel_check, verbose=self.verbose,
                     load_progress_callback=self.load_progress_callback,
                 )
                 self._hayai.__enter__()
-                if holder is not None:
-                    holder["session"] = self._hayai
-                    self._retained_session = True
+                holder["session"] = self._hayai
+                self._retained_session = True
+            else:
+                from adapters.hayai_ocr_adapter import HayaiOcrSession
+                self._hayai = self._lease_cached(lambda: HayaiOcrSession(
+                    engine_options=self.engine_options, cancel_check=self.cancel_check, verbose=self.verbose,
+                    load_progress_callback=self.load_progress_callback,
+                ).__enter__())
         elif self.engine == "manga_48px":
             from adapters.manga_48px_adapter import Manga48pxSession
-            self._manga48 = Manga48pxSession(
+            self._manga48 = self._lease_cached(lambda: Manga48pxSession(
                 cancel_check=self.cancel_check,
                 verbose=self.verbose,
                 load_progress_callback=self.load_progress_callback,
                 engine_options=self.engine_options,
-            )
-            self._manga48.__enter__()
+            ).__enter__())
         # Preserve the monkeypatch hook used by tests/plugins.  Persistent native
         # sessions are enabled only when the stock bridge is active.
         elif _recognizer_iterator is recognizer_iterator and self.engine == "apple_vision":
-            self._persistent = AppleVisionRecognitionSession(
+            self._persistent = self._lease_cached(lambda: AppleVisionRecognitionSession(
                 shortcut_name=self.shortcut_name,
                 engine_options=self.engine_options,
                 cancel_check=self.cancel_check,
-            )
-            self._persistent.__enter__()
+            ).__enter__())
         elif _recognizer_iterator is recognizer_iterator and self.engine == "ndlocr_lite":
             from adapters.ndlocr_lite_adapter import NDLOcrLiteSession
-            self._persistent = NDLOcrLiteSession(
+            self._persistent = self._lease_cached(lambda: NDLOcrLiteSession(
                 cancel_check=self.cancel_check,
                 verbose=self.verbose,
                 engine_options=self.engine_options,
-            )
-            self._persistent.__enter__()
+            ).__enter__())
         elif _recognizer_iterator is recognizer_iterator and self.engine == "paddle_ocr":
             # Paddle model startup is expensive. Keep exactly one JSONL worker
-            # alive for primary recognition, adaptive rescue and sentence OCR
-            # within this model run instead of reloading PP-OCR for every pass.
+            # alive for primary recognition, adaptive rescue and sentence OCR,
+            # and across OCR jobs through the process-wide session cache.
             from adapters.persistent_recognition_session import PersistentRecognitionSession
-            self._jsonl_persistent = PersistentRecognitionSession(
+            self._jsonl_persistent = self._lease_cached(lambda: PersistentRecognitionSession(
                 engine="paddle_ocr", engine_options=self.engine_options
-            )
-            self._jsonl_persistent.__enter__()
+            ).__enter__())
         return self
+
+    def _rebind(self, session) -> None:
+        from adapters.recognizer_session_cache import rebind_session
+        rebind_session(session, cancel_check=self.cancel_check, verbose=self.verbose)
+        if hasattr(session, "load_progress_callback"):
+            session.load_progress_callback = self.load_progress_callback
+
+    def _lease_cached(self, loader):
+        """Lease the loaded model runtime from the process-wide session cache."""
+        from adapters.recognizer_session_cache import default_session_cache, session_key_for
+        lease = default_session_cache().lease(
+            session_key_for(self.engine, self.engine_options),
+            loader,
+            cancel_check=self.cancel_check,
+            rebind=self._rebind,
+        )
+        session = lease.__enter__()
+        self._lease = lease
+        return session
 
     def recognize_blocks(
         self,
@@ -6203,6 +6246,12 @@ class _RecognizerSession:
         )
 
     def __exit__(self, exc_type, exc, tb):
+        lease, self._lease = self._lease, None
+        if lease is not None:
+            # Cached runtimes stay loaded for the next job; the lease discards
+            # them instead when this pass ended with an exception.
+            self._hayai = self._manga48 = self._persistent = self._jsonl_persistent = None
+            return bool(lease.__exit__(exc_type, exc, tb))
         if self._hayai is not None:
             if self._retained_session:
                 self._hayai = None
