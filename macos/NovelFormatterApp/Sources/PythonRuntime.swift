@@ -40,7 +40,7 @@ actor PythonRuntime {
             try await installPython(progress: progress)
         }
         try await verifyArchitecture()
-        try syncEmbeddedSourceIfNeeded(progress: progress)
+        syncEmbeddedSourceIfNeeded(progress: progress)
     }
 
     // MARK: - Source copy

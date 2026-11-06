@@ -33,5 +33,7 @@ codebase (`gui_pyside6.py`, `bootstrap.py`), launched through the same
 `packaging/build_macos_swift_app.sh` compiles this with a single `swiftc`
 invocation (no Xcode project required), embeds `Resources/app`, ad-hoc
 signs the bundle and packages DMG + app.zip under `package/`.
-The GitHub Actions job `macos-swift` in `.github/workflows/release.yml`
-runs it on every release.
+Requires macOS 14+ at runtime (SwiftUI `.onChange` without the `initial:`
+parameter). The GitHub Actions job `macos-swift` in
+`.github/workflows/release.yml` runs it on every release, and
+`.github/workflows/build-swift-app.yml` builds it on demand.

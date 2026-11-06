@@ -32,7 +32,7 @@ mkdir -p "$CONTENTS/MacOS" "$CONTENTS/Resources"
 
 xcrun --sdk macosx swiftc \
   -O -whole-module-optimization \
-  -target "$EXPECTED_ARCH-apple-macosx13.0" \
+  -target "$EXPECTED_ARCH-apple-macosx14.0" \
   -parse-as-library \
   -framework SwiftUI -framework AppKit -framework Foundation -framework CryptoKit \
   macos/NovelFormatterApp/Sources/*.swift \
@@ -101,7 +101,7 @@ cat > "$CONTENTS/Info.plist" <<PLIST
 	<key>CFBundleVersion</key>
 	<string>$VERSION</string>
 	<key>LSMinimumSystemVersion</key>
-	<string>13.0</string>
+	<string>14.0</string>
 	<key>NSHighResolutionCapable</key>
 	<true/>
 	<key>NSHumanReadableCopyright</key>
