@@ -17,6 +17,7 @@ import os
 import re
 import stat
 import threading
+import tempfile
 import zipfile
 from concurrent.futures import FIRST_COMPLETED, ProcessPoolExecutor, wait
 from dataclasses import dataclass
@@ -45,6 +46,8 @@ _ARCHIVE_EXTS = {".zip", ".cbz", ".rar", ".cbr"} | set(ARCHIVE_EXTENSIONS)
 _CACHE_VERSION = 2
 _ARCHIVE_MAX_MEMBERS = 20_000
 _ARCHIVE_MAX_TOTAL_BYTES = 4 * 1024 * 1024 * 1024
+_ARCHIVE_MAX_COMPRESSION_RATIO = 100
+_ARCHIVE_RATIO_MIN_BYTES = 10 * 1024 * 1024
 _ARCHIVE_SNIFF_BYTES = 64
 _ARCHIVE_COPY_CHUNK = 1024 * 1024
 _RAR_UNAVAILABLE = (
@@ -356,6 +359,10 @@ class ArchiveExtractionError(RuntimeError):
     """An image archive cannot be opened, violates safety limits, or holds no images."""
 
 
+class _ArchiveExtractionCancelled(RuntimeError):
+    """Abort extraction without treating cancellation as an unreadable entry."""
+
+
 @dataclass(frozen=True)
 class _ArchiveMember:
     name: str
@@ -364,6 +371,7 @@ class _ArchiveMember:
     is_link: bool
     encrypted: bool
     info: Any
+    compressed_size: int | None = None
 
 
 def _natural_member_key(name: str) -> list:
@@ -424,6 +432,7 @@ def _open_archive(
                 is_link=stat.S_ISLNK(mode),
                 encrypted=bool(info.flag_bits & 0x1),
                 info=info,
+                compressed_size=max(0, int(info.compress_size)),
             ))
         return archive, members, ()
     if detected.kind is FileKind.ARCHIVE_RAR:
@@ -434,6 +443,8 @@ def _open_archive(
         except Exception as exc:
             raise ArchiveExtractionError(f"{source}: cannot open RAR archive ({exc})") from exc
         members = []
+        is_solid = getattr(archive, "is_solid", None)
+        reliable_sizes = callable(is_solid) and not is_solid()
         for info in infos:
             name = str(info.filename).replace("\\", "/")
             is_symlink = getattr(info, "is_symlink", None)
@@ -442,9 +453,17 @@ def _open_archive(
                 name=name,
                 size=max(0, int(getattr(info, "file_size", 0) or 0)),
                 is_dir=bool(info.is_dir()) or name.endswith("/"),
-                is_link=bool(is_symlink()) if callable(is_symlink) else False,
+                is_link=(
+                    (bool(is_symlink()) if callable(is_symlink) else False)
+                    or bool(getattr(info, "file_redir", None))
+                ),
                 encrypted=bool(needs_password()) if callable(needs_password) else False,
                 info=info,
+                compressed_size=(
+                    max(0, int(info.compress_size))
+                    if reliable_sizes and getattr(info, "compress_size", None) is not None
+                    else None
+                ),
             ))
         fatal = tuple(
             exc_type for exc_type in (getattr(rarfile, "RarCannotExec", None),)
@@ -468,14 +487,20 @@ def _read_up_to(stream: Any, size: int) -> bytes:
     return b"".join(chunks)
 
 
-def _stream_member(stream: Any, header: bytes, target: Path, *, budget: int, source: Path) -> int:
-    """Write ``header`` plus the rest of ``stream`` atomically, enforcing ``budget`` bytes."""
-    temporary = target.with_name(f".{target.name}.part")
+def _stream_member(
+    stream: Any, header: bytes, target: Path, *, budget: int, source: Path,
+    cancel_check: Callable[[], bool] | None = None,
+) -> int:
+    """Publish a bounded stream atomically without replacing an existing file."""
+    descriptor, name = tempfile.mkstemp(prefix=f".{target.name}.", suffix=".part", dir=target.parent)
+    temporary = Path(name)
     written = 0
     try:
-        with temporary.open("wb") as handle:
+        with os.fdopen(descriptor, "wb") as handle:
             chunk = header
             while chunk:
+                if cancel_check is not None and cancel_check():
+                    raise _ArchiveExtractionCancelled(f"Archive extraction cancelled: {source}")
                 written += len(chunk)
                 if written > budget:
                     raise ArchiveExtractionError(
@@ -483,7 +508,14 @@ def _stream_member(stream: Any, header: bytes, target: Path, *, budget: int, sou
                     )
                 handle.write(chunk)
                 chunk = stream.read(_ARCHIVE_COPY_CHUNK)
-        os.replace(temporary, target)
+        if cancel_check is not None and cancel_check():
+            raise _ArchiveExtractionCancelled(f"Archive extraction cancelled: {source}")
+        try:
+            os.link(temporary, target)
+        except FileExistsError as exc:
+            raise ArchiveExtractionError(
+                f"{source}: refusing to overwrite existing extraction target: {target.name}"
+            ) from exc
     finally:
         temporary.unlink(missing_ok=True)
     return written
@@ -507,6 +539,7 @@ def _extract_archive_images(
     root.mkdir(parents=True, exist_ok=True)
     root_resolved = root.resolve()
     archive, members, fatal_errors = _open_archive(source, detect_file_type(source))
+    pages: list[str] = []
     try:
         if len(members) > _ARCHIVE_MAX_MEMBERS:
             raise ArchiveExtractionError(
@@ -517,6 +550,30 @@ def _extract_archive_images(
             raise ArchiveExtractionError(
                 f"{source}: declared uncompressed size {declared} exceeds "
                 f"{_ARCHIVE_MAX_TOTAL_BYTES} bytes"
+            )
+
+        sized_members = [
+            member for member in members
+            if not member.is_dir and member.compressed_size is not None
+        ]
+        for member in sized_members:
+            if (
+                member.size > _ARCHIVE_RATIO_MIN_BYTES
+                and member.size > _ARCHIVE_MAX_COMPRESSION_RATIO * member.compressed_size
+            ):
+                raise ArchiveExtractionError(
+                    f"{source}: suspicious compression ratio for {member.name!r} "
+                    f"(greater than {_ARCHIVE_MAX_COMPRESSION_RATIO}:1)"
+                )
+        sized_total = sum(member.size for member in sized_members)
+        compressed_total = sum(member.compressed_size for member in sized_members)
+        if (
+            sized_total > _ARCHIVE_RATIO_MIN_BYTES
+            and sized_total > _ARCHIVE_MAX_COMPRESSION_RATIO * compressed_total
+        ):
+            raise ArchiveExtractionError(
+                f"{source}: suspicious archive compression ratio "
+                f"(greater than {_ARCHIVE_MAX_COMPRESSION_RATIO}:1)"
             )
 
         candidates: list[_ArchiveMember] = []
@@ -542,10 +599,9 @@ def _extract_archive_images(
 
         total = len(candidates)
         written_total = 0
-        pages: list[str] = []
         for done, member in enumerate(candidates, start=1):
             if cancel_check is not None and cancel_check():
-                raise RuntimeError(f"Archive extraction cancelled: {source}")
+                raise _ArchiveExtractionCancelled(f"Archive extraction cancelled: {source}")
             suffix = PurePosixPath(member.name).suffix.lower()
             accepted = False
             try:
@@ -562,13 +618,18 @@ def _extract_archive_images(
                         written_total += _stream_member(
                             stream, header, resolved,
                             budget=_ARCHIVE_MAX_TOTAL_BYTES - written_total, source=source,
+                            cancel_check=cancel_check,
                         )
                         pages.append(str(resolved))
                         accepted = True
-            except ArchiveExtractionError:
+            except (ArchiveExtractionError, _ArchiveExtractionCancelled):
                 raise
             except fatal_errors as exc:
                 raise ArchiveExtractionError(f"{source}: {_RAR_UNAVAILABLE} ({exc})") from exc
+            except OSError as exc:
+                raise ArchiveExtractionError(
+                    f"{source}: I/O error extracting {member.name!r}: {exc}"
+                ) from exc
             except Exception as exc:
                 detected = _skip_type(f"unreadable: {type(exc).__name__}")
             if not accepted:
@@ -576,9 +637,15 @@ def _extract_archive_images(
             if progress_callback is not None:
                 progress_callback(done, total)
 
+        if cancel_check is not None and cancel_check():
+            raise _ArchiveExtractionCancelled(f"Archive extraction cancelled: {source}")
         if not pages:
             raise ArchiveExtractionError(f"No images found in archive: {source}")
         return pages, skipped
+    except BaseException:
+        for page in pages:
+            Path(page).unlink(missing_ok=True)
+        raise
     finally:
         archive.close()
 
@@ -637,8 +704,11 @@ def extract_image_archive(
 
     Raises :class:`ArchiveExtractionError` for unreadable or unsupported
     containers, a missing ``rarfile`` backend, exceeded limits (20 000 entries,
-    4 GiB uncompressed) and archives without any image.  Cancellation raises
-    ``RuntimeError`` so callers do not mistake it for a rejected file.
+    4 GiB uncompressed, compression ratio above 100:1 for more than 10 MiB
+    where compressed sizes are reliable), I/O errors and archives without any
+    image.  Cancellation raises ``RuntimeError`` so callers do not mistake it
+    for a rejected file.  Failure or cancellation removes files created by
+    this extraction, without overwriting or deleting existing work_dir files.
     """
     source = Path(path).expanduser().resolve()
     if not source.is_file():
@@ -730,8 +800,13 @@ def expand_inputs(
     expanded_paths = [Path(raw).expanduser() for raw in paths]
     images: list[str] = []
     rejected: list[tuple[str, DetectedType]] = []
+    seen_sources: set[Path] = set()
 
     def expand_file(path: Path) -> None:
+        resolved = path.resolve()
+        if resolved in seen_sources:
+            return
+        seen_sources.add(resolved)
         detected = detect_file_type(path)
         if detected.kind is FileKind.IMAGE:
             images.append(str(path))
@@ -760,6 +835,10 @@ def expand_inputs(
         if cancel_check is not None and cancel_check():
             raise RuntimeError("输入加载已取消")
         if path.is_dir():
+            resolved = path.resolve()
+            if resolved in seen_sources:
+                continue
+            seen_sources.add(resolved)
             for item in sorted(path.iterdir(), key=natural_sort_key):
                 if item.name.startswith(".") or item.is_dir():
                     continue
@@ -780,11 +859,12 @@ def expand_inputs(
 
 
 def release_pdf_caches(paths: list[str] | tuple[str, ...] | set[str]) -> int:
-    """Delete session-local PDF rasters belonging to ``paths``.
+    """Delete session-local PDF rasters and archive pages belonging to ``paths``.
 
     Only directories below this process' application-owned session root are
-    considered.  Original PDFs, images, persistent model caches, and files from
-    another running process can never be removed by this helper.
+    considered.  Original sources, images, persistent model caches, and files
+    from another running process can never be removed by this helper.
+    Source identity comes from manifests, not from filename extensions.
     """
     sources: set[str] = set()
     for raw in paths or []:
@@ -792,26 +872,31 @@ def release_pdf_caches(paths: list[str] | tuple[str, ...] | set[str]) -> int:
             path = Path(raw).expanduser().resolve()
         except Exception:
             continue
-        if path.suffix.lower() == ".pdf":
-            sources.add(str(path))
+        sources.add(str(path))
     if not sources:
         return 0
 
     registry = session_temp_registry()
-    cache_root = registry.path("pdf-pages")
-    if not cache_root.exists():
-        return 0
     removed = 0
-    for directory in list(cache_root.iterdir()):
-        if not directory.is_dir():
+    for namespace in ("pdf-pages", "archive-pages"):
+        cache_root = registry.root / namespace
+        if cache_root.is_symlink() or not cache_root.is_dir():
             continue
-        manifest = _read_manifest(directory)
-        try:
-            manifest_source = str(Path(str(manifest.get("source", ""))).expanduser().resolve())
-        except Exception:
-            manifest_source = ""
-        if manifest_source not in sources:
-            continue
-        if registry.release(directory, delete=True):
-            removed += 1
+        for directory in list(cache_root.iterdir()):
+            if directory.is_symlink() or not directory.is_dir():
+                continue
+            manifest = _read_manifest(directory)
+            if not isinstance(manifest, dict):
+                continue
+            source = manifest.get("source")
+            if not isinstance(source, str) or not source:
+                continue
+            try:
+                manifest_source = str(Path(source).expanduser().resolve())
+            except Exception:
+                continue
+            if manifest_source not in sources:
+                continue
+            if registry.release(directory, delete=True):
+                removed += 1
     return removed

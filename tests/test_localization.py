@@ -135,6 +135,52 @@ class PlaceholderParityTest(unittest.TestCase):
         self.assertIn("vol1.zip", translate_text("vol1.zip 等 3 个文件", LANG_JA))
 
 
+class ComposedMessageRegressionTest(unittest.TestCase):
+    def test_manual_sentence_status_precedes_generic_prefix(self) -> None:
+        source = "当前句：007/012 · 人工编辑 · 已确定"
+        expected = {
+            LANG_EN: "Current sentence: 007/012 · manually edited · confirmed",
+            LANG_JA: "現在の文：007/012 · 手動編集 · 確定済み",
+            LANG_ZH: source,
+        }
+        for language, target in expected.items():
+            with self.subTest(language=language):
+                self.assertEqual(translate_text(source, language), target)
+                self.assertEqual(dialog_localization.translate_dialog_text(source, language), target)
+
+    def test_connection_hint_preserves_model_identifier(self) -> None:
+        model = "模型/准备中-v2"
+        source = f"✓ 连接成功：{model}；AI 图文模式还建议点“测试图片能力”。"
+        expected = {
+            LANG_EN: f"✓ Connection succeeded: {model}; for AI image/text mode, also use “Test Image Capability”.",
+            LANG_JA: f"✓ 接続成功：{model}。AI画像・本文モードでは「画像能力をテスト」も実行してください。",
+            LANG_ZH: source,
+        }
+        for language, target in expected.items():
+            with self.subTest(language=language):
+                self.assertEqual(translate_text(source, language), target)
+                self.assertEqual(dialog_localization.translate_dialog_text(source, language), target)
+
+    def test_specific_sentence_rule_does_not_translate_free_form_text(self) -> None:
+        body = "正文引用：人工编辑 · 已确定"
+        self.assertEqual(
+            translate_text(f"当前句：{body}", LANG_EN),
+            f"Current sentence: {body}",
+        )
+
+    def test_adjudication_marker_preserves_book_text_matching_catalog(self) -> None:
+        body = "完成"
+        source = f"〔待裁决〕{body}"
+        expected = {
+            LANG_EN: f"[Awaiting adjudication]{body}",
+            LANG_JA: f"〔裁決待ち〕{body}",
+            LANG_ZH: source,
+        }
+        for language, target in expected.items():
+            with self.subTest(language=language):
+                self.assertEqual(translate_text(source, language), target)
+
+
 class EnglishChromeTest(unittest.TestCase):
     def test_english_values_have_no_cjk(self) -> None:
         leaks = []

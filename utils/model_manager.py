@@ -16,27 +16,33 @@ Every downloadable OCR model goes through one code path:
    through :mod:`utils.safe_archive` into a temporary directory that is
    atomically renamed afterwards.
 
-A corrupt or partial file never remains under its final name.  Concurrent
+A corrupt or partial download is never installed under its final name.
+An existing file is preserved until its replacement verifies. Concurrent
 callers are serialised per model with a :class:`threading.Lock` plus an
-inter-process lock file created with ``O_CREAT | O_EXCL``.
+OS-managed inter-process lock held on an open file descriptor.
 
 This module is stdlib-only and must not import Qt.
 """
 from __future__ import annotations
 
 import enum
+import errno
 import hashlib
 import http.client
+import ipaddress
 import json
 import os
+import queue
 import re
 import shutil
+import subprocess
 import sys
 import tarfile
 import tempfile
 import threading
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 import uuid
 from collections import deque
@@ -56,6 +62,7 @@ ENV_AUTO_DOWNLOAD = "NOVEL_FORMATTER_MODEL_AUTO_DOWNLOAD"
 LEGACY_MODELS_DIR = PROJECT_ROOT / ".model-cache"
 
 CHUNK_SIZE = 1024 * 1024
+MAX_DOWNLOAD_BYTES = 4 * 1024 * 1024 * 1024
 PART_SUFFIX = ".part"
 LOCK_SUFFIX = ".lock"
 VERIFIED_SUFFIX = ".verified"
@@ -118,6 +125,38 @@ class _TransientError(Exception):
     """Internal: retryable network-level failure."""
 
 
+class _TransientTimeout(_TransientError):
+    """Internal: a request or response read exceeded the configured timeout."""
+
+
+class _UnsafeDownloadURL(ValueError):
+    """Internal: reject a URL before opening its transport."""
+
+
+def _validate_download_url(url: str, *, redirect_from: str | None = None) -> None:
+    parsed = urllib.parse.urlsplit(url)
+    if not parsed.hostname or parsed.username is not None or parsed.password is not None:
+        raise _UnsafeDownloadURL("download URL must have a host and no embedded credentials")
+    if parsed.scheme == "https":
+        return
+    if redirect_from is not None and urllib.parse.urlsplit(redirect_from).scheme == "https":
+        raise _UnsafeDownloadURL("unsafe HTTPS redirect: the target must also use HTTPS")
+    if parsed.scheme == "http":
+        # Numeric loopback addresses only: no arbitrary HTTP hosts or DNS aliases.
+        try:
+            if ipaddress.ip_address(parsed.hostname).is_loopback:
+                return
+        except ValueError:
+            pass
+    raise _UnsafeDownloadURL("download URL must use HTTPS (HTTP is limited to numeric loopback)")
+
+
+class _SafeRedirectHandler(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        _validate_download_url(newurl, redirect_from=req.full_url)
+        return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+
 class _HTTPStatusError(Exception):
     """Internal: HTTP error status from the server."""
 
@@ -128,6 +167,159 @@ class _HTTPStatusError(Exception):
     @property
     def retryable(self) -> bool:
         return self.status in {408, 425, 429} or self.status >= 500
+
+
+class _CurlResponse:
+    """Bounded, cancellable stdout stream; never gives curl a filesystem path."""
+
+    status = 200
+
+    def __init__(self, url, *, timeout, check_cancel, context):
+        self.url = url
+        self.timeout = timeout
+        self.check_cancel = check_cancel
+        self.context = context
+        self.headers = {}
+        self._queue = queue.Queue(maxsize=2)
+        self._stop = threading.Event()
+        self._pending = b""
+        self._stderr = bytearray()
+        self._threads = []
+        self._proc = None
+        self._started = self._activity = time.monotonic()
+
+    def __enter__(self):
+        self.check_cancel()
+        curl = shutil.which("curl")
+        if not curl:
+            raise ModelNetworkError(
+                "System curl is unavailable; the Python HTTPS transport also failed.",
+                **self.context,
+            )
+        # -q must be first: a user curlrc must not enable insecure TLS, redirects
+        # to other protocols, extra transfers, or writing directly to a file.
+        command = [
+            curl, "-q",
+            "--proto", "=https", "--proto-redir", "=https",
+            "--disallow-username-in-url", "--globoff",
+            "--location", "--max-redirs", "10", "--fail",
+            "--silent", "--show-error",
+            "--connect-timeout", str(self.timeout), "--max-time", "1800",
+            "--output", "-", "--url", self.url,
+        ]
+        try:
+            self._proc = subprocess.Popen(
+                command, stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                bufsize=0, shell=False,
+            )
+        except OSError as exc:
+            raise ModelNetworkError(f"Cannot start system curl: {exc}", **self.context) from exc
+        self._started = self._activity = time.monotonic()
+        try:
+            for target, name in (
+                (self._read_stdout, "model-curl-stdout"),
+                (self._read_stderr, "model-curl-stderr"),
+            ):
+                thread = threading.Thread(target=target, name=name, daemon=True)
+                thread.start()
+                self._threads.append(thread)
+        except BaseException:
+            self.__exit__(*sys.exc_info())
+            raise
+        return self
+
+    def _put(self, item):
+        while not self._stop.is_set():
+            try:
+                self._queue.put(item, timeout=0.05)
+                return
+            except queue.Full:
+                pass
+
+    def _read_stdout(self):
+        try:
+            while not self._stop.is_set():
+                chunk = self._proc.stdout.read(64 * 1024)
+                if not chunk:
+                    break
+                self._put(chunk)
+        except Exception as exc:
+            self._put(exc)
+        finally:
+            self._put(None)
+
+    def _read_stderr(self):
+        try:
+            while not self._stop.is_set():
+                chunk = self._proc.stderr.read(4096)
+                if not chunk:
+                    break
+                self._stderr.extend(chunk)
+                del self._stderr[:-8192]
+        except OSError as exc:
+            self._put(exc)
+
+    def _check(self):
+        self.check_cancel()
+        now = time.monotonic()
+        if now - self._activity >= self.timeout or now - self._started >= 1800:
+            raise ModelNetworkError(
+                f"System curl timed out (inactivity timeout {self.timeout:g} seconds; "
+                "total timeout 1800 seconds).",
+                **self.context,
+            )
+
+    def read(self, size):
+        self._check()
+        while not self._pending:
+            try:
+                item = self._queue.get(timeout=0.05)
+            except queue.Empty:
+                self._check()
+                continue
+            if isinstance(item, Exception):
+                raise ModelNetworkError(f"Cannot read system curl output: {item}", **self.context) from item
+            if item is None:
+                while self._proc.poll() is None:
+                    self._check()
+                    self._stop.wait(0.05)
+                for thread in self._threads:
+                    while thread.is_alive():
+                        thread.join(0.05)
+                        self._check()
+                code = self._proc.returncode
+                if code:
+                    detail = self._stderr.decode("utf-8", errors="replace").strip()
+                    message = f"System curl exited with status {code}: {detail}"
+                    if code == 28:
+                        raise ModelNetworkError(f"System curl timed out. {message}", **self.context)
+                    if code in (1, 3, 47, 67):
+                        raise ModelDownloadError(message, **self.context)
+                    raise _TransientError(message)
+                return b""
+            self._pending = item
+            self._activity = time.monotonic()
+        chunk = self._pending[:size]
+        self._pending = self._pending[size:]
+        return chunk
+
+    def __exit__(self, exc_type, exc, traceback):
+        self._stop.set()
+        if self._proc is not None:
+            try:
+                if self._proc.poll() is None:
+                    self._proc.terminate()
+                try:
+                    self._proc.wait(timeout=1.0)
+                except subprocess.TimeoutExpired:
+                    self._proc.kill()
+                    self._proc.wait()
+            finally:
+                for thread in self._threads:
+                    thread.join()
+                self._proc.stdout.close()
+                self._proc.stderr.close()
 
 
 # ---------------------------------------------------------------------------
@@ -166,6 +358,7 @@ class ModelSpec:
     legacy_dirs: tuple[str, ...] = ()
     min_size: int = 1
     label: str = ""
+    curl_fallback: bool = False
 
     @property
     def directory_name(self) -> str:
@@ -226,6 +419,7 @@ MODEL_REGISTRY: dict[str, ModelSpec] = {
             legacy_dirs=(".model-cache/manga-48px-ar",),
             min_size=100_000_000,
             label="48px AR checkpoint",
+            curl_fallback=True,
         ),
         ModelSpec(
             model_id="manga_48px.dictionary",
@@ -236,12 +430,13 @@ MODEL_REGISTRY: dict[str, ModelSpec] = {
             ),
             filename="alphabet-all-v7.txt",
             sha256="f5722368146aa0fbcc9f4726866e4efc3203318ebb66c811d8cbbe915576538a",
-            size=None,
+            size=186_651,
             hash_source="existing-code",
             subdir="manga-48px-ar",
             legacy_dirs=(".model-cache/manga-48px-ar",),
             min_size=1_000,
             label="48px AR dictionary",
+            curl_fallback=True,
         ),
         ModelSpec(
             model_id="openvino_handwriting.xml",
@@ -486,6 +681,7 @@ class ModelManager:
         lock_timeout: float = 3600.0,
         stale_lock_seconds: float = 900.0,
         chunk_size: int = CHUNK_SIZE,
+        max_download_bytes: int = MAX_DOWNLOAD_BYTES,
         opener: Callable[..., object] | None = None,
         project_root: Path | None = None,
     ) -> None:
@@ -496,9 +692,14 @@ class ModelManager:
         self.retries = max(0, int(retries))
         self.backoff = max(0.0, float(backoff))
         self.lock_timeout = float(lock_timeout)
+        # Retained for constructor compatibility; OS locks do not expire by age.
         self.stale_lock_seconds = float(stale_lock_seconds)
         self.chunk_size = max(1, int(chunk_size))
-        self._open = opener or urllib.request.urlopen
+        self.max_download_bytes = int(max_download_bytes)
+        if self.max_download_bytes <= 0:
+            raise ValueError("max_download_bytes must be positive")
+        # An explicitly injected opener is a trusted transport, used by tests.
+        self._open = opener or urllib.request.build_opener(_SafeRedirectHandler()).open
         self.project_root = Path(project_root) if project_root else PROJECT_ROOT
 
     # -- configuration -----------------------------------------------------
@@ -562,6 +763,30 @@ class ModelManager:
                 result = state
         return result
 
+    def verify(
+        self, model_id: str, *, force: bool = True, target_dir: Path | None = None,
+    ) -> ModelStatus:
+        """Check a model without downloading; ``force`` bypasses file hash markers.
+
+        Full verification of extracted archives is unavailable: their source
+        archives are removed after installation and no per-file hashes are stored.
+        """
+        spec = self.spec(model_id)
+        if force and spec.archive != "none":
+            raise ModelError(
+                f"Full verification of extracted model {spec.model_id} is unavailable: "
+                f"the original archive and per-file hashes are not retained.",
+                model_id=spec.model_id,
+            )
+        result = ModelStatus.MISSING
+        for directory in self._candidate_dirs(spec, target_dir):
+            state = self._check(spec, self.installed_path(spec, directory), deep=True, force=force)
+            if state is ModelStatus.READY:
+                return state
+            if state is ModelStatus.CORRUPT:
+                result = state
+        return result
+
     def locate(self, model_id: str, *, target_dir: Path | None = None) -> Path | None:
         """Return the verified installed path without any network access."""
         return self._find_ready(self.spec(model_id), target_dir)
@@ -579,7 +804,9 @@ class ModelManager:
             return path / VERIFIED_SUFFIX
         return path.with_name(path.name + VERIFIED_SUFFIX)
 
-    def _check(self, spec: ModelSpec, path: Path, *, deep: bool) -> ModelStatus:
+    def _check(
+        self, spec: ModelSpec, path: Path, *, deep: bool, force: bool = False,
+    ) -> ModelStatus:
         if spec.archive != "none":
             return self._check_extracted(spec, path)
         try:
@@ -596,9 +823,10 @@ class ModelManager:
             return ModelStatus.CORRUPT
         if not (spec.sha256 or spec.sha384):
             return ModelStatus.READY
-        if self._marker_valid(spec, path, stat):
+        # .verified optimizes a trusted local cache; it is not a security boundary.
+        if not force and self._marker_valid(spec, path, stat):
             return ModelStatus.READY
-        if not deep:
+        if not deep and not force:
             return ModelStatus.READY
         try:
             digests = self._hash_file(spec, path)
@@ -641,6 +869,7 @@ class ModelManager:
         return True
 
     def _write_marker(self, spec: ModelSpec, path: Path, digests: dict[str, str]) -> None:
+        temp = None
         try:
             stat = path.stat()
             payload = {
@@ -651,12 +880,22 @@ class ModelManager:
                 "sha384": digests.get("sha384", ""),
             }
             marker = self._marker_path(path)
-            temp = marker.with_name(f"{marker.name}.{uuid.uuid4().hex}.tmp")
-            temp.write_text(json.dumps(payload, sort_keys=True), encoding="utf-8")
+            fd, name = tempfile.mkstemp(
+                prefix=f"{marker.name}.", suffix=".tmp", dir=marker.parent,
+            )
+            temp = Path(name)
+            with os.fdopen(fd, "w", encoding="utf-8") as stream:
+                stream.write(json.dumps(payload, sort_keys=True))
             os.replace(temp, marker)
         except OSError:
             # A read-only legacy folder simply means we re-hash next time.
             pass
+        finally:
+            if temp is not None:
+                try:
+                    temp.unlink(missing_ok=True)
+                except OSError:
+                    pass
 
     # -- hashing ---------------------------------------------------------------
 
@@ -694,6 +933,10 @@ class ModelManager:
 
     # -- public ensure -----------------------------------------------------------
 
+    @staticmethod
+    def _destination_lock_key(spec: ModelSpec, directory: Path) -> str:
+        return f"{spec.model_id}|{os.path.normcase(os.path.realpath(directory))}"
+
     def ensure(
         self,
         model_id: str,
@@ -720,13 +963,19 @@ class ModelManager:
         cancel_check: CancelCheck | None = None,
         allow_download: bool = True,
         target_dir: Path | None = None,
+        curl_fallback: bool | None = None,
     ) -> Path:
         """Like :meth:`ensure` for a spec that is not (or differently) registered.
 
         ``target_dir`` pins the exact directory and disables legacy lookup.
+        ``curl_fallback=None`` follows the registered artifact policy. An explicit
+        bool overrides it. Only network/HTTP failures permit a fresh curl attempt,
+        within the same lock, bounded writer and verification cycle.
         """
+        if curl_fallback is None:
+            curl_fallback = spec.curl_fallback
         directory = Path(target_dir) if target_dir is not None else self.target_dir(spec)
-        lock_key = f"{spec.model_id}|{os.path.normcase(os.path.abspath(directory))}"
+        lock_key = self._destination_lock_key(spec, directory)
         with _thread_lock_for(lock_key):
             found = self._find_ready(spec, target_dir)
             if found is not None:
@@ -741,8 +990,11 @@ class ModelManager:
                 found = self._find_ready(spec, target_dir)
                 if found is not None:
                     return found
-                self._discard_corrupt(spec, directory)
-                return self._download_and_install(spec, directory, progress_callback, cancel_check, heartbeat)
+                # Preserve the installed copy until a replacement has verified.
+                return self._download_and_install(
+                    spec, directory, progress_callback, cancel_check, heartbeat,
+                    curl_fallback=curl_fallback,
+                )
 
     def import_file(
         self,
@@ -752,9 +1004,12 @@ class ModelManager:
         target_dir: Path | None = None,
         move: bool = False,
     ) -> Path:
-        """Verify a manually obtained file and install it atomically.
+        """Copy, verify and atomically install under the same locks as ensure.
 
-        The source is never deleted when verification fails.
+        With ``move=True``, delete the unchanged source only after installation.
+        A source initially aliasing the destination is retained. If source cleanup
+        fails or its identity/content metadata changed, raise ModelError reporting
+        partial success; the verified installed model and its marker remain intact.
         """
         spec = self.spec(model_id_or_spec) if isinstance(model_id_or_spec, str) else model_id_or_spec
         if spec.archive != "none":
@@ -764,29 +1019,61 @@ class ModelManager:
             )
         source = Path(source)
         directory = Path(target_dir) if target_dir is not None else self.target_dir(spec)
-        try:
-            size = source.stat().st_size
-            digests = self._hash_file(spec, source)
-        except OSError as exc:
-            raise ModelError(f"Cannot read {source} for model {spec.model_id}: {exc}", model_id=spec.model_id) from exc
-        problem = self._digest_problem(spec, size, digests)
-        if problem:
-            raise ModelIntegrityError(
-                f"File {source} does not match model {spec.model_id} ({problem}).",
-                model_id=spec.model_id, directory=directory,
-            )
-        directory.mkdir(parents=True, exist_ok=True)
+        with _thread_lock_for(self._destination_lock_key(spec, directory)):
+            directory.mkdir(parents=True, exist_ok=True)
+            with self._process_lock(spec, directory, None):
+                return self._import_file_locked(spec, source, directory, move=move)
+
+    @staticmethod
+    def _source_fingerprint(source: Path) -> tuple:
+        # lstat also detects replacement of a symlink pointing to the same inode.
+        return tuple(
+            (stat.st_dev, stat.st_ino, stat.st_size, stat.st_mtime_ns, stat.st_ctime_ns)
+            for stat in (source.lstat(), source.stat())
+        )
+
+    def _import_file_locked(
+        self, spec: ModelSpec, source: Path, directory: Path, *, move: bool,
+    ) -> Path:
         final = self.installed_path(spec, directory)
-        temp = directory / f".{_safe_token(spec.filename)}.{uuid.uuid4().hex}.importing"
         try:
-            if move:
-                shutil.move(str(source), str(temp))
-            else:
-                shutil.copy2(source, temp)
+            fingerprint = self._source_fingerprint(source) if move else None
+            aliases_final = source.samefile(final) if final.exists() else False
+        except OSError as exc:
+            raise ModelError(
+                f"Cannot read {source} for model {spec.model_id}: {exc}",
+                model_id=spec.model_id, directory=directory,
+            ) from exc
+        fd, name = tempfile.mkstemp(
+            prefix=f".{_safe_token(spec.filename)}.", suffix=".importing", dir=directory,
+        )
+        temp = Path(name)
+        try:
+            os.close(fd)
+            shutil.copy2(source, temp)
+            size = temp.stat().st_size
+            digests = self._hash_file(spec, temp)
+            problem = self._digest_problem(spec, size, digests)
+            if problem:
+                raise ModelIntegrityError(
+                    f"File {source} does not match model {spec.model_id} ({problem}).",
+                    model_id=spec.model_id, directory=directory,
+                )
             os.replace(temp, final)
         finally:
             temp.unlink(missing_ok=True)
         self._write_marker(spec, final, digests)
+        if move and not aliases_final:
+            try:
+                if self._source_fingerprint(source) != fingerprint or source.samefile(final):
+                    raise OSError("source changed during import; it was not removed")
+                source.unlink()
+            except OSError as exc:
+                raise ModelError(
+                    f"Model {spec.model_id} is installed and verified at {final}, but source "
+                    f"{source} could not be removed; move is incomplete: {exc}",
+                    model_id=spec.model_id, directory=directory,
+                ) from exc
         return final
 
     # -- messages ------------------------------------------------------------------
@@ -810,86 +1097,44 @@ class ModelManager:
 
     # -- locking ----------------------------------------------------------------------
 
-    def _lock_is_stale(self, lock: Path) -> bool:
-        try:
-            age = time.time() - lock.stat().st_mtime
-        except FileNotFoundError:
-            return True
-        except OSError:
-            return False
-        if age > self.stale_lock_seconds:
-            return True
-        if os.name != "posix":
-            # os.kill(pid, 0) would terminate the process on Windows.
-            return False
-        try:
-            payload = json.loads(lock.read_text(encoding="utf-8") or "{}")
-            pid = int(payload.get("pid", 0))
-        except (OSError, ValueError):
-            return False
-        if pid <= 0 or pid == os.getpid():
-            return False
-        try:
-            os.kill(pid, 0)
-        except ProcessLookupError:
-            return True
-        except OSError:
-            return False
-        return False
-
     @contextmanager
     def _process_lock(
         self, spec: ModelSpec, directory: Path, cancel_check: CancelCheck | None,
     ) -> Iterator[Callable[[], None]]:
         lock = directory / f".{_safe_token(spec.model_id)}{LOCK_SUFFIX}"
         deadline = time.monotonic() + self.lock_timeout
-        while True:
-            try:
-                fd = os.open(str(lock), os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o644)
-            except FileExistsError:
-                if self._lock_is_stale(lock):
-                    lock.unlink(missing_ok=True)
-                    continue
-                if _cancelled(cancel_check):
-                    raise self._cancelled_error(spec, directory) from None
-                if time.monotonic() >= deadline:
-                    raise ModelError(
-                        f"Timed out waiting for another download of model {spec.model_id} "
-                        f"(lock file {lock}). If no other Novel-formatter instance is running, "
-                        f"delete the lock file and retry.",
-                        model_id=spec.model_id, directory=directory,
-                    ) from None
-                time.sleep(0.1)
-                continue
-            try:
-                payload = {"pid": os.getpid(), "time": time.time(), "model_id": spec.model_id}
-                os.write(fd, json.dumps(payload).encode("utf-8"))
-            finally:
-                os.close(fd)
-            break
-
-        last_beat = time.monotonic()
-
-        def heartbeat() -> None:
-            nonlocal last_beat
-            now = time.monotonic()
-            if now - last_beat >= 5.0:
-                last_beat = now
-                try:
-                    os.utime(lock, None)
-                except OSError:
-                    pass
-
+        fd = os.open(str(lock), os.O_CREAT | os.O_RDWR, 0o600)
         try:
-            yield heartbeat
-        finally:
-            lock.unlink(missing_ok=True)
+            while True:
+                if _cancelled(cancel_check):
+                    raise self._cancelled_error(spec, directory)
+                try:
+                    if os.name == "nt":
+                        import msvcrt
+                        os.lseek(fd, 0, os.SEEK_SET)
+                        msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)
+                    else:
+                        import fcntl
+                        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    break
+                except OSError as exc:
+                    if exc.errno not in (errno.EACCES, errno.EAGAIN, errno.EDEADLK):
+                        raise
+                    if time.monotonic() >= deadline:
+                        raise ModelError(
+                            f"Timed out waiting for another download of model {spec.model_id} "
+                            f"after {self.lock_timeout:g} seconds (lock file {lock}). "
+                            f"Wait for the other instance to finish; do not delete the lock file.",
+                            model_id=spec.model_id, directory=directory,
+                        ) from exc
+                    time.sleep(0.1)
 
-    def _discard_corrupt(self, spec: ModelSpec, directory: Path) -> None:
-        path = self.installed_path(spec, directory)
-        if spec.archive == "none" and path.is_file():
-            path.unlink(missing_ok=True)
-            self._marker_path(path).unlink(missing_ok=True)
+            # Keep the callback contract; an OS-held lock needs no heartbeat.
+            yield lambda: None
+        finally:
+            # Closing (including process exit) releases the OS lock. Never unlink:
+            # replacing its inode would let another process acquire a different lock.
+            os.close(fd)
 
     # -- download --------------------------------------------------------------------
 
@@ -907,6 +1152,47 @@ class ModelManager:
         progress_callback: ProgressCallback | None,
         cancel_check: CancelCheck | None,
         heartbeat: Callable[[], None],
+        *,
+        curl_fallback: bool = False,
+    ) -> Path:
+        reported = 0
+
+        def report(done: int, total: int | None) -> None:
+            nonlocal reported
+            reported = max(reported, int(done))
+            if progress_callback is not None:
+                progress_callback(reported, total)
+
+        try:
+            return self._download_attempts(spec, directory, report, cancel_check, heartbeat)
+        except (ModelNetworkError, ModelDownloadError) as primary:
+            if _cancelled(cancel_check):
+                raise self._cancelled_error(spec, directory) from primary
+            if not curl_fallback or (
+                isinstance(primary, ModelDownloadError) and primary.status is None
+            ):
+                raise
+            part = directory / (spec.filename + PART_SUFFIX)
+            try:
+                return self._download_attempts(
+                    spec, directory, report, cancel_check, heartbeat,
+                    use_curl=True,
+                )
+            except (ModelCancelledError, ModelIntegrityError):
+                raise
+            except ModelError as fallback:
+                raise type(fallback)(
+                    f"{fallback} Python HTTPS failure: {primary}",
+                    model_id=spec.model_id, url=fallback.url or spec.primary_url,
+                    directory=directory,
+                ) from primary
+            finally:
+                # Curl attempts never resume, including after cancellation or timeout.
+                part.unlink(missing_ok=True)
+
+    def _download_attempts(
+        self, spec, directory, progress_callback, cancel_check, heartbeat,
+        *, use_curl=False,
     ) -> Path:
         part = directory / (spec.filename + PART_SUFFIX)
         downloaded_file = directory / spec.filename
@@ -927,14 +1213,16 @@ class ModelManager:
         last_http_url = ""
         last_network: BaseException | None = None
         last_was_http = False
-        integrity: tuple[str, str] | None = None
         for url in spec.urls:
-            for attempt in range(self.retries + 1):
+            for attempt in range(1 if use_curl else self.retries + 1):
                 if attempt:
                     self._sleep_backoff(attempt, spec, directory, cancel_check)
                 try:
-                    digests, size = self._fetch(spec, url, part, directory, report, cancel_check, heartbeat)
-                except ModelCancelledError:
+                    digests, size = self._fetch(
+                        spec, url, part, directory, report, cancel_check, heartbeat,
+                        use_curl=use_curl,
+                    )
+                except (ModelCancelledError, ModelIntegrityError):
                     part.unlink(missing_ok=True)
                     raise
                 except _HTTPStatusError as exc:
@@ -950,8 +1238,12 @@ class ModelManager:
                 problem = self._digest_problem(spec, size, digests)
                 if problem:
                     part.unlink(missing_ok=True)
-                    integrity = (url, problem)
-                    break
+                    raise ModelIntegrityError(
+                        f"Downloaded file for model {spec.model_id} from {url} failed verification "
+                        f"({problem}); the file was deleted. Download it manually "
+                        f"from {spec.primary_url} and place it in {directory}.",
+                        model_id=spec.model_id, url=url, directory=directory,
+                    )
                 os.replace(part, downloaded_file)
                 if spec.archive == "none":
                     self._write_marker(spec, downloaded_file, digests)
@@ -959,14 +1251,6 @@ class ModelManager:
                 return self._extract(spec, downloaded_file, directory, url)
 
         primary = spec.primary_url
-        if integrity is not None:
-            url, problem = integrity
-            raise ModelIntegrityError(
-                f"Downloaded file for model {spec.model_id} from {url} failed verification ({problem}); "
-                f"the file was deleted. Retry the download; if it keeps failing, download it manually "
-                f"from {primary} and place it in {directory}.",
-                model_id=spec.model_id, url=url, directory=directory,
-            )
         tried = "; ".join(attempts)
         if last_http is not None and (last_was_http or last_network is None):
             raise ModelDownloadError(
@@ -975,8 +1259,13 @@ class ModelManager:
                 f"in {directory}, or set a local models folder in Settings. (Attempts: {tried})",
                 status=last_http.status, model_id=spec.model_id, url=last_http_url, directory=directory,
             )
+        reason = (
+            f"request timed out (timeout {self.timeout:g} seconds)"
+            if isinstance(last_network, _TransientTimeout)
+            else "no network connection"
+        )
         raise ModelNetworkError(
-            f"Cannot download model {spec.model_id}: no network connection. Download it manually from "
+            f"Cannot download model {spec.model_id}: {reason}. Download it manually from "
             f"{primary} and place it in {directory}, or set a local models folder in Settings. "
             f"(Last error: {last_network or 'unknown error'})",
             model_id=spec.model_id, url=primary, directory=directory,
@@ -991,13 +1280,35 @@ class ModelManager:
         report: Callable[[int, "int | None"], None],
         cancel_check: CancelCheck | None,
         heartbeat: Callable[[], None],
+        *,
+        use_curl: bool = False,
     ) -> tuple[dict[str, str], int]:
         if _cancelled(cancel_check):
             raise self._cancelled_error(spec, directory, url)
-        offset = part.stat().st_size if part.exists() else 0
-        if spec.size is not None and offset > spec.size:
+        try:
+            _validate_download_url(url)
+            if use_curl and urllib.parse.urlsplit(url).scheme != "https":
+                raise _UnsafeDownloadURL("system curl requires HTTPS")
+        except ValueError as exc:
+            raise ModelDownloadError(
+                f"Cannot download model {spec.model_id}: unsafe URL {url} ({exc}).",
+                model_id=spec.model_id, url=url, directory=directory,
+            ) from exc
+        limit = spec.size if spec.size is not None else self.max_download_bytes
+
+        def check_size(size: int) -> None:
+            if size > limit:
+                raise ModelIntegrityError(
+                    f"Download of model {spec.model_id} exceeds the limit of {limit} bytes "
+                    f"({size} bytes including any resumed data); the partial file was deleted. "
+                    f"Download it manually from {spec.primary_url} and place it in {directory}.",
+                    model_id=spec.model_id, url=url, directory=directory,
+                )
+
+        if use_curl:
             part.unlink(missing_ok=True)
-            offset = 0
+        offset = part.stat().st_size if part.exists() else 0
+        check_size(offset)
         if spec.size is not None and offset and offset == spec.size:
             hashers = self._new_hashers(spec)
             self._hash_into(part, hashers)
@@ -1008,59 +1319,111 @@ class ModelManager:
         if offset:
             headers.update({"Range": f"bytes={offset}-"})
         request = urllib.request.Request(url, headers=headers)
+
+        def check_cancel() -> None:
+            if _cancelled(cancel_check):
+                raise self._cancelled_error(spec, directory, url)
+
         try:
-            response = self._open(request, timeout=self.timeout)
+            if use_curl:
+                response = _CurlResponse(
+                    url, timeout=self.timeout, check_cancel=check_cancel,
+                    context=dict(model_id=spec.model_id, url=url, directory=directory),
+                )
+            else:
+                response = self._open(request, timeout=self.timeout)
         except urllib.error.HTTPError as exc:
             if exc.code == 416 and offset:
                 part.unlink(missing_ok=True)
                 raise _TransientError("server rejected the resume range; restarting") from exc
             raise _HTTPStatusError(exc.code, str(exc.reason or "")) from exc
+        except _UnsafeDownloadURL as exc:
+            raise ModelDownloadError(
+                f"Cannot download model {spec.model_id}: unsafe redirect from {url} ({exc}).",
+                model_id=spec.model_id, url=url, directory=directory,
+            ) from exc
         except (urllib.error.URLError, OSError, http.client.HTTPException, ValueError) as exc:
             reason = getattr(exc, "reason", exc)
-            raise _TransientError(f"{type(reason).__name__}: {reason}") from exc
+            error_type = _TransientTimeout if isinstance(reason, TimeoutError) else _TransientError
+            raise error_type(f"{type(reason).__name__}: {reason}") from exc
 
         with response:
             status = int(getattr(response, "status", 200) or 200)
             if status >= 400:
                 raise _HTTPStatusError(status)
-            if offset and status != 206:
+            range_end: int | None = None
+            content_range = str(response.headers.get("Content-Range") or "")
+
+            def reject_range() -> None:
+                raise ModelIntegrityError(
+                    f"Download of model {spec.model_id} has an invalid Content-Range "
+                    f"({content_range!r}, requested offset {offset}); the partial file was deleted. "
+                    f"Download it manually from {spec.primary_url} and place it in {directory}.",
+                    model_id=spec.model_id, url=url, directory=directory,
+                )
+
+            if status == 206:
+                match = re.fullmatch(r"bytes (\d+)-(\d+)/(\d+|\*)", content_range.strip())
+                if match is None:
+                    reject_range()
+                start, range_end = int(match.group(1)), int(match.group(2))
+                if start != offset or start > range_end:
+                    reject_range()
+                if match.group(3) != "*" and range_end >= int(match.group(3)):
+                    reject_range()
+                length = response.headers.get("Content-Length")
+                if length is not None:
+                    try:
+                        response_length = int(length)
+                    except (TypeError, ValueError):
+                        reject_range()
+                    if response_length != range_end - start + 1:
+                        reject_range()
+            elif offset:
                 # Server ignored Range: restart instead of appending a second copy.
                 offset = 0
             mode = "ab" if offset else "wb"
             total = _response_total(response, offset)
             if total is None:
                 total = spec.size
+            if total is not None:
+                check_size(total)
             hashers = self._new_hashers(spec)
             if offset:
                 self._hash_into(part, hashers)
             downloaded = offset
             report(downloaded, total)
             with part.open(mode) as output:
-                while True:
-                    if _cancelled(cancel_check):
-                        raise self._cancelled_error(spec, directory, url)
-                    try:
-                        chunk = response.read(self.chunk_size)
-                    except http.client.IncompleteRead as exc:
-                        if exc.partial:
-                            output.write(exc.partial)
-                            for hasher in hashers.values():
-                                hasher.update(exc.partial)
-                            downloaded += len(exc.partial)
-                            report(downloaded, total)
-                        raise _TransientError(f"connection closed after {downloaded} bytes") from exc
-                    except (OSError, http.client.HTTPException, ValueError) as exc:
-                        raise _TransientError(f"{type(exc).__name__}: {exc}") from exc
-                    if not chunk:
-                        break
+                def write_chunk(chunk: bytes) -> None:
+                    nonlocal downloaded
+                    check_size(downloaded + len(chunk))
+                    if range_end is not None and downloaded + len(chunk) > range_end + 1:
+                        reject_range()
                     output.write(chunk)
                     for hasher in hashers.values():
                         hasher.update(chunk)
                     downloaded += len(chunk)
                     report(downloaded, total)
+
+                while True:
+                    if _cancelled(cancel_check):
+                        raise self._cancelled_error(spec, directory, url)
+                    try:
+                        chunk = response.read(min(self.chunk_size, limit - downloaded + 1))
+                    except http.client.IncompleteRead as exc:
+                        if exc.partial:
+                            write_chunk(exc.partial)
+                        raise _TransientError(f"connection closed after {downloaded} bytes") from exc
+                    except (OSError, http.client.HTTPException, ValueError) as exc:
+                        error_type = _TransientTimeout if isinstance(exc, TimeoutError) else _TransientError
+                        raise error_type(f"{type(exc).__name__}: {exc}") from exc
+                    if not chunk:
+                        break
+                    write_chunk(chunk)
                     heartbeat()
-            if total is not None and downloaded < total:
-                raise _TransientError(f"connection closed after {downloaded} of {total} bytes")
+            expected = max(total or 0, range_end + 1 if range_end is not None else 0)
+            if expected > downloaded and not use_curl:
+                raise _TransientError(f"connection closed after {downloaded} of {expected} bytes")
         return {name: h.hexdigest() for name, h in hashers.items()}, downloaded
 
     # -- extraction -------------------------------------------------------------------

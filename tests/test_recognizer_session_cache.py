@@ -238,3 +238,320 @@ def test_cancel_with_dead_worker_or_opt_out_reloads():
     with cache.lease(KEY_A, loader) as reloaded:
         assert reloaded is not opted_out
     assert calls == ["d", "d", "d"]
+
+
+def _start_lease_client(cache, loader, **kwargs):
+    entered = threading.Event()
+    done = threading.Event()
+    errors = []
+
+    def run():
+        try:
+            with cache.lease(KEY_A, loader, **kwargs):
+                entered.set()
+        except BaseException as exc:
+            errors.append(exc)
+        finally:
+            done.set()
+
+    thread = threading.Thread(target=run, daemon=True)
+    thread.start()
+    from types import SimpleNamespace
+
+    return SimpleNamespace(thread=thread, entered=entered, done=done, errors=errors)
+
+
+def _join_client(client):
+    client.thread.join(timeout=5)
+    assert not client.thread.is_alive(), "lease client did not terminate"
+
+
+def _assert_cancelled_client(client):
+    from core.ocr_runtime_optimizer import OcrCancelled
+
+    assert client.done.wait(3), "cancelled lease client remained blocked"
+    assert not client.entered.is_set(), "cancelled client entered the lease body"
+    assert len(client.errors) == 1
+    error, = client.errors
+    assert isinstance(error, OcrCancelled)
+
+
+class _ObservedLeaseLock:
+    def __init__(self, lock, waiting, on_acquire=None):
+        self.lock = lock
+        self.waiting = waiting
+        self.on_acquire = on_acquire
+
+    def acquire(self, *args, **kwargs):
+        self.waiting.set()
+        acquired = self.lock.acquire(*args, **kwargs)
+        if acquired and self.on_acquire is not None:
+            self.on_acquire()
+        return acquired
+
+    def release(self):
+        self.lock.release()
+
+    def locked(self):
+        return self.lock.locked()
+
+
+@pytest.mark.parametrize("capacity", (0, 2))
+def test_cancel_before_loader_never_enters_lease(capacity):
+    from core.ocr_runtime_optimizer import OcrCancelled
+
+    closed, calls = [], []
+    cache = RecognizerSessionCache(capacity)
+    cancelled = threading.Event()
+    cancelled.set()
+    try:
+        with pytest.raises(OcrCancelled):
+            with cache.lease(
+                KEY_A, make_loader("unused", closed, calls),
+                cancel_check=cancelled.is_set,
+            ):
+                pytest.fail("cancelled client entered the lease body")
+        assert calls == []
+        assert cache.keys() == []
+    finally:
+        cache.clear()
+
+
+def test_cancel_waiting_for_ready_does_not_interrupt_loader(monkeypatch):
+    closed, calls = [], []
+    cache = RecognizerSessionCache(2)
+    loading = threading.Event()
+    release_loader = threading.Event()
+    waiting = threading.Event()
+    cancelled = threading.Event()
+
+    def loader():
+        calls.append("shared")
+        loading.set()
+        assert release_loader.wait(5), "test did not release loader"
+        return FakeSession("shared", closed)
+
+    owner = _start_lease_client(cache, loader)
+    waiter = None
+    try:
+        assert loading.wait(3)
+        entry = cache._entries[KEY_A]
+        original_wait = entry.ready.wait
+
+        def observed_wait(timeout=None):
+            waiting.set()
+            return original_wait(timeout)
+
+        monkeypatch.setattr(entry.ready, "wait", observed_wait)
+        waiter = _start_lease_client(cache, loader, cancel_check=cancelled.is_set)
+        assert waiting.wait(3)
+        cancelled.set()
+        _assert_cancelled_client(waiter)
+        assert not owner.done.is_set()
+        assert closed == []
+    finally:
+        release_loader.set()
+        _join_client(owner)
+        if waiter is not None:
+            _join_client(waiter)
+        cache.clear()
+    assert owner.entered.is_set()
+    assert owner.errors == []
+    assert calls == ["shared"]
+    assert closed == ["shared"]
+
+
+def test_cancel_waiting_for_busy_session_preserves_other_client():
+    closed, calls = [], []
+    cache = RecognizerSessionCache(2)
+    loader = make_loader("shared", closed, calls)
+    cancelled = threading.Event()
+    waiting = threading.Event()
+    waiter = None
+    try:
+        with cache.lease(KEY_A, loader) as held:
+            entry = cache._entries[KEY_A]
+            entry.lease_lock = _ObservedLeaseLock(entry.lease_lock, waiting)
+            waiter = _start_lease_client(cache, loader, cancel_check=cancelled.is_set)
+            assert waiting.wait(3)
+            cancelled.set()
+            _assert_cancelled_client(waiter)
+            assert entry.session is held
+            assert closed == []
+        with cache.lease(KEY_A, loader) as reused:
+            assert reused is held
+        assert calls == ["shared"]
+    finally:
+        if waiter is not None:
+            _join_client(waiter)
+        cache.clear()
+
+
+@pytest.mark.parametrize("checkpoint", ["lock", "rebind", "loader"])
+def test_cancel_before_yield_releases_lease_without_discarding(checkpoint):
+    from core.ocr_runtime_optimizer import OcrCancelled
+
+    closed, calls = [], []
+    cache = RecognizerSessionCache(2)
+    cancelled = threading.Event()
+    loader = make_loader("shared", closed, calls)
+    first = None
+    if checkpoint != "loader":
+        first = cache.get(KEY_A, loader)
+    if checkpoint == "lock":
+        entry = cache._entries[KEY_A]
+        entry.lease_lock = _ObservedLeaseLock(
+            entry.lease_lock, threading.Event(), cancelled.set,
+        )
+
+    def loading():
+        session = loader()
+        cancelled.set()
+        return session
+
+    try:
+        with pytest.raises(OcrCancelled):
+            with cache.lease(
+                KEY_A, loading if checkpoint == "loader" else loader,
+                cancel_check=cancelled.is_set,
+                rebind=(lambda session: cancelled.set()) if checkpoint == "rebind" else None,
+            ):
+                pytest.fail("cancelled client entered the lease body")
+        assert closed == []
+        assert not cache._entries[KEY_A].lease_lock.locked()
+        with cache.lease(KEY_A, loader) as reused:
+            if first is not None:
+                assert reused is first
+        assert calls == ["shared"]
+    finally:
+        cache.clear()
+
+
+@pytest.mark.parametrize("outcome", ("failure", "invalidate"))
+def test_loader_completion_and_invalidation_wake_waiters(monkeypatch, outcome):
+    from core.ocr_runtime_optimizer import OcrCancelled
+
+    cache = RecognizerSessionCache(2)
+    closed, calls = [], []
+    loading = threading.Event()
+    release_loader = threading.Event()
+    waiting = threading.Event()
+    cleared = threading.Event()
+    clear_results = []
+    clear_errors = []
+    failure = ValueError("loader failed")
+
+    def loader():
+        calls.append("pending")
+        loading.set()
+        assert release_loader.wait(5), "test did not release loader"
+        if outcome == "failure":
+            raise failure
+        return FakeSession("pending", closed)
+
+    def clear():
+        try:
+            clear_results.append(cache.clear())
+        except BaseException as exc:
+            clear_errors.append(exc)
+        finally:
+            cleared.set()
+
+    owner = _start_lease_client(cache, loader)
+    waiter = None
+    clearing = None
+    try:
+        assert loading.wait(3)
+        entry = cache._entries[KEY_A]
+        original_wait = entry.ready.wait
+
+        def observed_wait(timeout=None):
+            waiting.set()
+            return original_wait(timeout)
+
+        monkeypatch.setattr(entry.ready, "wait", observed_wait)
+        waiter = _start_lease_client(cache, loader)
+        assert waiting.wait(3)
+        if outcome == "invalidate":
+            clearing = threading.Thread(target=clear, daemon=True)
+            clearing.start()
+            assert cleared.wait(3), "clear waited for a non-cooperative loader"
+            assert clear_errors == []
+            assert clear_results == list((1,))
+            _assert_cancelled_client(waiter)
+            assert not owner.done.is_set()
+            assert closed == []
+        release_loader.set()
+        assert owner.done.wait(3)
+        assert waiter.done.wait(3)
+        for client in (owner, waiter):
+            assert not client.entered.is_set()
+            error, = client.errors
+            if outcome == "failure":
+                assert error is failure
+            else:
+                assert isinstance(error, OcrCancelled)
+        assert cache.keys() == []
+        assert closed == (["pending"] if outcome == "invalidate" else [])
+        with cache.lease(KEY_A, make_loader("fresh", closed, calls)) as fresh:
+            assert fresh.name == "fresh"
+        assert calls == ["pending", "fresh"]
+    finally:
+        release_loader.set()
+        _join_client(owner)
+        if waiter is not None:
+            _join_client(waiter)
+        if clearing is not None:
+            clearing.join(timeout=5)
+            assert not clearing.is_alive()
+        cache.clear()
+
+
+def test_nested_cancel_does_not_release_outer_lease():
+    from core.ocr_runtime_optimizer import OcrCancelled
+
+    closed, calls = [], []
+    cache = RecognizerSessionCache(2)
+    loader = make_loader("nested", closed, calls)
+    cancelled = threading.Event()
+    try:
+        with cache.lease(KEY_A, loader) as outer:
+            cancelled.set()
+            with pytest.raises(OcrCancelled):
+                with cache.lease(KEY_A, loader, cancel_check=cancelled.is_set):
+                    pytest.fail("cancelled nested client entered the lease body")
+            entry = cache._entries[KEY_A]
+            assert entry.owner == threading.get_ident()
+            assert entry.depth == 1
+            assert entry.lease_lock.locked()
+            assert entry.session is outer
+            assert closed == []
+        with cache.lease(KEY_A, loader) as reused:
+            assert reused is outer
+    finally:
+        cache.clear()
+
+
+@pytest.mark.parametrize("checkpoint", ("loader", "rebind"))
+def test_uncached_cancel_after_loading_closes_owned_session(checkpoint):
+    from core.ocr_runtime_optimizer import OcrCancelled
+
+    closed, calls = [], []
+    cache = RecognizerSessionCache(0)
+    cancelled = threading.Event()
+
+    def loader():
+        calls.append("uncached")
+        if checkpoint == "loader":
+            cancelled.set()
+        return FakeSession("uncached", closed)
+
+    with pytest.raises(OcrCancelled):
+        with cache.lease(
+            KEY_A, loader, cancel_check=cancelled.is_set,
+            rebind=(lambda session: cancelled.set()) if checkpoint == "rebind" else None,
+        ):
+            pytest.fail("cancelled uncached client entered the lease body")
+    assert closed == ["uncached"]
+    assert calls == ["uncached"]
+    assert cache.keys() == []

@@ -13,6 +13,7 @@ import re
 import sys
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parent.parent
 for extra in (ROOT, ROOT / "tools"):
@@ -39,6 +40,85 @@ def _report(findings) -> str:
     if len(findings) > 25:
         lines.append(f"... and {len(findings) - 25} more")
     return "\n".join(lines)
+
+
+class LiteralCollectionTest(unittest.TestCase):
+    def collect(self, source: str) -> list[tuple[str, str]]:
+        collector = i18n_audit._Collector()
+        collector.visit(ast.parse(source))
+        return [(raw, sample) for _line, raw, sample in collector.items]
+
+    def test_mixed_cjk_and_latin_literal_is_collected(self) -> None:
+        self.assertEqual(
+            self.collect('label.setText("OCR processing status: 等待")'),
+            [("OCR processing status: 等待", "OCR processing status: 等待")],
+        )
+
+    def test_fstring_collects_chrome_without_payload_keys(self) -> None:
+        self.assertEqual(
+            self.collect("""label.setText(f"OCR 正文：{book['正文']} · {path}")"""),
+            [("OCR 正文：{…} · {…}", "OCR 正文：1 · 1")],
+        )
+
+    def test_concatenation_is_collected_as_one_template(self) -> None:
+        self.assertEqual(
+            self.collect("""label.setText("OCR 正文：" + book["正文"] + f" · 共 {count} 页")"""),
+            [("OCR 正文：{…} · 共 {…} 页", "OCR 正文：1 · 共 1 页")],
+        )
+
+    def test_concatenation_keeps_conditional_literal_branches(self) -> None:
+        items = self.collect(
+            """label.setText("OCR 状态：" + ("等待" if pending else "完成"))"""
+        )
+        raw_texts = {raw for raw, _sample in items}
+        self.assertIn("等待", raw_texts)
+        self.assertIn("完成", raw_texts)
+
+    def test_non_display_contexts_are_skipped(self) -> None:
+        self.assertEqual(
+            self.collect(
+                """widget.setObjectName("正文标识")
+settings.setValue("正文路径", "书籍/正文.txt")
+print(f"内部调试：{path}")
+if kind == "正文":
+    pass
+"""
+            ),
+            [],
+        )
+
+
+class TranslationCompletenessTest(unittest.TestCase):
+    def test_partial_translation_does_not_pass_ui_audit(self) -> None:
+        with patch("ui.dialog_localization.translate_dialog_text", return_value="OCR status: 等待"):
+            with patch("ui.localization.translate_text", return_value="OCR status: 等待"):
+                check = i18n_audit._translators()
+                self.assertFalse(check("OCR 状态：等待", "OCR 状态：等待"))
+
+    def test_complete_translation_passes_ui_audit(self) -> None:
+        with patch("ui.dialog_localization.translate_dialog_text", side_effect=lambda text, language: text):
+            with patch("ui.localization.translate_text", return_value="OCR status: waiting"):
+                check = i18n_audit._translators()
+                self.assertTrue(check("OCR 状态：等待", "OCR 状态：等待"))
+
+
+    def test_known_book_syntax_is_not_untranslated_chrome(self) -> None:
+        source = "恢复｜漢字《よみ》ruby标注"
+        self.assertTrue(i18n_audit._translators()(source, source))
+
+    def test_book_syntax_exemption_does_not_hide_untranslated_chrome(self) -> None:
+        source = "恢复｜漢字《よみ》ruby标注"
+        rendered = "Restore ｜漢字《よみ》 标注"
+        with patch("ui.dialog_localization.translate_dialog_text", return_value=rendered):
+            with patch("ui.localization.translate_text", return_value=rendered):
+                self.assertFalse(i18n_audit._translators()(source, source))
+
+    def test_book_syntax_exemption_is_limited_to_known_descriptions(self) -> None:
+        source = "新的｜漢字《よみ》提示"
+        rendered = "New ｜漢字《よみ》 hint"
+        with patch("ui.dialog_localization.translate_dialog_text", return_value=rendered):
+            with patch("ui.localization.translate_text", return_value=rendered):
+                self.assertFalse(i18n_audit._translators()(source, source))
 
 
 class UiAuditTest(unittest.TestCase):

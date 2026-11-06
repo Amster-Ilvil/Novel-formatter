@@ -2942,6 +2942,9 @@ _PATTERNS = {
         (re.compile(r"^单 OCR：已载入\s*·\s*(.+)$"), lambda m: f"Single OCR: loaded · {m.group(1)}"),
         (re.compile(r"^查看AI修改（(\d+)）$"), lambda m: f"View AI Changes ({m.group(1)})"),
         (re.compile(r"^查看AI修改（采用(\d+) / 拦截(\d+)）$"), lambda m: f"View AI Changes (accepted {m.group(1)} / blocked {m.group(2)})"),
+        # The suffix is book text, even when it matches an exact UI entry.
+        (re.compile(r"^〔待裁决〕(.*)\Z", re.S), lambda m: f"[Awaiting adjudication]{m.group(1)}"),
+        (re.compile(r"^当前句：(\d+)/(\d+) · 人工编辑 · 已确定\Z"), lambda m: f"Current sentence: {m.group(1)}/{m.group(2)} · manually edited · confirmed"),
         (re.compile(r"^当前句：(.+)$"), lambda m: f"Current sentence: {m.group(1)}"),
     ],
     LANG_JA: [
@@ -2962,6 +2965,9 @@ _PATTERNS = {
         (re.compile(r"^单 OCR：已载入\s*·\s*(.+)$"), lambda m: f"単一OCR：読込済み · {m.group(1)}"),
         (re.compile(r"^查看AI修改（(\d+)）$"), lambda m: f"AI変更を表示（{m.group(1)}）"),
         (re.compile(r"^查看AI修改（采用(\d+) / 拦截(\d+)）$"), lambda m: f"AI変更を表示（採用 {m.group(1)} / ブロック {m.group(2)}）"),
+        # The suffix is book text, even when it matches an exact UI entry.
+        (re.compile(r"^〔待裁决〕(.*)\Z", re.S), lambda m: f"〔裁決待ち〕{m.group(1)}"),
+        (re.compile(r"^当前句：(\d+)/(\d+) · 人工编辑 · 已确定\Z"), lambda m: f"現在の文：{m.group(1)}/{m.group(2)} · 手動編集 · 確定済み"),
         (re.compile(r"^当前句：(.+)$"), lambda m: f"現在文：{m.group(1)}"),
     ],
 }
@@ -3220,6 +3226,7 @@ _PATTERNS[LANG_EN].extend([
     (re.compile(r"^(.+)：准备中$"), lambda m: f"{_catalog_fragment(m.group(1), LANG_EN)}: preparing"),
     (re.compile(r"^✓ 已读取 (\d+) 个可用模型，可从下拉框选择；也可以手动输入。$"), lambda m: f"✓ Loaded {m.group(1)} available model(s). Select from the list or enter one manually."),
     (re.compile(r"^模型列表读取失败：(.*)。仍可在下拉框中手动填写模型名称。$"), lambda m: f"Failed to load model list: {m.group(1)}. You can still enter a model name manually."),
+    (re.compile(r"^✓ 连接成功：(.*)；AI 图文模式还建议点“测试图片能力”。\Z"), lambda m: f"✓ Connection succeeded: {m.group(1)}; for AI image/text mode, also use “Test Image Capability”."),
     (re.compile(r"^✓ 连接成功：(.*)$"), lambda m: f"✓ Connection succeeded: {m.group(1)}"),
     (re.compile(r"^正在执行：(.*)$"), lambda m: f"Running: {_catalog_fragment(m.group(1), LANG_EN)}"),
     (re.compile(r"^(.+)正在处理$"), lambda m: f"{_catalog_fragment(m.group(1), LANG_EN)} in progress"),
@@ -3274,6 +3281,7 @@ _PATTERNS[LANG_JA].extend([
     (re.compile(r"^(.+)：准备中$"), lambda m: f"{_catalog_fragment(m.group(1), LANG_JA)}：準備中"),
     (re.compile(r"^✓ 已读取 (\d+) 个可用模型，可从下拉框选择；也可以手动输入。$"), lambda m: f"✓ 利用可能なモデルを {m.group(1)} 件読み込みました。リストから選択するか手動入力できます。"),
     (re.compile(r"^模型列表读取失败：(.*)。仍可在下拉框中手动填写模型名称。$"), lambda m: f"モデル一覧の読込に失敗：{m.group(1)}。モデル名は引き続き手動入力できます。"),
+    (re.compile(r"^✓ 连接成功：(.*)；AI 图文模式还建议点“测试图片能力”。\Z"), lambda m: f"✓ 接続成功：{m.group(1)}。AI画像・本文モードでは「画像能力をテスト」も実行してください。"),
     (re.compile(r"^✓ 连接成功：(.*)$"), lambda m: f"✓ 接続成功：{m.group(1)}"),
     (re.compile(r"^正在执行：(.*)$"), lambda m: f"実行中：{_catalog_fragment(m.group(1), LANG_JA)}"),
     (re.compile(r"^(.+)正在处理$"), lambda m: f"{_catalog_fragment(m.group(1), LANG_JA)}処理中"),

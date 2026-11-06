@@ -19,7 +19,7 @@ from PySide6.QtCore import QObject, Qt, Signal
 from PySide6.QtWidgets import QProgressDialog, QWidget
 
 from ui.localization import translate_text
-from ui.localized_dialogs import LocalizedMessageBox, current_ui_language
+from ui.localized_dialogs import LocalizedMessageBox, current_ui_language, ui_message
 from utils.model_manager import (
     ModelCancelledError,
     ModelError,
@@ -131,6 +131,7 @@ def ensure_models_in_background(
 
     def on_failed(message: str) -> None:
         release()
+        message = ui_message("model_download.failed.body", details=message)
         emit_log(f"{_tr('模型下载失败')}: {message}")
         LocalizedMessageBox.critical(parent, _tr("模型下载失败"), message)
 

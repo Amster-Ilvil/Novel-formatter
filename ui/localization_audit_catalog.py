@@ -15,6 +15,279 @@ from __future__ import annotations
 
 AUDIT_CATALOG: dict[str, tuple[str, str | None]] = {}
 
+# Review regressions: lazy workspaces and dynamic EPUB/OCR controls.
+AUDIT_CATALOG.update({
+    "↕ 横排": ("↕ Horizontal", "↕ 横書き"),
+    "↕ 竖排": ("↕ Vertical", "↕ 縦書き"),
+    "🧾 未选择正文": ("🧾 No body text selected", "🧾 本文未選択"),
+    "清空EPUB": ("Clear EPUB", "EPUBをクリア"),
+    "清空OCR": ("Clear OCR", "OCRをクリア"),
+    "清除当前{…}工作区，不影响磁盘上的原始文件": (
+        "Clear the current {…} workspace without affecting original files on disk",
+        "現在の{…}ワークスペースをクリアします。ディスク上の元ファイルには影響しません",
+    ),
+    "✓   不调用任何 OCR 模型": ("✓   No OCR model is used", "✓   OCRモデルを使用しません"),
+    "✓   按位置自动跳过页码": ("✓   Skip page numbers by position", "✓   位置に基づいてページ番号を自動的に除外"),
+    "✓   按字号自动跳过振假名": ("✓   Skip ruby by font size", "✓   文字サイズに基づいてルビを自動的に除外"),
+    "页面管理：无法开始 · 页面管理当前不是原始 PDF 来源（可能已删除/预处理为图片）": (
+        "Page Manager: cannot start · the current source is not an original PDF (it may have been deleted or preprocessed into images)",
+        "ページ管理：開始できません · 現在のソースは元のPDFではありません（削除済み、または画像に前処理された可能性があります）",
+    ),
+    "确认裁决": ("Confirm Adjudication", "裁決を確定"),
+})
+
+# Complete messages previously hidden by partial prefix/suffix translations.
+AUDIT_CATALOG.update({
+    "EPUB 已从启动任务时的独立正文快照生成：\n{…}\n构建期间当前正文已经切换，因此未把旧包预览安装到新书工作区。": (
+        "The EPUB was generated from an independent snapshot of the body text taken when the task started:\n{…}\nThe active body text changed during the build, so the old package preview was not installed into the new-book workspace.",
+        "タスク開始時の独立した本文スナップショットからEPUBを生成しました：\n{…}\nビルド中に現在の本文が切り替わったため、以前のパッケージのプレビューは新しい書籍のワークスペースに反映していません。",
+    ),
+    "列级救援：每列最多一种自适应路径": (
+        "Column recovery: at most one adaptive path per column",
+        "列単位の復旧：各列につき最大1つの適応型経路",
+    ),
+    "列级救援：关闭，疑难列直接进入人工复核": (
+        "Column recovery: off; difficult columns go directly to manual review",
+        "列単位の復旧：無効。難しい列は直接手動確認へ送ります",
+    ),
+    "列级救援：兼容旧版完整多轮恢复链": (
+        "Column recovery: legacy full multi-pass recovery chain",
+        "列単位の復旧：旧版互換の完全な複数回復旧チェーン",
+    ),
+    "候选页 {…}，ROI {…}，检测窗 {…}/{…}，后端 {…}": (
+        "Candidate page {…}, ROI {…}, detection window {…}/{…}, backend {…}",
+        "候補ページ {…}、ROI {…}、検出ウィンドウ {…}/{…}、バックエンド {…}",
+    ),
+    "⚠️ OCR 疑点：待人工确认 {…} 列 · 高风险 {…} 列 · 候选未自动改字": (
+        "⚠️ OCR concerns: {…} column(s) awaiting manual confirmation · {…} high-risk column(s) · candidate text was not changed automatically",
+        "⚠️ OCRの疑問点：手動確認待ち {…} 列 · 高リスク {…} 列 · 候補の文字は自動変更していません",
+    ),
+    "几何校正 {…} 页": (
+        "Geometry correction: {…} page(s)",
+        "幾何補正 {…} ページ",
+    ),
+    "漂白/去阴影 {…} 页": (
+        "Whitening/shadow removal: {…} page(s)",
+        "白色化・影除去 {…} ページ",
+    ),
+    "📑 页面管理：应用 {…} 个已确认页类型；非正文跳过 {…} 页": (
+        "📑 Page Manager: applied {…} confirmed page type(s); skipped {…} non-body page(s)",
+        "📑 ページ管理：確認済みページ種別を {…} 件適用。本文以外の {…} ページをスキップ",
+    ),
+    "📑 页面管理：应用 {…} 个已确认页类型；非正文跳过 {…} 页{…}": (
+        "📑 Page Manager: applied {…} confirmed page type(s); skipped {…} non-body page(s){…}",
+        "📑 ページ管理：確認済みページ種別を {…} 件適用。本文以外の {…} ページをスキップ{…}",
+    ),
+    "\n✅ 完成: {…} 物理页 → {…} 逻辑页；自动拆分 {…} 页；页面管理跳过 {…} 页；{…} 个块，{…} 章节": (
+        "\n✅ Complete: {…} physical pages → {…} logical pages; {…} pages split automatically; {…} pages skipped by Page Manager; {…} blocks, {…} chapters",
+        "\n✅ 完了: 物理ページ {…} → 論理ページ {…}。自動分割 {…} ページ。ページ管理で {…} ページをスキップ。{…} ブロック、{…} 章",
+    ),
+    "确认清理日志": (
+        "Confirm Log Cleanup",
+        "ログの整理を確認",
+    ),
+    "将保留最近 {…} 条运行记录，删除更旧的 JSON / 文本日志 / 性能明细。\n\n继续吗？": (
+        "Keep the latest {…} run records and delete older JSON files, text logs and performance details.\n\nContinue?",
+        "最新の実行記録 {…} 件を保持し、それ以前のJSON・テキストログ・性能詳細を削除します。\n\n続行しますか？",
+    ),
+    "应用范围：当前选中的 {…} 页": (
+        "Scope: the {…} currently selected page(s)",
+        "適用範囲：現在選択中の {…} ページ",
+    ),
+    "应用范围：全部 {…} 页": (
+        "Scope: all {…} page(s)",
+        "適用範囲：全 {…} ページ",
+    ),
+    "应用到{…} {…} 页": (
+        "Apply to {…} {…} page(s)",
+        "{…} {…} ページに適用",
+    ),
+    " · 双页已拆为 {…} 页，右侧显示第 1 页": (
+        " · The spread was split into {…} pages; page 1 is shown on the right",
+        " · 見開きを {…} ページに分割しました。右側には1ページ目を表示しています",
+    ),
+    "✓ 连接成功：{…}；AI 图文模式还建议点“测试图片能力”。": (
+        "✓ Connection succeeded: {…}; for AI image/text mode, also use “Test Image Capability”.",
+        "✓ 接続成功：{…}。AI画像・本文モードでは「画像能力をテスト」も実行してください。",
+    ),
+    "{…} · {…}\n本地版本：{…}    官方版本：{…}\n{…}": (
+        "{…} · {…}\nLocal version: {…}    Official version: {…}\n{…}",
+        "{…} · {…}\nローカル版：{…}    公式版：{…}\n{…}",
+    ),
+    "本地：v{…} · commit {…}\n远端：v{…} · commit {…} · {…}\n安装形态：{…}": (
+        "Local: v{…} · commit {…}\nRemote: v{…} · commit {…} · {…}\nInstallation type: {…}",
+        "ローカル：v{…} · commit {…}\nリモート：v{…} · commit {…} · {…}\nインストール形態：{…}",
+    ),
+    "模型：{…}。{…} 共同字符已标绿、差异字符已标红；真正分歧等待逐句裁决。快速共识仅减少后续 OCR 调用，任何独立模型异议都不会因 2:1 自动定稿。": (
+        "Models: {…}. {…} Matching characters are green and differing characters are red; genuine disagreements await sentence-by-sentence adjudication. Fast consensus only reduces subsequent OCR calls; a 2:1 vote never automatically finalizes text over an independent model's objection.",
+        "モデル：{…}。{…} 共通の文字は緑、異なる文字は赤で表示しています。実際の不一致は文ごとの裁決を待ちます。高速合意は後続のOCR呼び出しを減らすだけで、独立したモデルの異議を2対1の投票で自動確定することはありません。",
+    ),
+    "当前句：{…}/{…} · 人工编辑 · 已确定": (
+        "Current sentence: {…}/{…} · manually edited · confirmed",
+        "現在の文：{…}/{…} · 手動編集 · 確定済み",
+    ),
+    "正文条目：{…}\n锁定 Ruby：{…} 组（{…}）\n已包含锁定 Ruby sidecar、AI 正文模板、最终 EPUB 构建器和 Ruby 验证器。\n融合 JSON 和稳定 ID 骨架 EPUB 已打包：\n{…}": (
+        "Body entries: {…}\nLocked Ruby: {…} groups ({…})\nIncludes the locked Ruby sidecar, AI body template, final EPUB builder and Ruby validator.\nThe fusion JSON and stable-ID skeleton EPUB were packaged:\n{…}",
+        "本文項目：{…}\n固定Ruby：{…} 組（{…}）\n固定Ruby sidecar、AI本文テンプレート、最終EPUBビルダー、Ruby検証器を含みます。\n統合JSONと安定ID付き骨格EPUBをパッケージ化しました：\n{…}",
+    ),
+})
+
+# Composed UI messages: retain dynamic slots and translate the complete frame.
+AUDIT_CATALOG.update({
+    "；段落/对白结构高清复核 {…}/{…} 页采用{…}{…}": (
+        "; high-resolution paragraph/dialogue structure review accepted on {…}/{…} pages{…}{…}",
+        "；段落・会話構造の高解像度再確認を {…}/{…} ページで採用{…}{…}",
+    ),
+    "；最右列/页顶完整性复核 {…}/{…} 页采用{…}": (
+        "; rightmost-column/page-top completeness review accepted on {…}/{…} pages{…}",
+        "；右端列・ページ上部の完全性再確認を {…}/{…} ページで採用{…}",
+    ),
+    "{…}\n\n建议返回文字校对逐项处理。是否仍然继续导出？": (
+        "{…}\n\nReturn to text proofreading and address each item. Export anyway?",
+        "{…}\n\n文字校正に戻り、各項目を確認することをお勧めします。それでも出力を続行しますか？",
+    ),
+    "Formatter AI 已停止，已完成批次不会丢失，下次自动续跑{…}": (
+        "Formatter AI stopped; completed batches are preserved and processing will resume automatically next time{…}",
+        "Formatter AIを停止しました。完了済みバッチは保持され、次回は自動的に再開します{…}",
+    ),
+    "Formatter AI 处理失败，已完成批次断点已保存，下次自动续跑{…}": (
+        "Formatter AI processing failed; completed batch checkpoints are saved and processing will resume automatically next time{…}",
+        "Formatter AIの処理に失敗しました。完了済みバッチのチェックポイントを保存しました。次回は自動的に再開します{…}",
+    ),
+    "AI 图文处理已完成：无需传统 OCR 对比/Formatter，可直接生成 EPUB{…}": (
+        "AI image/text processing complete: generate an EPUB directly without traditional OCR comparison or Formatter{…}",
+        "AI画像・本文処理が完了しました。従来のOCR比較やFormatterを使わず、直接EPUBを生成できます{…}",
+    ),
+    "撤销最近一次人工候选选择/重新打开；若同句之后被 AI 或人工修改，会拒绝覆盖{…}": (
+        "Undo the latest manual candidate selection/reopening; refuse to overwrite the sentence if AI or a person subsequently changed it{…}",
+        "直前の手動候補選択・再オープンを取り消します。その後にAIまたは手動で同じ文が変更されている場合は上書きを拒否します{…}",
+    ),
+    "重做刚刚撤销的裁决；只在相关句仍保持撤销后状态时允许{…}": (
+        "Redo the adjudication just undone, only if the affected sentence still matches its state after undo{…}",
+        "取り消した裁決をやり直します。対象の文が取り消し直後の状態を維持している場合にのみ実行できます{…}",
+    ),
+    "当前权威正文尚未通过导出前致命检查：\n{…}{…}\n请在 OCR 对比/图文对照中完成判断后再导出。\n首项阻断：{…}": (
+        "The current authoritative body text has not passed the fatal pre-export checks:\n{…}{…}\nComplete the review in OCR comparison or image/text comparison before exporting.\nFirst blocker: {…}",
+        "現在の確定本文は出力前の致命的問題チェックに合格していません：\n{…}{…}\nOCR比較または画像・本文対照で判断を完了してから出力してください。\n最初の阻害項目：{…}",
+    ),
+    "{…}；证据：{…}": (
+        "{…}; evidence: {…}",
+        "{…}；証拠：{…}",
+    ),
+    "{…}；导出后本地同一区域已修改，结果已过期，禁止自动选择": (
+        "{…}; the same local region changed after export; the result is stale and automatic selection is prohibited",
+        "{…}；出力後に同じローカル領域が変更されました。結果は古いため、自動選択は禁止されています",
+    ),
+    "{…}；基线哈希已过期且结果未携带 baseline_text，无法三方合并": (
+        "{…}; the baseline hash is stale and the result has no baseline_text; three-way merge is unavailable",
+        "{…}；ベースラインハッシュが古く、結果に baseline_text がないため、3方向マージはできません",
+    ),
+    "{…}；已生成非重叠三方合并候选，请人工确认": (
+        "{…}; a non-overlapping three-way merge candidate was generated; confirm it manually",
+        "{…}；重複しない3方向マージ候補を生成しました。手動で確認してください",
+    ),
+    "{…}；审计：{…}": (
+        "{…}; audit: {…}",
+        "{…}；監査：{…}",
+    ),
+    "风险优先 · {…}": (
+        "Risk first · {…}",
+        "リスク優先 · {…}",
+    ),
+    "\n风险标记：{…}": (
+        "\nRisk flags: {…}",
+        "\nリスクフラグ：{…}",
+    ),
+    "〔待裁决〕{…}": (
+        "[Awaiting adjudication]{…}",
+        "〔裁決待ち〕{…}",
+    ),
+    "第 {…} 行 · {…}": (
+        "Line {…} · {…}",
+        "{…} 行目 · {…}",
+    ),
+    "{…} · 红底=替换，橙底=增删/缺失": (
+        "{…} · red background = replacement, orange background = insertion/deletion/missing text",
+        "{…} · 赤背景＝置換、オレンジ背景＝追加・削除・欠落",
+    ),
+})
+
+# Remaining composed OCR, page-management and settings messages.
+AUDIT_CATALOG.update({
+    "💎 Ruby 保留：已开启。普通 OCR 继续只识别 Ruby-free 分列正文；{…} Ruby 证据不参与正文投票/融合。": (
+        "💎 Ruby preservation: enabled. Regular OCR still recognizes only ruby-free body columns; {…} Ruby evidence does not participate in body-text voting/fusion.",
+        "💎 Ruby保持：有効。通常のOCRは引き続きRubyを除いた列単位の本文のみを認識します。{…} Rubyの証拠は本文の投票・統合には使用しません。",
+    ),
+    "\n💎 Ruby 结构识别：{…}": (
+        "\n💎 Ruby structure recognition: {…}",
+        "\n💎 Ruby構造認識：{…}",
+    ),
+    "🧩 多模型独立执行计划：{…}；每个槽位独立运行/缓存，单模型选择不参与本轮。": (
+        "🧩 Independent multi-model execution plan: {…}; each slot runs/caches independently; the single-model selection does not participate in this round.",
+        "🧩 複数モデルの独立実行計画：{…}。各スロットは独立して実行・キャッシュされ、単一モデルの選択は今回の処理には参加しません。",
+    ),
+    "所选主 OCR 角色均未能启动或返回结果。{…}": (
+        "None of the selected primary OCR roles could start or return results.{…}",
+        "選択した主OCRロールはいずれも起動できないか、結果を返しませんでした。{…}",
+    ),
+    "  分段 OCR 缓存：{…}": (
+        "  Segmented OCR cache: {…}",
+        "  分割OCRキャッシュ：{…}",
+    ),
+    "项目完整性：{…}": (
+        "Project integrity: {…}",
+        "プロジェクトの整合性：{…}",
+    ),
+    "{…}\n\n是否把孤儿页面缓存移动到 recovery/？": (
+        "{…}\n\nMove orphaned page caches to recovery/?",
+        "{…}\n\n孤立したページキャッシュを recovery/ に移動しますか？",
+    ),
+    "{…} · 扫描优化": (
+        "{…} · Scan optimization",
+        "{…} · スキャン最適化",
+    ),
+    "PDF 文字层不再单独导入文件。请先在页面管理导入一个 PDF，并保持其物理页映射可与原 PDF 对应。\n\n{…}": (
+        "PDF text-layer mode no longer imports files separately. First import a PDF in Page Manager and keep its physical-page mapping aligned with the original PDF.\n\n{…}",
+        "PDFテキストレイヤーモードではファイルを個別に読み込まなくなりました。先にページ管理でPDFを読み込み、物理ページの対応関係を元のPDFと一致させてください。\n\n{…}",
+    ),
+    "本更新功能不会在启动时检查、不会后台轮询、不会自动下载更新包或替换已安装模型。打开本窗口只读取本地版本；必须点击“检查更新”，再选择模型并确认，才会联网更新。首次启用尚未安装的 OCR 引擎仍沿用原有的用户触发安装流程。{…}": (
+        "This update feature does not check at startup, poll in the background, automatically download updates or replace installed models. Opening this window only reads local versions; online updates require clicking “Check for Updates”, selecting models and confirming. First-time activation of an uninstalled OCR engine still uses the existing user-triggered installation flow.{…}",
+        "この更新機能は起動時の確認、バックグラウンドでの定期確認、更新パッケージの自動ダウンロード、インストール済みモデルの自動置換を行いません。このウィンドウを開くだけではローカルのバージョンを読み取るのみです。「更新を確認」をクリックし、モデルを選択して確認した場合にのみオンライン更新を行います。未インストールのOCRエンジンを初めて有効にする場合は、従来のユーザー操作によるインストール手順を使用します。{…}",
+    ),
+    "    CUDA 设备：{…}": (
+        "    CUDA devices: {…}",
+        "    CUDAデバイス：{…}",
+    ),
+    "    说明：{…}": (
+        "    Details: {…}",
+        "    詳細：{…}",
+    ),
+    "结论：{…}": (
+        "Conclusion: {…}",
+        "結論：{…}",
+    ),
+    "注意：{…}": (
+        "Note: {…}",
+        "注意：{…}",
+    ),
+    "{…}\n平台: {…} {…} · {…}\nPython: {…}": (
+        "{…}\nPlatform: {…} {…} · {…}\nPython: {…}",
+        "{…}\nプラットフォーム: {…} {…} · {…}\nPython: {…}",
+    ),
+    "失败：{…}": (
+        "Failed: {…}",
+        "失敗：{…}",
+    ),
+    "本次只检查本地文件、环境和系统能力，没有安装或下载任何模型。\n\n{…}": (
+        "This check inspected only local files, the environment and system capabilities. No models were installed or downloaded.\n\n{…}",
+        "今回はローカルファイル、環境、システム機能のみを確認しました。モデルのインストールやダウンロードは行っていません。\n\n{…}",
+    ),
+    "工作区合同无效：{…}": (
+        "Invalid workspace contract: {…}",
+        "ワークスペース契約が無効です：{…}",
+    ),
+})
+
 # batch 01: AI image workflow, dialogs, EPUB tab header
 AUDIT_CATALOG.update({
     "未测试": ("Not tested", "未テスト"),
@@ -281,7 +554,7 @@ AUDIT_CATALOG.update({
     "对白与引号修复": ("Dialogue and quote repair", "台詞と括弧の修復"),
     "重复与破折号清理": ("Duplicate and dash cleanup", "重複とダッシュの整理"),
     "段首缩进与分节": ("Paragraph indents and section breaks", "段落字下げと区切り"),
-    "注音（ルビ）保留": ("Keep ruby (ルビ)", "ルビを保持"),
+    "注音（ルビ）保留": ("Keep ruby", "ルビを保持"),
     "标点与全半角统一": ("Unify punctuation and full/half width", "句読点と全角/半角の統一"),
     "章节标题识别": ("Chapter title detection", "章見出しの検出"),
     "脚注与前后书处理": ("Footnotes and front/back matter", "脚注と前後付録の処理"),

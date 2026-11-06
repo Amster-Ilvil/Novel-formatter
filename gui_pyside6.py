@@ -116,7 +116,7 @@ from ui.common.toast import notify
 from ui.interface_preferences import (
     InterfacePreferenceManager, THEME_LIGHT, THEME_DARK, manager_for,
 )
-from ui.localization import LANG_ZH, LANG_JA, LANG_EN, DEFAULT_LANGUAGE
+from ui.localization import LANG_ZH, LANG_JA, LANG_EN, DEFAULT_LANGUAGE, normalize_language
 from ui.localized_dialogs import (
     LocalizedFileDialog, LocalizedMessageBox, LocalizedInputDialog, LocalizedColorDialog, ui_message,
 )
@@ -5970,7 +5970,7 @@ def main():
     interface_manager = InterfacePreferenceManager(
         app,
         base_stylesheet=STYLE,
-        language=str(boot_settings.value(SystemSettingsTab.LANGUAGE_KEY, DEFAULT_LANGUAGE)),
+        language=normalize_language(boot_settings.value(SystemSettingsTab.LANGUAGE_KEY, DEFAULT_LANGUAGE)),
         theme=str(boot_settings.value(SystemSettingsTab.APPEARANCE_KEY, THEME_LIGHT)),
     )
     app._novel_formatter_interface_manager = interface_manager

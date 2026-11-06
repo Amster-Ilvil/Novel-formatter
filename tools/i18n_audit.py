@@ -101,35 +101,40 @@ def _has_cjk(text: str) -> bool:
 
 
 def _translators():
-    from ui.localization import LANG_EN, translate_text
-    from ui.dialog_localization import translate_dialog_text
-    from ui import message_catalog
-
-    zh_templates = {
-        templates.get("zh_CN", "")
-        for templates in getattr(message_catalog, "_MESSAGES", {}).values()
-    }
-
-    def is_translated(sample: str, raw: str) -> bool:
-        if raw in zh_templates:
-            return True
-        for candidate in {sample, raw}:
-            if translate_text(candidate, LANG_EN) != candidate:
-                return True
-            if translate_dialog_text(candidate, LANG_EN) != candidate:
-                return True
-        return False
-
-    return is_translated
+    """Require complete translations for UI and backend messages alike."""
+    return _strict_translators()
 
 
 # Corner-bracket quotes in an English message cite book/source tokens verbatim
 # (e.g. 『削除予定』); they are content, not untranslated UI text.
 _QUOTED_BOOK_TOKEN = re.compile("『[^』]*』|「[^」]*」")
 
+# These exact UI descriptions demonstrate source syntax. Only the listed
+# examples may remain CJK; the surrounding explanation must be translated.
+_PRESERVED_BOOK_TOKENS: dict[str, tuple[str, ...]] = {
+    "删除每话附带的（前書）/（後書き）编辑备注": ("（前書）", "（後書き）"),
+    "恢复｜漢字《よみ》ruby标注": ("｜漢字《よみ》",),
+    "识别章/话/回/Episode标题，完整生成TOC": ("章/话/回/Episode",),
+    "检测与正文粘连的“序章 / 第X章 / 幕间 / 后记”等标题，并从正文块中单独拆出。": (
+        "序章 / 第X章 / 幕间 / 后记",
+    ),
+    "识别每话开头或结尾的（前書き）/（後書き）及同类编辑备注。": (
+        "（前書き）", "（後書き）",
+    ),
+    "识别 OCR 中残留的竖线、括号和假名组合，恢复｜漢字《よみ》格式。": (
+        "｜漢字《よみ》",
+    ),
+    "识别序章、第X章、第X话、12话、第X回、Episode、幕间、终章、后记等标题，并逐条建立目录。": (
+        "序章", "第X章", "第X话", "12话", "第X回", "幕间", "终章", "后记",
+    ),
+    "默认关闭。勾选后 PDF 文字层保留真实作者前书/后记；不勾选时允许删除“数字（前書/後書き）”段落。": (
+        "前書/後書き",
+    ),
+}
+
 
 def _strict_translators():
-    """Fully-translated check for category-A backend literals.
+    """Fully-translated check for user-visible literals.
 
     A partial match (a generic template rewriting only a literal tail) changes
     the text but still leaves Chinese on screen, so the English rendering of
@@ -150,7 +155,10 @@ def _strict_translators():
         for candidate in {sample, raw}:
             for translate in (translate_text, translate_dialog_text):
                 rendered = translate(candidate, LANG_EN)
-                if rendered != candidate and not _has_cjk(_QUOTED_BOOK_TOKEN.sub("", rendered)):
+                chrome = _QUOTED_BOOK_TOKEN.sub("", rendered)
+                for token in _PRESERVED_BOOK_TOKENS.get(raw, ()):
+                    chrome = chrome.replace(token, "")
+                if rendered != candidate and not _has_cjk(chrome):
                     return True
         return False
 
@@ -222,6 +230,27 @@ class _Collector(ast.NodeVisitor):
         self.generic_visit(node)
 
     # --- candidates ------------------------------------------------------
+    def visit_BinOp(self, node: ast.BinOp) -> None:
+        if id(node) in self._skip:
+            return
+        if _is_concat(node):
+            raw, sample, has_text = _flatten_text(node)
+            if has_text:
+                if _has_cjk(raw):
+                    self.items.append((node.lineno, raw, sample))
+                # Do not collect the template's literal parts twice. Other
+                # operands can contain conditional UI text or nested calls;
+                # visit those with the normal non-display context rules.
+                pending = [node.right, node.left]
+                while pending:
+                    part = pending.pop()
+                    if _is_concat(part):
+                        pending.extend((part.right, part.left))
+                    elif not isinstance(part, (ast.Constant, ast.JoinedStr)):
+                        self.visit(part)
+                return
+        self.generic_visit(node)
+
     def visit_Constant(self, node: ast.Constant) -> None:
         if id(node) in self._skip or not isinstance(node.value, str) or not _has_cjk(node.value):
             return

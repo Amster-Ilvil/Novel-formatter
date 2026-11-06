@@ -28,7 +28,6 @@ import shutil
 import subprocess
 import sys
 import tempfile
-import time
 import urllib.error
 import urllib.request
 from pathlib import Path
@@ -152,6 +151,7 @@ def _model_spec(
         hash_source="existing-code",
         min_size=max(1, int(minimum_size)),
         label=label,
+        curl_fallback=True,
     )
 
 
@@ -242,170 +242,6 @@ def _origin_label(url: str) -> str:
     return "自定义下载源"
 
 
-def _response_total(response, offset: int) -> int:
-    content_range = str(response.headers.get("Content-Range") or "")
-    match = re.search(r"/(\d+)$", content_range)
-    if match:
-        return int(match.group(1))
-    try:
-        length = int(response.headers.get("Content-Length") or 0)
-    except (TypeError, ValueError):
-        length = 0
-    status = int(getattr(response, "status", 200) or 200)
-    return (offset + length) if status == 206 and length else length
-
-
-def _download_one(
-    url: str,
-    part_path: Path,
-    *,
-    label: str,
-    expected_size: int,
-    progress_callback: ProgressCallback | None,
-    cancel_check: CancelCheck | None,
-) -> None:
-    if _is_cancelled(cancel_check):
-        raise DownloadCancelled("用户取消 48px 模型下载")
-
-    offset = part_path.stat().st_size if part_path.exists() else 0
-    if expected_size and offset > expected_size:
-        part_path.unlink(missing_ok=True)
-        offset = 0
-
-    request = _request(url, offset=offset)
-    with urllib.request.urlopen(request, timeout=45) as response:
-        status = int(getattr(response, "status", 200) or 200)
-        # A server that ignored Range returned the complete file. Restart rather
-        # than appending a second copy to the partial download.
-        if offset and status != 206:
-            offset = 0
-            mode = "wb"
-        else:
-            mode = "ab" if offset else "wb"
-        total = _response_total(response, offset) or expected_size
-        downloaded = offset
-        origin = _origin_label(url)
-        _emit(
-            progress_callback,
-            "download",
-            downloaded,
-            total,
-            f"{label} · {origin} · 建立连接",
-        )
-        last_emit_time = 0.0
-        last_emit_bytes = downloaded
-        with part_path.open(mode) as output:
-            while True:
-                if _is_cancelled(cancel_check):
-                    raise DownloadCancelled("用户取消 48px 模型下载")
-                chunk = response.read(1024 * 1024)
-                if not chunk:
-                    break
-                output.write(chunk)
-                downloaded += len(chunk)
-                now = time.monotonic()
-                if now - last_emit_time >= 0.25 or downloaded - last_emit_bytes >= 4 * 1024 * 1024:
-                    _emit(
-                        progress_callback,
-                        "download",
-                        downloaded,
-                        total,
-                        f"{label} · {origin}",
-                    )
-                    last_emit_time = now
-                    last_emit_bytes = downloaded
-        _emit(
-            progress_callback,
-            "download",
-            downloaded,
-            total,
-            f"{label} · {origin} · 下载完成",
-        )
-
-
-
-
-
-def _download_one_curl(
-    url: str,
-    part_path: Path,
-    *,
-    label: str,
-    expected_size: int,
-    progress_callback: ProgressCallback | None,
-    cancel_check: CancelCheck | None,
-) -> None:
-    """Download through macOS/system curl when Python TLS cannot connect."""
-    curl = shutil.which("curl")
-    if not curl:
-        raise RuntimeError("系统未找到 curl")
-    origin = _origin_label(url)
-    command = [
-        curl,
-        "--location",
-        "--fail",
-        "--silent",
-        "--show-error",
-        "--retry",
-        "3",
-        "--retry-delay",
-        "1",
-        "--connect-timeout",
-        "20",
-        "--max-time",
-        "1800",
-    ]
-    if part_path.exists() and part_path.stat().st_size > 0:
-        command.extend(["--continue-at", "-"])
-    command.extend(["--output", str(part_path), url])
-    from adapters.subprocess_watchdog import isolated_process_kwargs, terminate_process
-
-    # curl can produce repeated TLS/retry diagnostics.  Keep them in a file so
-    # an unread stderr pipe can never block a long model download.
-    stderr_file = tempfile.TemporaryFile(mode="w+t", encoding="utf-8")
-    proc = subprocess.Popen(
-        command,
-        stdout=subprocess.DEVNULL,
-        stderr=stderr_file,
-        text=True,
-        **isolated_process_kwargs(),
-    )
-    try:
-        while proc.poll() is None:
-            if _is_cancelled(cancel_check):
-                terminate_process(proc)
-                raise DownloadCancelled("用户取消 48px 模型下载")
-            current = part_path.stat().st_size if part_path.exists() else 0
-            _emit(
-                progress_callback,
-                "download",
-                current,
-                expected_size,
-                f"{label} · {origin} · 系统 curl",
-            )
-            time.sleep(0.25)
-        stderr = ""
-        try:
-            stderr_file.flush()
-            stderr_file.seek(0)
-            stderr = stderr_file.read().strip()
-        except Exception:
-            pass
-        if proc.returncode != 0:
-            raise RuntimeError(stderr[-1200:] or f"curl 退出码 {proc.returncode}")
-        current = part_path.stat().st_size if part_path.exists() else 0
-        _emit(
-            progress_callback,
-            "download",
-            current,
-            expected_size,
-            f"{label} · {origin} · 系统 curl 下载完成",
-        )
-    finally:
-        if proc.poll() is None:
-            terminate_process(proc)
-        stderr_file.close()
-
 def _seed_from_local(
     destination: Path,
     *,
@@ -462,9 +298,10 @@ def _download(
 ) -> Path:
     """Locate/verify/download one file through utils.model_manager.
 
-    The manager handles the cache check, ``.verified`` marker, resumable
-    download, hashing and atomic replacement.  System curl stays as a
-    fallback transport for machines where Python TLS cannot connect.
+    The manager owns the lock, cache recheck, bounded writes, hashing and
+    atomic replacement for both transports. Python downloads can resume;
+    system curl starts from zero under the same lock after network/HTTP
+    failures, for machines where Python TLS cannot connect.
     """
     destination.parent.mkdir(parents=True, exist_ok=True)
     url_list = [urls] if isinstance(urls, str) else [str(item) for item in urls]
@@ -508,8 +345,6 @@ def _download(
     def on_progress(done: int, total: int | None) -> None:
         _emit(progress_callback, "download", done, total or expected_size, f"{label} · {origin}")
 
-    part_path = destination.with_name(destination.name + ".part")
-    errors: list[str] = []
     try:
         return manager.ensure_spec(
             spec,
@@ -519,56 +354,6 @@ def _download(
         )
     except model_manager.ModelCancelledError as exc:
         raise DownloadCancelled(str(exc)) from exc
-    except (model_manager.ModelNetworkError, model_manager.ModelDownloadError) as exc:
-        if not shutil.which("curl"):
-            raise
-        errors.append(f"Python HTTPS: {exc}")
-
-    for url in url_list:
-        try:
-            _emit(
-                progress_callback,
-                "connect",
-                part_path.stat().st_size if part_path.exists() else 0,
-                expected_size,
-                f"准备下载 {label} · {_origin_label(url)} · 系统 curl",
-            )
-            _download_one_curl(
-                url,
-                part_path,
-                label=label,
-                expected_size=expected_size,
-                progress_callback=progress_callback,
-                cancel_check=cancel_check,
-            )
-            _emit(progress_callback, "verify", 0, 1, f"正在校验 {label} SHA-256")
-            manager.import_file(spec, part_path, target_dir=target_dir, move=True)
-            _emit(progress_callback, "verify", 1, 1, f"{label} 校验完成")
-            return destination
-        except DownloadCancelled:
-            part_path.unlink(missing_ok=True)
-            raise
-        except model_manager.ModelIntegrityError as exc:
-            # A checksum mismatch is not resumable; start clean on the next origin.
-            part_path.unlink(missing_ok=True)
-            errors.append(f"{_origin_label(url)}·系统 curl: {exc}")
-        except Exception as exc:
-            errors.append(f"{_origin_label(url)}·系统 curl: {exc}")
-            _emit(
-                progress_callback,
-                "retry",
-                part_path.stat().st_size if part_path.exists() else 0,
-                expected_size,
-                f"{label} 下载失败，正在切换下载通道：{exc}",
-            )
-            time.sleep(0.35)
-
-    attempted = "\n".join(f"- {item}" for item in errors[-8:])
-    raise RuntimeError(
-        f"{label} 无法自动下载。已保留断点文件：{part_path}\n"
-        f"可手动把官方文件放到：{destination}\n"
-        f"下载尝试：\n{attempted}"
-    )
 
 
 

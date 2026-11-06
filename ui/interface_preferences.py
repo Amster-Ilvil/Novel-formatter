@@ -120,11 +120,16 @@ class InterfacePreferenceManager(QObject):
                         self._apply_widget_theme(obj)
                     if self.language != LANG_ZH:
                         self._translate_widget(obj, force=False)
-                elif et == QEvent.UpdateRequest and self.language != LANG_ZH and isinstance(obj, self._DYNAMIC_TEXT_TYPES):
-                    # setText()/setItemText() schedules an update.  Restrict the
-                    # dynamic pass to text-bearing widgets so live OCR status
-                    # messages switch language without rescanning theme/QSS on
-                    # every paint event.
+                elif et in (QEvent.WindowTitleChange, QEvent.ToolTipChange) and self.language != LANG_ZH:
+                    self._translate_widget(obj, force=False)
+                elif (
+                    et in (QEvent.UpdateRequest, QEvent.Paint)
+                    and self.language != LANG_ZH
+                    and isinstance(obj, self._DYNAMIC_TEXT_TYPES)
+                ):
+                    # Child labels/buttons may repaint without receiving their
+                    # own UpdateRequest. Translate before Paint too, retaining
+                    # the source/applied tracking used for language changes.
                     self._translate_widget(obj, force=False)
                 elif et == QEvent.StyleChange and id(obj) not in self._theme_guard:
                     # Widget code may replace its inline QSS in either theme.

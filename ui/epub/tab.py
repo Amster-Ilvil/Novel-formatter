@@ -40,6 +40,8 @@ from ui.dialogs import show_error_dialog
 from ui.formatter.tab import FormatProfileDialog
 from ui.common.signals import WorkerSignals
 from ui.common.toast import notify
+from ui.localization import translate_text
+from ui.localized_dialogs import current_ui_language
 from ui.common.styling import BG, ACC, BORDER, CARD, DANGER, INK, MUTED, SUCCESS, accent_button, link_button, make_separator, wrap_in_card
 from utils.clear_manager import ClearManager, create_workspace_clear_button
 
@@ -104,9 +106,12 @@ class EPUBTab(QWidget):
         self._build_btn = accent_button("生成 EPUB")
         self._build_btn.clicked.connect(self._build_epub)
         btn_row.addWidget(self._build_btn, 1)
-        create_workspace_clear_button(
+        clear_button = create_workspace_clear_button(
             self, "EPUB", ClearManager.clear_epub, target_layout=btn_row,
         )
+        clear_button._nf_i18n_source_text = "清空EPUB"
+        clear_button._nf_i18n_applied_text = translate_text("清空EPUB", current_ui_language())
+        clear_button.setText(clear_button._nf_i18n_applied_text)
         tv.addLayout(btn_row)
 
         ll.addWidget(top)
@@ -559,6 +564,7 @@ class EPUBTab(QWidget):
         self._compact_language_combo.currentIndexChanged.connect(self._sync_compact_epub_language_to_document)
         self._vert_radio.toggled.connect(lambda _v: self._sync_compact_epub_mode_from_advanced())
         self._horiz_radio.toggled.connect(lambda _v: self._sync_compact_epub_mode_from_advanced())
+        self._ltr_check.toggled.connect(lambda _v: self._sync_compact_epub_mode_from_advanced())
 
         compact_return = QPushButton("简洁视图")
         compact_return.setProperty("flat", True)
@@ -663,17 +669,21 @@ class EPUBTab(QWidget):
     def _sync_compact_epub_mode_to_advanced(self, _index: int = -1) -> None:
         vertical = self._compact_mode_combo.currentData() == "vertical"
         if vertical:
+            # Explicit vertical output cancels the horizontal LTR override.
+            self._ltr_check.setChecked(False)
             self._vert_radio.setChecked(True)
         else:
             self._horiz_radio.setChecked(True)
 
     def _sync_compact_epub_mode_from_advanced(self) -> None:
-        desired = "vertical" if self._vert_radio.isChecked() else "horizontal"
+        vertical = self._vert_radio.isChecked() and not self._ltr_check.isChecked()
+        desired = "vertical" if vertical else "horizontal"
         idx = self._compact_mode_combo.findData(desired)
         if idx >= 0 and self._compact_mode_combo.currentIndex() != idx:
             blocked = self._compact_mode_combo.blockSignals(True)
             self._compact_mode_combo.setCurrentIndex(idx)
             self._compact_mode_combo.blockSignals(blocked)
+        self._update_pills()
 
     def _refresh_compact_epub_summary(self) -> None:
         if not hasattr(self, "_compact_stat_values"):
@@ -907,8 +917,12 @@ class EPUBTab(QWidget):
         self._refresh_document_summary()
 
     def _update_pills(self):
-        mode = "竖排" if self._vert_radio.isChecked() and not self._ltr_check.isChecked() else "横排"
-        self._pills["mode"].setText(f"↕ {mode}")
+        vertical = self._vert_radio.isChecked() and not self._ltr_check.isChecked()
+        source = "↕ 竖排" if vertical else "↕ 横排"
+        mode_pill = self._pills["mode"]
+        mode_pill._nf_i18n_source_text = source
+        mode_pill._nf_i18n_applied_text = translate_text(source, current_ui_language())
+        mode_pill.setText(mode_pill._nf_i18n_applied_text)
         self._pills["source"].setText(f"🧾 {self._source_label}")
         if not self._doc:
             self._pills["cover"].setText("🖼 已设置封面" if self._effective_cover_path() else "🖼 封面未设置")

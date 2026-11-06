@@ -116,6 +116,41 @@ def test_unknown_suffix_is_sniffed_known_non_source_is_not(
     assert _names(import_sources.folder_sources(tmp_path)) == ["scan.dat"]
 
 
+@pytest.mark.parametrize("file_first", [False, True])
+def test_collected_folder_and_archive_expand_once(
+    import_sources: ModuleType, source_folder: Path,
+    monkeypatch: pytest.MonkeyPatch, file_first: bool,
+) -> None:
+    from adapters import pdf_input
+    from utils.session_temp import SessionTempRegistry
+
+    archive = source_folder / "c.cbz"
+    raw = [archive, source_folder] if file_first else [source_folder, archive]
+    registry = SessionTempRegistry()
+    monkeypatch.setattr(pdf_input, "session_temp_registry", lambda: registry)
+    try:
+        collected = import_sources.collect_sources(raw)
+        pages = pdf_input.expand_inputs(collected)
+        archive_pages = [page for page in pages if "archive-pages" in Path(page).parts]
+        assert len(archive_pages) == 1
+        first = str(source_folder / "a.png")
+        second = str(source_folder / "b.webp")
+        noext = str(source_folder / "noext")
+        expected = (
+            [*archive_pages, first, second, noext]
+            if file_first else [first, second, *archive_pages, noext]
+        )
+        assert pages == expected
+        assert Path(first).read_bytes() == Path(noext).read_bytes()
+        assert pdf_input.release_pdf_caches(collected) == 1
+        assert all(not Path(page).exists() for page in archive_pages)
+        assert archive.is_file()
+        assert Path(first).is_file()
+        assert Path(noext).is_file()
+    finally:
+        registry.cleanup()
+
+
 def test_import_label_unchanged(import_sources: ModuleType) -> None:
     assert import_sources.import_label(["/books/vol1.png"]) == "vol1"
     assert import_sources.import_label(["/books/a.png", "/books/b.png"]) == "a 等 2 个文件"

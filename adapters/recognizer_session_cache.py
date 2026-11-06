@@ -45,6 +45,14 @@ from collections import OrderedDict
 from dataclasses import dataclass
 from typing import Any, Callable, Iterator
 
+from core.ocr_runtime_optimizer import OcrCancelled
+
+
+def _check_cancel(cancel_check) -> None:
+    if cancel_check is not None and cancel_check():
+        raise OcrCancelled("OCR stopped while waiting for a shared recognizer")
+
+
 ENV_CACHE_SIZE = "NOVEL_FORMATTER_MODEL_CACHE_SIZE"
 DEFAULT_CAPACITY = 2
 _MAX_CAPACITY = 16
@@ -267,11 +275,15 @@ class RecognizerSessionCache:
 
     # -- loading -----------------------------------------------------------
 
-    def get(self, key: SessionKey, loader: Callable[[], Any]) -> Any:
-        """Return the session for ``key``, loading it at most once concurrently."""
-        return self._entry_for(key, loader).session
+    def get(self, key: SessionKey, loader: Callable[[], Any], *, cancel_check=None) -> Any:
+        """Return a shared session; use ``lease`` for exclusive access."""
+        entry = self._entry_for(key, loader, cancel_check=cancel_check)
+        _check_cancel(cancel_check)
+        return entry.session
 
-    def _entry_for(self, key: SessionKey, loader: Callable[[], Any]) -> _Entry:
+    def _entry_for(self, key: SessionKey, loader: Callable[[], Any], *,
+                   cancel_check=None) -> _Entry:
+        _check_cancel(cancel_check)
         with self._guard:
             entry = self._entries.get(key)
             if entry is None:
@@ -282,26 +294,40 @@ class RecognizerSessionCache:
                 self._entries.move_to_end(key)
                 owner = False
         if not owner:
-            entry.ready.wait()
-            if entry.error is not None:
-                raise entry.error
+            while True:
+                _check_cancel(cancel_check)
+                if entry.ready.wait(timeout=_LEASE_POLL_SECONDS):
+                    break
+            _check_cancel(cancel_check)
             with self._guard:
+                if entry.error is not None:
+                    raise entry.error
                 self._stats["hits"] += 1
             return entry
         try:
+            _check_cancel(cancel_check)
+            # Arbitrary loaders cannot be interrupted here. A completed load
+            # remains shared even if this client's cancellation arrived meanwhile.
             session = loader()
         except BaseException as exc:
-            entry.error = exc
             with self._guard:
+                if entry.error is None:
+                    entry.error = exc
                 if self._entries.get(key) is entry:
                     del self._entries[key]
-            entry.ready.set()
+                entry.ready.set()
             raise
-        entry.session = session
         with self._guard:
             self._stats["loads"] += 1
-        entry.ready.set()
+            invalidated = entry.evicted
+            if not invalidated:
+                entry.session = session
+            entry.ready.set()
+        if invalidated:
+            self._closer(session)
+            raise entry.error or OcrCancelled("OCR recognizer cache was invalidated")
         self._evict_over_capacity(keep=key)
+        _check_cancel(cancel_check)
         return entry
 
     # -- leasing -----------------------------------------------------------
@@ -309,12 +335,15 @@ class RecognizerSessionCache:
     @contextlib.contextmanager
     def lease(self, key: SessionKey, loader: Callable[[], Any], *, cancel_check=None,
               rebind: Callable[[Any], None] | None = None) -> Iterator[Any]:
-        """Exclusively use the cached session for ``key`` inside a ``with`` block."""
+        """Exclusively use a session, cooperatively cancelling waits and handoff."""
+        _check_cancel(cancel_check)
         if self._capacity <= 0:
             session = loader()
             try:
+                _check_cancel(cancel_check)
                 if rebind is not None:
                     rebind(session)
+                _check_cancel(cancel_check)
                 yield session
             finally:
                 self._closer(session)
@@ -322,19 +351,32 @@ class RecognizerSessionCache:
 
         me = threading.get_ident()
         while True:
-            entry = self._entry_for(key, loader)
+            entry = self._entry_for(key, loader, cancel_check=cancel_check)
+            _check_cancel(cancel_check)
             if entry.owner == me:
                 entry.depth += 1
                 try:
+                    _check_cancel(cancel_check)
                     yield entry.session
                 finally:
                     entry.depth -= 1
                 return
-            while not entry.lease_lock.acquire(timeout=_LEASE_POLL_SECONDS):
-                if cancel_check is not None and cancel_check():
-                    raise InterruptedError("OCR stopped while waiting for a shared recognizer")
-            if entry.evicted or not self._is_alive(entry.session):
-                entry.lease_lock.release()
+            while True:
+                _check_cancel(cancel_check)
+                if entry.error is not None:
+                    raise entry.error
+                if entry.lease_lock.acquire(timeout=_LEASE_POLL_SECONDS):
+                    break
+            usable = False
+            try:
+                _check_cancel(cancel_check)
+                if entry.error is not None:
+                    raise entry.error
+                usable = not entry.evicted and self._is_alive(entry.session)
+            finally:
+                if not usable:
+                    entry.lease_lock.release()
+            if not usable:
                 self._discard(entry)
                 continue
             break
@@ -342,18 +384,34 @@ class RecognizerSessionCache:
         entry.owner = me
         entry.depth = 1
         failed = False
+        entered = False
         try:
+            _check_cancel(cancel_check)
             if rebind is not None:
                 rebind(entry.session)
+            _check_cancel(cancel_check)
+            if entry.error is not None:
+                raise entry.error
+            entered = True
             yield entry.session
         except BaseException as exc:
-            failed = not self._reusable_after_cancel(entry.session, exc)
+            # Cancellation before handoff must not discard another client's
+            # healthy worker, including sessions opting out of in-body reuse.
+            failed = (
+                not self._reusable_after_cancel(entry.session, exc)
+                if entered else not is_cancellation(exc)
+            )
             raise
         finally:
             entry.owner = None
             entry.depth = 0
+            discard = failed or entry.evicted
+            if discard:
+                # Mark unavailable before unlocking, so a waiter cannot enter
+                # a failed session between release and removal.
+                self._discard(entry)
             entry.lease_lock.release()
-            if failed or entry.evicted:
+            if discard:
                 self._discard(entry)
 
     # -- eviction / invalidation ------------------------------------------
@@ -400,7 +458,11 @@ class RecognizerSessionCache:
 
     def invalidate(self, engine: str | None = None,
                    predicate: Callable[[SessionKey], bool] | None = None) -> int:
-        """Close matching sessions now (in-use ones close when released)."""
+        """Invalidate without waiting for loaders or active leases.
+
+        Waiters wake with ``OcrCancelled``. A running loader is not interrupted;
+        its result is closed when it returns. New clients may load fresh entries.
+        """
         wanted = str(engine or "").strip().lower()
         with self._guard:
             victims = [
@@ -410,9 +472,10 @@ class RecognizerSessionCache:
             for entry in victims:
                 del self._entries[entry.key]
                 entry.evicted = True
+                entry.error = OcrCancelled("OCR recognizer cache was invalidated")
+                entry.ready.set()
             self._stats["invalidations"] += len(victims)
         for entry in victims:
-            entry.ready.wait()
             self._discard(entry)
         return len(victims)
 

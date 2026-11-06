@@ -96,12 +96,21 @@ class OpenVINOJapaneseHandwritingRecognizer:
         ok, detail = model_available()
         if not ok:
             raise RuntimeError(detail)
+        manager = default_manager()
+        xml_path, _bin_path, charlist_path = _model_paths()
+        problems = []
+        for model_id in _MODEL_IDS:
+            state = manager.verify(model_id, force=True, target_dir=xml_path.parent)
+            if state is not ModelStatus.READY:
+                problems.append(f"{manager.spec(model_id).filename}: {state.value}")
+        if problems:
+            raise RuntimeError("OpenVINO model verification failed: " + "; ".join(problems))
+
         import numpy as np
         from openvino import Core
 
         self._np = np
         core = Core()
-        xml_path, _bin_path, charlist_path = _model_paths()
         model = core.read_model(str(xml_path))
         self._compiled = core.compile_model(model, device)
         self._input = model.inputs[0]
