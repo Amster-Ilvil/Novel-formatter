@@ -2,6 +2,12 @@ name: Build SwiftUI shell (manual)
 
 on:
   workflow_dispatch:
+  push:
+    branches: [feature/en-ui-ltr-models]
+    paths:
+      - "macos/**"
+      - "packaging/build_macos_swift_app.sh"
+      - ".github/workflows/build-swift-app.yml"
 
 permissions:
   contents: read
