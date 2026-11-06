@@ -49,6 +49,10 @@ jobs:
       VERSION: ${{ needs.metadata.outputs.version }}
       LABEL: ${{ matrix.label }}
       EXPECTED_ARCH: ${{ matrix.arch }}
+      # The workflow name mentions workflow_dispatch, which is only active
+      # once this file reaches the default branch; until then pushes to the
+      # PR branch trigger the same jobs.
+      BUILD_REASON: ${{ github.event_name }}
     steps:
       - uses: actions/checkout@v4
         with:
