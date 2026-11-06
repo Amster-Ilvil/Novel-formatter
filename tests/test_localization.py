@@ -35,6 +35,7 @@ _NAMED_FIELD = re.compile(r"\{[A-Za-z_]\w*\}")
 _CJK_ALLOWLIST = frozenset(LANGUAGE_LABELS.values()) | {"繁體中文"} | frozenset({
     "前書", "前書き", "後書き", "漢字", "よみ", "ルビ",
     "章", "话", "回", "第", "序章", "幕间", "终章", "后记",
+    "削除予定",
 })
 
 
@@ -213,6 +214,42 @@ class FeatureStringCoverageTest(unittest.TestCase):
     def test_chinese_ui_is_identity(self) -> None:
         for text in self.LTR + self.MODEL_DOWNLOAD:
             self.assertEqual(translate_text(text, LANG_ZH), text)
+
+
+class DictionarySourceTest(unittest.TestCase):
+    """Python silently keeps the last value of a repeated dict key, so
+    duplicates are only visible in the source: parse it with ast."""
+
+    FILES = ("ui/localization.py", "ui/dialog_localization.py", "ui/localization_audit_catalog.py")
+
+    def test_no_duplicate_keys_in_dictionary_literals(self) -> None:
+        import ast
+
+        problems: list[str] = []
+        for rel in self.FILES:
+            tree = ast.parse((ROOT / rel).read_text(encoding="utf-8"), filename=rel)
+            for node in ast.walk(tree):
+                if not isinstance(node, ast.Dict):
+                    continue
+                seen: dict[str, int] = {}
+                for key in node.keys:
+                    if not (isinstance(key, ast.Constant) and isinstance(key.value, str)):
+                        continue
+                    if key.value in seen:
+                        problems.append(
+                            f"{rel}:{key.lineno}: duplicate key {key.value!r} (first at line {seen.get(key.value)})"
+                        )
+                    else:
+                        seen.setdefault(key.value, key.lineno)
+        self.assertEqual(problems, [], "\n".join(problems))
+
+    def test_cleaned_entries_keep_ui_terminology(self) -> None:
+        self.assertEqual(translate_text("横排校对文本（可修改）", LANG_EN), "Proofreading Text (Editable)")
+        self.assertEqual(
+            translate_text("OCR 竖列（与原图列顺序对齐）", LANG_EN),
+            "OCR Vertical Columns (Aligned with Source Order)",
+        )
+        self.assertEqual(dialog_localization.translate_dialog_text("文本比较完成", LANG_JA), "テキスト比較完了")
 
 
 if __name__ == "__main__":

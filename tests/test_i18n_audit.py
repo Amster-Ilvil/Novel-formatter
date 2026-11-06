@@ -1,11 +1,14 @@
 """Regression gate for the UI/backend localization audit.
 
 UI text and backend messages from builder/, core/ and utils/ must all be
-covered by the runtime translation layer.  adapters/ and engine/ are tracked
-debt: run `python tools/i18n_audit.py --backend --stats` to list them.
+covered by the runtime translation layer.  In adapters/ and engine/ every CJK
+literal is classified as user-visible (A) or internal (B); only A must be
+translated.  Run `python tools/i18n_audit.py --backend-visible --stats` for
+the A/B breakdown by reason.
 """
 from __future__ import annotations
 
+import ast
 import re
 import sys
 import unittest
@@ -17,7 +20,7 @@ for extra in (ROOT, ROOT / "tools"):
         sys.path.insert(0, str(extra))
 
 import i18n_audit  # noqa: E402
-from ui.localization_audit_catalog import AUDIT_CATALOG  # noqa: E402
+from ui.localization_audit_catalog import AUDIT_CATALOG, BACKEND_EN  # noqa: E402
 
 _HAN = re.compile(r"[\u4e00-\u9fff]")
 _KANA = re.compile(r"[\u3040-\u30ff]")
@@ -27,6 +30,7 @@ _CJK_RUN = re.compile(r"[\u3040-\u30ff\u4e00-\u9fff]+")
 _LITERAL_MARKERS = frozenset({
     "前書", "前書き", "後書き", "漢字", "よみ", "ルビ",
     "章", "话", "回", "第", "序章", "幕间", "终章", "后记",
+    "削除予定",
 })
 
 
@@ -48,6 +52,61 @@ class BackendAuditTest(unittest.TestCase):
         findings = i18n_audit.audit_backend(("builder", "core", "utils"))
         self.assertEqual(findings, [], "untranslated backend messages:\n" + _report(findings))
 
+    def test_visible_adapter_and_engine_messages_are_translated(self) -> None:
+        findings = i18n_audit.audit_backend_visible(i18n_audit.VISIBLE_BACKEND_DIRS)
+        self.assertEqual(findings, [], "untranslated category-A backend messages:\n" + _report(findings))
+
+
+_CLASSIFIER_SAMPLE = '''
+import logging
+import re
+
+logger = logging.getLogger(__name__)
+TOKENS = {"前書き": 1}
+
+
+def run(text, progress_callback=None, log_callback=None):
+    """识别整页文本。"""
+    if text == "后记":
+        return None
+    pattern = re.compile(r"第[一二三]+章")
+    print("调试输出")
+    logger.debug("内部调试")
+    progress_callback("正在识别页面")
+    log_callback(f"已完成 {text} 页")
+    raise RuntimeError("模型加载失败")
+'''
+
+
+class BackendClassifierTest(unittest.TestCase):
+    def test_rules_on_known_sample(self) -> None:
+        tree = ast.parse(_CLASSIFIER_SAMPLE)
+        ctx = i18n_audit._FileContext(tree)
+        got = {
+            raw: i18n_audit._classify_literal(node, ctx)
+            for node, raw, _ in i18n_audit._iter_backend_literals(tree, ctx)
+        }
+        got = {raw: category for raw, (category, _reason) in got.items()}
+        A, B = i18n_audit.VISIBLE, i18n_audit.INTERNAL
+        expected = {
+            "前書き": B,          # dict key
+            "识别整页文本。": B,    # docstring
+            "后记": B,            # comparison operand
+            "第[一二三]+章": B,     # regular expression
+            "调试输出": B,         # print
+            "内部调试": B,         # stdlib logging
+            "正在识别页面": A,      # progress callback
+            "已完成 {…} 页": A,    # log callback f-string
+            "模型加载失败": A,      # raise
+        }
+        self.assertEqual(got, expected)
+
+    def test_every_literal_has_a_category(self) -> None:
+        items = i18n_audit.classify_backend(i18n_audit.VISIBLE_BACKEND_DIRS)
+        self.assertTrue(items)
+        self.assertEqual({item.category for item in items}, {i18n_audit.VISIBLE, i18n_audit.INTERNAL})
+        self.assertTrue(all(item.reason for item in items))
+
 
 class CatalogShapeTest(unittest.TestCase):
     def test_entries_are_well_formed(self) -> None:
@@ -65,6 +124,21 @@ class CatalogShapeTest(unittest.TestCase):
             if source.count("\n") != en.count("\n") or source.count("\n") != ja.count("\n"):
                 problems.append(f"{source!r}: line break count mismatch")
             leftover = [run for run in _CJK_RUN.findall(en) if run not in _LITERAL_MARKERS]
+            if leftover:
+                problems.append(f"{source!r}: CJK left in English text {leftover}")
+        self.assertEqual(problems, [], "\n".join(problems[:25]))
+
+    def test_backend_entries_are_well_formed(self) -> None:
+        problems: list[str] = []
+        for source, english in BACKEND_EN.items():
+            if not isinstance(english, str) or not english.strip():
+                problems.append(f"{source!r}: empty translation")
+                continue
+            if english.count("{…}") != source.count("{…}"):
+                problems.append(f"{source!r}: placeholder count mismatch")
+            if source.count("\n") != english.count("\n"):
+                problems.append(f"{source!r}: line break count mismatch")
+            leftover = [run for run in _CJK_RUN.findall(english) if run not in _LITERAL_MARKERS]
             if leftover:
                 problems.append(f"{source!r}: CJK left in English text {leftover}")
         self.assertEqual(problems, [], "\n".join(problems[:25]))

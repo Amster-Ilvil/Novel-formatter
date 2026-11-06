@@ -111,7 +111,6 @@ _EXACT_EN = {
     "↻ 刷新": "↻ Refresh",
     "删除": "Delete",
     "🗑 删除": "🗑 Delete",
-    "全选": "Select All",
     "取消选择": "Clear Selection",
     "停止": "Stop",
     "重新 OCR": "Re-run OCR",
@@ -152,13 +151,10 @@ _EXACT_EN = {
     "本地 AI": "In-app AI",
     "云端 AI": "Imported Cloud AI",
     "已裁决历史": "Adjudication History",
-    "OCR 竖列（与原图列顺序对齐）": "OCR Vertical Columns (Source Order)",
     "OCR 竖列": "OCR Vertical Columns",
-    "对应识别图片": "Matching Source Image",
     "拖动图片横向定位 OCR 列": "Drag across image to locate OCR column",
     "定位左侧 OCR 物理列（⌥⇧←）": "Move to the OCR physical column on the left (⌥⇧←)",
     "定位右侧 OCR 物理列（⌥⇧→）": "Move to the OCR physical column on the right (⌥⇧→)",
-    "横排校对文本（可修改）": "Proofreading Text (Editable)",
     "横排校对文本": "Proofreading Text",
     "打开后只读浏览明确裁决过的句子；可按本地、人工、本地 AI、云端 AI 分别筛选。自动一致/两模型共同候选不计入裁决历史。": "Browse explicitly adjudicated sentences in read-only mode. Filter by local, human, in-app AI, or imported cloud AI. Automatic consensus is not counted as adjudication history.",
     "当前正在浏览只读裁决历史；关闭“显示已裁决”后才能重新裁决。": "Adjudication history is read-only. Turn off ‘Show adjudicated’ before changing a decision.",
@@ -372,10 +368,10 @@ _EXACT_EN = {
     "开始导出": "Start Export",
     "图文逐句校对": "Sentence Image/Text Review",
     "尚未接收 OCR 结果": "No OCR result received",
-    "OCR 竖列（与原图列顺序对齐）": "OCR Vertical Columns (aligned with source order)",
+    "OCR 竖列（与原图列顺序对齐）": "OCR Vertical Columns (Aligned with Source Order)",
     "对应识别图片": "Corresponding OCR Image",
     "用预览打开": "Open in Preview",
-    "横排校对文本（可修改）": "Horizontal Review Text (editable)",
+    "横排校对文本（可修改）": "Proofreading Text (Editable)",
     "苹果系统手写": "Apple Handwriting",
     "多模型融合候选": "Multi-model Fusion Candidate",
     "← 上一句": "← Previous Sentence",
@@ -517,13 +513,10 @@ _EXACT_JA = {
     "本地 AI": "アプリ内AI",
     "云端 AI": "外部AI取込",
     "已裁决历史": "裁決履歴",
-    "OCR 竖列（与原图列顺序对齐）": "OCR縦列（原画像の列順）",
     "OCR 竖列": "OCR縦列",
-    "对应识别图片": "対応する認識画像",
     "拖动图片横向定位 OCR 列": "画像を横にドラッグしてOCR列を定位",
     "定位左侧 OCR 物理列（⌥⇧←）": "左側のOCR物理列へ移動（⌥⇧←）",
     "定位右侧 OCR 物理列（⌥⇧→）": "右側のOCR物理列へ移動（⌥⇧→）",
-    "横排校对文本（可修改）": "横書き校正テキスト（編集可）",
     "横排校对文本": "横書き校正テキスト",
     "打开后只读浏览明确裁决过的句子；可按本地、人工、本地 AI、云端 AI 分别筛选。自动一致/两模型共同候选不计入裁决历史。": "明示的に裁決済みの文を読み取り専用で閲覧します。ローカル・手動・アプリ内AI・外部AI取込で絞り込めます。自動一致は裁決履歴に含めません。",
     "当前正在浏览只读裁决历史；关闭“显示已裁决”后才能重新裁决。": "裁決履歴は読み取り専用です。裁決を変更するには「裁決済みを表示」をオフにしてください。",
@@ -5031,6 +5024,7 @@ del _key, _value
 # anchored templates behind one CJK-gated matcher per language, so English or
 # empty text never scans the template list.
 from ui.localization_audit_catalog import AUDIT_CATALOG as _AUDIT_CATALOG  # noqa: E402
+from ui.localization_audit_catalog import BACKEND_EN as _BACKEND_EN  # noqa: E402
 
 TEMPLATE_PLACEHOLDER = re.compile(r"\{…\}|\{[A-Za-z_]\w*\}|\{\}|%(?:[(][A-Za-z_]\w*[)])?[sd]")
 _ANONYMOUS_PLACEHOLDERS = frozenset({"{…}", "{}", "%s", "%d"})
@@ -5057,17 +5051,30 @@ def _compile_template(key: str):
 
 
 class _TemplateMatcher:
-    """Pattern-like ``_PATTERNS`` entry: the first matching audit template wins."""
+    """Pattern-like ``_PATTERNS`` entry: the most specific matching template wins.
+
+    Templates are ordered by the length of their literal (non-placeholder)
+    text, longest first; catalog order breaks ties.  Without this a short
+    generic key such as ``"{…} 列"`` would swallow a whole composed line and
+    leave everything before its literal tail untranslated.
+    """
 
     def __init__(self, language: str):
         self.language = language
         self.entries: list[tuple[re.Pattern, tuple[str, ...], str]] = []
+        self._weights: list[int] = []
 
     def add(self, key: str, target: str) -> None:
         # Runs of adjacent f-string slots carry no separator to anchor on; one
         # group per run keeps matching linear instead of exponential.
         pattern, tokens = _compile_template(_ADJACENT_SLOTS.sub("{…}", key))
         self.entries.append((pattern, tokens, _ADJACENT_SLOTS.sub("{…}", target)))
+        self._weights.append(len(TEMPLATE_PLACEHOLDER.sub("", key)))
+
+    def finalize(self) -> None:
+        order = sorted(range(len(self.entries)), key=lambda index: -self._weights[index])
+        self.entries = [self.entries[index] for index in order]
+        self._weights = [self._weights[index] for index in order]
 
     def match(self, source: str):
         if not _TEMPLATE_GATE.search(source):
@@ -5095,10 +5102,81 @@ class _TemplateMatcher:
         return TEMPLATE_PLACEHOLDER.sub(fill, target)
 
 
+# Brackets are written as \x5b / \x5d to keep the pattern free of bracket
+# escapes that editors and patch tools tend to mangle.
+_RUN_LOG_COUNTER_TAIL = re.compile(r"(.*?\S)(\s+\d+ / \d+)", re.S)
+_RUN_LOG_LINE = re.compile(r"(\s*\x5b)(.+?)(\s+\d+/\d+)?(\x5d )(.*)\Z", re.S)
+
+
+class _RunLogLineMatcher:
+    """OCR run-log lines ``  [label( N/M)] detail`` (``ui/ocr/run_controller``).
+
+    Label and detail are translated independently through ``translate_text``;
+    the bracket frame and counters are kept byte-for-byte.  When neither part
+    changes, ``match`` returns ``None`` so ordinary templates still apply.
+    """
+
+    def __init__(self, language: str):
+        self.language = language
+
+    def match(self, source: str):
+        if not _TEMPLATE_GATE.search(source):
+            return None
+        found = _RUN_LOG_LINE.match(source)
+        if found is None:
+            return None
+        lead, label, counter, close, detail = found.groups()
+        label_out = translate_text(label, self.language)
+        detail_out = self._translate_detail(detail) if detail else detail
+        if label_out == label and detail_out == detail:
+            return None
+        return f"{lead}{label_out}{counter or ''}{close}{detail_out}"
+
+    def _translate_detail(self, detail: str) -> str:
+        """Translate a `` · ``-joined progress detail segment by segment.
+
+        ``column_ocr_adapter`` builds ``"{stage} {i} / {n} · …"``; a trailing
+        `` i / n`` counter is preserved verbatim while the stage name is
+        translated.  The segmented form is used when every CJK segment was
+        translated; otherwise a whole-line translation (if any) is kept.
+        """
+        whole = translate_text(detail, self.language)
+        if whole != detail and not _TEMPLATE_GATE.search(whole):
+            return whole
+        parts: list[str] = []
+        untranslated = 0
+        for segment in detail.split(" · "):
+            out = self._translate_segment(segment)
+            if out == segment and _TEMPLATE_GATE.search(segment):
+                untranslated += 1
+            parts.append(out)
+        segmented = " · ".join(parts)
+        if untranslated == 0 or whole == detail:
+            return segmented
+        return whole
+
+    def _translate_segment(self, segment: str) -> str:
+        counter = _RUN_LOG_COUNTER_TAIL.fullmatch(segment)
+        core, tail = (counter.group(1), counter.group(2)) if counter else (segment, "")
+        out = translate_text(core, self.language)
+        if out == core:
+            # Adapter suffixes are catalogued with their " · " joiner.
+            joined = translate_text(" · " + core, self.language)
+            if joined != " · " + core and joined.startswith(" · "):
+                out = joined[3:]
+        return out + tail
+
+    @staticmethod
+    def render(hit) -> str:
+        return hit
+
+
 def _register_audit_catalog() -> None:
     matchers = {LANG_EN: _TemplateMatcher(LANG_EN), LANG_JA: _TemplateMatcher(LANG_JA)}
     exact_maps = {LANG_EN: _EXACT_EN, LANG_JA: _EXACT_JA}
-    for key, (english, japanese) in _AUDIT_CATALOG.items():
+    # Backend messages are English-only: Japanese falls back to the English text.
+    backend = ((key, (english, english)) for key, english in _BACKEND_EN.items())
+    for key, (english, japanese) in (*_AUDIT_CATALOG.items(), *backend):
         templated = TEMPLATE_PLACEHOLDER.search(key) is not None
         for language, target in ((LANG_EN, english), (LANG_JA, japanese)):
             if not target:
@@ -5108,7 +5186,10 @@ def _register_audit_catalog() -> None:
             else:
                 exact_maps[language].setdefault(key, target)
     for language, matcher in matchers.items():
-        _PATTERNS.setdefault(language, []).append((matcher, matcher.render))
+        matcher.finalize()
+        run_log = _RunLogLineMatcher(language)
+        _PATTERNS.setdefault(language, []).append((run_log, run_log.render))
+        _PATTERNS[language].append((matcher, matcher.render))
 
 
 _register_audit_catalog()
