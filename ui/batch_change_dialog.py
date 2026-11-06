@@ -6,12 +6,12 @@ from PySide6.QtWidgets import (
 )
 
 from core.batch_changes import BatchChangeSet
-from ui.localization import LANG_ZH, normalize_language, translate_text
+from ui.localization import DEFAULT_LANGUAGE, normalize_language, translate_text
 
 
 def _ui_language() -> str:
     app = QApplication.instance()
-    return normalize_language(app.property("nfLanguage") if app is not None else LANG_ZH)
+    return normalize_language(app.property("nfLanguage") if app is not None else DEFAULT_LANGUAGE)
 
 
 def _tr_ui(value: str) -> str:

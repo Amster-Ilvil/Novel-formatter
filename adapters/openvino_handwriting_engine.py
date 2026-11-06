@@ -3,17 +3,16 @@
 """Optional independent Japanese handwriting recognizer based on OpenVINO.
 
 The model is Open Model Zoo's handwritten-japanese-recognition-0001. Model files
-are downloaded from official locations and SHA-384 checked. They are not bundled.
+are downloaded from official locations through utils.model_manager (SHA-256 and
+SHA-384 checked). They are not bundled.
 """
 from __future__ import annotations
 
-import hashlib
-import os
-import tempfile
-import urllib.request
 from pathlib import Path
 
 from PIL import Image, ImageOps
+
+from utils.model_manager import ModelManager, ModelStatus, default_manager, get_spec, user_requested_download
 
 _PROJECT_ROOT = Path(__file__).resolve().parents[1]
 _MODEL_DIR = _PROJECT_ROOT / "models" / "handwriting_openvino"
@@ -22,24 +21,11 @@ _MODEL_XML = _MODEL_DIR / f"{_MODEL_NAME}.xml"
 _MODEL_BIN = _MODEL_DIR / f"{_MODEL_NAME}.bin"
 _CHARLIST = _MODEL_DIR / "kondate_nakayosi.txt"
 
-_FILES = {
-    _MODEL_XML: (
-        "https://storage.openvinotoolkit.org/repositories/open_model_zoo/2023.0/models_bin/1/"
-        f"{_MODEL_NAME}/FP16-INT8/{_MODEL_NAME}.xml",
-        "b8cac8a7a57ec8e741d336517e7406333aef866cf5976e28ef44f8f5afb43b116fc657050592229d28a932c9f1ed77c2",
-    ),
-    _MODEL_BIN: (
-        "https://storage.openvinotoolkit.org/repositories/open_model_zoo/2023.0/models_bin/1/"
-        f"{_MODEL_NAME}/FP16-INT8/{_MODEL_NAME}.bin",
-        "2120d799e261f6abbf46215de79592c3c334d955a8220c6e7c74791ce7d6662292080d90df593865c145d40516df6c7b",
-    ),
-    _CHARLIST: (
-        "https://raw.githubusercontent.com/openvinotoolkit/open_model_zoo/"
-        "7cc29a91472b4cb1289a11e655ba3e188e1d4a31/data/dataset_classes/kondate_nakayosi.txt",
-        None,
-    ),
-}
-
+_MODEL_IDS = (
+    "openvino_handwriting.xml",
+    "openvino_handwriting.bin",
+    "openvino_handwriting.charlist",
+)
 
 def runtime_available() -> tuple[bool, str]:
     try:
@@ -50,50 +36,59 @@ def runtime_available() -> tuple[bool, str]:
         return False, f"缺少 OpenVINO Runtime：{exc}"
 
 
+def _model_dir() -> Path:
+    """Folder holding a complete model set.
+
+    The legacy ``models/handwriting_openvino`` folder is reused when it already
+    contains all files; new installs go to the configured models folder.
+    """
+    manager = default_manager()
+    spec = get_spec("openvino_handwriting.xml")
+    target = manager.target_dir(spec)
+    for candidate in [target] + [_PROJECT_ROOT / item for item in spec.legacy_dirs]:
+        if all((candidate / get_spec(model_id).filename).is_file() for model_id in _MODEL_IDS):
+            return candidate
+    return target
+
+
+def _model_paths() -> tuple[Path, Path, Path]:
+    directory = _model_dir()
+    xml_path, bin_path, charlist_path = (directory / get_spec(model_id).filename for model_id in _MODEL_IDS)
+    return xml_path, bin_path, charlist_path
+
+
 def model_available() -> tuple[bool, str]:
-    missing = [path.name for path in _FILES if not path.exists()]
+    manager = default_manager()
+    directory = _model_dir()
+    missing = [
+        get_spec(model_id).filename
+        for model_id in _MODEL_IDS
+        if manager.status(model_id, target_dir=directory, deep=False) is not ModelStatus.READY
+    ]
     if missing:
         return False, "缺少模型文件：" + "、".join(missing)
     ok, detail = runtime_available()
     return (ok, "模型与运行环境可用" if ok else detail)
 
 
-def _sha384(path: Path) -> str:
-    digest = hashlib.sha384()
-    with path.open("rb") as fh:
-        for chunk in iter(lambda: fh.read(1024 * 1024), b""):
-            digest.update(chunk)
-    return digest.hexdigest()
-
-
-def download_model(progress_callback=None) -> Path:
-    _MODEL_DIR.mkdir(parents=True, exist_ok=True)
-    total = len(_FILES)
-    for index, (target, (url, checksum)) in enumerate(_FILES.items(), start=1):
-        if target.exists() and (not checksum or _sha384(target) == checksum):
+def download_model(progress_callback=None, *, cancel_check=None) -> Path:
+    """Download/verify all files after an explicit user action."""
+    manager: ModelManager = default_manager()
+    directory = _model_dir()
+    total = len(_MODEL_IDS)
+    with user_requested_download():
+        for index, model_id in enumerate(_MODEL_IDS, start=1):
+            name = get_spec(model_id).filename
+            if manager.status(model_id, target_dir=directory) is ModelStatus.READY:
+                if progress_callback:
+                    progress_callback(index, total, f"已存在：{name}")
+                continue
             if progress_callback:
-                progress_callback(index, total, f"已存在：{target.name}")
-            continue
-        if progress_callback:
-            progress_callback(index - 1, total, f"下载：{target.name}")
-        fd, temp_name = tempfile.mkstemp(
-            prefix=target.name + ".", suffix=".part", dir=str(_MODEL_DIR),
-        )
-        os.close(fd)
-        temp = Path(temp_name)
-        try:
-            request = urllib.request.Request(url, headers={"User-Agent": "NovelFormatter/2.0"})
-            with urllib.request.urlopen(request, timeout=120) as response, temp.open("wb") as out:
-                for chunk in iter(lambda: response.read(1024 * 1024), b""):
-                    out.write(chunk)
-            if checksum and _sha384(temp) != checksum:
-                raise RuntimeError(f"{target.name} 校验失败")
-            temp.replace(target)
-        finally:
-            temp.unlink(missing_ok=True)
-        if progress_callback:
-            progress_callback(index, total, f"完成：{target.name}")
-    return _MODEL_DIR
+                progress_callback(index - 1, total, f"下载：{name}")
+            manager.ensure(model_id, target_dir=directory, cancel_check=cancel_check)
+            if progress_callback:
+                progress_callback(index, total, f"完成：{name}")
+    return directory
 
 
 class OpenVINOJapaneseHandwritingRecognizer:
@@ -101,18 +96,28 @@ class OpenVINOJapaneseHandwritingRecognizer:
         ok, detail = model_available()
         if not ok:
             raise RuntimeError(detail)
+        manager = default_manager()
+        xml_path, _bin_path, charlist_path = _model_paths()
+        problems = []
+        for model_id in _MODEL_IDS:
+            state = manager.verify(model_id, force=True, target_dir=xml_path.parent)
+            if state is not ModelStatus.READY:
+                problems.append(f"{manager.spec(model_id).filename}: {state.value}")
+        if problems:
+            raise RuntimeError("OpenVINO model verification failed: " + "; ".join(problems))
+
         import numpy as np
         from openvino import Core
 
         self._np = np
         core = Core()
-        model = core.read_model(str(_MODEL_XML))
+        model = core.read_model(str(xml_path))
         self._compiled = core.compile_model(model, device)
         self._input = model.inputs[0]
         self._output = model.outputs[0]
         self._height = int(self._input.shape[2])
         self._width = int(self._input.shape[3])
-        characters = "".join(_CHARLIST.read_text(encoding="utf-8").splitlines())
+        characters = "".join(charlist_path.read_text(encoding="utf-8").splitlines())
         self._characters = ["[blank]", *list(characters)]
         if len(self._characters) != int(self._output.shape[2]):
             raise RuntimeError("OpenVINO 手写模型与字符表不匹配")

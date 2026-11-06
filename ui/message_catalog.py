@@ -10,10 +10,15 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 
-from ui.localization import LANG_EN, LANG_JA, LANG_ZH, normalize_language
+from ui.localization import DEFAULT_LANGUAGE, LANG_EN, LANG_JA, LANG_ZH, normalize_language
 
 
 _MESSAGES: dict[str, Mapping[str, str]] = {
+    "model_download.failed.body": {
+        LANG_ZH: "无法下载或校验模型。请查看以下详细信息；如有必要，请按提示手动安装。\n\n{details}",
+        LANG_EN: "The model could not be downloaded or verified. See the details below; if needed, follow the manual installation instructions.\n\n{details}",
+        LANG_JA: "モデルをダウンロードまたは検証できませんでした。以下の詳細を確認し、必要に応じて案内に従って手動でインストールしてください。\n\n{details}",
+    },
     "page.delete.confirm": {
         LANG_ZH: "确定要从当前导入中移除选中的 {count} 页吗？\n（只是从这次处理里去掉，不会删除原始图片文件）",
         LANG_EN: "Remove the selected {count} page(s) from this import?\n(They are removed only from this run; the original image files are not deleted.)",
@@ -82,7 +87,7 @@ _MESSAGES: dict[str, Mapping[str, str]] = {
 }
 
 
-def format_message(key: str, language: str = LANG_ZH, /, **values: object) -> str:
+def format_message(key: str, language: str = DEFAULT_LANGUAGE, /, **values: object) -> str:
     """Format a localized message by stable key.
 
     All values are interpolated *after* language selection.  Missing keys or

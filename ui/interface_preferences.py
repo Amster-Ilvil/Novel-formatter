@@ -12,13 +12,13 @@ from typing import Iterable
 from PySide6.QtCore import QObject, QEvent, QTimer
 from PySide6.QtGui import QAction, QColor, QPalette
 from PySide6.QtWidgets import (
-    QApplication, QWidget, QLabel, QPushButton, QToolButton, QCheckBox,
+    QApplication, QWidget, QLabel, QAbstractButton, QPushButton, QToolButton, QCheckBox,
     QRadioButton, QLineEdit, QComboBox, QTabWidget, QListWidget, QTableWidget,
     QMenu, QGroupBox, QTextEdit, QPlainTextEdit, QSpinBox, QDoubleSpinBox,
     QProgressBar, QTreeWidget,
 )
 
-from ui.localization import LANG_ZH, normalize_language, translate_text
+from ui.localization import DEFAULT_LANGUAGE, LANG_ZH, normalize_language, translate_text
 
 from ui.theme_palette import (
     THEME_LIGHT, THEME_DARK, SUPPORTED_THEMES, normalize_theme, darken_stylesheet,
@@ -55,7 +55,8 @@ class InterfacePreferenceManager(QObject):
     are unaffected by a language/theme switch.
     """
 
-    _TEXT_TYPES = (QLabel, QPushButton, QToolButton, QCheckBox, QRadioButton)
+    # QAbstractButton also covers custom buttons such as the sidebar DesignNavButton.
+    _TEXT_TYPES = (QLabel, QAbstractButton)
     # Polish can arrive while a Python QWidget subclass is still being built.
     # Calling back into that temporary wrapper can make PySide cache it as a
     # plain QWidget. Show happens after construction and is the safe boundary.
@@ -65,7 +66,7 @@ class InterfacePreferenceManager(QObject):
         QGroupBox, QSpinBox, QDoubleSpinBox, QProgressBar, QTreeWidget,
     )
 
-    def __init__(self, app: QApplication, *, base_stylesheet: str = "", language: str = LANG_ZH, theme: str = THEME_LIGHT):
+    def __init__(self, app: QApplication, *, base_stylesheet: str = "", language: str = DEFAULT_LANGUAGE, theme: str = THEME_LIGHT):
         super().__init__(app)
         self.app = app
         self.base_stylesheet = str(base_stylesheet or app.styleSheet() or "")
@@ -119,11 +120,16 @@ class InterfacePreferenceManager(QObject):
                         self._apply_widget_theme(obj)
                     if self.language != LANG_ZH:
                         self._translate_widget(obj, force=False)
-                elif et == QEvent.UpdateRequest and self.language != LANG_ZH and isinstance(obj, self._DYNAMIC_TEXT_TYPES):
-                    # setText()/setItemText() schedules an update.  Restrict the
-                    # dynamic pass to text-bearing widgets so live OCR status
-                    # messages switch language without rescanning theme/QSS on
-                    # every paint event.
+                elif et in (QEvent.WindowTitleChange, QEvent.ToolTipChange) and self.language != LANG_ZH:
+                    self._translate_widget(obj, force=False)
+                elif (
+                    et in (QEvent.UpdateRequest, QEvent.Paint)
+                    and self.language != LANG_ZH
+                    and isinstance(obj, self._DYNAMIC_TEXT_TYPES)
+                ):
+                    # Child labels/buttons may repaint without receiving their
+                    # own UpdateRequest. Translate before Paint too, retaining
+                    # the source/applied tracking used for language changes.
                     self._translate_widget(obj, force=False)
                 elif et == QEvent.StyleChange and id(obj) not in self._theme_guard:
                     # Widget code may replace its inline QSS in either theme.
@@ -364,6 +370,19 @@ class InterfacePreferenceManager(QObject):
             if current != target:
                 action.setText(target)
             setattr(action, "_nf_i18n_applied_text", target)
+            # Only an explicit tool tip needs its own pass; an implicit one
+            # mirrors text() and already follows the translated label.
+            tip = action.toolTip()
+            if tip and tip.replace("&", "") != action.text().replace("&", ""):
+                tip_source = getattr(action, "_nf_i18n_source_tooltip", None)
+                tip_applied = getattr(action, "_nf_i18n_applied_tooltip", None)
+                if tip_source is None or (tip_applied is not None and tip != tip_applied):
+                    tip_source = tip
+                    setattr(action, "_nf_i18n_source_tooltip", tip_source)
+                tip_target = translate_text(tip_source, self.language)
+                if tip != tip_target:
+                    action.setToolTip(tip_target)
+                setattr(action, "_nf_i18n_applied_tooltip", tip_target)
 
 
 def manager_for(app: QApplication | None = None) -> InterfacePreferenceManager | None:

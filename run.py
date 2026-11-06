@@ -1,35 +1,35 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Novel Formatter Studio — 一键运行脚本
+Novel Formatter Studio — one-shot command-line runner
 
-完整流程：
-    图片文件夹
-        → Apple Vision OCR（via macOS 快捷指令）
-        → 统一文档模型 JSON（可选保存中间结果）
-        → Novel Formatter Engine（六步处理）
-        → EPUB3 输出
+Full pipeline:
+    image folder
+        → Apple Vision OCR (via macOS Shortcuts)
+        → unified document model JSON (intermediate result can be saved)
+        → Novel Formatter Engine (post-processing steps)
+        → EPUB3 output
 
-用法：
-    # 最简：图片文件夹 → EPUB
+Usage:
+    # Minimal: image folder → EPUB
     python run.py /path/to/images output.epub
 
-    # 指定书名作者
+    # Set title and author
     python run.py /path/to/images output.epub --title "魔法科高校の劣等生" --author "佐島勤"
 
-    # 使用 Page Manager 手动标注（JSON格式）
+    # Use Page Manager manual page types (JSON)
     python run.py /path/to/images output.epub --overrides overrides.json
 
-    # 保存中间 JSON（方便调试或跳过 OCR 重跑 Formatter）
+    # Save the intermediate JSON (for debugging or re-running Formatter without OCR)
     python run.py /path/to/images output.epub --save-json intermediate.json
 
-    # 从已有 JSON 跳过 OCR 直接生成 EPUB
+    # Skip OCR and build the EPUB from an existing JSON
     python run.py --from-json intermediate.json output.epub
 
-    # 竖排模式 + 電撃文庫模板
+    # Vertical mode + Dengeki Bunko template
     python run.py /path/to/images output.epub --template denki --vertical
 
-    # 只跑部分 Formatter 步骤
+    # Run only some Formatter steps
     python run.py /path/to/images output.epub --steps merge_sentences detect_chapters normalize_punct
 """
 
@@ -38,7 +38,7 @@ import json
 import sys
 from pathlib import Path
 
-# 将当前目录加入 path
+# Make the project root importable.
 sys.path.insert(0, str(Path(__file__).parent))
 
 from models.document import UnifiedDocument
@@ -47,52 +47,52 @@ from core.temp_manager import TempCropManager
 
 def main(argv=None) -> int:
     parser = argparse.ArgumentParser(
-        description="Novel Formatter Studio — 图片文件夹 → EPUB3",
+        description="Novel Formatter Studio — image folder → EPUB3",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=__doc__,
     )
 
-    # 输入
-    parser.add_argument("input", help="图片文件夹路径，或导入模式下的 JSON/EPUB 文件")
-    parser.add_argument("output_epub", nargs="?", help="输出 EPUB 路径（批量模式不需要）")
+    # Input
+    parser.add_argument("input", help="image folder, or a JSON/EPUB file in import modes")
+    parser.add_argument("output_epub", nargs="?", help="output EPUB path (not needed in batch mode)")
 
-    # 模式
+    # Source mode
     source_mode = parser.add_mutually_exclusive_group()
     source_mode.add_argument("--from-json", dest="from_json", action="store_true",
-                             help="input 参数改为已有的 UnifiedDocument JSON，跳过 OCR")
+                             help="treat input as an existing UnifiedDocument JSON and skip OCR")
     source_mode.add_argument("--from-epub", dest="from_epub", action="store_true",
-                             help="input 参数改为已有的 .epub 文件，逆向导入后跳过 OCR "
-                                  "（常配合 --steps detect_chapters strip_boilerplate 清理样板文字）")
+                             help="treat input as an existing .epub, reverse-import it and skip OCR "
+                                  "(often combined with --steps detect_chapters strip_boilerplate to clean boilerplate)")
 
-    # OCR 选项
+    # OCR options
     parser.add_argument("--shortcut", default="ExtractText",
-                        help="快捷指令名称（默认: ExtractText）")
+                        help="macOS Shortcuts name (default: ExtractText)")
     parser.add_argument("--overrides", "-o",
-                        help='Page Manager 手动标注 JSON：{"1":"cover","5":"blank",...}')
+                        help='Page Manager manual page types as JSON: {"1":"cover","5":"blank",...}')
     parser.add_argument("--crop-top", type=float, default=0.0, metavar="0.0-0.3",
-                        help="识别前裁掉页面顶部的比例，排除页眉区域（默认 0 = 不裁）")
+                        help="fraction of the page top to crop before OCR to drop running headers (default 0 = no crop)")
     parser.add_argument("--crop-bottom", type=float, default=0.0, metavar="0.0-0.3",
-                        help="识别前裁掉页面底部的比例，排除页脚区域（默认 0 = 不裁）")
+                        help="fraction of the page bottom to crop before OCR to drop footers (default 0 = no crop)")
     parser.add_argument("--text-layer", action="store_true",
-                        help="input 是带文字层的 PDF 时，直接读取文字层（更准确、"
-                             "自动按字号跳过振假名/页码），不走图像 OCR")
+                        help="if input is a PDF with a text layer, read the text layer directly (more accurate; "
+                             "furigana/page numbers are skipped by font size automatically) instead of image OCR")
     parser.add_argument("--preserve-ruby", action="store_true",
-                        help="额外使用 findtextCenterNet 保留日文原文 Ruby；默认关闭。"
-                             "只提取振假名结构，不覆盖主 OCR 正文")
+                        help="additionally use findtextCenterNet to keep the Japanese source Ruby; off by default. "
+                             "Only extracts the furigana structure and never overwrites the main OCR body text")
     parser.add_argument(
         "--ruby-scan-mode", choices=["smart_roi", "full_page", "auto"], default="smart_roi",
-        help="Ruby 扫描范围：smart_roi=仅处理普通 OCR 记录的疑似 Ruby 上下文框（默认）；"
-             "full_page=整页精确扫描（慢）；auto=有候选时 ROI、无候选时回退整页",
+        help="Ruby scan scope: smart_roi = only the suspected Ruby context boxes recorded by regular OCR (default); "
+             "full_page = precise full-page scan (slow); auto = ROI when candidates exist, otherwise full page",
     )
 
-    # 元数据
-    parser.add_argument("--title",     help="书名（写入 EPUB metadata）")
-    parser.add_argument("--author",    help="作者（写入 EPUB metadata）")
-    parser.add_argument("--publisher", help="出版社")
+    # Metadata
+    parser.add_argument("--title",     help="book title (written to EPUB metadata)")
+    parser.add_argument("--author",    help="author (written to EPUB metadata)")
+    parser.add_argument("--publisher", help="publisher")
     parser.add_argument("--isbn",      help="ISBN")
-    parser.add_argument("--volume",    help="卷号，如 第1巻")
+    parser.add_argument("--volume",    help="volume label, e.g. Vol. 1")
 
-    # Formatter 选项
+    # Formatter options
     from engine.formatter import PIPELINE_STEPS
     step_names = [name for name, _ in PIPELINE_STEPS]
     step_help_lines = "\n".join(
@@ -101,55 +101,68 @@ def main(argv=None) -> int:
     parser.add_argument(
         "--steps", nargs="*",
         metavar="STEP",
-        help="指定 Formatter 步骤（默认全部，列表自动与 engine.formatter.PIPELINE_STEPS 同步）：\n"
+        help="Formatter steps to run (default: all; the list is synced with engine.formatter.PIPELINE_STEPS):\n"
              + step_help_lines,
     )
     parser.add_argument(
         "--repo", metavar="PATH", default=None,
-        help="版本仓库目录（默认自动分配临时目录）。指定后每一步 Formatter 都会 "
-             "commit 进这个目录，可用 `python -m engine.version_control log --repo PATH` 查看历史",
+        help="version repository folder (default: a temporary folder). When set, every Formatter step "
+             "commits into it; view the history with `python -m engine.version_control log --repo PATH`",
     )
 
-    # 输出选项
+    # Output options
     parser.add_argument(
         "--template", "-t",
         choices=["denki", "mf", "web"],
         default="denki",
-        help="CSS 模板（默认: denki = 電撃文庫），仅用于 EPUB 输出",
+        help="CSS template (default: denki = Dengeki Bunko); used only for EPUB output",
     )
-    parser.add_argument("--vertical", action="store_true", help="竖排模式（默认横排）")
+    parser.add_argument("--vertical", action="store_true", help="vertical mode (default: horizontal)")
+    parser.add_argument("--ltr", action="store_true",
+                        help="convert to left-to-right horizontal layout before exporting the EPUB")
     parser.add_argument("--output-word", metavar="PATH",
-                        help="额外生成一份 Word (.docx)，供人工校对/进一步编辑用")
+                        help="also write a Word (.docx) file for manual proofreading/further editing")
 
-    # 调试
+    # Debugging
     parser.add_argument("--save-json", metavar="PATH",
-                        help="保存 OCR 输出的中间 JSON（方便重跑 Formatter）")
+                        help="save the intermediate OCR JSON (to re-run Formatter later)")
     parser.add_argument("--save-formatted-json", metavar="PATH",
-                        help="保存 Formatter 处理后的 JSON")
+                        help="save the JSON after Formatter processing")
     parser.add_argument("--batch", action="store_true",
-                        help="批量处理输入目录中的书籍文件夹")
+                        help="batch-process book folders inside the input folder")
     parser.add_argument("--output-dir", default="./output",
-                        help="批量输出 EPUB 目录")
+                        help="output folder for EPUBs in batch mode")
     parser.add_argument("--no-preview", action="store_true",
-                        help="关闭实时预览/临时裁剪预览输出")
+                        help="disable live preview / temporary crop preview output")
 
     parser.add_argument("--quiet", "-q", action="store_true")
+    parser.add_argument("--models-dir", metavar="PATH", default=None,
+                        help="local model folder (takes precedence over NOVEL_FORMATTER_MODELS_DIR) for finding/downloading OCR models")
+    parser.add_argument("--no-download", action="store_true",
+                        help="never download models automatically; fail with a hint about where to place missing models")
 
     args = parser.parse_args(argv)
+    if args.models_dir or args.no_download:
+        from utils.model_manager import configure as configure_models
+        # Mirrored into env vars so OCR worker subprocesses use the same settings.
+        configure_models(
+            models_dir=args.models_dir,
+            auto_download=False if args.no_download else None,
+        )
 
     input_path = Path(args.input).expanduser()
     if not input_path.exists():
-        parser.error(f"输入路径不存在: {input_path}")
+        parser.error(f"input path does not exist: {input_path}")
     if not 0.0 <= args.crop_top <= 0.3:
-        parser.error("--crop-top 必须在 0.0 到 0.3 之间")
+        parser.error("--crop-top must be between 0.0 and 0.3")
     if not 0.0 <= args.crop_bottom <= 0.3:
-        parser.error("--crop-bottom 必须在 0.0 到 0.3 之间")
+        parser.error("--crop-bottom must be between 0.0 and 0.3")
     if args.crop_top + args.crop_bottom >= 0.8:
-        parser.error("顶部和底部裁剪比例之和必须小于 0.8")
+        parser.error("the sum of top and bottom crop fractions must be less than 0.8")
 
     if args.batch:
         if args.from_json or args.from_epub or args.text_layer:
-            parser.error("--batch 不能与 --from-json、--from-epub 或 --text-layer 同时使用")
+            parser.error("--batch cannot be combined with --from-json, --from-epub or --text-layer")
         unsupported = []
         for flag, value in (
             ("--overrides", args.overrides), ("--preserve-ruby", args.preserve_ruby),
@@ -157,16 +170,17 @@ def main(argv=None) -> int:
             ("--isbn", args.isbn), ("--volume", args.volume), ("--repo", args.repo),
             ("--output-word", args.output_word), ("--save-json", args.save_json),
             ("--save-formatted-json", args.save_formatted_json),
+            ("--ltr", args.ltr),
         ):
             if value:
                 unsupported.append(flag)
         if unsupported:
             parser.error(
-                "批量模式目前不支持以下单本参数（过去会被静默忽略）："
-                + "、".join(unsupported)
+                "batch mode does not support these single-book options yet (they used to be ignored silently): "
+                + ", ".join(unsupported)
             )
         if not input_path.is_dir():
-            parser.error("批量模式的 input 必须是包含书籍子目录的文件夹")
+            parser.error("in batch mode, input must be a folder containing book subfolders")
         from core.batch_processor import BatchProcessor
         BatchProcessor(
             input_dir=args.input,
@@ -183,23 +197,23 @@ def main(argv=None) -> int:
         return 0
 
     if not args.output_epub:
-        parser.error("非批量模式必须提供 output_epub")
+        parser.error("output_epub is required outside batch mode")
     output_path = Path(args.output_epub).expanduser()
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
     verbose = not args.quiet
 
-    # ── Step 1：获取 UnifiedDocument ─────────────────────────────────────────
+    # ── Step 1: obtain the UnifiedDocument ──────────────────────────────────
     if args.from_json:
         if not input_path.is_file():
-            parser.error("--from-json 的 input 必须是 JSON 文件")
+            parser.error("with --from-json, input must be a JSON file")
         if verbose:
-            print(f"📥  从 JSON 读取: {args.input}")
+            print(f"📥  Reading JSON: {args.input}")
         with open(args.input, encoding="utf-8") as f:
             doc = UnifiedDocument.from_json(f.read())
     elif args.from_epub:
         if not input_path.is_file():
-            parser.error("--from-epub 的 input 必须是 EPUB 文件")
+            parser.error("with --from-epub, input must be an EPUB file")
         from adapters.epub_adapter import import_epub
         doc = import_epub(args.input, verbose=verbose)
         if args.title:     doc.metadata.title     = args.title
@@ -213,11 +227,11 @@ def main(argv=None) -> int:
             with open(args.overrides, encoding="utf-8") as f:
                 overrides = json.load(f)
             if verbose:
-                print(f"📋  Page Manager 标注: {len(overrides)} 页已覆盖")
+                print(f"📋  Page Manager overrides: {len(overrides)} page(s)")
 
         if args.text_layer:
             if verbose:
-                print(f"\n── 第一步：PDF 文字层提取 ─────────────────────────────")
+                print(f"\n── Step 1: PDF text-layer extraction ─────────────────────")
             from adapters.pdf_text_layer import extract_pdf_text_layer
             doc = extract_pdf_text_layer(
                 args.input,
@@ -226,7 +240,7 @@ def main(argv=None) -> int:
             )
         else:
             if verbose:
-                print(f"\n── 第一步：Apple Vision OCR ─────────────────────────────")
+                print(f"\n── Step 1: Apple Vision OCR ──────────────────────────────")
             from adapters.apple_vision_adapter import run as ocr_run
             crop_manager = TempCropManager(name="novel_crops")
             crop_path = crop_manager.create(Path(args.input).name)
@@ -246,7 +260,7 @@ def main(argv=None) -> int:
 
         if args.preserve_ruby and not args.text_layer:
             if verbose:
-                print("\n── Ruby 旁路：findtextCenterNet ────────────────────────────")
+                print("\n── Ruby side pass: findtextCenterNet ─────────────────────────")
             from adapters.findtext_centernet_ruby import preserve_ruby_in_documents
             report = preserve_ruby_in_documents(
                 [doc],
@@ -259,11 +273,11 @@ def main(argv=None) -> int:
             )
             if verbose:
                 if report.error:
-                    print(f"⚠️ Ruby 保留失败，正文保持原样：{report.error}")
+                    print(f"⚠️ Ruby preservation failed; body text left unchanged: {report.error}")
                 else:
-                    print(f"✅ Ruby：检测 {report.ruby_pairs}，安全写回 {report.matched_pairs}")
+                    print(f"✅ Ruby: detected {report.ruby_pairs}, safely written back {report.matched_pairs}")
 
-        # 补充命令行传入的 metadata
+        # Apply metadata passed on the command line.
         if args.title:     doc.metadata.title     = args.title
         if args.author:    doc.metadata.author    = args.author
         if args.publisher: doc.metadata.publisher = args.publisher
@@ -274,27 +288,27 @@ def main(argv=None) -> int:
             with open(args.save_json, "w", encoding="utf-8") as f:
                 f.write(doc.to_json())
             if verbose:
-                print(f"💾  中间 JSON 已保存: {args.save_json}")
+                print(f"💾  Intermediate JSON saved: {args.save_json}")
 
     if verbose:
-        print(f"\n── 第二步：Novel Formatter Engine ──────────────────────────")
+        print(f"\n── Step 2: Novel Formatter Engine ────────────────────────")
 
-    # ── Step 2：Formatter Pipeline ───────────────────────────────────────────
+    # ── Step 2: Formatter pipeline ──────────────────────────────────────────
     from engine.formatter import run_pipeline
     formatted = run_pipeline(doc, steps=args.steps, verbose=verbose, repo_path=args.repo)
     if verbose and formatted.repo is not None:
-        print(f"📚  版本仓库: {formatted.repo.path}（可用 version_control log 查看历史）")
+        print(f"📚  Version repository: {formatted.repo.path} (see history with version_control log)")
 
     if args.save_formatted_json:
         with open(args.save_formatted_json, "w", encoding="utf-8") as f:
             f.write(formatted.to_json())
         if verbose:
-            print(f"💾  Formatter JSON 已保存: {args.save_formatted_json}")
+            print(f"💾  Formatter JSON saved: {args.save_formatted_json}")
 
     if verbose:
-        print(f"\n── 第三步：EPUB Builder ──────────────────────────────────────")
+        print(f"\n── Step 3: EPUB Builder ──────────────────────────────────")
 
-    # ── Step 3：EPUB Builder ─────────────────────────────────────────────────
+    # ── Step 3: EPUB Builder ────────────────────────────────────────────────
     from builder.epub_builder import build_epub
     build_epub(
         formatted,
@@ -302,9 +316,10 @@ def main(argv=None) -> int:
         css_template=args.template,
         vertical=args.vertical,
         verbose=verbose,
+        text_direction="ltr" if args.ltr else "keep",
     )
 
-    # ── 可选：额外生成 Word ───────────────────────────────────────────────────
+    # ── Optional: also write a Word document ────────────────────────────────
     if args.output_word:
         from builder.word_builder import build_word
         build_word(
@@ -315,14 +330,14 @@ def main(argv=None) -> int:
         )
 
     if verbose:
-        print(f"\n🎉  全部完成！")
-        print(f"    输入: {args.input}")
-        print(f"    输出: {output_path}")
+        print(f"\n🎉  All done!")
+        print(f"    Input:  {args.input}")
+        print(f"    Output: {output_path}")
         if args.output_word:
-            print(f"    Word: {args.output_word}")
+            print(f"    Word:   {args.output_word}")
         toc_items = "\n        ".join(t.title for t in formatted.toc)
         if toc_items:
-            print(f"    目录:\n        {toc_items}")
+            print(f"    Contents:\n        {toc_items}")
 
     return 0
 

@@ -59,7 +59,7 @@ from adapters.ocr_profiles import (
 
 SHORTCUT_NAME = "ExtractText"   # 快捷指令名称，与你在 Shortcuts App 中创建的保持一致
 
-IMAGE_EXTS = ('.png', '.jpg', '.jpeg', '.heic', '.tif', '.tiff', '.bmp', '.gif')
+IMAGE_EXTS = ('.png', '.jpg', '.jpeg', '.heic', '.tif', '.tiff', '.bmp', '.gif', '.webp')
 
 # Multi-model column OCR can ask several model threads to prepare the exact same
 # fixed-region page at the same time.  Protect each destination so 400-page books

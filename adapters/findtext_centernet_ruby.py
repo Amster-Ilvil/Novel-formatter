@@ -1613,14 +1613,73 @@ def _findtext_worker_environment() -> dict[str, str]:
     return environment
 
 
-def prepare_runtime(*, log_callback=None) -> tuple[Path, Path]:
-    """Prepare the optional upstream runtime after explicit opt-in.
+def _offline_runtime_error(component: str, location: Path, detail: str = "") -> RuntimeError:
+    message = (
+        f"findtextCenterNet: downloads are disabled (--no-download). "
+        f"Missing or unusable {component}: {location}."
+    )
+    if detail:
+        message += f" {detail}"
+    return RuntimeError(
+        message
+        + " Preinstall the Ruby runtime with downloads enabled: "
+        + 'NOVEL_FORMATTER_MODEL_AUTO_DOWNLOAD=1 python -c '
+        + '"from adapters.findtext_centernet_ruby import prepare_runtime; prepare_runtime()". '
+        + "Then retry with --no-download; custom installations can use "
+        + "NOVEL_FORMATTER_FINDTEXT_CENTERNET_DIR and NOVEL_FORMATTER_FINDTEXT_CENTERNET_PYTHON."
+    )
 
-    The lock prevents two OCR jobs from racing while creating the venv,
-    downloading multi-GB weights, or compiling ``linedetect``.
+
+def _local_runtime_only(source: Path) -> tuple[Path, Path]:
+    """Validate an installed runtime without invoking any installer."""
+    if not _source_tree_ready(source):
+        raise _offline_runtime_error("source", source)
+    backend = _ready_backend(source)
+    if not backend:
+        raise _offline_runtime_error(
+            "weights", source, "A complete CoreML, ONNX or Torch backend is required.",
+        )
+    python = _runtime_python(source)
+    if not python.is_file():
+        raise _offline_runtime_error("Python runtime", python)
+    linedetect = _linedetect_path(source)
+    if not linedetect.is_file():
+        raise _offline_runtime_error("linedetect", linedetect)
+    marker = "import torch, torchvision, numpy; from PIL import Image"
+    if backend == "coreml":
+        marker += "; import coremltools"
+    elif backend == "onnx":
+        marker += "; import onnxruntime"
+    try:
+        probe = subprocess.run(
+            [str(python), "-c", marker],
+            capture_output=True, text=True, timeout=30,
+            env=dict(os.environ, HF_HUB_OFFLINE="1", TRANSFORMERS_OFFLINE="1"),
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise _offline_runtime_error("Python dependencies", python, str(exc)) from exc
+    if probe.returncode != 0:
+        raise _offline_runtime_error(
+            "Python dependencies", python, (probe.stderr or probe.stdout or "").strip()[-2000:],
+        )
+    if backend == "coreml":
+        _align_coreml_transformer_length(source)
+    return source, python
+
+
+def prepare_runtime(*, log_callback=None, allow_download: bool | None = None) -> tuple[Path, Path]:
+    """Prepare Ruby, or validate its local installation when downloads are disabled.
+
+    ``allow_download=False`` further restricts the shared ModelManager policy;
+    ``True`` never overrides a global download prohibition. The lock prevents
+    two jobs racing during installation. Local-only mode never calls installers.
     """
+    from utils.model_manager import auto_download_enabled
+
     with _RUNTIME_PREPARE_LOCK:
         source = _source_dir()
+        if allow_download is False or not auto_download_enabled():
+            return _local_runtime_only(source)
         if source == DEFAULT_SOURCE_DIR:
             _install_source(source, log_callback=log_callback)
         elif not _source_tree_ready(source):
@@ -2353,6 +2412,7 @@ def _close_shared_findtext_session() -> None:
 
 def begin_findtext_ocr_job(
     job_id: str, *, cancel_check=None, log_callback=None, background: bool = True,
+    allow_download: bool | None = None,
 ) -> str:
     """Hold and prewarm findtext for one OCR job.
 
@@ -2383,7 +2443,9 @@ def begin_findtext_ocr_job(
                 "🔥 findtextCenterNet Ruby worker 开始后台预热；与正文 OCR 并行，生命周期跟随当前 OCR 任务。",
             )
             started = time.monotonic()
-            source_dir, python = prepare_runtime(log_callback=log_callback)
+            source_dir, python = prepare_runtime(
+                log_callback=log_callback, allow_download=allow_download,
+            )
             if job_cancelled():
                 return
             # The shared-session lock serializes worker startup and later JSONL
@@ -2689,6 +2751,7 @@ def detect_ruby_lines(
     roi_neighbor_columns: int = 1,
     roi_max_columns: int = 10,
     diagnostics: dict | None = None,
+    allow_download: bool | None = None,
 ) -> tuple[list[RubyLine], int]:
     """Return structured Ruby lines without making findtextCenterNet scan blindly.
 
@@ -2898,7 +2961,9 @@ def detect_ruby_lines(
                 diagnostics["cache_misses"] = cache_misses
 
             if pending_specs:
-                source_dir, python = prepare_runtime(log_callback=log_callback)
+                source_dir, python = prepare_runtime(
+                    log_callback=log_callback, allow_download=allow_download,
+                )
                 # Model files now exist.  Re-key pending entries with a cheap
                 # model stat fingerprint so manually updated weights cannot
                 # accidentally reuse stale Ruby JSON.  Check the final key once
@@ -4601,6 +4666,7 @@ def preserve_ruby_in_documents(
     candidate_root: str | Path | None = None,
     roi_neighbor_columns: int = 1,
     roi_max_columns: int = 10,
+    allow_download: bool | None = None,
 ) -> RubyPreservationReport:
     docs = [doc for doc in documents if doc is not None]
     if not docs:
@@ -4636,6 +4702,7 @@ def preserve_ruby_in_documents(
             roi_neighbor_columns=roi_neighbor_columns,
             roi_max_columns=roi_max_columns,
             diagnostics=diagnostics,
+            allow_download=allow_download,
         )
         reports = [apply_ruby_lines(doc, lines) for doc in target_docs]
         prose_mutations = _restore_and_check_prose_guard(prose_guard)
