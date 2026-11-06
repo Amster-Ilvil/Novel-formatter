@@ -15,7 +15,7 @@ Novel Formatter builds on the work of the open-source and platform communities a
 - Open Model Zoo and related handwriting-recognition resources.
 - jlect-jhr — Japanese handwriting-recognition auxiliary resources.
 
-更多项目级引用与说明见 `README.md` 中的“参考项目与引用”章节，以及仓库内对应 third-party license 文件。
+More project-level references: the “References and acknowledgments” section of `README.md` (English) / 更多项目级引用与说明见 `README.zh-CN.md` 中的“参考项目与引用”章节，以及仓库内对应 third-party license 文件。
 
 ## Licensing note / 许可说明
 
