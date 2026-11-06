@@ -3,8 +3,6 @@ name: Build and publish Novel Formatter releases
 on:
   push:
     branches: [main]
-    paths:
-      - VERSION
   workflow_dispatch:
 
 permissions:
@@ -41,9 +39,30 @@ jobs:
           echo "tag=v${VERSION}" >> "$GITHUB_OUTPUT"
           echo "Novel Formatter release: $VERSION"
 
+  tests:
+    name: Python test suite (offscreen)
+    needs: metadata
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+      - name: Install test dependencies
+        run: |
+          set -euo pipefail
+          python -m pip install --disable-pip-version-check -r requirements.txt pytest
+      - name: Run pytest offscreen
+        env:
+          QT_QPA_PLATFORM: offscreen
+        run: python -m pytest -q
+
   windows:
     name: Windows x64 installer + portable
-    needs: metadata
+    needs: [metadata, tests]
     runs-on: windows-latest
     timeout-minutes: 30
     env:
@@ -97,7 +116,7 @@ jobs:
 
   macos:
     name: macOS ${{ matrix.label }}
-    needs: metadata
+    needs: [metadata, tests]
     strategy:
       fail-fast: false
       matrix:
@@ -145,9 +164,63 @@ jobs:
           compression-level: 0
           retention-days: 30
 
+  macos-swift:
+    name: macOS ${{ matrix.label }} SwiftUI shell
+    needs: [metadata, tests]
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-15
+            label: AppleSilicon
+            arch: arm64
+          - os: macos-15-intel
+            label: Intel
+            arch: x86_64
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    env:
+      VERSION: ${{ needs.metadata.outputs.version }}
+      LABEL: ${{ matrix.label }}
+      EXPECTED_ARCH: ${{ matrix.arch }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+      - name: Confirm runner architecture
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "macOS: $(sw_vers -productVersion)"
+          echo "Architecture: $(uname -m)"
+          test "$(uname -m)" = "$EXPECTED_ARCH"
+      - name: Build SwiftUI app, sign and verify DMG
+        shell: bash
+        run: bash packaging/build_macos_swift_app.sh
+      - name: Verify Swift bundle contents
+        shell: bash
+        run: |
+          set -euo pipefail
+          APP="dist/NovelFormatterSwift/Novel Formatter Studio.app"
+          test -x "$APP/Contents/MacOS/NovelFormatterSwift"
+          test -f "$APP/Contents/Resources/app/bootstrap.py"
+          test -f "$APP/Contents/Resources/app/gui_pyside6.py"
+          test -f "$APP/Contents/Resources/app/requirements.txt"
+          ! test -e "$APP/Contents/Resources/app/.env"
+          test "$(lipo -archs "$APP/Contents/MacOS/NovelFormatterSwift")" = "$EXPECTED_ARCH"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: NovelFormatterSwift-macOS-${{ matrix.label }}
+          path: |
+            package/NovelFormatterSwift_${{ env.VERSION }}_macOS_${{ matrix.label }}.dmg
+            package/NovelFormatterSwift_${{ env.VERSION }}_macOS_${{ matrix.label }}.app.zip
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 30
+
   linux:
     name: Linux ${{ matrix.label }} AppImage + DEB + portable
-    needs: metadata
+    needs: [metadata, tests]
     strategy:
       fail-fast: false
       matrix:
@@ -245,7 +318,7 @@ jobs:
   publish:
     name: Publish GitHub Release
     if: github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main')
-    needs: [metadata, windows, macos, linux]
+    needs: [metadata, tests, windows, macos, macos-swift, linux]
     runs-on: ubuntu-latest
     timeout-minutes: 20
     permissions:
@@ -270,6 +343,10 @@ jobs:
           cp "downloaded/NovelFormatter-macOS-AppleSilicon/NovelFormatter_${VERSION}_macOS_AppleSilicon.app.zip" release-assets/
           cp "downloaded/NovelFormatter-macOS-Intel/NovelFormatter_${VERSION}_macOS_Intel.dmg" release-assets/
           cp "downloaded/NovelFormatter-macOS-Intel/NovelFormatter_${VERSION}_macOS_Intel.app.zip" release-assets/
+          cp "downloaded/NovelFormatterSwift-macOS-AppleSilicon/NovelFormatterSwift_${VERSION}_macOS_AppleSilicon.dmg" release-assets/
+          cp "downloaded/NovelFormatterSwift-macOS-AppleSilicon/NovelFormatterSwift_${VERSION}_macOS_AppleSilicon.app.zip" release-assets/
+          cp "downloaded/NovelFormatterSwift-macOS-Intel/NovelFormatterSwift_${VERSION}_macOS_Intel.dmg" release-assets/
+          cp "downloaded/NovelFormatterSwift-macOS-Intel/NovelFormatterSwift_${VERSION}_macOS_Intel.app.zip" release-assets/
           cp "downloaded/NovelFormatter-Linux-x86_64/NovelFormatter_${VERSION}_Linux_x86_64.AppImage" release-assets/
           cp "downloaded/NovelFormatter-Linux-x86_64/NovelFormatter_${VERSION}_Linux_x86_64.deb" release-assets/
           cp "downloaded/NovelFormatter-Linux-x86_64/NovelFormatter_${VERSION}_Linux_x86_64.tar.gz" release-assets/
@@ -288,6 +365,8 @@ jobs:
           Windows x64 portable ZIP: PASS
           macOS Apple Silicon arm64 DMG: PASS
           macOS Intel x86_64 DMG: PASS
+          macOS Apple Silicon SwiftUI shell DMG: PASS
+          macOS Intel SwiftUI shell DMG: PASS
           macOS ad-hoc codesign: PASS
           macOS hdiutil verification: PASS
           Linux x86_64 AppImage / DEB / portable tar.gz: PASS
@@ -306,6 +385,10 @@ jobs:
             "NovelFormatter_${VERSION}_macOS_AppleSilicon.app.zip" \
             "NovelFormatter_${VERSION}_macOS_Intel.dmg" \
             "NovelFormatter_${VERSION}_macOS_Intel.app.zip" \
+            "NovelFormatterSwift_${VERSION}_macOS_AppleSilicon.dmg" \
+            "NovelFormatterSwift_${VERSION}_macOS_AppleSilicon.app.zip" \
+            "NovelFormatterSwift_${VERSION}_macOS_Intel.dmg" \
+            "NovelFormatterSwift_${VERSION}_macOS_Intel.app.zip" \
             "NovelFormatter_${VERSION}_Linux_x86_64.AppImage" \
             "NovelFormatter_${VERSION}_Linux_x86_64.deb" \
             "NovelFormatter_${VERSION}_Linux_x86_64.tar.gz" \
@@ -337,6 +420,7 @@ jobs:
           - **Windows x64 便携版**：**NovelFormatter_${VERSION}_Windows_x64.zip** —— 解压后双击“启动Windows.bat”。
           - **Mac Apple Silicon / M 系列（推荐）**：**NovelFormatter_${VERSION}_macOS_AppleSilicon.dmg**。
           - **Mac Intel（推荐）**：**NovelFormatter_${VERSION}_macOS_Intel.dmg**。
+          - **Mac 原生 SwiftUI 外壳（Apple Silicon / Intel）**：**NovelFormatterSwift_${VERSION}_macOS_AppleSilicon.dmg** / **NovelFormatterSwift_${VERSION}_macOS_Intel.dmg** —— 原生 SwiftUI 启动器，Python 核心不变，仍按需安装 OCR 模型。
           - **Linux x86_64（推荐）**：**NovelFormatter_${VERSION}_Linux_x86_64.AppImage** —— 赋予执行权限后直接运行，无需管理员权限。
           - **Linux ARM64（推荐）**：**NovelFormatter_${VERSION}_Linux_ARM64.AppImage** —— 原生 ARM64 构建。
           - Linux 同时提供 .deb（Debian/Ubuntu 系）和 .tar.gz（通用便携版）。
@@ -369,6 +453,10 @@ jobs:
             "NovelFormatter_${VERSION}_macOS_AppleSilicon.app.zip" \
             "NovelFormatter_${VERSION}_macOS_Intel.dmg" \
             "NovelFormatter_${VERSION}_macOS_Intel.app.zip" \
+            "NovelFormatterSwift_${VERSION}_macOS_AppleSilicon.dmg" \
+            "NovelFormatterSwift_${VERSION}_macOS_AppleSilicon.app.zip" \
+            "NovelFormatterSwift_${VERSION}_macOS_Intel.dmg" \
+            "NovelFormatterSwift_${VERSION}_macOS_Intel.app.zip" \
             "NovelFormatter_${VERSION}_Linux_x86_64.AppImage" \
             "NovelFormatter_${VERSION}_Linux_x86_64.deb" \
             "NovelFormatter_${VERSION}_Linux_x86_64.tar.gz" \

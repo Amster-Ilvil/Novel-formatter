@@ -99,8 +99,8 @@ def test_real_signature_preserves_text_confidence_geometry():
 
 def test_redaction_prefers_longest_path():
     got = measure.redact(
-        "/private/home/repo/input.png /private/home/other",
-        [("/private/home", "<home>"), ("/private/home/repo", "<repo>")],
+        "/private/base/repo/input.png /private/base/other",
+        [("/private/base", "<home>"), ("/private/base/repo", "<repo>")],
     )
     assert got == "<repo>/input.png <home>/other"
 
