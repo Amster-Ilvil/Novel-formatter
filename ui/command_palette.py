@@ -13,7 +13,7 @@ from PySide6.QtWidgets import (
 from core.command_catalog import CommandSpec, rank_command_specs
 from ui.common.styling import BORDER, CARD, INK, MUTED, SURFACE
 from ui.interface_preferences import manager_for
-from ui.localization import LANG_ZH, translate_text
+from ui.localization import DEFAULT_LANGUAGE, translate_text
 
 
 @dataclass(frozen=True, slots=True)
@@ -87,7 +87,7 @@ class CommandPalette(QDialog):
         actions = self._load_actions()
         by_id = {action.spec.command_id: action for action in actions}
         app = QApplication.instance()
-        language = getattr(manager_for(app), "language", LANG_ZH) if app is not None else LANG_ZH
+        language = getattr(manager_for(app), "language", DEFAULT_LANGUAGE) if app is not None else DEFAULT_LANGUAGE
         display_specs = tuple(
             replace(
                 action.spec,

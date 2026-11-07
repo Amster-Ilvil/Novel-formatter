@@ -7,17 +7,18 @@ from pathlib import Path
 
 from PySide6.QtCore import Qt
 from PySide6.QtGui import QCursor, QImage, QImageReader
-from PySide6.QtWidgets import QApplication, QDialog, QLabel, QMessageBox, QPushButton, QVBoxLayout, QHBoxLayout
+from PySide6.QtWidgets import QApplication, QDialog, QLabel, QPushButton, QVBoxLayout, QHBoxLayout
+from ui.localized_dialogs import LocalizedMessageBox as QMessageBox
 
 from ui.common.styling import MUTED
 from ui.dialogs import show_error_dialog
 from ui.ocr.preview import OCRCropPreview
-from ui.localization import LANG_ZH, normalize_language, translate_text
+from ui.localization import DEFAULT_LANGUAGE, normalize_language, translate_text
 
 
 def _ui_language() -> str:
     app = QApplication.instance()
-    return normalize_language(app.property("nfLanguage") if app is not None else LANG_ZH)
+    return normalize_language(app.property("nfLanguage") if app is not None else DEFAULT_LANGUAGE)
 
 
 def _tr_ui(value: str) -> str:
@@ -485,7 +486,8 @@ class OCRPreviewController:
                 self._preview_filename_lbl.setText(_tr_ui("当前图片：尚未载入"))
             return
 
-        image_exts = {'.png', '.jpg', '.jpeg', '.heic', '.tif', '.tiff', '.bmp', '.gif'}
+        # Filters expand_inputs() output (page images); archives/PDFs are already expanded there.
+        image_exts = {'.png', '.jpg', '.jpeg', '.heic', '.tif', '.tiff', '.bmp', '.gif', '.webp'}
         try:
             from adapters.pdf_input import expand_inputs, natural_sort_key
             work_dir = (self._pending_inputs[0] if Path(self._pending_inputs[0]).is_dir()

@@ -116,7 +116,7 @@ from ui.common.toast import notify
 from ui.interface_preferences import (
     InterfacePreferenceManager, THEME_LIGHT, THEME_DARK, manager_for,
 )
-from ui.localization import LANG_ZH, LANG_JA, LANG_EN
+from ui.localization import LANG_ZH, LANG_JA, LANG_EN, DEFAULT_LANGUAGE, normalize_language
 from ui.localized_dialogs import (
     LocalizedFileDialog, LocalizedMessageBox, LocalizedInputDialog, LocalizedColorDialog, ui_message,
 )
@@ -2013,9 +2013,14 @@ class OCRTab(QWidget):
                     )
                 )
                 signals.finished.emit(str(model_path))
-            except Exception:
-                import traceback
-                signals.error.emit(traceback.format_exc())
+            except Exception as exc:
+                from utils.model_manager import ModelError
+
+                if isinstance(exc, ModelError):
+                    signals.error.emit(str(exc))
+                else:
+                    import traceback
+                    signals.error.emit(traceback.format_exc())
 
         threading.Thread(target=worker, daemon=True, name="handwriting-model-download").start()
 
@@ -2947,6 +2952,28 @@ class OCRTab(QWidget):
                 box.exec()
                 if box.clickedButton() is not install:
                     return
+            models = list(data.get("models") or [])
+            if models:
+                # Missing/corrupt managed weights: download in the background with
+                # MB progress and Cancel before OCR starts; ModelError is shown in a
+                # dialog and the log instead of failing inside the OCR worker.
+                from ui.common.model_download import ensure_models_in_background
+
+                def log(message: str) -> None:
+                    try:
+                        self._ocr_log_buffer.push(str(message))
+                        self._flush_ocr_log_buffer(force_all=True)
+                    except Exception:
+                        print(f"[models] {message}")
+
+                ensure_models_in_background(
+                    self,
+                    models,
+                    on_ready=lambda: QTimer.singleShot(0, resume_callback),
+                    explicit=bool(missing),
+                    log=log,
+                )
+                return
             QTimer.singleShot(0, resume_callback)
 
         def failed(message):
@@ -2965,7 +2992,19 @@ class OCRTab(QWidget):
                 # confirmation_text performs richer runtime/cache probes; keep
                 # those off the GUI thread too.
                 confirmation = confirmation_text(missing) if missing else ""
-                signals.finished.emit({"missing": missing, "confirmation": confirmation})
+                models: list = []
+                try:
+                    from adapters.ocr_runtime_catalog import managed_model_requirements
+                    from ui.common.model_download import pending_models
+
+                    models = pending_models(
+                        managed_model_requirements(set(component_ids) | set(engine_ids or ()))
+                    )
+                except Exception as exc:
+                    print(f"[models] model status check failed: {exc}")
+                signals.finished.emit(
+                    {"missing": missing, "confirmation": confirmation, "models": models}
+                )
             except Exception:
                 import traceback
                 signals.error.emit(traceback.format_exc())
@@ -5931,7 +5970,7 @@ def main():
     interface_manager = InterfacePreferenceManager(
         app,
         base_stylesheet=STYLE,
-        language=str(boot_settings.value(SystemSettingsTab.LANGUAGE_KEY, LANG_ZH)),
+        language=normalize_language(boot_settings.value(SystemSettingsTab.LANGUAGE_KEY, DEFAULT_LANGUAGE)),
         theme=str(boot_settings.value(SystemSettingsTab.APPEARANCE_KEY, THEME_LIGHT)),
     )
     app._novel_formatter_interface_manager = interface_manager

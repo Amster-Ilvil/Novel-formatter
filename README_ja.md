@@ -1,6 +1,6 @@
 <div align="center">
 
-[简体中文](README.md) · [English](README_en.md) · **日本語**
+[English](README.md) · [简体中文](README.zh-CN.md) · **日本語**
 
 </div>
 
@@ -21,6 +21,8 @@
 </p>
 
 > 日本語縦書き OCR · 複数 OCR エンジンの比較・統合 · 画像とテキストの照合校正 · Formatter · EPUB · AI 校正パッケージ · Apple Vision
+
+本リポジトリは [Amster-Ilvil/Novel-formatter](https://github.com/Amster-Ilvil/Novel-formatter) のフォークです。入力形式の自動判別、左から右への横書き変換、モデルの自動ダウンロード、UI 言語、ベンチマークなどの新機能については[英語版 README](README.md) を参照してください。
 
 ## 主な機能
 

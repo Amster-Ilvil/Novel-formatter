@@ -25,6 +25,7 @@ import zipfile
 import sys
 import importlib.metadata as importlib_metadata
 from pathlib import Path
+from utils.model_manager import directory_ready
 from utils.safe_archive import safe_extract_zip
 from utils.apple_silicon_runtime import is_m6, profile, recommended_cpu_threads
 
@@ -94,8 +95,11 @@ def _is_real_model(path: Path) -> bool:
 def _models_ready(source_dir: Path | None = None) -> bool:
     source_dir = source_dir or SOURCE_DIR
     model_dir = source_dir / "src" / "model"
-    models = list(model_dir.glob("*.onnx"))
-    return len(models) >= 4 and all(_is_real_model(path) for path in models)
+    # NDLOCR ONNX files ship with the pinned source tag (no upstream hashes);
+    # check presence/size and reject Git LFS pointer stubs.
+    if not directory_ready(model_dir, pattern="*.onnx", min_count=4, min_size=MODEL_MIN_BYTES):
+        return False
+    return all(_is_real_model(path) for path in model_dir.glob("*.onnx"))
 
 
 def _ref_candidates(ref: str) -> list[str]:

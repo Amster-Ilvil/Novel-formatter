@@ -1,0 +1,89 @@
+name: Build SwiftUI shell (manual)
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [feature/en-ui-ltr-models]
+    paths:
+      - "macos/**"
+      - "packaging/build_macos_swift_app.sh"
+      - ".github/workflows/build-swift-app.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  metadata:
+    name: Version
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.meta.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+      - id: meta
+        shell: bash
+        run: |
+          set -euo pipefail
+          VERSION="$(tr -d '[:space:]' < VERSION)"
+          test -n "$VERSION"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+
+  macos-swift:
+    name: macOS ${{ matrix.label }} SwiftUI shell
+    needs: metadata
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-15
+            label: AppleSilicon
+            arch: arm64
+          - os: macos-15-intel
+            label: Intel
+            arch: x86_64
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    env:
+      VERSION: ${{ needs.metadata.outputs.version }}
+      LABEL: ${{ matrix.label }}
+      EXPECTED_ARCH: ${{ matrix.arch }}
+      # The workflow name mentions workflow_dispatch, which is only active
+      # once this file reaches the default branch; until then pushes to the
+      # PR branch trigger the same jobs.
+      BUILD_REASON: ${{ github.event_name }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+      - name: Confirm runner architecture
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "macOS: $(sw_vers -productVersion)"
+          echo "Architecture: $(uname -m)"
+          test "$(uname -m)" = "$EXPECTED_ARCH"
+      - name: Build SwiftUI app, sign and verify DMG
+        shell: bash
+        run: bash packaging/build_macos_swift_app.sh
+      - name: Verify Swift bundle contents
+        shell: bash
+        run: |
+          set -euo pipefail
+          APP="dist/NovelFormatterSwift/Novel Formatter Studio.app"
+          test -x "$APP/Contents/MacOS/NovelFormatterSwift"
+          test -f "$APP/Contents/Resources/app/bootstrap.py"
+          test -f "$APP/Contents/Resources/app/gui_pyside6.py"
+          test -f "$APP/Contents/Resources/app/requirements.txt"
+          ! test -e "$APP/Contents/Resources/app/.env"
+          test "$(lipo -archs "$APP/Contents/MacOS/NovelFormatterSwift")" = "$EXPECTED_ARCH"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: NovelFormatterSwift-macOS-${{ matrix.label }}
+          path: |
+            package/NovelFormatterSwift_${{ env.VERSION }}_macOS_${{ matrix.label }}.dmg
+            package/NovelFormatterSwift_${{ env.VERSION }}_macOS_${{ matrix.label }}.app.zip
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 30

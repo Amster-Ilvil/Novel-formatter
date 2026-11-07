@@ -28,8 +28,8 @@ from ui.common.signals import WorkerSignals
 from ui.common.toast import notify
 from ui.common.styling import LIGHT_LOG_STYLE, CARD, BORDER, INK, MUTED, accent_button, wrap_in_card
 from ui.interface_preferences import THEME_LIGHT, THEME_DARK, manager_for
-from ui.localization import LANG_ZH, LANG_JA, LANG_EN
-from ui.localized_dialogs import LocalizedMessageBox, ui_message
+from ui.localization import LANG_ZH, LANG_JA, LANG_EN, DEFAULT_LANGUAGE, LANGUAGE_LABELS, normalize_language
+from ui.localized_dialogs import LocalizedFileDialog, LocalizedMessageBox, ui_message
 from ui.navigation.sidebar import (
     REFERENCE_SECTION_ITEMS, SECTION_WORKSPACE, SECTION_PAGE, SECTION_SYSTEM,
 )
@@ -445,6 +445,9 @@ class SystemSettingsTab(QWidget):
     OCR_REVIEW_PANEL_OPEN_MIGRATION_KEY = "ocr/review_panel_open_default_v3"
     OCR_ENGINE_TAB_STARTUP_MIGRATION_KEY = "ocr/engine_tab_startup_migration_v1"
 
+    MODELS_DIR_KEY = "models/local_dir"
+    MODELS_AUTO_DOWNLOAD_KEY = "models/auto_download"
+
     def __init__(self, parent=None):
         super().__init__(parent)
         self._settings = QSettings(self.SETTINGS_ORG, self.SETTINGS_APP)
@@ -694,9 +697,10 @@ class SystemSettingsTab(QWidget):
             ("设备", f"{platform.system() or '系统'} · {machine}"),
             ("显存策略", "自动"),
         ]
+        saved_language = normalize_language(str(self._settings.value(self.LANGUAGE_KEY, DEFAULT_LANGUAGE)))
         self._overview_interface_rows = [
             ("主题", "跟随系统"),
-            ("语言", "简体中文"),
+            ("语言", LANGUAGE_LABELS.get(saved_language, LANGUAGE_LABELS.get(DEFAULT_LANGUAGE, "English"))),
         ]
         ai_rows = [
             ("服务", "按需调用"),
@@ -757,9 +761,9 @@ class SystemSettingsTab(QWidget):
         # Language names stay self-identifying in every locale; itemData is the
         # stable setting value used by the runtime manager.
         self._language_combo.setProperty("nfNoTranslateItems", True)
+        self._language_combo.addItem("English", LANG_EN)
         self._language_combo.addItem("简体中文", LANG_ZH)
         self._language_combo.addItem("日本語", LANG_JA)
-        self._language_combo.addItem("English", LANG_EN)
         self._appearance_combo = NoWheelComboBox()
         self._appearance_combo.addItem("浅色", THEME_LIGHT)
         self._appearance_combo.addItem("深色", THEME_DARK)
@@ -888,6 +892,26 @@ class SystemSettingsTab(QWidget):
         ai_btn.clicked.connect(lambda: AISettingsDialog(self).exec())
         ai_box.addWidget(ai_btn, 0, Qt.AlignLeft)
         layout.addWidget(ai_card)
+
+        storage_card, storage_box = self._make_card(
+            "本地模型文件夹",
+            "OCR 模型下载、校验和查找的位置。留空则使用默认位置；已安装在旧位置的模型会继续使用。",
+        )
+        models_dir_row = QHBoxLayout()
+        self._models_dir_edit = QLineEdit()
+        self._models_dir_edit.setPlaceholderText(self._default_models_dir_text())
+        models_dir_row.addWidget(self._models_dir_edit, 1)
+        choose_models_dir = QPushButton("选择文件夹…")
+        choose_models_dir.clicked.connect(self._choose_models_dir)
+        models_dir_row.addWidget(choose_models_dir)
+        reset_models_dir = QPushButton("恢复默认")
+        reset_models_dir.clicked.connect(self._reset_models_dir)
+        models_dir_row.addWidget(reset_models_dir)
+        storage_box.addLayout(models_dir_row)
+        self._models_auto_download_cb = QCheckBox("需要时自动下载模型")
+        self._models_auto_download_cb.setChecked(True)
+        storage_box.addWidget(self._models_auto_download_cb)
+        layout.addWidget(storage_card)
 
         model_card, model_box = self._make_card(
             "OCR 模型更新（仅手动）",
@@ -1479,7 +1503,7 @@ class SystemSettingsTab(QWidget):
         )
         self._set_combo_data(
             self._language_combo,
-            str(self._settings.value(self.LANGUAGE_KEY, LANG_ZH)),
+            str(self._settings.value(self.LANGUAGE_KEY, DEFAULT_LANGUAGE)),
         )
         self._set_combo_data(
             self._appearance_combo,
@@ -1509,6 +1533,11 @@ class SystemSettingsTab(QWidget):
         self._ocr_progress_default_cb.setChecked(
             self._settings.value(self.OCR_PROGRESS_DEFAULT_KEY, True, type=bool)
         )
+        self._models_dir_edit.setText(str(self._settings.value(self.MODELS_DIR_KEY, "") or ""))
+        self._models_auto_download_cb.setChecked(
+            self._settings.value(self.MODELS_AUTO_DOWNLOAD_KEY, True, type=bool)
+        )
+        self._apply_model_preferences()
 
     @staticmethod
     def _set_combo_data(combo: QComboBox, value) -> None:
@@ -1526,7 +1555,7 @@ class SystemSettingsTab(QWidget):
             "remember_subtabs": self._remember_subtabs_cb.isChecked(),
             "default_section": int(self._default_section_combo.currentData() or 0),
             "start_maximized": self._start_maximized_cb.isChecked(),
-            "language": str(self._language_combo.currentData() or LANG_ZH),
+            "language": str(self._language_combo.currentData() or DEFAULT_LANGUAGE),
             "appearance": str(self._appearance_combo.currentData() or THEME_LIGHT),
             "ocr_engine": str(self._ocr_engine_combo.currentData() or "apple_vision"),
             "ocr_settings_tab": int(self._ocr_settings_tab_combo.currentData() or 0),
@@ -1534,6 +1563,8 @@ class SystemSettingsTab(QWidget):
             "ocr_review_expanded": self._ocr_review_expanded_cb.isChecked(),
             "ocr_preview_default": self._ocr_preview_default_cb.isChecked(),
             "ocr_progress_default": self._ocr_progress_default_cb.isChecked(),
+            "models_dir": self._models_dir_edit.text().strip(),
+            "models_auto_download": self._models_auto_download_cb.isChecked(),
         }
 
     def _save(self, _checked=False, *, show_message: bool = True) -> None:
@@ -1550,6 +1581,9 @@ class SystemSettingsTab(QWidget):
         self._settings.setValue(self.OCR_REVIEW_EXPANDED_KEY, prefs["ocr_review_expanded"])
         self._settings.setValue(self.OCR_PREVIEW_DEFAULT_KEY, prefs["ocr_preview_default"])
         self._settings.setValue(self.OCR_PROGRESS_DEFAULT_KEY, prefs["ocr_progress_default"])
+        self._settings.setValue(self.MODELS_DIR_KEY, prefs["models_dir"])
+        self._settings.setValue(self.MODELS_AUTO_DOWNLOAD_KEY, prefs["models_auto_download"])
+        self._apply_model_preferences()
         self._settings.sync()
         self.settings_changed.emit(dict(prefs))
         if show_message:
@@ -1559,7 +1593,7 @@ class SystemSettingsTab(QWidget):
         self._restore_workspace_cb.setChecked(False)
         self._remember_subtabs_cb.setChecked(True)
         self._start_maximized_cb.setChecked(False)
-        self._set_combo_data(self._language_combo, LANG_ZH)
+        self._set_combo_data(self._language_combo, DEFAULT_LANGUAGE)
         self._set_combo_data(self._appearance_combo, THEME_LIGHT)
         self._set_combo_data(self._default_section_combo, SECTION_PAGE)
         self._set_combo_data(self._ocr_engine_combo, "apple_vision")
@@ -1568,6 +1602,8 @@ class SystemSettingsTab(QWidget):
         self._ocr_review_expanded_cb.setChecked(True)
         self._ocr_preview_default_cb.setChecked(True)
         self._ocr_progress_default_cb.setChecked(True)
+        self._models_dir_edit.clear()
+        self._models_auto_download_cb.setChecked(True)
         self._save(show_message=True)
 
     def _preview_interface_preferences(self, _index=0) -> None:
@@ -1576,7 +1612,7 @@ class SystemSettingsTab(QWidget):
         if manager is None or not hasattr(self, "_language_combo"):
             return
         manager.apply_preferences(
-            language=str(self._language_combo.currentData() or LANG_ZH),
+            language=str(self._language_combo.currentData() or DEFAULT_LANGUAGE),
             theme=str(self._appearance_combo.currentData() or THEME_LIGHT),
         )
 
@@ -1615,6 +1651,31 @@ class SystemSettingsTab(QWidget):
 
     def start_maximized_enabled(self) -> bool:
         return self._settings.value(self.START_MAXIMIZED_KEY, False, type=bool)
+
+    @staticmethod
+    def _default_models_dir_text() -> str:
+        from utils import model_manager
+
+        legacy = model_manager.LEGACY_MODELS_DIR
+        return str(legacy if legacy.is_dir() else model_manager.default_platform_models_dir())
+
+    def _choose_models_dir(self, _checked=False) -> None:
+        start = self._models_dir_edit.text().strip() or self._default_models_dir_text()
+        path = LocalizedFileDialog.getExistingDirectory(self, "选择本地模型文件夹", start)
+        if path:
+            self._models_dir_edit.setText(path)
+
+    def _reset_models_dir(self, _checked=False) -> None:
+        self._models_dir_edit.clear()
+
+    def _apply_model_preferences(self) -> None:
+        """Apply models folder / auto-download to this process and OCR workers."""
+        from utils import model_manager
+
+        model_manager.configure(
+            models_dir=self._models_dir_edit.text().strip() or None,
+            auto_download=self._models_auto_download_cb.isChecked(),
+        )
 
     def _open_ocr_model_updates(self, _checked=False) -> None:
         OCRModelUpdateDialog(self).exec()

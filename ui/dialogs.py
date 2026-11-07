@@ -16,7 +16,7 @@ from collections.abc import Callable
 from typing import Optional
 
 from PySide6.QtCore import QEvent, QObject, QTimer, Qt, Signal, Slot
-from ui.localization import LANG_ZH, normalize_language, translate_text
+from ui.localization import DEFAULT_LANGUAGE, normalize_language, translate_text
 from ui.theme_palette import darken_stylesheet
 from PySide6.QtGui import QFontDatabase
 from PySide6.QtWidgets import (
@@ -214,7 +214,7 @@ class DialogPolishFilter(QObject):
         for button in box.findChildren(QPushButton):
             standard = box.standardButton(button)
             if standard in _STANDARD_TEXT:
-                language = normalize_language(str(app.property("nfLanguage") or LANG_ZH)) if app else LANG_ZH
+                language = normalize_language(str(app.property("nfLanguage") or DEFAULT_LANGUAGE)) if app else DEFAULT_LANGUAGE
                 target_text = translate_text(_STANDARD_TEXT[standard], language)
                 if button.text() != target_text:
                     button.setText(target_text)
@@ -243,7 +243,7 @@ class DialogPolishFilter(QObject):
                     button.setProperty("dialogRole", "details")
                     button.style().unpolish(button)
                     button.style().polish(button)
-                language = normalize_language(str(app.property("nfLanguage") or LANG_ZH)) if app else LANG_ZH
+                language = normalize_language(str(app.property("nfLanguage") or DEFAULT_LANGUAGE)) if app else DEFAULT_LANGUAGE
                 source_text = "隐藏详情" if _details_are_visible(box) else "显示详情"
                 target_text = translate_text(source_text, language)
                 if button.text() != target_text:
