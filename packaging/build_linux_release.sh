@@ -231,10 +231,71 @@ cp "$STAGE/share/applications/novelformatter.desktop" "$APPDIR/novelformatter.de
 cp "$STAGE/share/icons/hicolor/256x256/apps/novelformatter.png" "$APPDIR/novelformatter.png"
 ln -s novelformatter.png "$APPDIR/.DirIcon"
 
-APPIMAGETOOL="$WORK/appimagetool-${APPIMAGE_ARCH}.AppImage"
-curl --fail --location --retry 3 --connect-timeout 20 \
-  "https://github.com/AppImage/AppImageKit/releases/download/continuous/appimagetool-${APPIMAGE_ARCH}.AppImage" \
+# Pin AppImageKit by GitHub release asset ID, byte size and update timestamp.
+# The continuous tag is mutable and GitHub exposes no SHA-256 for these 2025
+# assets. A deleted/reuploaded asset receives a different ID, so the build
+# fails closed instead of silently running a changed executable. Optionally
+# provide a separately verified APPIMAGETOOL_SHA256 to bind bytes as well.
+case "$APPIMAGE_ARCH" in
+  x86_64)
+    APPIMAGETOOL_ASSET_ID=98605504
+    APPIMAGETOOL_EXPECTED_SIZE=8811712
+    ;;
+  aarch64)
+    APPIMAGETOOL_ASSET_ID=98605483
+    APPIMAGETOOL_EXPECTED_SIZE=6115712
+    ;;
+  *) echo "Unsupported AppImage tool architecture" >&2; exit 2 ;;
+esac
+APPIMAGETOOL_UPDATED_AT="2025-07-26T07:31:24Z"
+APPIMAGETOOL_NAME="appimagetool-${APPIMAGE_ARCH}.AppImage"
+APPIMAGETOOL="$WORK/$APPIMAGETOOL_NAME"
+APPIMAGETOOL_META="$WORK/appimagetool-asset-metadata.json"
+APPIMAGETOOL_META_URL="https://api.github.com/repos/AppImage/AppImageKit/releases/assets/${APPIMAGETOOL_ASSET_ID}"
+
+validate_appimagetool_metadata() {
+  local metadata="$1"
+  python3 - "$metadata" "$APPIMAGETOOL_ASSET_ID" "$APPIMAGETOOL_NAME" "$APPIMAGETOOL_EXPECTED_SIZE" "$APPIMAGETOOL_UPDATED_AT" <<'PYTHON'
+import json, sys
+from pathlib import Path
+obj = json.loads(Path(sys.argv[1]).read_text())
+expected_id, expected_name, expected_size, expected_timestamp = sys.argv[2:]
+assert obj.get("id") == int(expected_id), "AppImageKit asset ID changed"
+assert obj.get("name") == expected_name, "AppImageKit asset name changed"
+assert obj.get("size") == int(expected_size), "AppImageKit asset size changed"
+assert obj.get("updated_at") == expected_timestamp, "AppImageKit asset replaced"
+assert obj.get("state") == "uploaded", "AppImageKit asset is not uploaded"
+assert obj.get("browser_download_url") == (
+  "https://github.com/AppImage/AppImageKit/releases/download/continuous/" + expected_name
+), "AppImageKit asset URL changed"
+PYTHON
+}
+
+curl --proto '=https' --tlsv1.2 --fail --silent --show-error --location \
+  --retry 3 --connect-timeout 20 --max-time 180 \
+  -H 'Accept: application/vnd.github+json' "$APPIMAGETOOL_META_URL" \
+  -o "$APPIMAGETOOL_META"
+validate_appimagetool_metadata "$APPIMAGETOOL_META"
+curl --proto '=https' --tlsv1.2 --fail --silent --show-error --location \
+  --retry 3 --connect-timeout 20 --max-time 180 \
+  "https://github.com/AppImage/AppImageKit/releases/download/continuous/${APPIMAGETOOL_NAME}" \
   -o "$APPIMAGETOOL"
+test "$(stat -c '%s' "$APPIMAGETOOL")" = "$APPIMAGETOOL_EXPECTED_SIZE" || {
+  echo 'AppImageKit downloaded byte count changed; refusing to execute' >&2; exit 1;
+}
+# Recheck the immutable asset identity after downloading to detect a reupload.
+curl --proto '=https' --tlsv1.2 --fail --silent --show-error --location \
+  --retry 3 --connect-timeout 20 --max-time 180 \
+  -H 'Accept: application/vnd.github+json' "$APPIMAGETOOL_META_URL" \
+  -o "$APPIMAGETOOL_META"
+validate_appimagetool_metadata "$APPIMAGETOOL_META"
+if [[ -n "${APPIMAGETOOL_SHA256:-}" ]]; then
+  printf '%s  %s\n' "$APPIMAGETOOL_SHA256" "$APPIMAGETOOL" | sha256sum --check --status || {
+    echo 'AppImageKit SHA-256 mismatch; refusing to execute' >&2; exit 1;
+  }
+fi
+sha256sum "$APPIMAGETOOL"
+
 chmod 0755 "$APPIMAGETOOL"
 ARCH="$APPIMAGE_ARCH" APPIMAGE_EXTRACT_AND_RUN=1 "$APPIMAGETOOL" "$APPDIR" "$APPIMAGE_OUT" >/dev/null
 chmod 0755 "$APPIMAGE_OUT"

@@ -35,46 +35,114 @@ def _config_dir() -> Path:
 
 def persistence_available() -> bool:
     if sys.platform == "darwin":
-        return Path("/usr/bin/security").exists()
+        return Path("/System/Library/Frameworks/Security.framework/Security").exists()
     return os.name == "nt"
 
 
+def _mac_security_framework():
+    """Use the native Keychain C API, never put credentials in process argv.
+
+    The Security.framework path is a fixed macOS system framework, not a
+    downloaded library or a caller-supplied path. The framework handles
+    Keychain ACLs and any user-interaction prompts.
+    """
+    security = ctypes.CDLL("/System/Library/Frameworks/Security.framework/Security")
+    core = ctypes.CDLL("/System/Library/Frameworks/CoreFoundation.framework/CoreFoundation")
+    u32 = ctypes.c_uint32
+    ptr = ctypes.c_void_p
+    security.SecKeychainFindGenericPassword.argtypes = [
+        ptr, u32, ctypes.c_char_p, u32, ctypes.c_char_p,
+        ctypes.POINTER(u32), ctypes.POINTER(ptr), ctypes.POINTER(ptr),
+    ]
+    security.SecKeychainFindGenericPassword.restype = ctypes.c_int32
+    security.SecKeychainAddGenericPassword.argtypes = [
+        ptr, u32, ctypes.c_char_p, u32, ctypes.c_char_p,
+        u32, ptr, ctypes.POINTER(ptr),
+    ]
+    security.SecKeychainAddGenericPassword.restype = ctypes.c_int32
+    security.SecKeychainItemModifyAttributesAndData.argtypes = [ptr, ptr, u32, ptr]
+    security.SecKeychainItemModifyAttributesAndData.restype = ctypes.c_int32
+    security.SecKeychainItemDelete.argtypes = [ptr]
+    security.SecKeychainItemDelete.restype = ctypes.c_int32
+    security.SecKeychainItemFreeContent.argtypes = [ptr, ptr]
+    security.SecKeychainItemFreeContent.restype = ctypes.c_int32
+    core.CFRelease.argtypes = [ptr]
+    core.CFRelease.restype = None
+    return security, core
+
+
+def _mac_find(service: str, account: str, *, fetch_password: bool = False):
+    security, core = _mac_security_framework()
+    svc = service.encode("utf-8")
+    acct = account.encode("utf-8")
+    pw_len = ctypes.c_uint32()
+    pw_data = ctypes.c_void_p()
+    item = ctypes.c_void_p()
+    status = security.SecKeychainFindGenericPassword(
+        None, len(svc), svc, len(acct), acct,
+        ctypes.byref(pw_len) if fetch_password else None,
+        ctypes.byref(pw_data) if fetch_password else None,
+        ctypes.byref(item),
+    )
+    return security, core, int(status), item, pw_len, pw_data
+
+
 def _mac_load(service: str = _SERVICE, account: str = _ACCOUNT) -> str:
-    result = subprocess.run(
-        ["/usr/bin/security", "find-generic-password", "-a", account, "-s", service, "-w"],
-        text=True,
-        capture_output=True,
-        timeout=8,
-        check=False,
-    )
-    return result.stdout.strip() if result.returncode == 0 else ""
+    security, core, status, item, pw_len, pw_data = _mac_find(service, account, fetch_password=True)
+    try:
+        if status != 0 or not pw_data.value:
+            return ""
+        return ctypes.string_at(pw_data, pw_len.value).decode("utf-8")
+    finally:
+        if pw_data.value:
+            security.SecKeychainItemFreeContent(None, pw_data)
+        if item.value:
+            core.CFRelease(item)
 
 
-def _mac_save(value: str, service: str = _SERVICE, account: str = _ACCOUNT, label: str = "Novel Formatter AI API Key") -> bool:
-    # security(1) is the system-supported Keychain CLI. Avoid shell=True so the
-    # credential cannot be reinterpreted as shell syntax.
-    result = subprocess.run(
-        [
-            "/usr/bin/security", "add-generic-password", "-U",
-            "-a", account, "-s", service, "-l", label,
-            "-w", value,
-        ],
-        text=True,
-        capture_output=True,
-        timeout=8,
-        check=False,
+def _mac_save(value: str, service: str = _SERVICE, account: str = _ACCOUNT,
+              label: str = "Novel Formatter AI API Key") -> bool:
+    """Store a Keychain item without exposing the secret in ps or argv.
+
+    Existing items are modified rather than deleted so their access controls
+    survive ordinary updates. label is preserved in the public interface;
+    the system item's service name is the default display label.
+    """
+    del label
+    security, core = _mac_security_framework()
+    svc, acct = service.encode("utf-8"), account.encode("utf-8")
+    secret = ctypes.create_string_buffer(value.encode("utf-8"))
+    status = security.SecKeychainAddGenericPassword(
+        None, len(svc), svc, len(acct), acct,
+        len(secret) - 1, ctypes.cast(secret, ctypes.c_void_p), None,
     )
-    return result.returncode == 0
+    if status == 0:
+        return True
+    if status != -25299:  # errSecDuplicateItem
+        return False
+    security, core, found, item, _pw_len, _pw_data = _mac_find(service, account)
+    if found != 0 or not item.value:
+        return False
+    try:
+        return security.SecKeychainItemModifyAttributesAndData(
+            item, None, len(secret) - 1, ctypes.cast(secret, ctypes.c_void_p)
+        ) == 0
+    finally:
+        core.CFRelease(item)
 
 
 def _mac_delete(service: str = _SERVICE, account: str = _ACCOUNT) -> None:
-    subprocess.run(
-        ["/usr/bin/security", "delete-generic-password", "-a", account, "-s", service],
-        text=True,
-        capture_output=True,
-        timeout=8,
-        check=False,
-    )
+    security, core, status, item, _pw_len, _pw_data = _mac_find(service, account)
+    if status == -25300:  # errSecItemNotFound: deleting an absent item is OK
+        return
+    if status != 0 or not item.value:
+        raise OSError(f"Keychain item lookup failed: OSStatus {status}")
+    try:
+        result = security.SecKeychainItemDelete(item)
+        if result != 0:
+            raise OSError(f"Keychain item removal failed: OSStatus {result}")
+    finally:
+        core.CFRelease(item)
 
 
 class _DATA_BLOB(ctypes.Structure):

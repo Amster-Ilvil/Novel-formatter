@@ -116,9 +116,10 @@ function Install-PortablePython {
     if (-not (Test-Path -LiteralPath $archivePath)) {
         Invoke-Download -Urls @("$mirrorRoot/$archive", "$officialRoot/$archive") -Destination $archivePath
     }
-    if (-not (Test-Path -LiteralPath $sumPath)) {
-        Invoke-Download -Urls @("$mirrorRoot/SHA256SUMS", "$officialRoot/SHA256SUMS") -Destination $sumPath
-    }
+    # The executable may be mirrored, but checksums must come from the
+    # upstream GitHub release. Always refresh rather than trusting a cached
+    # mirror-supplied checksum from an older launcher.
+    Invoke-Download -Urls @("$officialRoot/SHA256SUMS") -Destination $sumPath
 
     $line = Get-Content -LiteralPath $sumPath | Where-Object { $_ -match [regex]::Escape($archive) } | Select-Object -First 1
     if (-not $line) { throw 'The standalone Python checksum file does not contain the required archive entry.' }

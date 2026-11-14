@@ -22,21 +22,23 @@ jobs:
       version: ${{ steps.meta.outputs.version }}
       tag: ${{ steps.meta.outputs.tag }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           fetch-depth: 1
-      - uses: actions/setup-python@v6
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
         with:
           python-version: "3.12"
       - name: Privacy audit
         run: python scripts/privacy_audit.py
+      - name: Release supply-chain and Keychain regression
+        run: python -m unittest discover -s tests -p test_release_security_v22.py -v
       - id: meta
         name: Resolve version
         shell: bash
         run: |
           set -euo pipefail
           VERSION="$(tr -d '[:space:]' < VERSION)"
-          test -n "$VERSION"
+          [[ "$VERSION" =~ ^[0-9]+\.[0-9]+(\.[0-9]+)?$ ]] || { echo "Invalid release VERSION" >&2; exit 1; }
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
           echo "tag=v${VERSION}" >> "$GITHUB_OUTPUT"
           echo "Novel Formatter release: $VERSION"
@@ -49,10 +51,10 @@ jobs:
     env:
       VERSION: ${{ needs.metadata.outputs.version }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           fetch-depth: 1
-      - uses: actions/setup-python@v6
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
         with:
           python-version: "3.12"
           architecture: x64
@@ -85,7 +87,7 @@ jobs:
           if (-not (Test-Path -LiteralPath $zip)) { throw "Missing $zip" }
           if ((Get-Item -LiteralPath $setup).Length -lt 100KB) { throw 'Installer is unexpectedly small.' }
           if ((Get-Item -LiteralPath $zip).Length -lt 100KB) { throw 'Portable ZIP is unexpectedly small.' }
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: NovelFormatter-Windows-x64
           path: |
@@ -115,10 +117,10 @@ jobs:
       LABEL: ${{ matrix.label }}
       EXPECTED_ARCH: ${{ matrix.arch }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           fetch-depth: 1
-      - uses: actions/setup-python@v6
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
         with:
           python-version: "3.12"
       - name: Confirm runner architecture
@@ -135,7 +137,7 @@ jobs:
       - name: Build app, sign and verify DMG
         shell: bash
         run: bash packaging/build_macos_dmg.sh
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: NovelFormatter-macOS-${{ matrix.label }}
           path: |
@@ -165,10 +167,10 @@ jobs:
       LABEL: ${{ matrix.label }}
       EXPECTED_ARCH: ${{ matrix.arch }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           fetch-depth: 1
-      - uses: actions/setup-python@v6
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
         with:
           python-version: "3.12"
       - name: Confirm Linux runner architecture
@@ -231,7 +233,7 @@ jobs:
           cat "$XDG_STATE_HOME/NovelFormatter/logs/launcher.log"
           grep -q 'LINUX_PREPARE_OK' "$XDG_STATE_HOME/NovelFormatter/logs/launcher.log"
           grep -q 'BOOT_STAGE=main_dependencies_ready' "$XDG_STATE_HOME/NovelFormatter/logs/launcher.log"
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: NovelFormatter-Linux-${{ matrix.label }}
           path: |
@@ -255,8 +257,8 @@ jobs:
       RELEASE_TAG: ${{ needs.metadata.outputs.tag }}
       GH_TOKEN: ${{ github.token }}
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/download-artifact@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           path: downloaded
       - name: Assemble release assets
@@ -313,6 +315,7 @@ jobs:
             "NovelFormatter_${VERSION}_Linux_ARM64.deb" \
             "NovelFormatter_${VERSION}_Linux_ARM64.tar.gz" \
             > SHA256SUMS.txt
+          sha256sum --check SHA256SUMS.txt
           cat SHA256SUMS.txt
 
       - name: Create or update release
@@ -325,12 +328,19 @@ jobs:
 
           本 Release 直接由当前 main 提交 **${GITHUB_SHA}** 在 GitHub Actions 干净环境中构建。
 
-          ### v2.1 基于最新 main 的改进
-          - 新增多模型 OCR 全文逐句比较、字符级差异高亮和只读融合视图。
-          - 改善 OCR 对比、图文对照、人工裁决状态和任务进度反馈。
-          - 优化 Hayai、NDL、48px OCR 运行适配与模型配置，清理旧兼容链。
-          - 增强工作区快照恢复及 AI 裁决包导出导入。
-          - 新增 EPUB 发布校验报告及问题定位界面。
+          ### v2.2 更新（相对 v2.1）
+          - **macOS 凭据安全**：通过系统 Security.framework Keychain API 保存、更新和删除 AI/OCR 密钥，避免把密钥放进 `security` 命令的进程参数。
+          - **Python 下载校验**：Mac/Windows 可从镜像下载运行时，但 SHA256SUMS 只能从官方 astral-sh GitHub Release 获取；无法取到官方校验文件时拒绝安装。
+          - **Linux 构建链加固**：AppImageKit 构建工具绑定固定的官方 GitHub 资产 ID、大小和更新时间，下载前后核验；检测到更换即拒绝执行。上游未提供独立 SHA-256，资产身份锁定不等于文件哈希签名校验。
+          - **CI 审计**：GitHub Actions 使用固定提交 SHA，发布前执行 Keychain/下载来源安全回归与隐私审计。
+          - **OCR 运行改进**：Hayai 优先复用既有环境并统一 GUI/Worker 选择，离线拒绝重复安装；Hayai、48px、NDLOCR 增加可选的独立 Worker 缓存。
+          - **导入及 EPUB**：支持 CBZ/ZIP 漫画、WebP 和基于文件签名的图片导入；补齐 OCR WebP 参考预览，增加可选 LTR 横排 EPUB。
+          - **质量与兼容性**：增强 Pillow 备用分栏、OpenVINO 模型哈希检查、Ruby 离线保护和自绘侧边栏的语言切换。
+
+          ### 安全及验证说明
+          - 发布包不内置任何 OCR 权重或用户数据。首次运行可能下载安装独立 Python 和主程序依赖；请勿在不信任网络中使用自动安装。
+          - 模型上游、镜像、在线 AI 服务和未经独立校验的第三方依赖仍属于供应链与隐私边界；本版本不宣称不存在所有潜在后门。
+          - 多平台打包与 Linux 首次启动由 GitHub Actions 验证；不代表三种 OCR 已在所有 Mac/Windows/Linux 硬件完成端到端准确率验收。
 
           ### 推荐下载
           - **Windows x64（推荐）**：**NovelFormatter_${VERSION}_Windows_x64_Setup.exe** —— 双击安装，无需管理员权限；安装后从开始菜单启动。

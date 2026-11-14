@@ -169,12 +169,14 @@ install_python_runtime() {
       return 1
     }
   fi
-  if [[ ! -s "$SUMS_PATH" ]]; then
-    fetch_file "$SUMS_PATH" "$MIRROR_ROOT/SHA256SUMS" "$OFFICIAL_ROOT/SHA256SUMS" || {
-      show_error "无法下载 Python 校验文件，请检查网络后重试。"
-      return 1
-    }
-  fi
+  # Only trust checksums fetched directly from the upstream GitHub release.
+  # The archive can come from a mirror, but a compromised mirror must not be
+  # able to supply both executable bytes and its own matching SHA256SUMS.
+  # Always refresh: do not reuse an old checksum from the download cache.
+  fetch_file "$SUMS_PATH" "$OFFICIAL_ROOT/SHA256SUMS" || {
+    show_error "无法从 Python 上游官方 Release 获取校验文件；安全起见停止安装。"
+    return 1
+  }
   local expected actual
   expected=$(/usr/bin/awk -v filename="$ARCHIVE" '$2 == filename || $2 == "*" filename {print $1; exit}' "$SUMS_PATH")
   actual=$(/usr/bin/shasum -a 256 "$ARCHIVE_PATH" | /usr/bin/awk '{print $1}')
