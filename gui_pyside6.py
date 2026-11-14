@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Novel Formatter 2.0 — PySide6 GUI
+Novel Formatter — PySide6 GUI
 七个主功能区：工作区 / 页面管理 / OCR 识别 / 格式处理 / 文字校对 / EPUB生成 / 设置。
 OCR/PDF 仍使用紧凑模式切换；文字校对由全文总览与图文对照在页内互切，macOS 简约风格，完整功能保留。
 

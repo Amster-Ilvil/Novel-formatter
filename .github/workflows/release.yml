@@ -329,7 +329,7 @@ jobs:
           本 Release 直接由当前 main 提交 **${GITHUB_SHA}** 在 GitHub Actions 干净环境中构建。
 
           ### v2.2 更新（相对 v2.1）
-          - **macOS 凭据安全**：通过系统 Security.framework Keychain API 保存、更新和删除 AI/OCR 密钥，避免把密钥放进 `security` 命令的进程参数。
+          - **macOS 凭据安全**：通过系统 Security.framework Keychain API 保存、更新和删除 AI/OCR 密钥，避免把密钥放进 security(1) 命令的进程参数。
           - **Python 下载校验**：Mac/Windows 可从镜像下载运行时，但 SHA256SUMS 只能从官方 astral-sh GitHub Release 获取；无法取到官方校验文件时拒绝安装。
           - **Linux 构建链加固**：AppImageKit 构建工具绑定固定的官方 GitHub 资产 ID、大小和更新时间，下载前后核验；检测到更换即拒绝执行。上游未提供独立 SHA-256，资产身份锁定不等于文件哈希签名校验。
           - **CI 审计**：GitHub Actions 使用固定提交 SHA，发布前执行 Keychain/下载来源安全回归与隐私审计。
@@ -360,6 +360,14 @@ jobs:
           EOF
 
           if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
+            # A v2.2 rebuild must retarget the existing lightweight tag to the
+            # exact new commit, or the tag would refer to stale v2.2 packages.
+            # Never force a non-fast-forward tag move.
+            CURRENT_TAG_SHA="$(gh api "repos/${GITHUB_REPOSITORY}/git/ref/tags/${RELEASE_TAG}" --jq .object.sha)"
+            if [[ "$CURRENT_TAG_SHA" != "$GITHUB_SHA" ]]; then
+              gh api --method PATCH "repos/${GITHUB_REPOSITORY}/git/refs/tags/${RELEASE_TAG}" \
+                -f sha="$GITHUB_SHA" -F force=false >/dev/null
+            fi
             gh release edit "$RELEASE_TAG" --title "Novel Formatter Studio ${VERSION}" --notes-file "$NOTES" --latest
           else
             gh release create "$RELEASE_TAG" --target "$GITHUB_SHA" --title "Novel Formatter Studio ${VERSION}" --notes-file "$NOTES" --latest
@@ -391,6 +399,7 @@ jobs:
           done
           BODY="$(gh release view "$RELEASE_TAG" --json body --jq .body)"
           grep -Fq "$GITHUB_SHA" <<< "$BODY"
+          test "$(gh api "repos/${GITHUB_REPOSITORY}/git/ref/tags/${RELEASE_TAG}" --jq .object.sha)" = "$GITHUB_SHA"
           grep -Fq "NovelFormatter_${VERSION}_Windows_x64_Setup.exe" <<< "$BODY"
           grep -Fq "NovelFormatter_${VERSION}_Linux_x86_64.AppImage" <<< "$BODY"
           grep -Fq "NovelFormatter_${VERSION}_Linux_ARM64.AppImage" <<< "$BODY"

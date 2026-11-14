@@ -5,7 +5,10 @@ set -eu
 
 PROJECT_DIR=${0:A:h:h}
 PACKAGING_DIR="$PROJECT_DIR/packaging"
-VERSION="${1:-2.0.0}"
+VERSION="${1:-}"
+if [[ -z "$VERSION" ]]; then
+  VERSION="$(tr -d '[:space:]' < "$PROJECT_DIR/VERSION")"
+fi
 DATE_TAG="$(date +%Y%m%d)"
 DIST_ROOT="$PROJECT_DIR/dist"
 PKG_DIR="$DIST_ROOT/NovelFormatterStudio"

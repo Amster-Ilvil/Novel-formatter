@@ -1,6 +1,7 @@
-param([string]$Version = '2.0.0')
+param([string]$Version = '')
 $ErrorActionPreference = 'Stop'
 $ProjectDir = Split-Path -Parent $PSScriptRoot
+if (-not $Version) { $Version = (Get-Content -LiteralPath (Join-Path $ProjectDir 'VERSION') -Raw).Trim() }
 $DateTag = Get-Date -Format 'yyyyMMdd'
 $DistRoot = Join-Path $ProjectDir 'dist'
 $PackageDir = Join-Path $DistRoot 'NovelFormatterStudio-Windows'

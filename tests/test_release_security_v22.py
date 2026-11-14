@@ -115,6 +115,8 @@ class SecurityTests(unittest.TestCase):
 
     def test_version_is_22(self):
         self.assertEqual((ROOT / "VERSION").read_text().strip(), "2.2")
+        self.assertIn('VERSION = "2.2"', (ROOT / "core/app_meta.py").read_text())
+        self.assertIn('self._make_card(f"Novel Formatter {VERSION}")', (ROOT / "ui/settings/tab.py").read_text())
 
 
 if __name__ == "__main__":

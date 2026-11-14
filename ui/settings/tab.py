@@ -1438,7 +1438,7 @@ class SystemSettingsTab(QWidget):
 
     def _build_about_page(self) -> QWidget:
         scroll, _page, layout = self._scroll_page()
-        card, box = self._make_card("Novel Formatter 2.0")
+        card, box = self._make_card(f"Novel Formatter {VERSION}")
         summary = QLabel(
             "日文书籍 OCR、逐列与逐字审校、文本修订、Formatter 和出版级 EPUB 导出的统一桌面工作台。"
         )
