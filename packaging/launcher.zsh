@@ -7,6 +7,12 @@ setopt NULL_GLOB
 
 BUNDLE_CONTENTS=${0:A:h:h}
 APP_BUNDLE=${BUNDLE_CONTENTS:h}
+# Source installations reuse the local environment and never bootstrap a second
+# Python or install dependencies. The source launcher has no bundle delegation.
+if [[ -f "${APP_BUNDLE:h}/gui_pyside6.py" && -f "${APP_BUNDLE:h}/run_novel_formatter.command" ]]; then
+  /bin/mkdir -p "${APP_BUNDLE:h}/debug"
+  exec /bin/zsh "${APP_BUNDLE:h}/run_novel_formatter.command" >>"${APP_BUNDLE:h}/debug/app-launcher.log" 2>&1
+fi
 SUPPORT_DIR="$HOME/Library/Application Support/Novel Formatter Studio"
 RUNTIME_DIR="$SUPPORT_DIR/native-runtime-v1"
 DOWNLOAD_DIR="$SUPPORT_DIR/downloads"

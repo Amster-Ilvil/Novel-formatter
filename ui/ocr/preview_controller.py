@@ -485,7 +485,9 @@ class OCRPreviewController:
                 self._preview_filename_lbl.setText(_tr_ui("当前图片：尚未载入"))
             return
 
-        image_exts = {'.png', '.jpg', '.jpeg', '.heic', '.tif', '.tiff', '.bmp', '.gif'}
+        # Expand_inputs() already accepts WebP pages; keep the crop/reference
+        # preview filter in sync so a WebP-only book can select its OCR region.
+        image_exts = {'.png', '.jpg', '.jpeg', '.heic', '.tif', '.tiff', '.bmp', '.gif', '.webp'}
         try:
             from adapters.pdf_input import expand_inputs, natural_sort_key
             work_dir = (self._pending_inputs[0] if Path(self._pending_inputs[0]).is_dir()

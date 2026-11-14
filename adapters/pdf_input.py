@@ -335,36 +335,52 @@ def expand_inputs(
     page_ready_callback: PageReadyCallback | None = None,
     cancel_check: Callable[[], bool] | None = None,
 ) -> list[str]:
-    """Expand folders, PDFs, and images into naturally ordered image paths.
+    """Expand folders, PDFs, CBZ/CBR image archives and individual images.
 
-    Multi-model OCR resolves PDF/folder inputs once at run start and then hands
-    every role the same immutable image list.  Detect that hot path lexically
-    and return it directly: no repeated directory probes, PDF cache checks or
-    filesystem stats are needed for each later OCR engine.
+    Multi-engine OCR sometimes calls this on a previously expanded list of
+    hundreds of PNG files. Keep the original fast path: those files are already
+    validated/rendered and must not be reopened on each model invocation.
+    Original source paths are never modified; archive pages are session-owned.
     """
     del work_dir
     expanded_paths = [Path(raw).expanduser() for raw in paths]
-    if expanded_paths and all(path.suffix.lower() in _IMAGE_EXTS for path in expanded_paths):
+    if expanded_paths and len(expanded_paths) > 1 and all(
+        path.suffix.lower() in _IMAGE_EXTS for path in expanded_paths
+    ):
         if cancel_check is not None and cancel_check():
             raise RuntimeError("输入加载已取消")
         return [str(path) for path in expanded_paths]
+
+    from adapters.file_type import detect_file_type, FileKind
+    from adapters.image_archive import extract_image_archive
     images: list[str] = []
+
+    def collect(path: Path) -> None:
+        if cancel_check is not None and cancel_check():
+            raise RuntimeError("输入加载已取消")
+        if not path.is_file() or path.name.startswith((".", "._")):
+            return
+        detected = detect_file_type(path)
+        if detected.kind is FileKind.PDF:
+            images.extend(pdf_to_images(
+                str(path), dpi=int(dpi), progress_callback=progress_callback,
+                page_ready_callback=page_ready_callback, cancel_check=cancel_check,
+            ))
+        elif detected.kind in (FileKind.ZIP, FileKind.RAR):
+            images.extend(extract_image_archive(
+                path, progress_callback=progress_callback, cancel_check=cancel_check,
+            ))
+        elif detected.kind is FileKind.IMAGE:
+            images.append(str(path))
+
     for path in expanded_paths:
         if cancel_check is not None and cancel_check():
             raise RuntimeError("输入加载已取消")
         if path.is_dir():
-            images.extend(sorted(
-                (str(item) for item in path.iterdir() if item.suffix.lower() in _IMAGE_EXTS),
-                key=natural_sort_key,
-            ))
-        elif path.suffix.lower() == ".pdf":
-            images.extend(pdf_to_images(
-                str(path), dpi=int(dpi), progress_callback=progress_callback,
-                page_ready_callback=page_ready_callback,
-                cancel_check=cancel_check,
-            ))
-        elif path.suffix.lower() in _IMAGE_EXTS:
-            images.append(str(path))
+            for item in sorted(path.iterdir(), key=natural_sort_key):
+                collect(item)
+        else:
+            collect(path)
     return images
 
 

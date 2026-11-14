@@ -12,7 +12,7 @@ from typing import Iterable
 from PySide6.QtCore import QObject, QEvent, QTimer
 from PySide6.QtGui import QAction, QColor, QPalette
 from PySide6.QtWidgets import (
-    QApplication, QWidget, QLabel, QPushButton, QToolButton, QCheckBox,
+    QApplication, QWidget, QLabel, QAbstractButton, QPushButton, QToolButton, QCheckBox,
     QRadioButton, QLineEdit, QComboBox, QTabWidget, QListWidget, QTableWidget,
     QMenu, QGroupBox, QTextEdit, QPlainTextEdit, QSpinBox, QDoubleSpinBox,
     QProgressBar, QTreeWidget,
@@ -55,7 +55,10 @@ class InterfacePreferenceManager(QObject):
     are unaffected by a language/theme switch.
     """
 
-    _TEXT_TYPES = (QLabel, QPushButton, QToolButton, QCheckBox, QRadioButton)
+    # A custom painted DesignNavButton derives directly from QAbstractButton,
+    # not QPushButton. Treat it like standard text-bearing buttons so switching
+    # interface languages also updates visible sidebar labels.
+    _TEXT_TYPES = (QLabel, QAbstractButton)
     # Polish can arrive while a Python QWidget subclass is still being built.
     # Calling back into that temporary wrapper can make PySide cache it as a
     # plain QWidget. Show happens after construction and is the safe boundary.

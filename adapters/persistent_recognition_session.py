@@ -86,7 +86,7 @@ class PersistentRecognitionSession:
         if self.engine == "paddle_ocr":
             from adapters.paddle_ocr_adapter import (
                 setup_venv, VENV_PYTHON, WORKER_SCRIPT, _prepare_vl_runtime,
-                recommended_paddle_batch, _paddle_worker_env,
+                recommended_paddle_batch,
             )
             pipeline = str(self.options.get("pipeline") or "ocr")
             if pipeline not in {"ocr", "structure", "vl"}:
@@ -120,8 +120,8 @@ class PersistentRecognitionSession:
             return None
         from adapters.paddle_ocr_models import (
             paddle_model_source_attempts,
-            paddle_source_environment,
         )
+        from adapters.paddle_ocr_adapter import _paddle_worker_env
         sources = paddle_model_source_attempts(str(self.options.get("model_source") or "auto"))
         source = sources[min(self._paddle_source_index, len(sources) - 1)]
         return _paddle_worker_env(source)

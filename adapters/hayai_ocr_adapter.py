@@ -171,25 +171,85 @@ def _current_interpreter_runtime() -> Path | None:
     return Path(sys.executable).resolve()
 
 
+def _project_runtime_python() -> Path:
+    return ROOT / ".venv-hayai-ocr" / ("Scripts/python.exe" if os.name == "nt" else "bin/python")
+
+
+def _probe_existing_runtime(python: Path, backend: str) -> bool:
+    """Check installed dependencies without repairing or downloading anything."""
+    if not python.is_file():
+        return False
+    marker = (
+        "import sys; assert (3,10) <= sys.version_info[:2] <= (3,13); "
+        "from hayai_ocr import HayaiOcr; from importlib.metadata import version; "
+        f"assert version('hayai-ocr') == {HAYAI_OCR_VERSION!r}; "
+        "v=version('transformers').split('+',1)[0].split('.'); "
+        "assert int(v[0]) == 4 and int(v[1]) >= 49"
+    )
+    if backend == "litert":
+        marker += "; import ai_edge_litert"
+    elif is_m6():
+        marker += "; import torch; v=version('torch').split('+',1)[0].split('.'); assert tuple(map(int,v[:2])) >= (2,14)"
+    try:
+        result = subprocess.run(
+            [str(python), "-c", marker], capture_output=True, timeout=60,
+            env=dict(os.environ, HF_HUB_OFFLINE="1", TRANSFORMERS_OFFLINE="1", PIP_NO_INDEX="1"),
+        )
+        return result.returncode == 0
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+
+
+def _offline_runtime_requested() -> bool:
+    """One policy for dependency installation and Hugging Face worker access.
+
+    PIP_NO_INDEX is treated as an explicit no-network request for the OCR
+    component, even if the caller forgot to set the other offline flags.
+    """
+    yes = {"1", "true", "yes", "on"}
+    no = {"0", "false", "no", "off"}
+    return any(
+        os.environ.get(name, "").strip().lower() in yes
+        for name in ("NOVEL_FORMATTER_OCR_OFFLINE", "HF_HUB_OFFLINE", "TRANSFORMERS_OFFLINE", "PIP_NO_INDEX")
+    ) or os.environ.get("NOVEL_FORMATTER_MODEL_AUTO_DOWNLOAD", "").strip().lower() in no
+
+
 def setup_venv(*, verbose: bool = True, backend: str = "torch") -> Path:
     backend = _normalise_backend(backend)
-    # Offline/cloud acceptance can reuse an already-provisioned exact Hayai
-    # runtime instead of invoking pip. Normal desktop installs keep the private
-    # venv path unless this advanced override is explicitly set.
+    # Single selection order shared with the GUI runtime catalog:
+    # explicit > project > existing private > eligible current > installer.
+    # Never silently accept a broken explicit override or repair it via pip.
     explicit = os.environ.get("NOVEL_FORMATTER_HAYAI_OCR_PYTHON", "").strip()
     if explicit:
         path = Path(explicit).expanduser()
-        if path.is_file():
-            return path
-    # If this process already has the pinned runtime and is explicitly bound to
-    # a local model/cache, do not create a second venv and never invoke pip.
-    # LiteRT still uses its isolated dependency set unless explicitly overridden.
+        if not _probe_existing_runtime(path, backend):
+            raise RuntimeError(
+                f"Hayai OCR 指定的 Python 环境不可用或版本不匹配：{path}。"
+                "已拒绝自动安装；请修正 NOVEL_FORMATTER_HAYAI_OCR_PYTHON。"
+            )
+        return path
+
+    project_python = _project_runtime_python()
+    if _probe_existing_runtime(project_python, backend):
+        if verbose:
+            print(f"[Hayai OCR] reuse installed project runtime: {project_python}", flush=True)
+        return project_python
+
+    private_python = VENV_DIR / ("Scripts/python.exe" if os.name == "nt" else "bin/python")
+    if str(private_python) != str(project_python) and _probe_existing_runtime(private_python, backend):
+        if verbose:
+            print(f"[Hayai OCR] reuse installed private runtime: {private_python}", flush=True)
+        return private_python
+
+    # Never claim a plain system interpreter is the runtime merely because it
+    # has the package: it must also have an already usable model/processor cache.
     if backend == "torch":
         current_python = _current_interpreter_runtime()
-        if current_python is not None:
+        if current_python is not None and _probe_existing_runtime(current_python, backend):
             if verbose:
                 print(f"[Hayai OCR] reuse current offline runtime: {current_python}", flush=True)
             return current_python
+
     package = HAYAI_OCR_PACKAGE
     if backend == "litert" and "[litert]" not in package:
         if "==" in package:
@@ -213,6 +273,8 @@ def setup_venv(*, verbose: bool = True, backend: str = "torch") -> Path:
     packages = [package, HAYAI_TRANSFORMERS_PACKAGE]
     if is_m6() and backend == "torch":
         packages.insert(0, HAYAI_TORCH_PACKAGE)
+    if _offline_runtime_requested():
+        raise RuntimeError("Hayai OCR 离线模式拒绝安装依赖：未找到可用的已安装环境；可通过 NOVEL_FORMATTER_HAYAI_OCR_PYTHON 指定已有 Python。")
     return ensure_venv(
         VENV_DIR,
         label="Hayai OCR / PyTorch",
@@ -287,7 +349,14 @@ def _worker_env(backend: str = "torch") -> dict[str, str]:
     # required before a new upstream snapshot can be fetched.
     explicit_model = str(env.get("NOVEL_FORMATTER_HAYAI_OCR_MODEL") or "").strip()
     explicit_local_model = bool(explicit_model and Path(explicit_model).expanduser().exists())
-    if _offline_cache_ready(backend) or explicit_local_model:
+    # A global offline request is stronger than the cache-ready heuristic.
+    # Forward it into the subprocess even if the static cache scanner failed.
+    if _offline_runtime_requested():
+        env["HF_HUB_OFFLINE"] = "1"
+        env["TRANSFORMERS_OFFLINE"] = "1"
+        env["PIP_NO_INDEX"] = "1"
+        env["NOVEL_FORMATTER_HAYAI_OFFLINE_ACTIVE"] = "1"
+    elif _offline_cache_ready(backend) or explicit_local_model:
         # An explicitly local model is a no-network contract.  If its processor
         # assets are incomplete, fail with a local-cache error rather than
         # silently contacting Hugging Face during an OCR button click.

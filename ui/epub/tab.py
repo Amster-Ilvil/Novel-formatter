@@ -11,7 +11,7 @@ from typing import Optional
 
 from PySide6.QtWidgets import (
     QApplication, QWidget, QVBoxLayout, QHBoxLayout, QGridLayout, QFormLayout, QFrame, QLabel, QPushButton, QComboBox,
-    QLineEdit, QListWidget, QPlainTextEdit, QProgressBar, QRadioButton, QStackedWidget, QTabWidget,
+    QLineEdit, QListWidget, QPlainTextEdit, QProgressBar, QRadioButton, QCheckBox, QStackedWidget, QTabWidget,
     QTextBrowser, QTreeView, QFileSystemModel, QFileDialog, QMessageBox, QSizePolicy, QAbstractItemView, QMenu,
 )
 from PySide6.QtCore import Qt, Signal, QTimer, QUrl, QDir, QModelIndex
@@ -206,6 +206,12 @@ class EPUBTab(QWidget):
         mr.addWidget(self._horiz_radio)
         mr.addStretch()
         fl.addRow("排版:", mode_row)
+        # Advanced-only opt-in. The historical vertical/horizontal radio and
+        # all old projects retain their output unless this is explicitly set.
+        self._ltr_check = QCheckBox("竖排来源转换为从左到右横排 EPUB")
+        self._ltr_check.setChecked(False)
+        self._ltr_check.setToolTip("仅导出时转换 CSS、标点和翻页方向；不修改 OCR/Ruby/裁决数据")
+        fl.addRow("可选转换:", self._ltr_check)
 
         ll.addWidget(form)
         meta_hint = QLabel("可复制粘贴书名；生成 EPUB 时会自动把书名填入保存文件名。书名留空时使用导出的文件名。")
@@ -568,6 +574,8 @@ class EPUBTab(QWidget):
         self._template_combo.currentTextChanged.connect(self._schedule_live_preview)
         self._vert_radio.toggled.connect(self._schedule_live_preview)
         self._horiz_radio.toggled.connect(self._schedule_live_preview)
+        self._ltr_check.toggled.connect(self._schedule_live_preview)
+        self._ltr_check.toggled.connect(lambda _v: self._sync_compact_epub_mode_from_advanced())
 
     def _clear_validation_report(self) -> None:
         self._last_validation_info = None
@@ -658,12 +666,13 @@ class EPUBTab(QWidget):
     def _sync_compact_epub_mode_to_advanced(self, _index: int = -1) -> None:
         vertical = self._compact_mode_combo.currentData() == "vertical"
         if vertical:
+            self._ltr_check.setChecked(False)
             self._vert_radio.setChecked(True)
         else:
             self._horiz_radio.setChecked(True)
 
     def _sync_compact_epub_mode_from_advanced(self) -> None:
-        desired = "vertical" if self._vert_radio.isChecked() else "horizontal"
+        desired = "vertical" if self._vert_radio.isChecked() and not self._ltr_check.isChecked() else "horizontal"
         idx = self._compact_mode_combo.findData(desired)
         if idx >= 0 and self._compact_mode_combo.currentIndex() != idx:
             blocked = self._compact_mode_combo.blockSignals(True)
@@ -1033,6 +1042,10 @@ class EPUBTab(QWidget):
             if not self._vert_radio.isChecked():
                 css = re.sub(r"(?i)(?:-epub-)?writing-mode\s*:\s*[^;}]*(?:;)?", "", css)
 
+            if self._ltr_check.isChecked():
+                from builder.text_direction import convert_css_to_ltr
+                css = convert_css_to_ltr(css)
+
             pieces = []
             text_count = 0
             for block in self._doc.blocks:
@@ -1056,6 +1069,9 @@ class EPUBTab(QWidget):
                 f"<title>{safe_title}</title><style>{css}</style></head><body>"
                 f"<section><h1>{safe_title}</h1>{byline}{''.join(pieces)}</section></body></html>"
             )
+            if self._ltr_check.isChecked():
+                from builder.text_direction import convert_xhtml_to_ltr, convert_css_to_ltr
+                html_text = convert_xhtml_to_ltr(html_text)
             self._set_preview_html(html_text)
         except Exception as exc:
             self._set_preview_html(f"<html><body><pre>实时预览失败：{exc}</pre></body></html>")
@@ -1167,12 +1183,20 @@ class EPUBTab(QWidget):
         if self._build_running:
             notify(self, "当前已有一个 EPUB 构建任务，请等待完成后再生成。", "warning")
             return
+        main_win = self.window()
+        if (bool(getattr(main_win, "_ocr_fusion_export_stale", False))
+                and getattr(self, "_source_kind", "") in {"ocr", "format", "formatter"}):
+            QMessageBox.warning(
+                self, "正文版本已过期",
+                "最新 OCR 裁决尚未应用到 EPUB 正文。请回到 OCR 对比点击“应用整本”，"
+                "再生成 EPUB；已有格式和手动编辑不会被自动覆盖。",
+            )
+            return
         # EPUB always builds from a private immutable snapshot. Page Manager is
         # merged as an overlay first, then metadata edits and the background
         # builder operate only on the deep copy. No title/author/export change
         # can leak back into Formatter, OCR comparison, or MainWindow.
         doc = self._doc
-        main_win = self.window()
 
         # Only fall back when the EPUB workspace has never received a document;
         # never replace an explicitly selected AI/document version.
@@ -1364,6 +1388,7 @@ class EPUBTab(QWidget):
 
         template = self._template_combo.currentText()
         vertical = self._vert_radio.isChecked()
+        convert_ltr = self._ltr_check.isChecked()
 
         def worker():
             try:
@@ -1377,7 +1402,8 @@ class EPUBTab(QWidget):
                 buf = io.StringIO()
                 with contextlib.redirect_stdout(buf):
                     build_epub(doc, output_path=path, css_template=template,
-                              vertical=vertical, verbose=True, custom_css=custom_css)
+                              vertical=vertical, verbose=True, custom_css=custom_css,
+                              text_direction="ltr" if convert_ltr else "keep")
                 ai_css_path = ""
                 if (getattr(doc.metadata,"ai_processing_mode","") == "typeset"
                         and bool(getattr(doc.metadata,"ai_layout_locked",False))
@@ -1390,7 +1416,7 @@ class EPUBTab(QWidget):
                 # every build.  Structural failures are fatal; warnings are
                 # surfaced together with epubcheck in the completion dialog.
                 from utils.epub_quality_gate import validate_epub_quality
-                quality_gate = validate_epub_quality(path, expect_vertical=vertical)
+                quality_gate = validate_epub_quality(path, expect_vertical=vertical and not convert_ltr)
                 if not quality_gate.valid:
                     detail = "\n".join(quality_gate.errors[:20])
                     raise RuntimeError(

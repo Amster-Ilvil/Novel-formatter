@@ -30,7 +30,8 @@ from utils.apple_silicon_runtime import is_m6, recommended_cpu_threads, torch_wo
 ROOT = Path(__file__).parent.parent
 VENV_DIR = ROOT / ".venv-manga-48px"
 WORKER_SCRIPT = Path(__file__).parent / "manga_48px_worker.py"
-MODEL_CACHE = Path(os.environ.get("NOVEL_FORMATTER_CLOUD_48PX_CACHE", "").strip() or (ROOT / ".model-cache" / "manga-48px-ar")).expanduser()
+from utils.model_inventory import manga_48px_cache_dir
+MODEL_CACHE = manga_48px_cache_dir()
 MANGA_48PX_TORCH_PACKAGE = os.environ.get(
     "NOVEL_FORMATTER_MANGA_48PX_TORCH",
     "torch>=2.14,<2.15" if is_m6() else "torch>=2.3,<3",

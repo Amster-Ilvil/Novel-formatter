@@ -423,6 +423,11 @@ def setup_venv(verbose: bool = True) -> tuple[Path, Path]:
     local_source = _explicit_local_source()
     offline = any(os.environ.get(flag, "").strip().lower() in {"1", "true", "yes"}
                   for flag in ("HF_HUB_OFFLINE", "TRANSFORMERS_OFFLINE", "NOVEL_FORMATTER_OCR_OFFLINE"))
+    if (offline and local_source is None
+            and (SOURCE_DIR / "src" / "ocr.py").is_file()
+            and (SOURCE_DIR / "src" / "config" / "NDLmoji.yaml").is_file()
+            and _models_ready(SOURCE_DIR)):
+        local_source = SOURCE_DIR
     if offline and local_source is None:
         raise RuntimeError(
             "NDLOCR-Lite 离线模型权重已存在，但官方 src/config 源码未安装。"
@@ -439,6 +444,16 @@ def setup_venv(verbose: bool = True) -> tuple[Path, Path]:
     if local_source is not None and _current_interpreter_ready():
         return Path(sys.executable).resolve(), local_source
     if offline:
+        # GUI Python need not contain ONNX dependencies. Reuse the installed
+        # isolated interpreter without invoking pip or replacing the runtime.
+        managed_python = VENV_DIR / ("Scripts/python.exe" if os.name == "nt" else "bin/python")
+        if managed_python.is_file():
+            check = subprocess.run(
+                [str(managed_python), "-c", "import cv2, onnxruntime, yaml"],
+                capture_output=True, text=True, timeout=20,
+            )
+            if check.returncode == 0:
+                return managed_python, local_source
         raise RuntimeError(
             "NDLOCR-Lite 官方源码已找到，但当前 Python 缺少运行依赖；"
             "离线模式拒绝通过 pip 安装，请先提供固定版本离线依赖。"

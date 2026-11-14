@@ -118,6 +118,7 @@ def main(argv=None) -> int:
         help="CSS 模板（默认: denki = 電撃文庫），仅用于 EPUB 输出",
     )
     parser.add_argument("--vertical", action="store_true", help="竖排模式（默认横排）")
+    parser.add_argument("--ltr", action="store_true", help="导出为从左到右横排 EPUB（仅改变出版包）")
     parser.add_argument("--output-word", metavar="PATH",
                         help="额外生成一份 Word (.docx)，供人工校对/进一步编辑用")
 
@@ -148,8 +149,8 @@ def main(argv=None) -> int:
         parser.error("顶部和底部裁剪比例之和必须小于 0.8")
 
     if args.batch:
-        if args.from_json or args.from_epub or args.text_layer:
-            parser.error("--batch 不能与 --from-json、--from-epub 或 --text-layer 同时使用")
+        if args.from_json or args.from_epub or args.text_layer or args.ltr:
+            parser.error("--batch 不能与 --from-json、--from-epub、--text-layer 或 --ltr 同时使用")
         unsupported = []
         for flag, value in (
             ("--overrides", args.overrides), ("--preserve-ruby", args.preserve_ruby),
@@ -301,6 +302,7 @@ def main(argv=None) -> int:
         output_path=str(output_path),
         css_template=args.template,
         vertical=args.vertical,
+        text_direction="ltr" if args.ltr else "keep",
         verbose=verbose,
     )
 

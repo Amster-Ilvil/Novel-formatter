@@ -34,9 +34,9 @@ def main() -> int:
         select_application_download_sources,
     )
 
-    sources = select_application_download_sources()
-    apply_application_download_environment(sources)
     if args.install_main_deps:
+        sources = select_application_download_sources()
+        apply_application_download_environment(sources)
         install_main_dependencies(sources=sources)
     if args.prepare_models:
         print(

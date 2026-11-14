@@ -96,11 +96,37 @@ def download_model(progress_callback=None) -> Path:
     return _MODEL_DIR
 
 
+_MODEL_INVENTORY_IDS = (
+    'openvino_handwriting.xml',
+    'openvino_handwriting.bin',
+    'openvino_handwriting.charlist',
+)
+
+
+def verify_local_model_integrity() -> None:
+    """Read-only full SHA-256 check of the files actually used by the engine.
+
+    Uses the pinned manifests already present in the local adaptation. Does not
+    download, migrate, rewrite, or mark model files as verified. Executed only
+    when instantiating the optional engine, before the OpenVINO backend loads.
+    """
+    from utils.model_inventory import ModelState, inspect_model
+
+    failures = []
+    for model_id in _MODEL_INVENTORY_IDS:
+        result = inspect_model(model_id, models_dir=_MODEL_DIR.parent, full_hash=True)
+        if result['state'] != ModelState.READY.value:
+            failures.append(f"{Path(result['path']).name}: {result['state']}")
+    if failures:
+        raise RuntimeError('OpenVINO 模型完整性校验失败：' + '、'.join(failures))
+
+
 class OpenVINOJapaneseHandwritingRecognizer:
     def __init__(self, device: str = "CPU"):
         ok, detail = model_available()
         if not ok:
             raise RuntimeError(detail)
+        verify_local_model_integrity()
         import numpy as np
         from openvino import Core
 

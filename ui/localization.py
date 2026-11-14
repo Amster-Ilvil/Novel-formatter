@@ -4963,3 +4963,53 @@ _EXACT_JA.update({
     "显示/隐藏右侧实时预览中的红色实线检测框": "リアルタイムプレビューの赤い実線検出枠を表示/非表示",
     "显示/隐藏右侧实时预览中的绿色实线 OCR 输入原像素框": "リアルタイムプレビューの緑の実線OCR入力原画素枠を表示/非表示",
 })
+
+# P52 full-book viewer and EPUB adjudication handoff messages.
+_EXACT_EN.update({
+    "正文版本已过期": "Body Version Is Outdated",
+    "最新 OCR 裁决尚未应用到 EPUB 正文。请回到 OCR 对比点击“应用整本”，再生成 EPUB；已有格式和手动编辑不会被自动覆盖。": "The latest OCR decisions have not been applied to the EPUB body. Apply Whole Book in OCR Compare before exporting. Existing formatting and manual edits will be preserved.",
+    "刚导入的新 OCR 裁决尚未应用到当前 Formatter/EPUB 正文。为保留当前正文上的格式与手动编辑，这里不会自动覆盖它。请回到 OCR 对比点击“应用整本”；若需要格式处理，再重新处理后生成 EPUB。": "The imported OCR decisions have not been applied to the current Formatter/EPUB body. Apply Whole Book in OCR Compare, then format again if needed before exporting. Existing formatting and manual edits will not be overwritten automatically.",
+    "没有可导出的正文": "No Body Text to Export",
+    "当前没有可导出的正文。请在 OCR 对比中应用单 OCR/多模型融合稿，或在 Formatter 载入并应用正文后再导出。": "There is no body text to export. Apply the single-OCR or fused manuscript in OCR Compare, or load and apply text in Formatter first.",
+    "应用多模型融合稿": "Apply Multi-model Fused Manuscript",
+    "当前多模型 OCR 和导入的 AI 裁决还保存在 OCR 对比中，尚未应用到 Formatter/EPUB。\n\n先将当前完整融合稿应用到 Formatter/EPUB，再继续生成吗？\n原始 OCR 与裁决记录会保留。": "Multi-model OCR and imported AI decisions remain in OCR Compare and have not been applied to Formatter/EPUB.\n\nApply the complete fused manuscript before generating?\nOriginal OCR and decision records will be preserved.",
+    "融合裁决状态未就绪": "Fusion Decisions Not Ready",
+    "当前 OCR 对比的候选状态尚未完整恢复。请回到 OCR 对比等待裁决状态载入后再生成 EPUB。": "OCR candidate states have not been fully restored. Wait for decisions to load in OCR Compare before generating EPUB.",
+    "融合稿仍有待裁决内容": "Fused Manuscript Has Pending Decisions",
+    "多模型 OCR 尚未应用": "Multi-model OCR Not Applied",
+    "当前正文仍是未应用的多模型 OCR 原始融合稿。请先打开 OCR 对比，恢复裁决状态并点击“应用整本”，再生成 EPUB；避免把未裁决的原始融合稿误导出。": "The body is still an unapplied multi-model OCR draft. Restore decisions and Apply Whole Book in OCR Compare before generating EPUB to avoid exporting an unreviewed draft.",
+    "多模型全文对照": "Multi-model Full Text Comparison",
+    "开启后四栏同步显示所有 OCR 模型的完整对齐正文和融合结果，红色标记不同字符，淡红底标记分歧行。关闭后恢复逐句候选面板。": "Show aligned OCR texts and fusion in synchronized columns. Red highlights different characters; a light red background marks conflicting rows. Turn off to restore sentence candidates.",
+    "多模型全文对照 · 逐行对应 · 红色=字符差异，浅红=模型分歧": "Multi-model Full Text · Aligned Rows · Red: character differences; light red: model conflicts",
+    "仅在点击后按文件名标记封面、插图等；保留已确认的人工标记": "Mark covers and illustrations by filename only when clicked; preserve confirmed manual tags"
+})
+_EXACT_JA.update({
+    "正文版本已过期": "本文のバージョンが古くなっています",
+    "最新 OCR 裁决尚未应用到 EPUB 正文。请回到 OCR 对比点击“应用整本”，再生成 EPUB；已有格式和手动编辑不会被自动覆盖。": "最新のOCR裁定がEPUB本文に未適用です。OCR比較で「全体を適用」を押してから生成してください。既存の書式と手動編集は自動上書きされません。",
+    "刚导入的新 OCR 裁决尚未应用到当前 Formatter/EPUB 正文。为保留当前正文上的格式与手动编辑，这里不会自动覆盖它。请回到 OCR 对比点击“应用整本”；若需要格式处理，再重新处理后生成 EPUB。": "取り込んだOCR裁定は現在のFormatter/EPUB本文に未適用です。OCR比較で「全体を適用」を押し、必要に応じて再整形してから生成してください。既存の書式や手動編集は自動上書きされません。",
+    "没有可导出的正文": "書き出せる本文がありません",
+    "当前没有可导出的正文。请在 OCR 对比中应用单 OCR/多模型融合稿，或在 Formatter 载入并应用正文后再导出。": "書き出せる本文がありません。OCR比較で単一OCRまたは統合原稿を適用するか、Formatterで本文を読み込んで適用してください。",
+    "应用多模型融合稿": "複数モデルの統合原稿を適用",
+    "当前多模型 OCR 和导入的 AI 裁决还保存在 OCR 对比中，尚未应用到 Formatter/EPUB。\n\n先将当前完整融合稿应用到 Formatter/EPUB，再继续生成吗？\n原始 OCR 与裁决记录会保留。": "複数モデルOCRと取り込んだAI裁定はOCR比較内にあり、Formatter/EPUBには未適用です。\n\n統合原稿全体を適用してから生成を続けますか？\n元のOCRと裁定記録は保持されます。",
+    "融合裁决状态未就绪": "統合裁定の状態が未準備です",
+    "当前 OCR 对比的候选状态尚未完整恢复。请回到 OCR 对比等待裁决状态载入后再生成 EPUB。": "OCR比較の候補状態が完全には復元されていません。裁定状態の読み込み完了後にEPUBを生成してください。",
+    "融合稿仍有待裁决内容": "統合原稿に未裁定の内容があります",
+    "多模型 OCR 尚未应用": "複数モデルOCRが未適用です",
+    "当前正文仍是未应用的多模型 OCR 原始融合稿。请先打开 OCR 对比，恢复裁决状态并点击“应用整本”，再生成 EPUB；避免把未裁决的原始融合稿误导出。": "本文は複数モデルOCRの未適用原稿です。OCR比較で裁定状態を復元し「全体を適用」を押してからEPUBを生成してください。",
+    "多模型全文对照": "複数モデルの全文比較",
+    "开启后四栏同步显示所有 OCR 模型的完整对齐正文和融合结果，红色标记不同字符，淡红底标记分歧行。关闭后恢复逐句候选面板。": "整列済みOCR全文と統合結果を同期する欄に表示します。文字差異は赤、競合行は薄赤色で示します。オフにすると文ごとの候補表示に戻ります。",
+    "多模型全文对照 · 逐行对应 · 红色=字符差异，浅红=模型分歧": "複数モデル全文比較・行ごとに対応・赤＝文字差異、薄赤＝モデル競合",
+    "仅在点击后按文件名标记封面、插图等；保留已确认的人工标记": "クリック時のみファイル名から表紙や挿絵を分類し、確認済みの手動分類を保持します"
+})
+
+# PR #12 optional EPUB LTR control; keep offline English/Japanese UI coverage.
+_EXACT_EN.update({
+    '竖排来源转换为从左到右横排 EPUB': 'Convert vertical source to left-to-right EPUB',
+    '仅导出时转换 CSS、标点和翻页方向；不修改 OCR/Ruby/裁决数据': 'Convert CSS, punctuation and page direction at export only; OCR, Ruby and adjudication data remain unchanged',
+    '可选转换:': 'Optional conversion:',
+})
+_EXACT_JA.update({
+    '竖排来源转换为从左到右横排 EPUB': '縦書きソースを左から右の横書きEPUBに変換',
+    '仅导出时转换 CSS、标点和翻页方向；不修改 OCR/Ruby/裁决数据': '書き出し時のみCSS・句読点・ページ方向を変換し、OCR・ルビ・校正結果は変更しません',
+    '可选转换:': '任意の変換:',
+})

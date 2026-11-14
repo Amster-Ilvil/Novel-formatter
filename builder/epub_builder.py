@@ -39,6 +39,7 @@ from textwrap import dedent
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 from models.document import UnifiedDocument, Block, BlockType
+from builder.text_direction import TextDirectionMode, coerce_text_direction, convert_css_to_ltr, convert_xhtml_to_ltr
 from utils.atomic_io import atomic_write_text
 from engine.illustration_spread import detect_likely_illustration_spreads
 
@@ -685,6 +686,7 @@ def build_epub(
     custom_css: str | None = None,
     preserve_image_bytes: bool = False,
     include_nav_in_spine: bool = False,
+    text_direction: TextDirectionMode | str = TextDirectionMode.KEEP,
 ) -> None:
     """
     从 UnifiedDocument 生成 EPUB3 文件。
@@ -698,6 +700,7 @@ def build_epub(
     /手写的自定义排版），此时 css_template 只在 custom_css 为空时才生效。
     include_nav_in_spine: 兼容极少数旧阅读器；默认 False，避免目录被当作正文翻到。
     """
+    ltr = coerce_text_direction(text_direction) is TextDirectionMode.LTR
     out = Path(output_path)
     tmp = out.parent / f"_epub_tmp_{out.stem}"
     tmp.mkdir(parents=True, exist_ok=True)
@@ -772,6 +775,9 @@ html, body, p, h1, h2 {
 ruby { ruby-position: over; }
 ruby rt { ruby-position: over; -webkit-ruby-position: before; }
 """
+
+    if ltr:
+        css_content = convert_css_to_ltr(css_content)
 
     if not vertical:
         # 移除完整的 writing-mode 声明。旧正则只识别 -epub- 前缀，
@@ -1102,6 +1108,13 @@ ruby rt { ruby-position: over; -webkit-ruby-position: before; }
     )
     (oebps / "toc.ncx").write_text(ncx, encoding="utf-8")
 
+    # Optional LTR is applied at publication time only. All intermediate
+    # canonical documents, Ruby positions and source image references stay as-is.
+    if ltr:
+        for xhtml_path in (oebps / "content").glob("*.xhtml"):
+            original = xhtml_path.read_text(encoding="utf-8")
+            xhtml_path.write_text(convert_xhtml_to_ltr(original), encoding="utf-8")
+
     # ── content.opf ─────────────────────────────────────────────────────────
     # manifest items
     manifest_lines = [
@@ -1150,7 +1163,7 @@ ruby rt { ruby-position: over; -webkit-ruby-position: before; }
         cover_meta += '\n    <meta property="rendition:spread">auto</meta>'
 
     # 竖排日文书从右往左翻页；横排则是常规从左往右翻页
-    page_direction = "rtl" if vertical else "ltr"
+    page_direction = "rtl" if vertical and not ltr else "ltr"
     modified = datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
 
     # 和 _xhtml_wrap 同样的坑：manifest_lines/spine_lines/cover_meta 都是多行、
@@ -1305,6 +1318,7 @@ if __name__ == "__main__":
         help=f"CSS 模板（默认: {DEFAULT_TEMPLATE}）",
     )
     parser.add_argument("--vertical", action="store_true", help="竖排模式（默认横排）")
+    parser.add_argument("--ltr", action="store_true", help="输出时将竖排 EPUB 转为从左到右横排（不改正文源文件）")
     parser.add_argument("--quiet", "-q", action="store_true")
     args = parser.parse_args()
 
@@ -1316,5 +1330,6 @@ if __name__ == "__main__":
         output_path=args.output_epub,
         css_template=args.template,
         vertical=args.vertical,
+        text_direction="ltr" if args.ltr else "keep",
         verbose=not args.quiet,
     )

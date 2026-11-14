@@ -58,6 +58,21 @@ REQUIRED_PATHS = (
 ProgressCallback = Callable[[str], None]
 
 
+def _block_source_update_for_local_test() -> None:
+    """Prevent manual upstream replacement in the offline local-test launcher.
+
+    Normal launches are unchanged. The safety launcher sets the environment
+    variable so an accidental Settings click cannot overwrite this patched ZIP.
+    """
+    if os.environ.get("NOVEL_FORMATTER_DISABLE_SOURCE_UPDATE", "").strip().lower() in {
+        "1", "true", "yes", "on",
+    }:
+        raise RuntimeError(
+            "本地安全测试模式已禁止检查及安装源码更新。"
+            "如需更新，请退出安全测试模式并自行检查远端代码。"
+        )
+
+
 def _emit(progress: ProgressCallback | None, message: str) -> None:
     if progress is not None:
         progress(str(message).strip())
@@ -280,6 +295,7 @@ class SourceUpdateResult:
 def check_source_update(repo: str | None = None, branch: str | None = None, *,
                         project_root: str | Path | None = None,
                         timeout: float = 12.0) -> SourceUpdateInfo:
+    _block_source_update_for_local_test()
     repository = normalize_repository(repo)
     branch_name = normalize_branch(branch)
     root = discover_project_root(project_root)
@@ -580,6 +596,7 @@ def _install_git(info: SourceUpdateInfo, *, progress: ProgressCallback | None) -
 
 
 def install_source_update(info: SourceUpdateInfo, *, progress: ProgressCallback | None = None) -> SourceUpdateResult:
+    _block_source_update_for_local_test()
     if normalize_repository(info.repository) != info.repository or normalize_branch(info.branch) != info.branch:
         raise RuntimeError("更新目标与锁定仓库不一致")
     root = discover_project_root(info.project_root)

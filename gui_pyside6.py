@@ -318,6 +318,8 @@ class OCRTab(QWidget):
 
     def __init__(self, parent=None):
         super().__init__(parent)
+        from utils.qt_gc import install_gui_gc
+        install_gui_gc()
         self._ocr_preview_controller = OCRPreviewController(self)
         self._ocr_run_lifecycle = OCRRunLifecycleController(self)
         self._pending_inputs: list[str] = []
@@ -5587,6 +5589,8 @@ class MainWindow(MainWindowControllerMixin, QMainWindow):
 
     def __init__(self):
         super().__init__()
+        from utils.qt_gc import install_gui_gc
+        install_gui_gc()
         self.setWindowTitle(f"Novel Formatter {VERSION}")
         self.setMinimumSize(1180, 760)
         self.resize(1440, 900)

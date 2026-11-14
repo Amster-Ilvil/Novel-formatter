@@ -239,61 +239,35 @@ def _manga_48px_effective_python() -> tuple[Path | None, str]:
 
 
 def _hayai_effective_python(component_id: str = "hayai_ocr") -> tuple[Path | None, str]:
-    """Return the Python interpreter the Hayai adapter can *actually* use.
+    """Match Hayai's worker selection without creating/installing anything.
 
-    The desktop install normally uses Novel Formatter's persistent private
-    Hayai venv.  Offline/cloud bundles may deliberately pre-provision the exact
-    pinned Hayai runtime in the current interpreter instead.  The adapter has
-    supported that fast path for a while, but the GUI runtime catalog used to
-    look only for the private venv, which produced a false "需要安装 OCR 模型"
-    prompt immediately before a worker that would have started successfully.
-
-    Keep LiteRT conservative: unlike the PyTorch backend, it still requires its
-    dedicated dependency set unless the user explicitly points at a compatible
-    interpreter.
+    Keep explicit overrides fail-closed; neither the GUI nor the worker may
+    silently fall back to another interpreter after an invalid override.
     """
-    candidates: list[tuple[Path, str]] = []
+    from adapters.hayai_ocr_adapter import (
+        _current_interpreter_runtime,
+        _probe_existing_runtime,
+        _project_runtime_python,
+        VENV_DIR,
+    )
+    backend = "litert" if component_id == "hayai_ocr_litert" else "torch"
     explicit = os.environ.get("NOVEL_FORMATTER_HAYAI_OCR_PYTHON", "").strip()
     if explicit:
-        candidates.append((Path(explicit).expanduser(), "explicit"))
-    if component_id == "hayai_ocr":
-        candidates.append((Path(sys.executable).resolve(), "current"))
-    private = _venv_python_path(component_id)
-    if private is not None:
-        candidates.append((private, "private"))
+        path = Path(explicit).expanduser()
+        return (path, "explicit") if _probe_existing_runtime(path, backend) else (None, "invalid-explicit")
 
-    seen: set[str] = set()
-    for python, source in candidates:
-        key = str(python)
-        if key in seen or not python.is_file():
-            continue
-        seen.add(key)
-        if component_id == "hayai_ocr_litert":
-            marker = (
-                "import importlib.util; from importlib.metadata import version; "
-                "v=version('hayai-ocr'); t=version('transformers'); "
-                "maj,minr=(int(x) for x in t.split('+',1)[0].split('.')[:2]); "
-                f"assert v=={HAYAI_OCR_RUNTIME_VERSION!r}; assert maj==4 and minr>=49; "
-                "assert importlib.util.find_spec('ai_edge_litert') is not None"
-            )
-        else:
-            marker = (
-                "from importlib.metadata import version; "
-                "v=version('hayai-ocr'); t=version('transformers'); "
-                "maj,minr=(int(x) for x in t.split('+',1)[0].split('.')[:2]); "
-                f"assert v=={HAYAI_OCR_RUNTIME_VERSION!r}; assert maj==4 and minr>=49"
-            )
-        try:
-            proc = subprocess.run(
-                [str(python), "-c", marker],
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-                timeout=10,
-            )
-        except Exception:
-            continue
-        if proc.returncode == 0:
-            return python, source
+    project = _project_runtime_python()
+    if _probe_existing_runtime(project, backend):
+        return project, "project"
+
+    private = VENV_DIR / ("Scripts/python.exe" if os.name == "nt" else "bin/python")
+    if str(private) != str(project) and _probe_existing_runtime(private, backend):
+        return private, "private"
+
+    if backend == "torch":
+        current = _current_interpreter_runtime()
+        if current is not None and _probe_existing_runtime(current, backend):
+            return current, "current"
     return None, ""
 
 
@@ -316,13 +290,12 @@ def _environment_installed(component_id: str, *, deep: bool = False) -> tuple[bo
         return True, f"48px 运行环境已验证（{source}: {python}）"
     python = _venv_python_path(component_id)
     python_source = "private"
-    if python is None and component_id in {"hayai_ocr", "hayai_ocr_litert"}:
-        # The adapter's offline/cloud fast path may intentionally use the
-        # already-provisioned current interpreter.  Prefer the traditional
-        # private venv when it exists so version-mismatch diagnostics remain
-        # precise and unchanged for normal desktop installs.
+    if component_id in {"hayai_ocr", "hayai_ocr_litert"}:
+        # Match the adapter's project/current/private environment selection.
         python, python_source = _hayai_effective_python(component_id)
     if python is None:
+        if python_source == "invalid-explicit":
+            return False, "Hayai 显式指定的 Python 环境不可用或版本不匹配；已拒绝静默切换环境"
         return False, "未找到独立运行环境"
 
     if component_id in {"hayai_ocr", "hayai_ocr_litert"}:

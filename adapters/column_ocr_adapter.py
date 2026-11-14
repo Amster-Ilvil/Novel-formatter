@@ -1965,7 +1965,7 @@ class _InkComponent:
         return (self.top + self.bottom) / 2.0
 
 
-def _scanline_connected_ink_components(mask: Image.Image) -> list[_InkComponent]:
+def _scanline_connected_ink_components_legacy(mask: Image.Image) -> list[_InkComponent]:
     """Label 8-connected ink components using only Pillow and Python.
 
     The ordinary column splitter must work in the main GUI environment even when
@@ -2073,6 +2073,117 @@ def _scanline_connected_ink_components(mask: Image.Image) -> list[_InkComponent]
         for left, top, right, bottom, area in aggregated.values()
         if right > left and bottom > top and area > 0
     ]
+
+
+def _scanline_connected_ink_components(mask: Image.Image) -> list[_InkComponent]:
+    """Single-pass run labelling for the Pillow-only 8-connected fallback.
+
+    Maintains bounding boxes and areas while scanning rather than keeping a
+    list of all row runs for a second aggregation pass. ``NOVEL_FORMATTER_PIL_SINGLE_PASS=0``
+    selects the original implementation for troubleshooting or comparisons.
+    This does not alter the OpenCV/SciPy accelerated paths.
+    """
+    if os.environ.get('NOVEL_FORMATTER_PIL_SINGLE_PASS', '1').strip().lower() in {'0', 'false', 'off', 'no'}:
+        return _scanline_connected_ink_components_legacy(mask)
+
+    binary = mask.convert('L').point(lambda value: 255 if value else 0, mode='L')
+    try:
+        width, height = binary.size
+        if width <= 0 or height <= 0:
+            return []
+        raw = binary.tobytes()
+    finally:
+        if binary is not mask:
+            binary.close()
+
+    parent: list[int] = []
+    rank: list[int] = []
+    lefts: list[int] = []
+    tops: list[int] = []
+    rights: list[int] = []
+    bottoms: list[int] = []
+    areas: list[int] = []
+    firsts: list[int] = []
+    find_byte = raw.find
+    ink, paper = b'\xff', b'\x00'
+    serial = 0
+    previous_starts: list[int] = []
+    previous_ends: list[int] = []
+    previous_labels: list[int] = []
+    for y in range(height):
+        offset = y * width
+        limit = offset + width
+        current_starts: list[int] = []
+        current_ends: list[int] = []
+        current_labels: list[int] = []
+        previous_count = len(previous_labels)
+        previous_index = 0
+        bottom = y + 1
+        cursor = offset
+        while cursor < limit:
+            x_start = find_byte(ink, cursor, limit)
+            if x_start < 0:
+                break
+            x_end = find_byte(paper, x_start, limit)
+            if x_end < 0:
+                x_end = limit
+            cursor = x_end + 1
+            x_start -= offset
+            x_end -= offset
+
+            # Exclusive ends: equality is diagonal adjacency (8-connectivity).
+            while previous_index < previous_count and previous_ends[previous_index] < x_start:
+                previous_index += 1
+            label = -1
+            probe = previous_index
+            while probe < previous_count and previous_starts[probe] <= x_end:
+                root = previous_labels[probe]
+                while parent[root] != root:
+                    root = parent[root]
+                node = previous_labels[probe]
+                while parent[node] != root:
+                    parent[node], node = root, parent[node]
+                if label < 0:
+                    label = root
+                elif root != label:
+                    if rank[label] < rank[root]:
+                        label, root = root, label
+                    parent[root] = label
+                    if rank[label] == rank[root]:
+                        rank[label] += 1
+                    lefts[label] = min(lefts[label], lefts[root])
+                    tops[label] = min(tops[label], tops[root])
+                    rights[label] = max(rights[label], rights[root])
+                    bottoms[label] = max(bottoms[label], bottoms[root])
+                    areas[label] += areas[root]
+                    firsts[label] = min(firsts[label], firsts[root])
+                probe += 1
+            if label < 0:
+                label = len(parent)
+                parent.append(label)
+                rank.append(0)
+                lefts.append(x_start)
+                tops.append(y)
+                rights.append(x_end)
+                bottoms.append(bottom)
+                areas.append(x_end - x_start)
+                firsts.append(serial)
+            else:
+                lefts[label] = min(lefts[label], x_start)
+                rights[label] = max(rights[label], x_end)
+                bottoms[label] = bottom
+                areas[label] += x_end - x_start
+            serial += 1
+            current_starts.append(x_start)
+            current_ends.append(x_end)
+            current_labels.append(label)
+        previous_starts, previous_ends, previous_labels = current_starts, current_ends, current_labels
+
+    roots = [label for label in range(len(parent)) if parent[label] == label]
+    roots.sort(key=firsts.__getitem__)
+    return [_InkComponent(lefts[root], tops[root], rights[root], bottoms[root], areas[root])
+            for root in roots if rights[root] > lefts[root] and bottoms[root] > tops[root] and areas[root] > 0]
+
 
 
 def _connected_ink_components(mask: Image.Image) -> list[_InkComponent]:
@@ -6034,6 +6145,8 @@ class _RecognizerSession:
         self._manga48 = None
         self._persistent = None
         self._jsonl_persistent = None
+        self._48px_lease = None
+        self._ndl_lease = None
         self._serial = 0
 
     def __enter__(self):
@@ -6043,25 +6156,66 @@ class _RecognizerSession:
             if existing is not None:
                 self._hayai = existing
                 self._retained_session = True
+                # The retained holder is shared by multiple passes of this job.
+                # Bind Stop/progress to the current pass, even when cached.
+                self._hayai.cancel_check = self.cancel_check
+                self._hayai.verbose = self.verbose
+                self._hayai.load_progress_callback = self.load_progress_callback
             else:
                 from adapters.hayai_ocr_adapter import HayaiOcrSession
-                self._hayai = HayaiOcrSession(
-                    engine_options=self.engine_options, cancel_check=self.cancel_check, verbose=self.verbose,
-                    load_progress_callback=self.load_progress_callback,
+                from adapters.opt_in_hayai_session_cache import (
+                    enabled as hayai_cache_enabled, default_cache as hayai_cache,
+                    HayaiLease,
                 )
-                self._hayai.__enter__()
+
+                def load_hayai():
+                    return HayaiOcrSession(
+                        engine_options=self.engine_options, cancel_check=self.cancel_check,
+                        verbose=self.verbose, load_progress_callback=self.load_progress_callback,
+                    ).__enter__()
+
+                # The early-consensus retained holder deliberately releases
+                # Hayai before loading a third model. Never keep its ~1.4 GiB
+                # worker resident across that boundary, even with cache opt-in.
+                if hayai_cache_enabled() and holder is None:
+                    self._hayai = HayaiLease(
+                        load_hayai, options=self.engine_options,
+                        cancel_check=self.cancel_check, verbose=self.verbose,
+                        load_progress_callback=self.load_progress_callback,
+                    ).__enter__()
+                else:
+                    # Disabling the experimental option releases any resident
+                    # worker before returning to the original ownership path.
+                    hayai_cache().clear()
+                    self._hayai = load_hayai()
                 if holder is not None:
                     holder["session"] = self._hayai
                     self._retained_session = True
         elif self.engine == "manga_48px":
             from adapters.manga_48px_adapter import Manga48pxSession
-            self._manga48 = Manga48pxSession(
-                cancel_check=self.cancel_check,
-                verbose=self.verbose,
-                load_progress_callback=self.load_progress_callback,
-                engine_options=self.engine_options,
-            )
-            self._manga48.__enter__()
+            from adapters.opt_in_48px_session_cache import enabled, default_cache, session_key
+
+            def load_48px():
+                return Manga48pxSession(
+                    cancel_check=self.cancel_check,
+                    verbose=self.verbose,
+                    load_progress_callback=self.load_progress_callback,
+                    engine_options=self.engine_options,
+                ).__enter__()
+
+            if enabled():
+                lease = default_cache().lease(
+                    session_key(self.engine_options), load_48px,
+                    cancel_check=self.cancel_check, verbose=self.verbose,
+                    load_progress_callback=self.load_progress_callback,
+                )
+                self._manga48 = lease.__enter__()
+                self._48px_lease = lease
+            else:
+                # If the user disabled this experimental option during the
+                # same GUI process, unload any earlier resident worker.
+                default_cache().clear()
+                self._manga48 = load_48px()
         # Preserve the monkeypatch hook used by tests/plugins.  Persistent native
         # sessions are enabled only when the stock bridge is active.
         elif _recognizer_iterator is recognizer_iterator and self.engine == "apple_vision":
@@ -6073,12 +6227,37 @@ class _RecognizerSession:
             self._persistent.__enter__()
         elif _recognizer_iterator is recognizer_iterator and self.engine == "ndlocr_lite":
             from adapters.ndlocr_lite_adapter import NDLOcrLiteSession
-            self._persistent = NDLOcrLiteSession(
-                cancel_check=self.cancel_check,
-                verbose=self.verbose,
-                engine_options=self.engine_options,
+            from adapters.opt_in_ndlocr_session_cache import (
+                NDLOcrWorkerHandle, default_cache as ndl_cache, enabled as ndl_enabled,
+                session_key as ndl_session_key,
             )
-            self._persistent.__enter__()
+
+            def load_ndl():
+                session = NDLOcrLiteSession(
+                    cancel_check=self.cancel_check, verbose=self.verbose,
+                    engine_options=self.engine_options,
+                )
+                try:
+                    session.__enter__()
+                except BaseException:
+                    session.close()
+                    raise
+                return NDLOcrWorkerHandle(session)
+
+            if ndl_enabled():
+                lease = ndl_cache().lease(
+                    ndl_session_key(self.engine_options), load_ndl,
+                    cancel_check=self.cancel_check, verbose=self.verbose,
+                )
+                self._persistent = lease.__enter__()
+                self._ndl_lease = lease
+            else:
+                ndl_cache().clear()
+                self._persistent = NDLOcrLiteSession(
+                    cancel_check=self.cancel_check, verbose=self.verbose,
+                    engine_options=self.engine_options,
+                )
+                self._persistent.__enter__()
         elif _recognizer_iterator is recognizer_iterator and self.engine == "paddle_ocr":
             # Paddle model startup is expensive. Keep exactly one JSONL worker
             # alive for primary recognition, adaptive rescue and sentence OCR
@@ -6203,6 +6382,14 @@ class _RecognizerSession:
         )
 
     def __exit__(self, exc_type, exc, tb):
+        if self._ndl_lease is not None:
+            lease, self._ndl_lease = self._ndl_lease, None
+            self._persistent = None
+            return bool(lease.__exit__(exc_type, exc, tb))
+        if self._48px_lease is not None:
+            lease, self._48px_lease = self._48px_lease, None
+            self._manga48 = None
+            return bool(lease.__exit__(exc_type, exc, tb))
         if self._hayai is not None:
             if self._retained_session:
                 self._hayai = None

@@ -232,6 +232,27 @@ def _recognize_batch(recognizer, inference_context, paths: list[str], max_new_to
             return [{"ok": False, "path": path, "error": str(exc or first_error)}], 1, True
 
 
+def _disable_unrequested_compilation(kwargs: dict, recognizer_class, device: str) -> None:
+    """Keep CPU/MPS Hayai starts free from unrequested torch.compile.
+
+    Inspect only after the upstream class has been imported. Older Hayai
+    constructors without a public ``compile`` argument keep their legacy
+    fallback instead of receiving an unsupported keyword argument.
+    CUDA behaviour remains unchanged.
+    """
+    if device not in {"cpu", "mps"}:
+        return
+    try:
+        import inspect
+        supports_compile = "compile" in inspect.signature(recognizer_class).parameters
+    except (TypeError, ValueError):
+        supports_compile = False
+    if supports_compile:
+        kwargs["compile"] = False
+    else:
+        os.environ.setdefault("TORCHDYNAMO_DISABLE", "1")
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--stream", action="store_true")
@@ -280,18 +301,6 @@ def main() -> None:
                     "offline_mode": os.environ.get("NOVEL_FORMATTER_HAYAI_OFFLINE_ACTIVE") == "1",
                 })
             configure_torch_memory_safety(torch)
-            # Newer Hayai releases expose compile=False. Avoid CPU/MPS startup
-            # compilation when that public constructor option exists, but keep
-            # compatibility with older Hayai builds that do not accept it.
-            if effective_device_hint in {"cpu", "mps"}:
-                try:
-                    import inspect
-                    if "compile" in inspect.signature(HayaiOcr).parameters:
-                        kwargs["compile"] = False
-                    else:
-                        os.environ.setdefault("TORCHDYNAMO_DISABLE", "1")
-                except Exception:
-                    os.environ.setdefault("TORCHDYNAMO_DISABLE", "1")
             kwargs["pretrained_model_name_or_path"] = model_name
             # Novel Formatter deliberately pins nova to 512 NaFlex patches for
             # every torch role/run.  Do not inherit HAYAI_MAX_NUM_PATCHES.
@@ -313,6 +322,8 @@ def main() -> None:
 
         status.phase("import_hayai")
         from hayai_ocr import HayaiOcr
+        if backend == "torch":
+            _disable_unrequested_compilation(kwargs, HayaiOcr, effective_device_hint)
 
         requested_quantize = args.quantize if backend == "torch" else args.litert_quant
         effective_quantize = requested_quantize

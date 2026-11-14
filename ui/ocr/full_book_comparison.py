@@ -94,20 +94,21 @@ class FullBookComparisonModel(QAbstractTableModel):
 
     def update_states(self, states):
         """Repaint adjudication overlays without resetting the book position."""
-        previous = tuple(_fusion_cell(state) for state in self.states)
         # States can mutate in place between updates, so UI preserves its own
         # last text snapshot instead of comparing only state object identity.
-        previous = getattr(self, '_last_fusion_cells', previous)
+        previous = getattr(self, '_last_fusion_cells', ())
         self.states = tuple(states or ())
         fresh = tuple(_fusion_cell(state) for state in self.states)
         changed = [i for i, (old, new) in enumerate(zip(previous, fresh)) if old != new]
-        changed.extend(range(len(previous), len(fresh)))
+        changed.extend(range(min(len(previous), len(fresh)), max(len(previous), len(fresh))))
         self._last_fusion_cells = fresh
         if changed and self.rows:
             for row in changed:
                 if row < len(self.rows):
-                    idx = self.index(row, self.model_count)
-                    self.dataChanged.emit(idx, idx, [Qt.DisplayRole, Qt.UserRole])
+                    self.dataChanged.emit(
+                        self.index(row, 0), self.index(row, self.model_count),
+                        [Qt.DisplayRole, self.RawValueRole, self.DiffSpansRole, self.ConflictRole, Qt.ToolTipRole],
+                    )
         return changed
 
     def rowCount(self, parent=QModelIndex()):
@@ -192,18 +193,24 @@ class FullBookDiffDelegate(QStyledItemDelegate):
         doc.setPlainText(text)
         ranges = index.data(FullBookComparisonModel.DiffSpansRole) or ()
         if ranges:
+            # Qt cursor positions count UTF-16 code units, unlike Python's
+            # code-point offsets (emoji and supplementary kanji use two units).
+            offsets = [0]
+            for character in text:
+                offsets.append(offsets[-1] + (2 if ord(character) > 0xffff else 1))
             cursor = QTextCursor(doc)
             fmt = QTextCharFormat()
             fmt.setBackground(QColor('#F5B1B6'))
             fmt.setForeground(QColor('#8B1027'))
             for start, end in ranges:
-                cursor.setPosition(max(0, min(start, doc.characterCount() - 1)))
-                cursor.setPosition(max(0, min(end, doc.characterCount() - 1)), QTextCursor.KeepAnchor)
+                cursor.setPosition(offsets[max(0, min(start, len(text)))])
+                cursor.setPosition(offsets[max(0, min(end, len(text)))], QTextCursor.KeepAnchor)
                 cursor.mergeCharFormat(fmt)
         return doc
 
     def paint(self, painter, option, index):
         painter.save()
+        painter.setClipRect(option.rect)
         painter.fillRect(option.rect, QColor('#FFF0F0') if index.data(FullBookComparisonModel.ConflictRole) else QColor('#FFFFFF'))
         if option.state & QStyle.State_Selected:
             painter.fillRect(option.rect, QColor('#E4EEFF'))
@@ -253,8 +260,10 @@ class FullBookComparisonTable(QTableView):
         if comparison is not None and comparison is self._last_comparison and labels == self._last_labels:
             changed = self.model().update_states(states)
             if changed:
-                self._resize_generation += 1
-                QTimer.singleShot(0, lambda: self._resize_changed_rows(changed, self._resize_generation))
+                # An adjudication overlay must not cancel a pending whole-book
+                # sizing pass: later long rows would retain the default height.
+                generation = self._resize_generation
+                QTimer.singleShot(0, lambda: self._resize_changed_rows(changed, generation))
             return False  # no reset; preserve current scroll / selection
         rows = getattr(comparison, 'rows', ()) if comparison is not None else ()
         self._last_comparison = comparison
