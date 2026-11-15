@@ -14,6 +14,9 @@ LANG_ZH = "zh_CN"
 LANG_JA = "ja_JP"
 LANG_EN = "en_US"
 SUPPORTED_LANGUAGES = (LANG_ZH, LANG_JA, LANG_EN)
+# Language used when no preference has been saved yet (fresh install) or the
+# stored value is unknown.  A saved supported value always wins.
+DEFAULT_LANGUAGE = LANG_ZH
 
 LANGUAGE_LABELS = {
     LANG_ZH: "简体中文",
@@ -108,7 +111,6 @@ _EXACT_EN = {
     "↻ 刷新": "↻ Refresh",
     "删除": "Delete",
     "🗑 删除": "🗑 Delete",
-    "全选": "Select All",
     "取消选择": "Clear Selection",
     "停止": "Stop",
     "重新 OCR": "Re-run OCR",
@@ -149,13 +151,10 @@ _EXACT_EN = {
     "本地 AI": "In-app AI",
     "云端 AI": "Imported Cloud AI",
     "已裁决历史": "Adjudication History",
-    "OCR 竖列（与原图列顺序对齐）": "OCR Vertical Columns (Source Order)",
     "OCR 竖列": "OCR Vertical Columns",
-    "对应识别图片": "Matching Source Image",
     "拖动图片横向定位 OCR 列": "Drag across image to locate OCR column",
     "定位左侧 OCR 物理列（⌥⇧←）": "Move to the OCR physical column on the left (⌥⇧←)",
     "定位右侧 OCR 物理列（⌥⇧→）": "Move to the OCR physical column on the right (⌥⇧→)",
-    "横排校对文本（可修改）": "Proofreading Text (Editable)",
     "横排校对文本": "Proofreading Text",
     "打开后只读浏览明确裁决过的句子；可按本地、人工、本地 AI、云端 AI 分别筛选。自动一致/两模型共同候选不计入裁决历史。": "Browse explicitly adjudicated sentences in read-only mode. Filter by local, human, in-app AI, or imported cloud AI. Automatic consensus is not counted as adjudication history.",
     "当前正在浏览只读裁决历史；关闭“显示已裁决”后才能重新裁决。": "Adjudication history is read-only. Turn off ‘Show adjudicated’ before changing a decision.",
@@ -180,8 +179,6 @@ _EXACT_EN = {
     "重试": "Retries",
     "Hayai 后端": "Hayai Backend",
     "运行设备": "Device",
-    "Torch 量化": "Torch Quantization",
-    "LiteRT 量化": "LiteRT Quantization",
     "Paddle 模型": "Paddle Model",
     "VL 后端": "VL Backend",
     "模型下载源": "Model Download Source",
@@ -369,10 +366,10 @@ _EXACT_EN = {
     "开始导出": "Start Export",
     "图文逐句校对": "Sentence Image/Text Review",
     "尚未接收 OCR 结果": "No OCR result received",
-    "OCR 竖列（与原图列顺序对齐）": "OCR Vertical Columns (aligned with source order)",
+    "OCR 竖列（与原图列顺序对齐）": "OCR Vertical Columns (Aligned with Source Order)",
     "对应识别图片": "Corresponding OCR Image",
     "用预览打开": "Open in Preview",
-    "横排校对文本（可修改）": "Horizontal Review Text (editable)",
+    "横排校对文本（可修改）": "Proofreading Text (Editable)",
     "苹果系统手写": "Apple Handwriting",
     "多模型融合候选": "Multi-model Fusion Candidate",
     "← 上一句": "← Previous Sentence",
@@ -514,13 +511,10 @@ _EXACT_JA = {
     "本地 AI": "アプリ内AI",
     "云端 AI": "外部AI取込",
     "已裁决历史": "裁決履歴",
-    "OCR 竖列（与原图列顺序对齐）": "OCR縦列（原画像の列順）",
     "OCR 竖列": "OCR縦列",
-    "对应识别图片": "対応する認識画像",
     "拖动图片横向定位 OCR 列": "画像を横にドラッグしてOCR列を定位",
     "定位左侧 OCR 物理列（⌥⇧←）": "左側のOCR物理列へ移動（⌥⇧←）",
     "定位右侧 OCR 物理列（⌥⇧→）": "右側のOCR物理列へ移動（⌥⇧→）",
-    "横排校对文本（可修改）": "横書き校正テキスト（編集可）",
     "横排校对文本": "横書き校正テキスト",
     "打开后只读浏览明确裁决过的句子；可按本地、人工、本地 AI、云端 AI 分别筛选。自动一致/两模型共同候选不计入裁决历史。": "明示的に裁決済みの文を読み取り専用で閲覧します。ローカル・手動・アプリ内AI・外部AI取込で絞り込めます。自動一致は裁決履歴に含めません。",
     "当前正在浏览只读裁决历史；关闭“显示已裁决”后才能重新裁决。": "裁決履歴は読み取り専用です。裁決を変更するには「裁決済みを表示」をオフにしてください。",
@@ -545,8 +539,6 @@ _EXACT_JA = {
     "重试": "再試行",
     "Hayai 后端": "Hayaiバックエンド",
     "运行设备": "実行デバイス",
-    "Torch 量化": "Torch量子化",
-    "LiteRT 量化": "LiteRT量子化",
     "Paddle 模型": "Paddleモデル",
     "VL 后端": "VLバックエンド",
     "模型下载源": "モデル取得元",
@@ -777,13 +769,7 @@ _EXACT_EN.update({
     'PaddleOCR-VL-1.6（官方文档解析，推荐）': 'PaddleOCR-VL-1.6 (official document parsing, recommended)',
     'PP-OCRv6（官方 OCR）': 'PP-OCRv6 (official OCR)',
     'PP-OCRv5-latin（拉丁文字）': 'PP-OCRv5-latin (Latin text)',
-    'PyTorch（推荐：CUDA / MPS / CPU）': 'PyTorch (recommended: CUDA / MPS / CPU)',
-    'LiteRT（CPU / 边缘端，实验）': 'LiteRT (CPU / edge, experimental)',
     '自动（CUDA → MPS → CPU）': 'Auto (CUDA → MPS → CPU)',
-    '不量化（默认 / 最高兼容）': 'No quantization (default / best compatibility)',
-    'INT8 weight-only（约 2× 降显存）': 'INT8 weight-only (~2× lower VRAM)',
-    'INT4 weight-only（约 4× 降显存）': 'INT4 weight-only (~4× lower VRAM)',
-    'WI4（默认）': 'WI4 (default)',
     '快速：tiny 动态宽度 + 分桶': 'Fast: tiny dynamic width + bucketing',
     '精确：middle v5 动态宽度': 'Accurate: middle v5 dynamic width',
     'middle-v5 复核阈值': 'middle-v5 review threshold',
@@ -853,13 +839,7 @@ _EXACT_JA.update({
     'PaddleOCR-VL-1.6（官方文档解析，推荐）': 'PaddleOCR-VL-1.6（公式ドキュメント解析、推奨）',
     'PP-OCRv6（官方 OCR）': 'PP-OCRv6（公式OCR）',
     'PP-OCRv5-latin（拉丁文字）': 'PP-OCRv5-latin（ラテン文字）',
-    'PyTorch（推荐：CUDA / MPS / CPU）': 'PyTorch（推奨：CUDA / MPS / CPU）',
-    'LiteRT（CPU / 边缘端，实验）': 'LiteRT（CPU / エッジ、実験）',
     '自动（CUDA → MPS → CPU）': '自動（CUDA → MPS → CPU）',
-    '不量化（默认 / 最高兼容）': '量子化なし（既定 / 最高互換性）',
-    'INT8 weight-only（约 2× 降显存）': 'INT8 weight-only（VRAM約1/2）',
-    'INT4 weight-only（约 4× 降显存）': 'INT4 weight-only（VRAM約1/4）',
-    'WI4（默认）': 'WI4（既定）',
     '快速：tiny 动态宽度 + 分桶': '高速：tiny 動的幅 + バケット化',
     '精确：middle v5 动态宽度': '高精度：middle v5 動的幅',
     'middle-v5 复核阈值': 'middle-v5 再確認しきい値',
@@ -2667,8 +2647,8 @@ _EXACT_JA.update({'正在逐段裁决两份 OCR；图片、页码、章节和目
 
 
 # Full UI help/status: settings, diagnostics and remaining workspace states.
-_EXACT_EN.update({'日本語': 'Japanese', '尚未检测。Windows 会检查 CIM、NVIDIA 驱动、CUDA/DirectML；Mac 会检查 Metal/MPS。': 'Not checked. Windows checks CIM, NVIDIA drivers and CUDA/DirectML; Mac checks Metal/MPS.', '点击“检测设备与 GPU”后显示 CPU、内存、显卡、驱动以及各 OCR 运行时可用的 CUDA / DirectML / MPS 后端。': "After clicking 'Detect Device & GPU', show CPU, memory, GPU, drivers and the CUDA / DirectML / MPS backends available to each OCR runtime.", '更新保护：不会自动更新、不会自动降级；Git 工作树有未提交修改时拒绝更新；便携包同版本且没有可信 commit 基线时也拒绝覆盖。更新程序代码时不会删除 .venv、模型缓存、OCR 运行时、debug/logs、输出书籍或用户工作区。': 'Update protection: never auto-update or auto-downgrade; refuse updates when the Git working tree has uncommitted changes; also refuse overwriting a portable package at the same version without a trusted commit baseline. Updating app code never deletes .venv, model caches, OCR runtimes, debug/logs, exported books or user workspaces.', '正在连接 GitHub 检查 main 分支版本和 commit…': 'Connecting to GitHub to check the main branch version and commit…', '日文书籍 OCR、逐列与逐字审校、文本修订、Formatter 和出版级 EPUB 导出的统一桌面工作台。': 'Unified desktop workspace for Japanese-book OCR, per-column/per-character review, text revision, Formatter and publication-grade EPUB export.', '✕ PaddleOCR 模型准备失败；请查看 OCR 日志并切换下载源。': '✕ PaddleOCR model preparation failed; check the OCR log and switch download source.', 'LiteRT 当前由 CPU interpreter 执行。': 'LiteRT is currently executed by the CPU interpreter.', 'PDF文字层模式需要重新接续物理列，因此不能同时固定原OCR排版': 'PDF text-layer mode must reconnect physical columns, so the original OCR layout cannot be fixed at the same time.', '内置模板，只读——想在它基础上改，先「新建空白格式」再把这段 CSS 复制过去编辑。': 'Built-in template, read-only. To modify it, create a blank format first and copy this CSS into it for editing.', 'DeepSeek 默认使用 V4-Flash 非思考模式；系统会固定静态提示前缀以提高缓存命中，并自动采用高并发批处理。': 'DeepSeek uses V4-Flash non-reasoning mode by default; the system pins a static prompt prefix to improve cache hits and automatically uses high-concurrency batching.', '设置已保存；API Key 仅在本次程序运行期间保存在内存中': 'Settings saved; API Key is kept in memory only for this application run', 'AI纠错排版版本会自动应用 AI 返回的 CSS；此处模板不参与导出': 'AI correction/layout versions automatically apply CSS returned by AI; this template is not used for export.', '已对当前单 OCR 副本执行无损 Unicode 标准化；未删除字符、未替换汉字，原始 OCR 未覆盖，点击“恢复初始”可撤销，点击“应用单OCR结果”后才进入后续流程。': "Lossless Unicode normalization was applied to the current single-OCR copy: no characters were deleted, no kanji replaced, and raw OCR was not overwritten. 'Restore Initial' undoes it; 'Apply Single OCR Result' is required before later workflow steps.", '已恢复标准化前的单 OCR 原始结果；Unicode 标准化副本已撤销。': 'Restored the pre-normalization single-OCR source; the Unicode-normalized copy was reverted.', '已开启单框逐句：每个模型只显示当前句，下方只显示一个对比框；选择后自动进入下一句。': 'Single-box sentence mode enabled: each model shows only the current sentence and one comparison box appears below; selecting a candidate advances automatically.', '已将当前单 OCR 结果应用到工作流；来源仍保留在 OCR 对比页。': 'Applied the current single-OCR result to the workflow; the source remains available on the OCR Compare page.', '需要 macOS 27 和 Xcode 27 / macOS 27 SDK。': 'Requires macOS 27 and Xcode 27 / macOS 27 SDK.', '自动模式将使用 Apple PKStrokeRecognizer（日语、设备本地、严格单字提交）。': 'Auto mode uses Apple PKStrokeRecognizer (Japanese, on-device, strict single-character submission).', '先运行 pip3 install -r requirements-handwriting-openvino.txt，再下载模型。': 'Run pip3 install -r requirements-handwriting-openvino.txt first, then download the model.', '高置信字符级融合 · 已自动采用（可重新选择原始 OCR）': 'High-confidence character-level fusion · Auto accepted (you can reselect among the raw OCR sources)', 'AI纠错已采用 · 原始OCR分歧保持可见 · 未覆盖任何模型原文': 'AI correction accepted · Raw OCR conflicts remain visible · No model source was overwritten', '所有真正分歧均已完成裁决；两模型共同候选已按 v8 规则自动保留。': 'All true conflicts have been adjudicated; two-model shared candidates were auto-kept under v8 rules.', '设置已保存；当前平台无系统密钥库，API Key 已安全降级为仅本次运行': 'Settings saved; this platform has no system key store, so API Key safely falls back to memory-only for this run'})
-_EXACT_JA.update({'日本語': '日本語', '尚未检测。Windows 会检查 CIM、NVIDIA 驱动、CUDA/DirectML；Mac 会检查 Metal/MPS。': '未確認です。WindowsではCIM、NVIDIAドライバ、CUDA/DirectML、MacではMetal/MPSを確認します。', '点击“检测设备与 GPU”后显示 CPU、内存、显卡、驱动以及各 OCR 运行时可用的 CUDA / DirectML / MPS 后端。': '「デバイスとGPUを検出」をクリックすると、CPU、メモリ、GPU、ドライバ、各OCR実行環境で利用可能なCUDA / DirectML / MPSバックエンドを表示します。', '更新保护：不会自动更新、不会自动降级；Git 工作树有未提交修改时拒绝更新；便携包同版本且没有可信 commit 基线时也拒绝覆盖。更新程序代码时不会删除 .venv、模型缓存、OCR 运行时、debug/logs、输出书籍或用户工作区。': '更新保護：自動更新・自動ダウングレードは行いません。Git作業ツリーに未コミット変更がある場合は更新を拒否し、同一版のポータブルパッケージで信頼できるcommit基準がない場合も上書きを拒否します。アプリコード更新時も .venv、モデルキャッシュ、OCR実行環境、debug/logs、出力書籍、ユーザーワークスペースは削除しません。', '正在连接 GitHub 检查 main 分支版本和 commit…': 'GitHubへ接続しmainブランチのバージョンとcommitを確認中…', '日文书籍 OCR、逐列与逐字审校、文本修订、Formatter 和出版级 EPUB 导出的统一桌面工作台。': '日本語書籍OCR、列/文字単位校正、本文修訂、Formatter、出版級EPUB出力を統合したデスクトップワークスペースです。', '✕ PaddleOCR 模型准备失败；请查看 OCR 日志并切换下载源。': '✕ PaddleOCRモデル準備に失敗しました。OCRログを確認し、ダウンロード元を切り替えてください。', 'LiteRT 当前由 CPU interpreter 执行。': 'LiteRTは現在CPU interpreterで実行されています。', 'PDF文字层模式需要重新接续物理列，因此不能同时固定原OCR排版': 'PDFテキストレイヤーモードでは物理列を再接続する必要があるため、元OCRレイアウトを同時に固定できません。', '内置模板，只读——想在它基础上改，先「新建空白格式」再把这段 CSS 复制过去编辑。': '内蔵テンプレートは読み取り専用です。これを基に変更する場合は「空白形式を新規作成」して、このCSSをコピーして編集してください。', 'DeepSeek 默认使用 V4-Flash 非思考模式；系统会固定静态提示前缀以提高缓存命中，并自动采用高并发批处理。': 'DeepSeekは既定でV4-Flash非思考モードを使用します。キャッシュ命中率向上のため静的プロンプト接頭辞を固定し、高並列バッチ処理を自動使用します。', '设置已保存；API Key 仅在本次程序运行期间保存在内存中': '設定を保存しました。API Keyは今回のアプリ実行中だけメモリに保持します', 'AI纠错排版版本会自动应用 AI 返回的 CSS；此处模板不参与导出': 'AI校正・組版版はAIが返したCSSを自動適用し、ここでのテンプレートは出力に使いません。', '已对当前单 OCR 副本执行无损 Unicode 标准化；未删除字符、未替换汉字，原始 OCR 未覆盖，点击“恢复初始”可撤销，点击“应用单OCR结果”后才进入后续流程。': '現在の単一OCRコピーへ無損失Unicode正規化を適用しました。文字削除・漢字置換・元OCR上書きはありません。「初期状態を復元」で取り消し、「単一OCR結果を適用」後に次工程へ進みます。', '已恢复标准化前的单 OCR 原始结果；Unicode 标准化副本已撤销。': '正規化前の単一OCR原結果を復元し、Unicode正規化コピーを取り消しました。', '已开启单框逐句：每个模型只显示当前句，下方只显示一个对比框；选择后自动进入下一句。': '単一枠の文単位モードを有効化しました。各モデルは現在文だけを表示し、下に比較枠1つだけ表示します。候補選択後は自動で次へ進みます。', '已将当前单 OCR 结果应用到工作流；来源仍保留在 OCR 对比页。': '現在の単一OCR結果をワークフローへ適用しました。ソースはOCR比較画面に保持されます。', '需要 macOS 27 和 Xcode 27 / macOS 27 SDK。': 'macOS 27 と Xcode 27 / macOS 27 SDK が必要です。', '自动模式将使用 Apple PKStrokeRecognizer（日语、设备本地、严格单字提交）。': '自動モードではApple PKStrokeRecognizer（日本語、デバイス内、厳密な1文字送信）を使用します。', '先运行 pip3 install -r requirements-handwriting-openvino.txt，再下载模型。': '先に pip3 install -r requirements-handwriting-openvino.txt を実行し、その後モデルをダウンロードしてください。', '高置信字符级融合 · 已自动采用（可重新选择原始 OCR）': '高信頼の文字単位融合 · 自動採用済み（元OCRから再選択可能）', 'AI纠错已采用 · 原始OCR分歧保持可见 · 未覆盖任何模型原文': 'AI修正採用済み · 元OCR差異は表示維持 · どのモデル原文も上書きしていません', '所有真正分歧均已完成裁决；两模型共同候选已按 v8 规则自动保留。': '真の差異はすべて裁決済みで、2モデル共通候補はv8規則に従い自動保持しました。', '设置已保存；当前平台无系统密钥库，API Key 已安全降级为仅本次运行': '設定を保存しました。この環境にはシステム鍵保管庫がないため、API Keyは安全に今回の実行メモリ内のみへ切り替えました'})
+_EXACT_EN.update({'日本語': 'Japanese', '尚未检测。Windows 会检查 CIM、NVIDIA 驱动、CUDA/DirectML；Mac 会检查 Metal/MPS。': 'Not checked. Windows checks CIM, NVIDIA drivers and CUDA/DirectML; Mac checks Metal/MPS.', '点击“检测设备与 GPU”后显示 CPU、内存、显卡、驱动以及各 OCR 运行时可用的 CUDA / DirectML / MPS 后端。': "After clicking 'Detect Device & GPU', show CPU, memory, GPU, drivers and the CUDA / DirectML / MPS backends available to each OCR runtime.", '更新保护：不会自动更新、不会自动降级；Git 工作树有未提交修改时拒绝更新；便携包同版本且没有可信 commit 基线时也拒绝覆盖。更新程序代码时不会删除 .venv、模型缓存、OCR 运行时、debug/logs、输出书籍或用户工作区。': 'Update protection: never auto-update or auto-downgrade; refuse updates when the Git working tree has uncommitted changes; also refuse overwriting a portable package at the same version without a trusted commit baseline. Updating app code never deletes .venv, model caches, OCR runtimes, debug/logs, exported books or user workspaces.', '正在连接 GitHub 检查 main 分支版本和 commit…': 'Connecting to GitHub to check the main branch version and commit…', '日文书籍 OCR、逐列与逐字审校、文本修订、Formatter 和出版级 EPUB 导出的统一桌面工作台。': 'Unified desktop workspace for Japanese-book OCR, per-column/per-character review, text revision, Formatter and publication-grade EPUB export.', '✕ PaddleOCR 模型准备失败；请查看 OCR 日志并切换下载源。': '✕ PaddleOCR model preparation failed; check the OCR log and switch download source.', 'PDF文字层模式需要重新接续物理列，因此不能同时固定原OCR排版': 'PDF text-layer mode must reconnect physical columns, so the original OCR layout cannot be fixed at the same time.', '内置模板，只读——想在它基础上改，先「新建空白格式」再把这段 CSS 复制过去编辑。': 'Built-in template, read-only. To modify it, create a blank format first and copy this CSS into it for editing.', 'DeepSeek 默认使用 V4-Flash 非思考模式；系统会固定静态提示前缀以提高缓存命中，并自动采用高并发批处理。': 'DeepSeek uses V4-Flash non-reasoning mode by default; the system pins a static prompt prefix to improve cache hits and automatically uses high-concurrency batching.', '设置已保存；API Key 仅在本次程序运行期间保存在内存中': 'Settings saved; API Key is kept in memory only for this application run', 'AI纠错排版版本会自动应用 AI 返回的 CSS；此处模板不参与导出': 'AI correction/layout versions automatically apply CSS returned by AI; this template is not used for export.', '已对当前单 OCR 副本执行无损 Unicode 标准化；未删除字符、未替换汉字，原始 OCR 未覆盖，点击“恢复初始”可撤销，点击“应用单OCR结果”后才进入后续流程。': "Lossless Unicode normalization was applied to the current single-OCR copy: no characters were deleted, no kanji replaced, and raw OCR was not overwritten. 'Restore Initial' undoes it; 'Apply Single OCR Result' is required before later workflow steps.", '已恢复标准化前的单 OCR 原始结果；Unicode 标准化副本已撤销。': 'Restored the pre-normalization single-OCR source; the Unicode-normalized copy was reverted.', '已开启单框逐句：每个模型只显示当前句，下方只显示一个对比框；选择后自动进入下一句。': 'Single-box sentence mode enabled: each model shows only the current sentence and one comparison box appears below; selecting a candidate advances automatically.', '已将当前单 OCR 结果应用到工作流；来源仍保留在 OCR 对比页。': 'Applied the current single-OCR result to the workflow; the source remains available on the OCR Compare page.', '需要 macOS 27 和 Xcode 27 / macOS 27 SDK。': 'Requires macOS 27 and Xcode 27 / macOS 27 SDK.', '自动模式将使用 Apple PKStrokeRecognizer（日语、设备本地、严格单字提交）。': 'Auto mode uses Apple PKStrokeRecognizer (Japanese, on-device, strict single-character submission).', '先运行 pip3 install -r requirements-handwriting-openvino.txt，再下载模型。': 'Run pip3 install -r requirements-handwriting-openvino.txt first, then download the model.', '高置信字符级融合 · 已自动采用（可重新选择原始 OCR）': 'High-confidence character-level fusion · Auto accepted (you can reselect among the raw OCR sources)', 'AI纠错已采用 · 原始OCR分歧保持可见 · 未覆盖任何模型原文': 'AI correction accepted · Raw OCR conflicts remain visible · No model source was overwritten', '所有真正分歧均已完成裁决；两模型共同候选已按 v8 规则自动保留。': 'All true conflicts have been adjudicated; two-model shared candidates were auto-kept under v8 rules.', '设置已保存；当前平台无系统密钥库，API Key 已安全降级为仅本次运行': 'Settings saved; this platform has no system key store, so API Key safely falls back to memory-only for this run'})
+_EXACT_JA.update({'日本語': '日本語', '尚未检测。Windows 会检查 CIM、NVIDIA 驱动、CUDA/DirectML；Mac 会检查 Metal/MPS。': '未確認です。WindowsではCIM、NVIDIAドライバ、CUDA/DirectML、MacではMetal/MPSを確認します。', '点击“检测设备与 GPU”后显示 CPU、内存、显卡、驱动以及各 OCR 运行时可用的 CUDA / DirectML / MPS 后端。': '「デバイスとGPUを検出」をクリックすると、CPU、メモリ、GPU、ドライバ、各OCR実行環境で利用可能なCUDA / DirectML / MPSバックエンドを表示します。', '更新保护：不会自动更新、不会自动降级；Git 工作树有未提交修改时拒绝更新；便携包同版本且没有可信 commit 基线时也拒绝覆盖。更新程序代码时不会删除 .venv、模型缓存、OCR 运行时、debug/logs、输出书籍或用户工作区。': '更新保護：自動更新・自動ダウングレードは行いません。Git作業ツリーに未コミット変更がある場合は更新を拒否し、同一版のポータブルパッケージで信頼できるcommit基準がない場合も上書きを拒否します。アプリコード更新時も .venv、モデルキャッシュ、OCR実行環境、debug/logs、出力書籍、ユーザーワークスペースは削除しません。', '正在连接 GitHub 检查 main 分支版本和 commit…': 'GitHubへ接続しmainブランチのバージョンとcommitを確認中…', '日文书籍 OCR、逐列与逐字审校、文本修订、Formatter 和出版级 EPUB 导出的统一桌面工作台。': '日本語書籍OCR、列/文字単位校正、本文修訂、Formatter、出版級EPUB出力を統合したデスクトップワークスペースです。', '✕ PaddleOCR 模型准备失败；请查看 OCR 日志并切换下载源。': '✕ PaddleOCRモデル準備に失敗しました。OCRログを確認し、ダウンロード元を切り替えてください。', 'PDF文字层模式需要重新接续物理列，因此不能同时固定原OCR排版': 'PDFテキストレイヤーモードでは物理列を再接続する必要があるため、元OCRレイアウトを同時に固定できません。', '内置模板，只读——想在它基础上改，先「新建空白格式」再把这段 CSS 复制过去编辑。': '内蔵テンプレートは読み取り専用です。これを基に変更する場合は「空白形式を新規作成」して、このCSSをコピーして編集してください。', 'DeepSeek 默认使用 V4-Flash 非思考模式；系统会固定静态提示前缀以提高缓存命中，并自动采用高并发批处理。': 'DeepSeekは既定でV4-Flash非思考モードを使用します。キャッシュ命中率向上のため静的プロンプト接頭辞を固定し、高並列バッチ処理を自動使用します。', '设置已保存；API Key 仅在本次程序运行期间保存在内存中': '設定を保存しました。API Keyは今回のアプリ実行中だけメモリに保持します', 'AI纠错排版版本会自动应用 AI 返回的 CSS；此处模板不参与导出': 'AI校正・組版版はAIが返したCSSを自動適用し、ここでのテンプレートは出力に使いません。', '已对当前单 OCR 副本执行无损 Unicode 标准化；未删除字符、未替换汉字，原始 OCR 未覆盖，点击“恢复初始”可撤销，点击“应用单OCR结果”后才进入后续流程。': '現在の単一OCRコピーへ無損失Unicode正規化を適用しました。文字削除・漢字置換・元OCR上書きはありません。「初期状態を復元」で取り消し、「単一OCR結果を適用」後に次工程へ進みます。', '已恢复标准化前的单 OCR 原始结果；Unicode 标准化副本已撤销。': '正規化前の単一OCR原結果を復元し、Unicode正規化コピーを取り消しました。', '已开启单框逐句：每个模型只显示当前句，下方只显示一个对比框；选择后自动进入下一句。': '単一枠の文単位モードを有効化しました。各モデルは現在文だけを表示し、下に比較枠1つだけ表示します。候補選択後は自動で次へ進みます。', '已将当前单 OCR 结果应用到工作流；来源仍保留在 OCR 对比页。': '現在の単一OCR結果をワークフローへ適用しました。ソースはOCR比較画面に保持されます。', '需要 macOS 27 和 Xcode 27 / macOS 27 SDK。': 'macOS 27 と Xcode 27 / macOS 27 SDK が必要です。', '自动模式将使用 Apple PKStrokeRecognizer（日语、设备本地、严格单字提交）。': '自動モードではApple PKStrokeRecognizer（日本語、デバイス内、厳密な1文字送信）を使用します。', '先运行 pip3 install -r requirements-handwriting-openvino.txt，再下载模型。': '先に pip3 install -r requirements-handwriting-openvino.txt を実行し、その後モデルをダウンロードしてください。', '高置信字符级融合 · 已自动采用（可重新选择原始 OCR）': '高信頼の文字単位融合 · 自動採用済み（元OCRから再選択可能）', 'AI纠错已采用 · 原始OCR分歧保持可见 · 未覆盖任何模型原文': 'AI修正採用済み · 元OCR差異は表示維持 · どのモデル原文も上書きしていません', '所有真正分歧均已完成裁决；两模型共同候选已按 v8 规则自动保留。': '真の差異はすべて裁決済みで、2モデル共通候補はv8規則に従い自動保持しました。', '设置已保存；当前平台无系统密钥库，API Key 已安全降级为仅本次运行': '設定を保存しました。この環境にはシステム鍵保管庫がないため、API Keyは安全に今回の実行メモリ内のみへ切り替えました'})
 
 # Common full-sentence strings used in settings and visible help panels.
 _EXACT_EN.update({
@@ -2946,6 +2926,9 @@ _PATTERNS = {
         (re.compile(r"^单 OCR：已载入\s*·\s*(.+)$"), lambda m: f"Single OCR: loaded · {m.group(1)}"),
         (re.compile(r"^查看AI修改（(\d+)）$"), lambda m: f"View AI Changes ({m.group(1)})"),
         (re.compile(r"^查看AI修改（采用(\d+) / 拦截(\d+)）$"), lambda m: f"View AI Changes (accepted {m.group(1)} / blocked {m.group(2)})"),
+        # The suffix is book text, even when it matches an exact UI entry.
+        (re.compile(r"^〔待裁决〕(.*)\Z", re.S), lambda m: f"[Awaiting adjudication]{m.group(1)}"),
+        (re.compile(r"^当前句：(\d+)/(\d+) · 人工编辑 · 已确定\Z"), lambda m: f"Current sentence: {m.group(1)}/{m.group(2)} · manually edited · confirmed"),
         (re.compile(r"^当前句：(.+)$"), lambda m: f"Current sentence: {m.group(1)}"),
     ],
     LANG_JA: [
@@ -2966,14 +2949,29 @@ _PATTERNS = {
         (re.compile(r"^单 OCR：已载入\s*·\s*(.+)$"), lambda m: f"単一OCR：読込済み · {m.group(1)}"),
         (re.compile(r"^查看AI修改（(\d+)）$"), lambda m: f"AI変更を表示（{m.group(1)}）"),
         (re.compile(r"^查看AI修改（采用(\d+) / 拦截(\d+)）$"), lambda m: f"AI変更を表示（採用 {m.group(1)} / ブロック {m.group(2)}）"),
+        # The suffix is book text, even when it matches an exact UI entry.
+        (re.compile(r"^〔待裁决〕(.*)\Z", re.S), lambda m: f"〔裁決待ち〕{m.group(1)}"),
+        (re.compile(r"^当前句：(\d+)/(\d+) · 人工编辑 · 已确定\Z"), lambda m: f"現在の文：{m.group(1)}/{m.group(2)} · 手動編集 · 確定済み"),
         (re.compile(r"^当前句：(.+)$"), lambda m: f"現在文：{m.group(1)}"),
     ],
 }
 
 
+# Page Manager filter chips: "<label> <count>" (ui/pages/tab.py).
+_FILTER_COUNT = re.compile(r"^(全部|正文|插图|封面) (\d+)$")
+_FILTER_COUNT_LABELS = {
+    LANG_EN: {"全部": "All", "正文": "Body", "插图": "Illustrations", "封面": "Cover"},
+    LANG_JA: {"全部": "すべて", "正文": "本文", "插图": "挿絵", "封面": "表紙"},
+}
+for _lang, _labels in _FILTER_COUNT_LABELS.items():
+    _PATTERNS.get(_lang).append(
+        (_FILTER_COUNT, lambda m, labels=_labels: f"{labels.get(m.group(1), m.group(1))} {m.group(2)}")
+    )
+
+
 def normalize_language(value: str | None) -> str:
     value = str(value or "").strip()
-    return value if value in SUPPORTED_LANGUAGES else LANG_ZH
+    return value if value in SUPPORTED_LANGUAGES else DEFAULT_LANGUAGE
 
 
 
@@ -3145,6 +3143,16 @@ _EXACT_JA.update({
     "当前文档不是 PDF 文字层结果": "現在の文書はPDFテキストレイヤー結果ではありません。",
 })
 
+# EPUB export: optional left-to-right horizontal conversion.
+_EXACT_EN.update({
+    "转换为从左到右横排版式": "Convert to left-to-right (horizontal) layout",
+    "导出前将竖排转为从左到右横排：横排 CSS、ltr 翻页、竖排标点改为横排字形": "Before export, convert vertical layout to horizontal LTR: horizontal CSS, ltr page progression, vertical punctuation forms replaced",
+})
+_EXACT_JA.update({
+    "转换为从左到右横排版式": "左から右への横書きレイアウトに変換",
+    "导出前将竖排转为从左到右横排：横排 CSS、ltr 翻页、竖排标点改为横排字形": "出力前に縦書きを左から右の横書きへ変換します：横書きCSS、ltrページ送り、縦書き用句読点を横書き字形へ置換",
+})
+
 def translate_text(text: str | None, language: str) -> str:
     """Translate UI chrome only; unknown strings remain exactly unchanged."""
     source = "" if text is None else str(text)
@@ -3202,6 +3210,7 @@ _PATTERNS[LANG_EN].extend([
     (re.compile(r"^(.+)：准备中$"), lambda m: f"{_catalog_fragment(m.group(1), LANG_EN)}: preparing"),
     (re.compile(r"^✓ 已读取 (\d+) 个可用模型，可从下拉框选择；也可以手动输入。$"), lambda m: f"✓ Loaded {m.group(1)} available model(s). Select from the list or enter one manually."),
     (re.compile(r"^模型列表读取失败：(.*)。仍可在下拉框中手动填写模型名称。$"), lambda m: f"Failed to load model list: {m.group(1)}. You can still enter a model name manually."),
+    (re.compile(r"^✓ 连接成功：(.*)；AI 图文模式还建议点“测试图片能力”。\Z"), lambda m: f"✓ Connection succeeded: {m.group(1)}; for AI image/text mode, also use “Test Image Capability”."),
     (re.compile(r"^✓ 连接成功：(.*)$"), lambda m: f"✓ Connection succeeded: {m.group(1)}"),
     (re.compile(r"^正在执行：(.*)$"), lambda m: f"Running: {_catalog_fragment(m.group(1), LANG_EN)}"),
     (re.compile(r"^(.+)正在处理$"), lambda m: f"{_catalog_fragment(m.group(1), LANG_EN)} in progress"),
@@ -3256,6 +3265,7 @@ _PATTERNS[LANG_JA].extend([
     (re.compile(r"^(.+)：准备中$"), lambda m: f"{_catalog_fragment(m.group(1), LANG_JA)}：準備中"),
     (re.compile(r"^✓ 已读取 (\d+) 个可用模型，可从下拉框选择；也可以手动输入。$"), lambda m: f"✓ 利用可能なモデルを {m.group(1)} 件読み込みました。リストから選択するか手動入力できます。"),
     (re.compile(r"^模型列表读取失败：(.*)。仍可在下拉框中手动填写模型名称。$"), lambda m: f"モデル一覧の読込に失敗：{m.group(1)}。モデル名は引き続き手動入力できます。"),
+    (re.compile(r"^✓ 连接成功：(.*)；AI 图文模式还建议点“测试图片能力”。\Z"), lambda m: f"✓ 接続成功：{m.group(1)}。AI画像・本文モードでは「画像能力をテスト」も実行してください。"),
     (re.compile(r"^✓ 连接成功：(.*)$"), lambda m: f"✓ 接続成功：{m.group(1)}"),
     (re.compile(r"^正在执行：(.*)$"), lambda m: f"実行中：{_catalog_fragment(m.group(1), LANG_JA)}"),
     (re.compile(r"^(.+)正在处理$"), lambda m: f"{_catalog_fragment(m.group(1), LANG_JA)}処理中"),
@@ -4964,6 +4974,218 @@ _EXACT_JA.update({
     "显示/隐藏右侧实时预览中的绿色实线 OCR 输入原像素框": "リアルタイムプレビューの緑の実線OCR入力原画素枠を表示/非表示",
 })
 
+
+# Unified model manager (Settings > OCR: local models folder, auto-download, progress dialog).
+for _key, _value in {
+    "本地模型文件夹": "Local models folder",
+    "OCR 模型下载、校验和查找的位置。留空则使用默认位置；已安装在旧位置的模型会继续使用。": "Where OCR models are downloaded, verified and looked up. Leave empty to use the default location; models already installed in the old location keep working.",
+    "选择文件夹…": "Choose Folder…",
+    "恢复默认": "Reset to Default",
+    "需要时自动下载模型": "Download models automatically when needed",
+    "选择本地模型文件夹": "Choose Local Models Folder",
+    "下载 OCR 模型": "Download OCR Models",
+    "正在准备模型下载…": "Preparing model download…",
+    "正在下载模型": "Downloading model",
+    "模型已下载并通过校验。": "Model downloaded and verified.",
+    "模型下载失败": "Model download failed",
+    "模型下载已取消。": "Model download cancelled.",
+    "取消": "Cancel",
+}.items():
+    _EXACT_EN.setdefault(_key, _value)
+for _key, _value in {
+    "本地模型文件夹": "ローカルモデルフォルダ",
+    "OCR 模型下载、校验和查找的位置。留空则使用默认位置；已安装在旧位置的模型会继续使用。": "OCRモデルのダウンロード・検証・検索先です。空欄なら既定の場所を使用し、旧来の場所にインストール済みのモデルは引き続き使用されます。",
+    "选择文件夹…": "フォルダを選択…",
+    "恢复默认": "既定に戻す",
+    "需要时自动下载模型": "必要に応じてモデルを自動ダウンロード",
+    "选择本地模型文件夹": "ローカルモデルフォルダを選択",
+    "下载 OCR 模型": "OCRモデルをダウンロード",
+    "正在准备模型下载…": "モデルのダウンロードを準備中…",
+    "正在下载模型": "モデルをダウンロード中",
+    "模型已下载并通过校验。": "モデルをダウンロードし、検証しました。",
+    "模型下载失败": "モデルのダウンロードに失敗しました",
+    "模型下载已取消。": "モデルのダウンロードをキャンセルしました。",
+    "取消": "キャンセル",
+}.items():
+    _EXACT_JA.setdefault(_key, _value)
+del _key, _value
+
+
+# Audit-driven gap catalog (tools/i18n_audit.py).  Exact entries extend the
+# exact maps without overriding hand-written ones; placeholder keys become
+# anchored templates behind one CJK-gated matcher per language, so English or
+# empty text never scans the template list.
+from ui.localization_audit_catalog import AUDIT_CATALOG as _AUDIT_CATALOG  # noqa: E402
+from ui.localization_audit_catalog import BACKEND_EN as _BACKEND_EN  # noqa: E402
+
+TEMPLATE_PLACEHOLDER = re.compile(r"\{…\}|\{[A-Za-z_]\w*\}|\{\}|%(?:[(][A-Za-z_]\w*[)])?[sd]")
+_ANONYMOUS_PLACEHOLDERS = frozenset({"{…}", "{}", "%s", "%d"})
+_ADJACENT_SLOTS = re.compile(r"(?:\{…\}){2,}")
+_TEMPLATE_GATE = re.compile(r"[\u3040-\u30ff\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff]")
+
+
+def template_placeholders(text: str) -> list[str]:
+    """Placeholder tokens of a catalog template, in order (testing helper)."""
+    return TEMPLATE_PLACEHOLDER.findall(str(text))
+
+
+def _compile_template(key: str):
+    parts: list[str] = []
+    tokens: list[str] = []
+    pos = 0
+    for match in TEMPLATE_PLACEHOLDER.finditer(key):
+        parts.append(re.escape(key[pos:match.start()]))
+        parts.append("(.*?)")
+        tokens.append(match.group(0))
+        pos = match.end()
+    parts.append(re.escape(key[pos:]))
+    return re.compile("".join(parts) + r"\Z", re.S), tuple(tokens)
+
+
+class _TemplateMatcher:
+    """Pattern-like ``_PATTERNS`` entry: the most specific matching template wins.
+
+    Templates are ordered by the length of their literal (non-placeholder)
+    text, longest first; catalog order breaks ties.  Without this a short
+    generic key such as ``"{…} 列"`` would swallow a whole composed line and
+    leave everything before its literal tail untranslated.
+    """
+
+    def __init__(self, language: str):
+        self.language = language
+        self.entries: list[tuple[re.Pattern, tuple[str, ...], str]] = []
+        self._weights: list[int] = []
+
+    def add(self, key: str, target: str) -> None:
+        # Runs of adjacent f-string slots carry no separator to anchor on; one
+        # group per run keeps matching linear instead of exponential.
+        pattern, tokens = _compile_template(_ADJACENT_SLOTS.sub("{…}", key))
+        self.entries.append((pattern, tokens, _ADJACENT_SLOTS.sub("{…}", target)))
+        self._weights.append(len(TEMPLATE_PLACEHOLDER.sub("", key)))
+
+    def finalize(self) -> None:
+        order = sorted(range(len(self.entries)), key=lambda index: -self._weights[index])
+        self.entries = [self.entries[index] for index in order]
+        self._weights = [self._weights[index] for index in order]
+
+    def match(self, source: str):
+        if not _TEMPLATE_GATE.search(source):
+            return None
+        for pattern, tokens, target in self.entries:
+            found = pattern.match(source)
+            if found is not None:
+                return found, tokens, target
+        return None
+
+    def render(self, hit) -> str:
+        found, tokens, target = hit
+        values = found.groups()
+        anonymous = iter(v for tok, v in zip(tokens, values) if tok in _ANONYMOUS_PLACEHOLDERS)
+        named = {tok: v for tok, v in zip(tokens, values) if tok not in _ANONYMOUS_PLACEHOLDERS}
+
+        def fill(token_match):
+            token = token_match.group(0)
+            if token in _ANONYMOUS_PLACEHOLDERS:
+                raw = next(anonymous, "")
+            else:
+                raw = named.get(token, token)
+            return translate_text(raw, self.language)
+
+        return TEMPLATE_PLACEHOLDER.sub(fill, target)
+
+
+# Brackets are written as \x5b / \x5d to keep the pattern free of bracket
+# escapes that editors and patch tools tend to mangle.
+_RUN_LOG_COUNTER_TAIL = re.compile(r"(.*?\S)(\s+\d+ / \d+)", re.S)
+_RUN_LOG_LINE = re.compile(r"(\s*\x5b)(.+?)(\s+\d+/\d+)?(\x5d )(.*)\Z", re.S)
+
+
+class _RunLogLineMatcher:
+    """OCR run-log lines ``  [label( N/M)] detail`` (``ui/ocr/run_controller``).
+
+    Label and detail are translated independently through ``translate_text``;
+    the bracket frame and counters are kept byte-for-byte.  When neither part
+    changes, ``match`` returns ``None`` so ordinary templates still apply.
+    """
+
+    def __init__(self, language: str):
+        self.language = language
+
+    def match(self, source: str):
+        if not _TEMPLATE_GATE.search(source):
+            return None
+        found = _RUN_LOG_LINE.match(source)
+        if found is None:
+            return None
+        lead, label, counter, close, detail = found.groups()
+        label_out = translate_text(label, self.language)
+        detail_out = self._translate_detail(detail) if detail else detail
+        if label_out == label and detail_out == detail:
+            return None
+        return f"{lead}{label_out}{counter or ''}{close}{detail_out}"
+
+    def _translate_detail(self, detail: str) -> str:
+        """Translate a `` · ``-joined progress detail segment by segment.
+
+        ``column_ocr_adapter`` builds ``"{stage} {i} / {n} · …"``; a trailing
+        `` i / n`` counter is preserved verbatim while the stage name is
+        translated.  The segmented form is used when every CJK segment was
+        translated; otherwise a whole-line translation (if any) is kept.
+        """
+        whole = translate_text(detail, self.language)
+        if whole != detail and not _TEMPLATE_GATE.search(whole):
+            return whole
+        parts: list[str] = []
+        untranslated = 0
+        for segment in detail.split(" · "):
+            out = self._translate_segment(segment)
+            if out == segment and _TEMPLATE_GATE.search(segment):
+                untranslated += 1
+            parts.append(out)
+        segmented = " · ".join(parts)
+        if untranslated == 0 or whole == detail:
+            return segmented
+        return whole
+
+    def _translate_segment(self, segment: str) -> str:
+        counter = _RUN_LOG_COUNTER_TAIL.fullmatch(segment)
+        core, tail = (counter.group(1), counter.group(2)) if counter else (segment, "")
+        out = translate_text(core, self.language)
+        if out == core:
+            # Adapter suffixes are catalogued with their " · " joiner.
+            joined = translate_text(" · " + core, self.language)
+            if joined != " · " + core and joined.startswith(" · "):
+                out = joined[3:]
+        return out + tail
+
+    @staticmethod
+    def render(hit) -> str:
+        return hit
+
+
+def _register_audit_catalog() -> None:
+    matchers = {LANG_EN: _TemplateMatcher(LANG_EN), LANG_JA: _TemplateMatcher(LANG_JA)}
+    exact_maps = {LANG_EN: _EXACT_EN, LANG_JA: _EXACT_JA}
+    # Backend messages are English-only: Japanese falls back to the English text.
+    backend = ((key, (english, english)) for key, english in _BACKEND_EN.items())
+    for key, (english, japanese) in (*_AUDIT_CATALOG.items(), *backend):
+        templated = TEMPLATE_PLACEHOLDER.search(key) is not None
+        for language, target in ((LANG_EN, english), (LANG_JA, japanese)):
+            if not target:
+                continue
+            if templated:
+                matchers[language].add(key, target)
+            else:
+                exact_maps[language].setdefault(key, target)
+    for language, matcher in matchers.items():
+        matcher.finalize()
+        run_log = _RunLogLineMatcher(language)
+        _PATTERNS.setdefault(language, []).append((run_log, run_log.render))
+        _PATTERNS[language].append((matcher, matcher.render))
+
+
+_register_audit_catalog()
+
 # P52 full-book viewer and EPUB adjudication handoff messages.
 _EXACT_EN.update({
     "正文版本已过期": "Body Version Is Outdated",
@@ -5012,4 +5234,31 @@ _EXACT_JA.update({
     '竖排来源转换为从左到右横排 EPUB': '縦書きソースを左から右の横書きEPUBに変換',
     '仅导出时转换 CSS、标点和翻页方向；不修改 OCR/Ruby/裁决数据': '書き出し時のみCSS・句読点・ページ方向を変換し、OCR・ルビ・校正結果は変更しません',
     '可选转换:': '任意の変換:',
+})
+
+# Hayai v2.7 Supernova-only UI (keep language audit coverage in sync).
+_HAYAI_SUPERNOVA_HINT_ZH = (
+    "Hayai 只负责已经分离的文字 crop，不做整页文字检测。Novel Formatter 会复用固定正文框、"
+    "右→左物理列、Ruby 清理、共享 crop 与多模型融合；每段默认约 24 字。"
+    "v2.7 采用 Transformers 5 环境与 256 patches；旧配置自动迁移至 v2.7。"
+)
+_EXACT_EN.update({
+    "Hayai 模型 / 后端": "Hayai model / backend",
+    "v2.7 Supernova（推荐 · PyTorch / Transformers 5）": "v2.7 Supernova (recommended · PyTorch / Transformers 5)",
+    _HAYAI_SUPERNOVA_HINT_ZH: (
+        "Hayai only recognizes pre-extracted text crops, not full pages. Novel Formatter retains "
+        "fixed text regions, physical columns ordered right to left, Ruby cleanup, shared crops "
+        "and multi-model fusion; about 24 characters per crop. v2.7 uses Transformers 5 and "
+        "256 patches; previous settings are migrated to v2.7 automatically."
+    ),
+})
+_EXACT_JA.update({
+    "Hayai 模型 / 后端": "Hayaiのモデル／バックエンド",
+    "v2.7 Supernova（推荐 · PyTorch / Transformers 5）": "v2.7 Supernova（推奨・PyTorch / Transformers 5）",
+    _HAYAI_SUPERNOVA_HINT_ZH: (
+        "Hayaiは抽出済みの文字クロップだけを認識し、ページ全体の文字検出は行いません。"
+        "Novel Formatterは固定本文枠、右から左への物理列、ルビの整理、共有クロップ、"
+        "複数モデルの統合を維持します。1クロップ約24文字が標準です。"
+        "v2.7はTransformers 5と256パッチを使用し、旧設定は自動的にv2.7へ移行します。"
+    ),
 })

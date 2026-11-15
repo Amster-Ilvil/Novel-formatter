@@ -501,6 +501,7 @@ class _FusionDecisionRow(QFrame):
         self._reference_open = QPushButton("原尺寸查看")
         self._reference_open.setEnabled(False)
         self._reference_open.clicked.connect(self._open_reference_image)
+        self._reference_preview_text.original_image_requested.connect(self._open_reference_image)
         preview_layout.addWidget(self._reference_open)
         self._reference_path = ""
         self._reference_source_key = ""
@@ -693,19 +694,8 @@ class _FusionDecisionRow(QFrame):
     def _open_reference_image(self):
         if not self._reference_path:
             return
-        from PySide6.QtGui import QPixmap
-        dialog = QDialog(self)
-        dialog.setWindowTitle("OCR 参考原图 · 原尺寸")
-        dialog.resize(800, 850)
-        layout = QVBoxLayout(dialog)
-        scroll = QScrollArea(dialog)
-        image = QLabel()
-        image.setPixmap(QPixmap(self._reference_path))
-        image.setAlignment(Qt.AlignCenter)
-        scroll.setWidget(image)
-        scroll.setWidgetResizable(False)
-        layout.addWidget(scroll)
-        dialog.exec()
+        from ui.ocr.reference_zoom_dialog import ReferenceZoomDialog
+        ReferenceZoomDialog(self._reference_path, self).exec()
 
     @staticmethod
     def _candidate_signature(candidate) -> tuple:

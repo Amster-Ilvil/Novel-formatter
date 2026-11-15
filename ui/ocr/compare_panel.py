@@ -3,6 +3,7 @@ from __future__ import annotations
 from functools import partial
 
 from PySide6.QtCore import Qt, QTimer
+from PySide6.QtGui import QKeySequence, QShortcut
 from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QSplitter, QPlainTextEdit, QLabel, QPushButton,
     QCheckBox, QComboBox, QProgressBar, QFrame, QSizePolicy, QScrollArea, QToolButton,
@@ -130,8 +131,9 @@ def build_ocr_compare_panel(self):
     self._full_text_compare_check.setCursor(Qt.PointingHandCursor)
     self._full_text_compare_check.setFocusPolicy(Qt.StrongFocus)
     self._full_text_compare_check.setToolTip(
-        "打开：多份 OCR 结果显示完整全文并保持同步滚动；"
-        "关闭：只显示当前稳定句，继续逐句裁决。只改变显示，不重新 OCR 或对齐。"
+        "打开：默认显示原版多模型文字框；"
+        "可在全文总览中切换到融合全文或多模型对齐表格。"
+        "关闭：逐句图文裁决。只改变显示，不重新 OCR 或对齐。"
     )
     self._full_text_compare_check.setMinimumWidth(96)
     self._full_text_compare_check.setMinimumHeight(30)
@@ -573,7 +575,8 @@ def build_ocr_compare_panel(self):
     self._decision_queue_count = QLabel("0")
     self._decision_queue_count.setVisible(False)
     self._active_review_check = QCheckBox("高风险优先")
-    self._active_review_check.setChecked(True)
+    # Default to the original book order. Risk-first must be explicitly enabled.
+    self._active_review_check.setChecked(False)
     self._active_review_check.setToolTip(
         "只改变人工复核顺序，不改变正文、OCR 候选或自动裁决。"
         "优先显示三方分歧、空/占位符、长度差异、数字/等级内容和高共识熵句。"
@@ -596,12 +599,14 @@ def build_ocr_compare_panel(self):
     queue_controls.setSpacing(6)
     self._decision_queue_scope = QComboBox()
     configure_combo(self._decision_queue_scope)
-    self._decision_queue_scope.addItem("待判断", "pending")
+    self._decision_queue_scope.addItem("仅看待裁决", "pending")
     self._decision_queue_scope.addItem("高风险优先", "risk")
     self._decision_queue_scope.addItem("三方分歧", "threeway")
     self._decision_queue_scope.addItem("空/占位符", "broken")
+    self._decision_queue_scope.addItem("数字/日期疑点", "numeric")
+    self._decision_queue_scope.addItem("拒识证据", "rejection")
     self._decision_queue_scope.addItem("已裁决", "history")
-    self._decision_queue_scope.setFixedWidth(108)
+    self._decision_queue_scope.setFixedWidth(122)
     self._decision_queue_scope.setMinimumHeight(28)
     self._decision_queue_scope.setToolTip("切换待判断、高风险优先或已裁决历史；只改变浏览范围。")
     self._decision_queue_scope.currentIndexChanged.connect(self._decision_queue_scope_changed)
@@ -628,6 +633,22 @@ def build_ocr_compare_panel(self):
     self._decision_queue_stats.setStyleSheet("color:#667085;font-size:8.5px;font-weight:600;")
     self._decision_queue_stats.setWordWrap(True)
     decision_queue_layout.addWidget(self._decision_queue_stats)
+
+    # Font size is view-only, never stored into OCR or EPUB content.
+    font_row = QHBoxLayout()
+    font_row.addWidget(QLabel('裁决字号'))
+    self._review_font_size_combo = QComboBox(self._decision_queue_panel)
+    for size in (12, 14, 16, 18, 20):
+        self._review_font_size_combo.addItem(f'{size} px', size)
+    self._review_font_size_combo.setCurrentIndex(2)
+    self._review_font_size_combo.setToolTip('调节候选原文和人工草稿显示字号；不改变输出正文')
+    self._review_font_size_combo.currentIndexChanged.connect(self._review_font_size_changed)
+    font_row.addWidget(self._review_font_size_combo)
+    font_row.addStretch(1)
+    self._review_progress_label = QLabel('第 0 / 0 句 · 0%')
+    self._review_progress_label.setStyleSheet('color:#546987;font-size:10px;')
+    font_row.addWidget(self._review_progress_label)
+    decision_queue_layout.addLayout(font_row)
 
     self._compare_sentence_strip = SentenceStrip(self._decision_queue_panel)
     self._compare_sentence_strip.setToolTip("整本裁决总览：橙=待判断，蓝=人工/AI裁决，绿=稳定；点击可跳转。")
@@ -771,13 +792,11 @@ def build_ocr_compare_panel(self):
     proof_right.setStyleSheet("background:transparent;border:none;")
     proof_right_layout = QHBoxLayout(proof_right)
     proof_right_layout.setContentsMargins(0, 0, 0, 0)
-    proof_right_layout.setSpacing(0)
-    self._proof_evidence_splitter = QSplitter(Qt.Horizontal, proof_right)
-    self._proof_evidence_splitter.setChildrenCollapsible(False)
-    self._proof_evidence_splitter.setHandleWidth(5)
-    self._proof_evidence_splitter.setStyleSheet(
-        "QSplitter::handle{background:#E3ECF7;border-radius:2px;margin:28px 1px;}"
-    )
+    # The evidence and candidate panels are deliberately laid out without a
+    # draggable divider.  The OCR full-text splitters elsewhere stay intact.
+    # Stretch factors provide a responsive 2:3 width allocation without a
+    # visible splitter handle or persisted user-dragged width state.
+    proof_right_layout.setSpacing(10)
     self._proof_reference_host = QFrame(proof_right)
     self._proof_reference_host.setObjectName("ocrReferenceEvidence")
     self._proof_reference_host.setMinimumWidth(300)
@@ -796,16 +815,69 @@ def build_ocr_compare_panel(self):
     open_review.setFixedHeight(25)
     open_review.setToolTip("在图文对照中打开同一稳定句（Alt+I）")
     open_review.clicked.connect(self._request_image_review)
-    # Compatibility/backend identity for the Phase 20 compact command bar.
-    # The reference-card button remains the authoritative action; compact
-    # proxies mirror its enabled state instead of inventing a second state.
+    # Keep a hidden compatibility proxy for existing state synchronization;
+    # the compact command bar owns the visible action.
     self._image_review_mode_btn = open_review
     reference_header.addWidget(open_review)
+    open_review.setVisible(False)
     self._proof_reference_layout.addLayout(reference_header)
+    from ui.ocr.page_column_navigator import PageColumnNavigator
+    self._page_nav_index = None
+    self._page_nav_index_key = None
+    # Sentence crops are the default source evidence; full-page column boxes
+    # remain available through the adjacent toggle.
+    self._page_nav_preferred = False
+    self._page_nav_view = PageColumnNavigator(self._proof_reference_host)
+    self._page_nav_view.column_clicked.connect(self._on_full_page_column_clicked)
+    self._page_nav_info = QLabel('选择裁决句后定位全页物理列')
+    self._page_nav_info.setWordWrap(True)
+    self._page_nav_info.setStyleSheet('color:#48658C;font-size:10px;border:none;')
+    self._page_nav_toggle = QPushButton('切到全页', self._proof_reference_host)
+    self._page_nav_toggle.setToolTip('在整页列框与原有单句 OCR 裁片间切换；仅改变显示')
+    self._page_nav_toggle.clicked.connect(self._toggle_page_column_view)
+    self._page_nav_zoom_btn = QPushButton('仅放大选中列', self._proof_reference_host)
+    self._page_nav_zoom_btn.setToolTip('只放大选中物理列附近原始像素，不修改任何图片')
+    self._page_nav_zoom_btn.clicked.connect(self._zoom_active_physical_column)
+    self._page_nav_zoom_btn.setEnabled(False)
+    reference_header.addWidget(self._page_nav_toggle)
+    self._page_nav_prev_btn = QPushButton('‹')
+    self._page_nav_next_btn = QPushButton('›')
+    for button in (self._page_nav_prev_btn, self._page_nav_next_btn):
+        button.setFixedSize(24, 25)
+        button.setToolTip('同一句跨页时切换有该句物理列的源页')
+        button.setEnabled(False)
+    self._page_nav_prev_btn.clicked.connect(lambda: self._step_page_column(-1))
+    self._page_nav_next_btn.clicked.connect(lambda: self._step_page_column(+1))
+    reference_header.addWidget(self._page_nav_prev_btn)
+    reference_header.addWidget(self._page_nav_next_btn)
+    self._proof_reference_layout.addWidget(self._page_nav_info)
+    # Full-page controls live on the evidence side, independently from crop
+    # previews and never alter OCR/candidate data.
+    self._page_nav_zoom_controls = QWidget(self._proof_reference_host)
+    nav_zoom_layout = QHBoxLayout(self._page_nav_zoom_controls)
+    nav_zoom_layout.setContentsMargins(0, 0, 0, 0)
+    nav_zoom_layout.setSpacing(5)
+    self._page_nav_zoom_out = QPushButton('−', self._page_nav_zoom_controls)
+    self._page_nav_zoom_fit = QPushButton('适窗', self._page_nav_zoom_controls)
+    self._page_nav_zoom_in = QPushButton('+', self._page_nav_zoom_controls)
+    self._page_nav_zoom_text = QLabel('适窗', self._page_nav_zoom_controls)
+    for control in (self._page_nav_zoom_out, self._page_nav_zoom_fit, self._page_nav_zoom_in):
+        control.setFixedHeight(24)
+        nav_zoom_layout.addWidget(control)
+    nav_zoom_layout.addWidget(self._page_nav_zoom_text, 1)
+    self._page_nav_zoom_out.clicked.connect(lambda: self._page_nav_view.zoom_by(1 / 1.25))
+    self._page_nav_zoom_fit.clicked.connect(self._page_nav_view.fit_to_window)
+    self._page_nav_zoom_in.clicked.connect(lambda: self._page_nav_view.zoom_by(1.25))
+    self._page_nav_view.zoom_changed.connect(
+        lambda zoom: self._page_nav_zoom_text.setText('适窗' if zoom == 1 else f'适窗 ×{zoom:.2f}')
+    )
+    self._page_nav_zoom_text.setToolTip('Ctrl+滚轮缩放；放大后拖动图片可平移')
+    self._proof_reference_layout.addWidget(self._page_nav_zoom_controls)
+    self._proof_reference_layout.addWidget(self._page_nav_view, 1)
+    self._proof_reference_layout.addWidget(self._page_nav_zoom_btn)
     reference_hint = QLabel("只读像素证据 · 不随候选修改")
     reference_hint.setStyleSheet("color:#7B8797;font-size:8.5px;border:none;")
     self._proof_reference_layout.addWidget(reference_hint)
-    self._proof_evidence_splitter.addWidget(self._proof_reference_host)
     self._mounted_reference_row = None
     output_column = QWidget(proof_right)
     output_layout = QVBoxLayout(output_column)
@@ -832,15 +904,8 @@ def build_ocr_compare_panel(self):
     self._fusion_scroll.setMinimumHeight(300)
     self._fusion_scroll.setMaximumHeight(16777215)
     output_layout.addWidget(self._proof_suggestion_card)
-    self._proof_evidence_splitter.addWidget(output_column)
-    self._proof_evidence_splitter.setStretchFactor(0, 2)
-    self._proof_evidence_splitter.setStretchFactor(1, 3)
-    self._proof_evidence_splitter.setSizes([380, 720])
-    self._proof_evidence_splitter.splitterMoved.connect(
-        lambda _pos, _index: self._schedule_manual_decision_editor_fit()
-    )
-    proof_right_layout.addWidget(self._proof_evidence_splitter, 1)
-    bind_splitter(self._proof_evidence_splitter, "compare_reference_evidence_v2")
+    proof_right_layout.addWidget(self._proof_reference_host, 2)
+    proof_right_layout.addWidget(output_column, 3)
     self._proof_right_column = proof_right
 
     def sync_proof_mode_geometry(checked: bool):
@@ -880,14 +945,14 @@ def build_ocr_compare_panel(self):
     compact_title.setStyleSheet("font-size:12px;font-weight:750;")
     compact_row.addWidget(compact_title)
     self._compact_title_label = compact_title
-    # Opt-in reading layout: original source editors and disagreement widgets
-    # remain alive, with their state unchanged, while the book text fills the UI.
+    # Legacy two-state proxy. The visible three-way layout selector below is
+    # authoritative and defaults to the original model boxes.
     self._full_only_check = QPushButton("多模型全文对照")
     self._full_only_check.setObjectName("ocrCompareFullOnlyToggle")
     self._full_only_check.setCheckable(True)
     self._full_only_check.setToolTip(
-        "开启后四栏同步显示所有 OCR 模型的完整对齐正文和融合结果，"
-        "红色标记不同字符，淡红底标记分歧行。关闭后恢复逐句候选面板。"
+        "兼容开关：在融合全文与多模型对齐表格间切换；"
+        "原版多模型框是全文总览默认布局，不改变 OCR 候选或裁决。"
     )
     self._full_only_check.setStyleSheet(
         "QPushButton{font-size:10px;padding:5px 12px;border:1px solid #D7E3F4;"
@@ -896,7 +961,12 @@ def build_ocr_compare_panel(self):
         "border-color:#2F6BFF;font-weight:700;}"
     )
     self._full_only_check.toggled.connect(self._set_full_only_view)
+    # Compatibility switch for older sessions/tests. The real three-way
+    # selector is a dedicated, always reachable bar below the compact header.
+    # Keeping the old toggle in the crowded toolbar made it easy to miss on
+    # narrower Mac windows and offered no way to restore the original boxes.
     compact_row.addWidget(self._full_only_check)
+    self._full_only_check.setVisible(False)
     self._compact_compare_state = QLabel("等待 OCR 结果")
     self._compact_compare_state.setStyleSheet(f"color:{MUTED};font-size:10px;")
     compact_row.addWidget(self._compact_compare_state, 1)
@@ -904,8 +974,8 @@ def build_ocr_compare_panel(self):
     compact_full = QPushButton("显示全文")
     compact_full.setCheckable(False)
     compact_full.setEnabled(False)
-    compact_full.setToolTip("当前为全文总览；点击可从任何兼容恢复状态回到全文显示")
-    compact_full.clicked.connect(self._show_multimodel_full)
+    compact_full.setToolTip("回到全文总览；默认显示原版多模型文字框")
+    compact_full.clicked.connect(self._show_default_full)
     compact_row.addWidget(compact_full)
     self._compact_full_compare_btn = compact_full
 
@@ -989,7 +1059,7 @@ def build_ocr_compare_panel(self):
     more_menu.addSeparator()
     show_full_action = more_menu.addAction("显示全文")
     show_full_action.setCheckable(False)
-    show_full_action.triggered.connect(lambda _checked=False: self._show_multimodel_full())
+    show_full_action.triggered.connect(lambda _checked=False: self._show_default_full())
     ai_action = more_menu.addAction("AI 裁决")
     ai_action.triggered.connect(compact_ai.click)
     ai_settings_action = more_menu.addAction("AI 服务设置…")
@@ -1045,6 +1115,50 @@ def build_ocr_compare_panel(self):
     )
     self._decision_queue.setToolTip("右键可打开更多操作")
     root.addWidget(compact_header)
+
+    # The full-book presentation choices must remain visible even when the
+    # original model editors occupy the workspace (unlike controls inside the
+    # table-only panel). No OCR, alignment or adjudication data is copied.
+    full_layout_bar = QFrame()
+    full_layout_bar.setObjectName("ocrCompareFullLayoutBar")
+    full_layout_bar.setStyleSheet(
+        "QFrame#ocrCompareFullLayoutBar{background:#F4F7FC;"
+        "border-bottom:1px solid #D7E3F4;}"
+    )
+    full_layout_row = QHBoxLayout(full_layout_bar)
+    full_layout_row.setContentsMargins(12, 5, 12, 5)
+    full_layout_row.setSpacing(7)
+    full_layout_caption = QLabel("全文显示：")
+    full_layout_caption.setStyleSheet("font-size:11px;color:#43536C;font-weight:600;")
+    full_layout_row.addWidget(full_layout_caption)
+    self._full_layout_group = QButtonGroup(self)
+    self._full_layout_group.setExclusive(True)
+    self._full_layout_buttons = {}
+    for mode, label, hint in (
+        ("fusion", "融合全文", "只显示按正文顺序排列的融合全文"),
+        ("table", "多模型对齐表格", "逐句横向对齐显示各模型及融合结果，差异标色"),
+        ("boxes", "原版多模型框", "全文总览默认布局；显示各 OCR 模型原文框和融合候选区域"),
+    ):
+        button = QPushButton(label)
+        button.setObjectName("ocrCompareFullLayout_" + mode)
+        button.setCheckable(True)
+        button.setToolTip(hint)
+        button.setMinimumHeight(29)
+        button.setStyleSheet(
+            "QPushButton{font-size:11px;padding:4px 11px;"
+            "border:1px solid #D7E3F4;border-radius:7px;background:white;}"
+            "QPushButton:checked{color:#245BCE;background:#E4EEFF;"
+            "border-color:#2F6BFF;font-weight:700;}"
+        )
+        self._full_layout_group.addButton(button)
+        button.clicked.connect(lambda _checked=False, selected=mode: self._set_full_layout_mode(selected))
+        self._full_layout_buttons[mode] = button
+        full_layout_row.addWidget(button)
+    self._full_layout_buttons["boxes"].setChecked(True)
+    full_layout_row.addStretch(1)
+    full_layout_bar.setVisible(False)
+    self._full_layout_bar = full_layout_bar
+    root.addWidget(full_layout_bar)
     # Keyboard shortcuts remain active but the persistent instruction strip is
     # removed to return that vertical space to the decision workspace.
     self._keyboard_hint = None
@@ -1067,8 +1181,64 @@ def build_ocr_compare_panel(self):
     only_layout.setContentsMargins(18, 12, 18, 12)
     only_layout.setSpacing(8)
     self._full_overview_note = QLabel("多模型全文对照 · 逐行对应 · 红色=字符差异，浅红=模型分歧")
-    self._full_overview_note.setStyleSheet("color:#44546B;font-size:11px;font-weight:600;")
+    self._full_overview_note.setStyleSheet("color:#44546B;font-size:12px;font-weight:600;")
     only_layout.addWidget(self._full_overview_note)
+    # Non-destructive, keyboard-friendly whole-book review controls. They
+    # operate on original stable row IDs rather than filtering/reordering the
+    # underlying fusion records or duplicating a second document.
+    search_bar = QHBoxLayout()
+    search_bar.setContentsMargins(0, 0, 0, 0)
+    search_bar.setSpacing(6)
+    self._full_search_input = QLineEdit(self._full_overview_panel)
+    self._full_search_input.setObjectName("ocrFullBookFindInput")
+    self._full_search_input.setPlaceholderText("搜索融合全文（⌘/Ctrl+F）")
+    self._full_search_input.setClearButtonEnabled(True)
+    self._full_search_input.setMinimumHeight(32)
+    self._full_search_input.setStyleSheet(
+        "QLineEdit{border:1px solid #CFDBEA;border-radius:7px;"
+        "background:#F9FBFF;padding:5px 12px;font-size:12px;}"
+        "QLineEdit:focus{border:1px solid #3267DA;background:#FFFFFF;}"
+    )
+    search_bar.addWidget(self._full_search_input, 1)
+    self._full_search_scope = QComboBox(self._full_overview_panel)
+    self._full_search_scope.addItem("融合结果", False)
+    self._full_search_scope.addItem("全部模型", True)
+    self._full_search_scope.setMinimumHeight(32)
+    self._full_search_scope.setToolTip("默认仅查找融合全文；需要跨 OCR 原始候选查找时手动切换。")
+    search_bar.addWidget(self._full_search_scope)
+    self._full_search_count = QLabel("", self._full_overview_panel)
+    self._full_search_count.setObjectName("ocrFullBookFindStatus")
+    self._full_search_count.setMinimumWidth(70)
+    self._full_search_count.setStyleSheet("font-size:11px;color:#52657F;")
+    search_bar.addWidget(self._full_search_count)
+    self._full_find_prev_btn = QPushButton("上一处", self._full_overview_panel)
+    self._full_find_next_btn = QPushButton("下一处", self._full_overview_panel)
+    self._full_diff_prev_btn = QPushButton("上一分歧", self._full_overview_panel)
+    self._full_diff_next_btn = QPushButton("下一分歧", self._full_overview_panel)
+    for btn in (self._full_find_prev_btn, self._full_find_next_btn,
+                self._full_diff_prev_btn, self._full_diff_next_btn):
+        btn.setMinimumHeight(32)
+        btn.setStyleSheet(
+            "QPushButton{background:#FFFFFF;color:#24354B;padding:5px 9px;"
+            "border:1px solid #D7E3F4;border-radius:7px;font-size:11px;}"
+            "QPushButton:hover{background:#EEF5FF;border-color:#8EB0EC;}"
+        )
+        search_bar.addWidget(btn)
+    only_layout.addLayout(search_bar)
+    self._full_search_timer = QTimer(self._full_overview_panel)
+    self._full_search_timer.setSingleShot(True)
+    self._full_search_timer.setInterval(140)
+    self._full_search_timer.timeout.connect(self._apply_full_book_search)
+    self._full_search_input.textChanged.connect(lambda _text: self._full_search_timer.start())
+    self._full_search_scope.currentIndexChanged.connect(lambda _index: self._apply_full_book_search())
+    self._full_search_input.returnPressed.connect(lambda: self._step_full_book_search())
+    self._full_find_prev_btn.clicked.connect(lambda: self._step_full_book_search(backward=True))
+    self._full_find_next_btn.clicked.connect(lambda: self._step_full_book_search())
+    self._full_diff_prev_btn.clicked.connect(lambda: self._step_full_book_difference(backward=True))
+    self._full_diff_next_btn.clicked.connect(lambda: self._step_full_book_difference())
+    self._full_find_shortcut = QShortcut(QKeySequence.Find, self._full_overview_panel)
+    self._full_find_shortcut.setContext(Qt.WidgetWithChildrenShortcut)
+    self._full_find_shortcut.activated.connect(self._full_search_input.setFocus)
     # One shared scroll surface keeps 4,058+ sentence rows aligned without
     # independent editor offsets or the old one-sentence-only source widgets.
     from ui.ocr.full_book_comparison import FullBookComparisonTable

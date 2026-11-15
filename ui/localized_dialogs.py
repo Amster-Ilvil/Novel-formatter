@@ -14,6 +14,7 @@ from PySide6.QtWidgets import (
     QMessageBox as _QMessageBox,
     QInputDialog as _QInputDialog,
     QColorDialog as _QColorDialog,
+    QPlainTextEdit as _QPlainTextEdit,
 )
 
 from ui.dialog_localization import translate_dialog_text
@@ -151,3 +152,20 @@ class LocalizedColorDialog(_QColorDialog):
     def getColor(*args, **kwargs):
         args, kwargs = _translated_call_args(args, kwargs, text_indices=(2,), text_keys=("title",))
         return _QColorDialog.getColor(*args, **kwargs)
+
+
+class LocalizedLogView(_QPlainTextEdit):
+    """Read-only log pane that localizes known UI status lines on append.
+
+    Translation happens once, when a line is written, through the same dialog
+    layer as message boxes: complete known lines/templates are localized and
+    every unknown line (paths, OCR/document text, tracebacks, model output) is
+    kept byte-for-byte.  Lines already written are not re-translated after a
+    later language switch.
+    """
+
+    def appendPlainText(self, text):
+        super().appendPlainText(_tr(text))
+
+    def setPlainText(self, text):
+        super().setPlainText(_tr(text))

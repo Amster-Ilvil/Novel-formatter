@@ -21,6 +21,7 @@ class OCRProofreadImageLabel(QLabel):
     """Aspect-ratio image viewer with drag-to-column scrub linkage."""
 
     column_scrubbed = Signal(float)
+    original_image_requested = Signal()
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -37,7 +38,7 @@ class OCRProofreadImageLabel(QLabel):
         self._scrub_position: float | None = None
         self._column_intervals: tuple[tuple[float, float], ...] = ()
         self._active_column_index = -1
-        self._scrub_dragging = False
+        self._scrub_dragging = False  # kept for compatible state/readback
         self._smooth_scale_timer = QTimer(self)
         self._smooth_scale_timer.setSingleShot(True)
         self._smooth_scale_timer.setInterval(70)
@@ -49,7 +50,7 @@ class OCRProofreadImageLabel(QLabel):
         self.setWordWrap(True)
         self.setStyleSheet(LIGHT_IMAGE_PREVIEW_STYLE)
         self.setText("完成 OCR 后，右侧显示当前句对应的单列或多列原图。")
-        self.setToolTip("按住鼠标左键在图片上横向拖动，可联动定位旁边的 OCR 物理列。")
+        self.setToolTip("裁片居中显示；双击打开原尺寸大图。")
 
     @staticmethod
     def _pixmap_cost(pixmap: QPixmap) -> int:
@@ -171,30 +172,19 @@ class OCRProofreadImageLabel(QLabel):
         self.column_scrubbed.emit(normalized)
         self.update()
 
-    def mousePressEvent(self, event):
+    def mouseDoubleClickEvent(self, event):
         if event.button() == Qt.LeftButton and self._source_pixmap is not None:
-            self._scrub_dragging = True
-            self.setCursor(Qt.SizeHorCursor)
-            self._emit_scrub_from_event(event)
-            event.accept()
-            return
-        super().mousePressEvent(event)
-
-    def mouseMoveEvent(self, event):
-        if self._scrub_dragging:
-            self._emit_scrub_from_event(event)
-            event.accept()
-            return
-        super().mouseMoveEvent(event)
-
-    def mouseReleaseEvent(self, event):
-        if self._scrub_dragging and event.button() == Qt.LeftButton:
-            self._emit_scrub_from_event(event)
             self._scrub_dragging = False
             self.unsetCursor()
+            self.original_image_requested.emit()
             event.accept()
             return
-        super().mouseReleaseEvent(event)
+        super().mouseDoubleClickEvent(event)
+
+    # A crop is passive image evidence: it should not grow an unexplained
+    # draggable blue position line when clicked or dragged.  Full-page
+    # physical-column rectangles remain interactive in PageColumnNavigator,
+    # and double-click here still opens the original-size image.
 
     def paintEvent(self, event):
         super().paintEvent(event)
@@ -215,14 +205,7 @@ class OCRProofreadImageLabel(QLabel):
             painter.setBrush(Qt.NoBrush)
             painter.setPen(QPen(QColor("#2F6BFF"), 2))
             painter.drawRoundedRect(band.adjusted(1, 1, -1, -1), 8, 8)
-        elif self._scrub_position is not None:
-            x = rect.left() + round(self._scrub_position * rect.width())
-            painter.fillRect(
-                QRect(max(rect.left(), x - 9), rect.top(), 18, rect.height()),
-                QColor(37, 99, 235, 28),
-            )
-            painter.setPen(QPen(QColor("#2F6BFF"), 2))
-            painter.drawLine(x, rect.top(), x, rect.bottom())
+        # Do not draw the former draggable blue scrub line on crop previews.
         painter.end()
 
     def resizeEvent(self, event):
@@ -232,18 +215,27 @@ class OCRProofreadImageLabel(QLabel):
         self._rescale(smooth=False)
         self._smooth_scale_timer.start()
 
+    # A one-character or short-column screenshot must not balloon to fill the
+    # reference panel.  The cap is deliberately measured against *native
+    # pixels*, not the previous sentence crop (whose height can vary greatly).
+    MAX_CROP_AUTO_UPSCALE = 1.5
+
     def _rescale(self, *, smooth: bool = False) -> None:
         if self._source_pixmap is None or self._source_pixmap.isNull():
             return
         target = self.contentsRect().size()
         if target.width() <= 1 or target.height() <= 1:
             return
-        if smooth and target == self._last_scaled_size:
-            # The fast preview used the same dimensions; replace it once with a
-            # smooth version. Repeated resize events are coalesced by the timer.
-            pass
+        source = self._source_pixmap
+        factor = min(
+            target.width() / max(1, source.width()),
+            target.height() / max(1, source.height()),
+            self.MAX_CROP_AUTO_UPSCALE,
+        )
+        width = max(1, round(source.width() * factor))
+        height = max(1, round(source.height() * factor))
         mode = Qt.SmoothTransformation if smooth else Qt.FastTransformation
-        self.setPixmap(self._source_pixmap.scaled(target, Qt.KeepAspectRatio, mode))
+        self.setPixmap(source.scaled(width, height, Qt.KeepAspectRatio, mode))
         self._last_scaled_size = QSize(target)
 
 

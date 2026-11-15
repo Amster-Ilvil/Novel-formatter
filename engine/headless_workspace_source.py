@@ -119,6 +119,32 @@ def _from_project(project: Path) -> ResolvedOcrSource:
     raw_rows = list(raw_comparison.pop("rows", []) or [])
     rows = [MultiOcrRow(**dict(item)) for item in raw_rows if isinstance(item, dict)]
     comparison = MultiOcrComparison(rows=rows, **raw_comparison) if rows else None
+    # A workspace ZIP copied from macOS carries absolute image paths from the
+    # source computer. Rebind ONLY existing local page/illustration files before
+    # sealing the new round-trip package. OCR text and geometry stay unchanged.
+    def _portable_source_path(raw: str) -> str:
+        # Prefer a copied project's OWN original-page file even when the
+        # machine still happens to contain the previous project's absolute
+        # path.  Otherwise, restoring a ZIP beside its source silently uses
+        # the old workspace and fails once that source is removed.
+        value = str(raw or "")
+        marker = "source/original/"
+        normalized = value.replace("\\", "/")
+        if marker in normalized:
+            relative = normalized.rsplit(marker, 1)[1]
+            base = (project / "source" / "original").resolve()
+            local = (base / relative).resolve()
+            if local.is_relative_to(base) and local.is_file():
+                return str(local)
+        original = Path(value)
+        return str(original) if original.is_file() else value
+
+    for doc in documents:
+        for page in doc.pages:
+            page.image_path = _portable_source_path(page.image_path)
+        for block in doc.blocks:
+            if block.image_path:
+                block.image_path = _portable_source_path(block.image_path)
     ruby_payload = snapshot.get("ruby_overlay_doc")
     ruby_doc = UnifiedDocument.from_dict(ruby_payload) if isinstance(ruby_payload, dict) else None
     if len(documents) < 2 or comparison is None:

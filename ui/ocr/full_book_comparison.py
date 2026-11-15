@@ -6,7 +6,9 @@ per row. A single QTableView scrollbar keeps models and fusion in lockstep.
 """
 from __future__ import annotations
 
+from bisect import bisect_left, bisect_right
 from difflib import SequenceMatcher
+import re
 from functools import lru_cache
 
 from PySide6.QtCore import QAbstractTableModel, QModelIndex, Qt, QTimer
@@ -74,6 +76,7 @@ class FullBookComparisonModel(QAbstractTableModel):
     DiffSpansRole = Qt.UserRole + 1
     ConflictRole = Qt.UserRole + 2
     RawValueRole = Qt.UserRole + 3
+    SearchSpansRole = Qt.UserRole + 4
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -81,6 +84,8 @@ class FullBookComparisonModel(QAbstractTableModel):
         self.states = ()
         self.labels = ()
         self.model_count = 0
+        self.search_term = ""
+        self.search_all_models = False
 
     def set_session(self, rows, states, labels):
         self.beginResetModel()
@@ -91,6 +96,37 @@ class FullBookComparisonModel(QAbstractTableModel):
         self._last_fusion_cells = tuple(_fusion_cell(state) for state in self.states)
         difference_spans.cache_clear()
         self.endResetModel()
+
+    def set_search(self, term: str, all_models: bool = False) -> None:
+        """Presentation-only search: never changes a source or fusion candidate."""
+        term = str(term or "").strip()
+        all_models = bool(all_models)
+        if term == self.search_term and all_models == self.search_all_models:
+            return
+        self.search_term = term
+        self.search_all_models = all_models
+        if self.rows:
+            self.dataChanged.emit(
+                self.index(0, 0), self.index(len(self.rows) - 1, self.model_count),
+                [self.SearchSpansRole],
+            )
+
+    def search_spans(self, text: str, column: int) -> tuple[tuple[int, int], ...]:
+        if not self.search_term or (column < self.model_count and not self.search_all_models):
+            return ()
+        return tuple((match.start(), match.end()) for match in re.finditer(
+            re.escape(self.search_term), text, flags=re.IGNORECASE,
+        ))
+
+    def contains_search(self, row_index: int) -> bool:
+        if not self.search_term:
+            return False
+        state = self.states[row_index] if row_index < len(self.states) else None
+        if self.search_spans(_fusion_cell(state), self.model_count):
+            return True
+        if self.search_all_models:
+            return any(self.search_spans(text, col) for col, text in enumerate(self.raw_values(row_index)))
+        return False
 
     def update_states(self, states):
         """Repaint adjudication overlays without resetting the book position."""
@@ -156,6 +192,8 @@ class FullBookComparisonModel(QAbstractTableModel):
             return raw
         if role == self.ConflictRole:
             return self.row_disagrees(row_index)
+        if role == self.SearchSpansRole:
+            return self.search_spans(raw, col)
         if role == self.DiffSpansRole:
             if col < self.model_count:
                 return difference_spans(values, col)
@@ -206,14 +244,29 @@ class FullBookDiffDelegate(QStyledItemDelegate):
                 cursor.setPosition(offsets[max(0, min(start, len(text)))])
                 cursor.setPosition(offsets[max(0, min(end, len(text)))], QTextCursor.KeepAnchor)
                 cursor.mergeCharFormat(fmt)
+        # Search uses an underline rather than another background color so
+        # OCR substitutions remain visibly red even inside a searched phrase.
+        search_ranges = index.data(FullBookComparisonModel.SearchSpansRole) or ()
+        if search_ranges:
+            offsets = [0]
+            for character in text:
+                offsets.append(offsets[-1] + (2 if ord(character) > 0xffff else 1))
+            cursor = QTextCursor(doc)
+            fmt = QTextCharFormat()
+            fmt.setUnderlineStyle(QTextCharFormat.SingleUnderline)
+            fmt.setUnderlineColor(QColor('#C58113'))
+            for start, end in search_ranges:
+                cursor.setPosition(offsets[max(0, min(start, len(text)))])
+                cursor.setPosition(offsets[max(0, min(end, len(text)))], QTextCursor.KeepAnchor)
+                cursor.mergeCharFormat(fmt)
         return doc
 
     def paint(self, painter, option, index):
         painter.save()
         painter.setClipRect(option.rect)
-        painter.fillRect(option.rect, QColor('#FFF0F0') if index.data(FullBookComparisonModel.ConflictRole) else QColor('#FFFFFF'))
+        painter.fillRect(option.rect, QColor('#FFF8F6') if index.data(FullBookComparisonModel.ConflictRole) else QColor('#FFFFFF'))
         if option.state & QStyle.State_Selected:
-            painter.fillRect(option.rect, QColor('#E4EEFF'))
+            painter.fillRect(option.rect, QColor('#EAF2FF'))
         doc = self._document(option, index)
         doc.setTextWidth(max(80, option.rect.width() - 10))
         painter.translate(option.rect.left() + 5, option.rect.top() + 3)
@@ -249,17 +302,31 @@ class FullBookComparisonTable(QTableView):
         self.verticalHeader().setMinimumWidth(62)
         self.verticalHeader().setDefaultSectionSize(56)
         self._resize_generation = 0
+        self._fusion_only = False
         self._last_comparison = None
         self._last_labels = ()
+        self._row_height_cache: dict[tuple, int] = {}
+        self._search_matches: tuple[int, ...] = ()
+        self._search_query = ""
+        self._search_all_models = False
         self.horizontalHeader().sectionResized.connect(self._schedule_resize)
-        self.setStyleSheet('QTableView{background:#FFFFFF;gridline-color:#E1E8F2;font-size:12px;}'
-                           'QHeaderView::section{background:#EFF4FB;border:1px solid #DCE5F1;padding:7px;font-weight:600;}')
+        self.setStyleSheet('QTableView{background:#FFFFFF;gridline-color:#E1E8F2;font-size:14px;}'
+                           'QHeaderView::section{background:#EFF4FB;border:1px solid #DCE5F1;padding:8px;font-size:12px;font-weight:600;}')
 
     def set_comparison(self, comparison, states, labels):
         labels = tuple(labels or ())
         if comparison is not None and comparison is self._last_comparison and labels == self._last_labels:
             changed = self.model().update_states(states)
             if changed:
+                changed_rows = set(changed)
+                self._row_height_cache = {
+                    key: value for key, value in self._row_height_cache.items()
+                    if key[0] not in changed_rows
+                }
+                # Fused words may change after a decision; keep live find
+                # results synchronized without replacing the stable row model.
+                if self._search_query:
+                    self._compute_search_matches()
                 # An adjudication overlay must not cancel a pending whole-book
                 # sizing pass: later long rows would retain the default height.
                 generation = self._resize_generation
@@ -268,11 +335,91 @@ class FullBookComparisonTable(QTableView):
         rows = getattr(comparison, 'rows', ()) if comparison is not None else ()
         self._last_comparison = comparison
         self._last_labels = labels
+        self._row_height_cache.clear()
         self.model().set_session(rows, states, labels)
+        self.model().set_search(self._search_query, self._search_all_models)
+        self._compute_search_matches()
         for i in range(self.model().columnCount()):
             self.setColumnWidth(i, 330 if i < self.model().model_count else 390)
-        self._schedule_resize()
+        self.set_fusion_only(self._fusion_only, force=True)
         return True
+
+    def set_fusion_only(self, enabled: bool, *, force: bool = False) -> None:
+        """Show the publication-facing fusion first; OCR source columns opt in."""
+        enabled = bool(enabled)
+        if not force and enabled == self._fusion_only:
+            return
+        self._fusion_only = enabled
+        model = self.model()
+        for column in range(model.model_count):
+            self.setColumnHidden(column, enabled)
+        if model.columnCount():
+            self.setColumnHidden(model.model_count, False)
+        if enabled and model.columnCount():
+            self.setColumnWidth(model.model_count, max(440, self.viewport().width() - 36))
+        self._schedule_resize()
+
+    def _selected_source_row(self) -> int:
+        index = self.currentIndex()
+        if index.isValid():
+            return index.row()
+        selected = self.selectionModel().selectedRows() if self.selectionModel() else ()
+        return selected[0].row() if selected else -1
+
+    def _jump_to_row(self, row: int) -> int | None:
+        model = self.model()
+        if row < 0 or row >= model.rowCount():
+            return None
+        col = model.model_count if self._fusion_only else 0
+        index = model.index(row, col)
+        self.setCurrentIndex(index)
+        self.selectRow(row)
+        self.scrollTo(index, QAbstractItemView.PositionAtCenter)
+        return row
+
+    def _compute_search_matches(self) -> tuple[int, ...]:
+        model = self.model()
+        self._search_matches = tuple(
+            row for row in range(model.rowCount()) if model.contains_search(row)
+        ) if self._search_query else ()
+        return self._search_matches
+
+    def search_text(self, query: str, *, all_models: bool = False) -> int:
+        """Return matching *original* row count; source-row IDs never change."""
+        query = str(query or '').strip()
+        all_models = bool(all_models)
+        self._search_query = query
+        self._search_all_models = all_models
+        self.model().set_search(query, all_models)
+        return len(self._compute_search_matches())
+
+    def find_next(self, *, backward: bool = False) -> tuple[int | None, int, int]:
+        """Jump in reading order, wrapping at the end of the book."""
+        matches = self._search_matches
+        if not matches:
+            return None, 0, 0
+        current = self._selected_source_row()
+        if backward:
+            pos = (bisect_left(matches, current) - 1) % len(matches)
+        else:
+            pos = bisect_right(matches, current) % len(matches)
+        row = matches[pos]
+        self._jump_to_row(row)
+        return row, pos + 1, len(matches)
+
+    def jump_difference(self, *, backward: bool = False) -> tuple[int | None, int, int]:
+        model = self.model()
+        differences = tuple(row for row in range(model.rowCount()) if model.row_disagrees(row))
+        if not differences:
+            return None, 0, 0
+        current = self._selected_source_row()
+        if backward:
+            pos = (bisect_left(differences, current) - 1) % len(differences)
+        else:
+            pos = bisect_right(differences, current) % len(differences)
+        row = differences[pos]
+        self._jump_to_row(row)
+        return row, pos + 1, len(differences)
 
     def _resize_changed_rows(self, indices, generation):
         if generation != self._resize_generation:
@@ -303,14 +450,23 @@ class FullBookComparisonTable(QTableView):
         model = self.model()
         if not model or not 0 <= row < model.rowCount():
             return
-        required = 32
-        for column in range(model.columnCount()):
-            idx = model.index(row, column)
-            doc = QTextDocument()
-            doc.setDocumentMargin(4)
-            doc.setDefaultFont(self.font())
-            doc.setPlainText(str(idx.data(Qt.DisplayRole) or ''))
-            doc.setTextWidth(max(80, self.columnWidth(column) - 10))
-            required = max(required, int(doc.size().height()) + 8)
+        visible_widths = tuple((col, self.columnWidth(col)) for col in range(model.columnCount())
+                               if not self.isColumnHidden(col))
+        # The same full book is often toggled between fused-only and multi OCR.
+        # Layout is expensive (~N rows × M QTextDocuments); reuse exact Qt
+        # measurements until source text, font or column width changes.
+        cache_key = (row, self.font().toString(), visible_widths)
+        required = self._row_height_cache.get(cache_key)
+        if required is None:
+            required = 32
+            for column, width in visible_widths:
+                idx = model.index(row, column)
+                doc = QTextDocument()
+                doc.setDocumentMargin(4)
+                doc.setDefaultFont(self.font())
+                doc.setPlainText(str(idx.data(Qt.DisplayRole) or ''))
+                doc.setTextWidth(max(80, width - 10))
+                required = max(required, int(doc.size().height()) + 8)
+            self._row_height_cache[cache_key] = required
         if self.rowHeight(row) != required:
             self.setRowHeight(row, required)

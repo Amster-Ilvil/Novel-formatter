@@ -19,7 +19,7 @@ from PySide6.QtGui import QCursor, QDesktopServices, QImage, QImageReader, QPixm
 
 from core.project_workspace import ProjectWorkspaceManager
 from ui.flow_layout import FlowLayout
-from ui.localized_dialogs import ui_message
+from ui.localized_dialogs import LocalizedFileDialog, ui_message
 from ui.responsive import preserve_button_text
 from ui.dialogs import show_error_dialog
 from utils.clear_manager import ClearManager, create_workspace_clear_button
@@ -1110,9 +1110,9 @@ class PageManagerTab(QWidget):
             self._load_inputs(imported, name)
 
     def _open_image_files(self):
-        paths, _ = QFileDialog.getOpenFileNames(
+        paths, _ = LocalizedFileDialog.getOpenFileNames(
             self, "选择图片（可多选）", "",
-            "图片 (*.png *.jpg *.jpeg *.heic *.tif *.tiff *.bmp *.gif);;所有文件 (*)")
+            "图片 (*.png *.jpg *.jpeg *.heic *.tif *.tiff *.bmp *.gif *.webp);;所有文件 (*)")
         if paths:
             name = Path(paths[0]).stem if len(paths) == 1 else f"{Path(paths[0]).stem} 等 {len(paths)} 个文件"
             imported = self._import_sources_into_project(paths, name)
@@ -1129,7 +1129,7 @@ class PageManagerTab(QWidget):
                 self._load_inputs(imported, name)
 
     def _open_files(self):
-        paths, _ = QFileDialog.getOpenFileNames(
+        paths, _ = LocalizedFileDialog.getOpenFileNames(
             self, "选择图片或 PDF（可多选）", "",
             "图片和PDF (*.png *.jpg *.jpeg *.heic *.tif *.tiff *.bmp *.gif *.pdf);;所有文件 (*)")
         if paths:

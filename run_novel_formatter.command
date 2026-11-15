@@ -11,9 +11,24 @@ echo "$APP_NAME launcher"
 echo "Project: $(pwd)"
 echo
 
+# Finder's PATH often omits /opt/homebrew/bin, and Rosetta can report
+# x86_64 via uname even on Apple Silicon. Never silently select a translated
+# interpreter for the GUI/OCR setup on a native Apple Silicon Mac.
+mac_required_arch() {
+  if [[ "$(uname -s)" != "Darwin" ]]; then
+    print -r -- "$(uname -m)"
+    return
+  fi
+  if [[ "$(uname -m)" == "arm64" ]] || [[ "$(/usr/sbin/sysctl -in sysctl.proc_translated 2>/dev/null || true)" == "1" ]]; then
+    print -r -- "arm64"
+  else
+    print -r -- "x86_64"
+  fi
+}
+
 python_supported() {
   "$1" -c 'import sys, platform; import PySide6, PIL, fitz, docx, httpx
-raise SystemExit(0 if sys.version_info >= (3, 10) and (sys.argv[1] != "arm64" or platform.machine() == "arm64") else 1)' "$(uname -m)" >/dev/null 2>&1
+raise SystemExit(0 if sys.version_info >= (3, 10) and (sys.argv[1] != "arm64" or platform.machine() == "arm64") else 1)' "$(mac_required_arch)" >/dev/null 2>&1
 }
 
 find_python() {
@@ -28,7 +43,7 @@ find_python() {
     return 1
   fi
 
-  for candidate in .venv/bin/python "/Library/Frameworks/Python.framework/Versions/3.14/bin/python3" python3.13 /usr/local/bin/python3 /Library/Frameworks/Python.framework/Versions/3.13/bin/python3 python3 python3.14 python3.12 python3.11 python3.10 python; do
+  for candidate in .venv/bin/python /opt/homebrew/bin/python3.13 /opt/homebrew/bin/python3.14 /opt/homebrew/bin/python3.12 "/Library/Frameworks/Python.framework/Versions/3.14/bin/python3" python3.13 /usr/local/bin/python3 /Library/Frameworks/Python.framework/Versions/3.13/bin/python3 python3 python3.14 python3.12 python3.11 python3.10 python; do
     if command -v "$candidate" >/dev/null 2>&1; then
       candidate="$(command -v "$candidate")"
       if python_supported "$candidate"; then

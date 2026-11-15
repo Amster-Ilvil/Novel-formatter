@@ -4,7 +4,8 @@ import threading
 import time
 from pathlib import Path
 
-from PySide6.QtWidgets import QFrame, QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton, QPlainTextEdit, QProgressBar, QFileDialog, QMessageBox, QSizePolicy, QCheckBox
+from PySide6.QtWidgets import QFrame, QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton, QPlainTextEdit, QProgressBar, QSizePolicy, QCheckBox
+from ui.localized_dialogs import LocalizedFileDialog as QFileDialog, LocalizedLogView, LocalizedMessageBox as QMessageBox
 from PySide6.QtCore import Qt, Signal, QTimer
 
 from utils.async_generation import GenerationGuard
@@ -206,7 +207,7 @@ class PdfTextLayerTab(QWidget):
         self._prog.setTextVisible(False)
         self._prog.setVisible(False)
         rl.addWidget(self._prog)
-        self._log_view = QPlainTextEdit()
+        self._log_view = LocalizedLogView()
         self._log_view.setReadOnly(True)
         self._log_view.setStyleSheet(LIGHT_LOG_STYLE)
         rl.addWidget(self._log_view, 1)
