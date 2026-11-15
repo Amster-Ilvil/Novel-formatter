@@ -35,28 +35,31 @@ def session_key(options: dict | None = None) -> str:
     except (TypeError, ValueError):
         serialized = repr(sorted((str(key), id(value)) for key, value in values.items()))
 
-    model_name = os.environ.get("NOVEL_FORMATTER_HAYAI_OCR_MODEL", "JustANormalTinkerer/hayai-ocr-v2.5-nova")
-    local = Path(model_name).expanduser()
-    signatures = []
-    if local.is_dir():
-        for name in ("model.safetensors", "config.json", "modeling_hayai.py", "configuration_hayai.py"):
-            path = local / name
+    from adapters.hayai_ocr_adapter import SUPERNOVA_MODEL, SUPERNOVA_REVISION
+    supernova_name = os.environ.get("NOVEL_FORMATTER_HAYAI_SUPERNOVA_MODEL", SUPERNOVA_MODEL)
+    supernova_local = Path(supernova_name).expanduser()
+    supernova_signatures = []
+    if supernova_local.is_dir():
+        for name in (
+            "model.safetensors", "config.json", "tokenizer.json",
+            "modeling_hayai.py", "configuration_hayai.py", "processing_hayai.py",
+        ):
+            path = supernova_local / name
             try:
                 stat = path.stat()
-                signatures.append((name, stat.st_size, stat.st_mtime_ns))
+                supernova_signatures.append((name, stat.st_size, stat.st_mtime_ns))
             except OSError:
-                signatures.append((name, -1, -1))
+                supernova_signatures.append((name, -1, -1))
     relevant_env = (
-        "NOVEL_FORMATTER_HAYAI_OCR_MODEL", "NOVEL_FORMATTER_HAYAI_OCR_PYTHON",
         "NOVEL_FORMATTER_HAYAI_OCR_CACHE_DIR", "NOVEL_FORMATTER_HAYAI_OCR_BATCH",
         "NOVEL_FORMATTER_HAYAI_OCR_THREADS", "NOVEL_FORMATTER_HAYAI_OCR_SOURCE_WINDOW",
-        "NOVEL_FORMATTER_HAYAI_OCR_PACKAGE", "NOVEL_FORMATTER_HAYAI_TRANSFORMERS_PACKAGE",
-        "NOVEL_FORMATTER_HAYAI_OCR_LITERT_REPO", "NOVEL_FORMATTER_HAYAI_OCR_LITERT_MODEL_PATH",
+        "NOVEL_FORMATTER_HAYAI_SUPERNOVA_MODEL", "NOVEL_FORMATTER_HAYAI_SUPERNOVA_PYTHON",
         "HF_HOME", "HF_HUB_OFFLINE", "TRANSFORMERS_OFFLINE",
     )
     return json.dumps({
-        "model": str(local.resolve()) if local.exists() else model_name,
-        "files": signatures,
+        "supernova_model": str(supernova_local.resolve()) if supernova_local.exists() else supernova_name,
+        "supernova_revision": SUPERNOVA_REVISION,
+        "supernova_files": supernova_signatures,
         "options": serialized,
         "environment": {name: os.environ.get(name, "") for name in relevant_env},
         "python": sys.executable,

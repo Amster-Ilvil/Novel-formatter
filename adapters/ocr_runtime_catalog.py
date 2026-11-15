@@ -31,8 +31,7 @@ from adapters.paddle_ocr_models import (
 )
 ROOT = Path(__file__).parent.parent
 STATE_DIR = ROOT / ".ocr-runtime-state"
-HAYAI_OCR_RUNTIME_VERSION = os.environ.get("NOVEL_FORMATTER_HAYAI_OCR_VERSION", "2.3.0").strip() or "2.3.0"
-HAYAI_OCR_VENV_DIR = persistent_venv_dir("hayai-ocr-v2.1")
+HAYAI_SUPERNOVA_VENV_DIR = persistent_venv_dir("hayai-ocr-v2.7-supernova")
 
 
 @dataclass(frozen=True)
@@ -82,15 +81,11 @@ COMPONENTS: dict[str, RuntimeComponent] = {
         "Novel Formatter 只提供 Smart ROI 与解析上游 Ruby JSON，不改主 OCR、OCR 对比或 Fusion。",
         ".venv-findtext-centernet",
     ),
-    "hayai_ocr": RuntimeComponent(
-        "hayai_ocr", "Hayai OCR · PyTorch", "本地模型",
-        "CJK crop 识别器；Hayai OCR 默认使用当前固定兼容运行时，支持批量、MPS/CUDA/CPU 与可选 INT4/INT8，页面输入强制先做物理分列。",
-        str(HAYAI_OCR_VENV_DIR),
-    ),
-    "hayai_ocr_litert": RuntimeComponent(
-        "hayai_ocr_litert", "Hayai OCR v2 · LiteRT", "本地模型",
-        "与 PyTorch 版共享独立 Hayai 环境，但会额外安装 LiteRT 运行库并下载独立 TFLite v2 权重；仅在选择 LiteRT 后端时需要。",
-        str(HAYAI_OCR_VENV_DIR),
+    "hayai_ocr_supernova": RuntimeComponent(
+        "hayai_ocr_supernova", "Hayai OCR v2.7 Supernova · PyTorch", "本地模型",
+        "官方 v2.7 纯 Transformers 5 推理；独立虚拟环境和独立模型缓存；"
+        "首次确认后下载 Hugging Face 官方权重及执行其定制模型代码。",
+        str(HAYAI_SUPERNOVA_VENV_DIR),
     ),
     "manga_48px": RuntimeComponent(
         "manga_48px", "Manga 48px AR OCR", "本地模型",
@@ -105,8 +100,7 @@ _PACKAGE_MARKERS = {
     "paddle_vl": ("paddle", "paddleocr", "paddlex"),
     "ndlocr_lite": ("onnxruntime", "cv2", "yaml"),
     "findtext_centernet_ruby": ("torch", "torchvision", "PIL"),
-    "hayai_ocr": ("hayai_ocr",),
-    "hayai_ocr_litert": ("hayai_ocr", "ai_edge_litert", "tokenizers", "huggingface_hub"),
+    "hayai_ocr_supernova": ("torch", "transformers", "PIL", "huggingface_hub"),
     "manga_48px": ("torch", "einops", "PIL"),
 }
 _DEEP_IMPORTS = {
@@ -115,8 +109,7 @@ _DEEP_IMPORTS = {
     "paddle_vl": "import paddle, paddleocr, paddlex",
     "ndlocr_lite": "import onnxruntime, cv2, yaml",
     "findtext_centernet_ruby": "import torch, torchvision; from PIL import Image",
-    "hayai_ocr": "from hayai_ocr import HayaiOcr",
-    "hayai_ocr_litert": "from hayai_ocr import HayaiOcr; import ai_edge_litert, tokenizers, huggingface_hub",
+    "hayai_ocr_supernova": "import torch; from transformers import AutoModel, AutoProcessor; from PIL import Image",
     "manga_48px": "import torch, einops; from PIL import Image",
 }
 _PROBE_CACHE: dict[tuple[str, bool], RuntimeProbe] = {}
@@ -238,39 +231,6 @@ def _manga_48px_effective_python() -> tuple[Path | None, str]:
     return None, ""
 
 
-def _hayai_effective_python(component_id: str = "hayai_ocr") -> tuple[Path | None, str]:
-    """Match Hayai's worker selection without creating/installing anything.
-
-    Keep explicit overrides fail-closed; neither the GUI nor the worker may
-    silently fall back to another interpreter after an invalid override.
-    """
-    from adapters.hayai_ocr_adapter import (
-        _current_interpreter_runtime,
-        _probe_existing_runtime,
-        _project_runtime_python,
-        VENV_DIR,
-    )
-    backend = "litert" if component_id == "hayai_ocr_litert" else "torch"
-    explicit = os.environ.get("NOVEL_FORMATTER_HAYAI_OCR_PYTHON", "").strip()
-    if explicit:
-        path = Path(explicit).expanduser()
-        return (path, "explicit") if _probe_existing_runtime(path, backend) else (None, "invalid-explicit")
-
-    project = _project_runtime_python()
-    if _probe_existing_runtime(project, backend):
-        return project, "project"
-
-    private = VENV_DIR / ("Scripts/python.exe" if os.name == "nt" else "bin/python")
-    if str(private) != str(project) and _probe_existing_runtime(private, backend):
-        return private, "private"
-
-    if backend == "torch":
-        current = _current_interpreter_runtime()
-        if current is not None and _probe_existing_runtime(current, backend):
-            return current, "current"
-    return None, ""
-
-
 def _environment_installed(component_id: str, *, deep: bool = False) -> tuple[bool, str]:
     if component_id == "manga_48px":
         python, source = _manga_48px_effective_python()
@@ -290,51 +250,16 @@ def _environment_installed(component_id: str, *, deep: bool = False) -> tuple[bo
         return True, f"48px 运行环境已验证（{source}: {python}）"
     python = _venv_python_path(component_id)
     python_source = "private"
-    if component_id in {"hayai_ocr", "hayai_ocr_litert"}:
-        # Match the adapter's project/current/private environment selection.
-        python, python_source = _hayai_effective_python(component_id)
+    if component_id == "hayai_ocr_supernova":
+        from adapters.hayai_ocr_adapter import _supernova_effective_python
+        python, python_source = _supernova_effective_python()
+        if python is None:
+            return False, ("v2.7 指定的运行环境无效" if python_source == "invalid-explicit"
+                           else "缺少 v2.7 独立 Transformers 5 环境")
+        # The same probe is used by the worker before installing dependencies.
+        return True, f"Hayai v2.7 Transformers 5 环境已验证（{python_source}: {python}）"
     if python is None:
-        if python_source == "invalid-explicit":
-            return False, "Hayai 显式指定的 Python 环境不可用或版本不匹配；已拒绝静默切换环境"
         return False, "未找到独立运行环境"
-
-    if component_id in {"hayai_ocr", "hayai_ocr_litert"}:
-        # Use the venv's own importlib.metadata as the authoritative package
-        # check.  Static site-packages filename scanning is fast but proved too
-        # brittle across pip/install layouts and caused a repeated GUI
-        # "安装并继续" prompt even though the same worker started normally.
-        # This probe is side-effect-free: it does not instantiate HayaiOcr or
-        # touch Hugging Face/model loading.
-        code = (
-            "from importlib.metadata import version; "
-            "v=version('hayai-ocr'); print(v); "
-            f"raise SystemExit(0 if v=={HAYAI_OCR_RUNTIME_VERSION!r} else 9)"
-        )
-        if component_id == "hayai_ocr_litert":
-            code = (
-                "import importlib.util; from importlib.metadata import version; "
-                "v=version('hayai-ocr'); print(v); "
-                f"raise SystemExit(0 if v=={HAYAI_OCR_RUNTIME_VERSION!r} "
-                "and importlib.util.find_spec('ai_edge_litert') is not None else 9)"
-            )
-        try:
-            proc = subprocess.run(
-                [str(python), "-c", code], capture_output=True, text=True, timeout=10
-            )
-        except Exception as exc:
-            return False, f"Hayai OCR 环境探测失败：{exc}"
-        if proc.returncode != 0:
-            installed_version = (proc.stdout or "").strip().splitlines()[-1] if (proc.stdout or "").strip() else "未知"
-            return False, (
-                f"检测到 Hayai OCR 环境，但版本/后端不匹配（{installed_version}）；"
-                f"当前项目固定要求 {HAYAI_OCR_RUNTIME_VERSION}"
-            )
-        if not deep:
-            return True, (
-                f"Hayai OCR {HAYAI_OCR_RUNTIME_VERSION} 运行环境已安装"
-                f"（{python_source}: {python}）"
-            )
-
     markers = _PACKAGE_MARKERS.get(component_id, ())
     if markers and not all(_module_marker_exists(component_id, marker) for marker in markers):
         return False, "运行环境存在，但所需 OCR 包不完整"
@@ -429,7 +354,7 @@ def _hayai_cache_roots() -> list[Path]:
             roots.append(Path(key))
 
     override = os.environ.get("NOVEL_FORMATTER_HAYAI_OCR_CACHE_DIR", "").strip()
-    add(override or (ROOT / ".model-cache" / "hayai-ocr"))
+    add(override or (ROOT / ".model-cache" / "hayai-supernova"))
     add(os.environ.get("HF_HOME", "").strip())
     add(os.environ.get("HUGGINGFACE_HUB_CACHE", "").strip())
     add(os.environ.get("TRANSFORMERS_CACHE", "").strip())
@@ -440,10 +365,8 @@ def _hayai_cache_roots() -> list[Path]:
 def _hayai_repo_candidates(root: Path, repo_dir: str) -> tuple[Path, ...]:
     """Return the cache layouts used by Hugging Face Hub and Transformers.
 
-    Older Hayai downloads in this project were written below
-    ``<HF_HOME>/transformers`` while newer Hub versions prefer
-    ``<HF_HOME>/hub``.  Both layouts are valid snapshots, and the worker pins
-    ``TRANSFORMERS_CACHE`` to the former for compatibility.
+    Both Hugging Face hub and older Transformers cache layouts are accepted
+    for a fully verified v2.7 Supernova snapshot.
     """
     return (
         root / "hub" / repo_dir,
@@ -452,84 +375,49 @@ def _hayai_repo_candidates(root: Path, repo_dir: str) -> tuple[Path, ...]:
     )
 
 
-def _hayai_litert_cache_complete(root: Path) -> bool:
+def _supernova_cache_complete(root: Path, *, revision: str | None = None) -> bool:
+    """Require a complete v2.7 inference bundle, not a bare weight file.
+
+    The processor resides in the official v2.7 model repository. Never
+    import or execute remote model code during a cache probe.
+    """
     if not root.exists():
         return False
-    required = {"encoder.tflite", "prefill.tflite", "decode.tflite", "position_base.npy", "tokenizer.json"}
+    required = (
+        "model.safetensors", "config.json", "tokenizer.json",
+        "preprocessor_config.json", "processor_config.json",
+        "modeling_hayai.py", "configuration_hayai.py", "processing_hayai.py",
+    )
     try:
-        for encoder in root.rglob("encoder.tflite"):
-            folder = encoder.parent
+        snapshots = root / "snapshots"
+        if revision and root.name.startswith("models--"):
+            folders = [snapshots / revision]
+        elif snapshots.is_dir():
+            folders = [path for path in snapshots.iterdir() if path.is_dir()]
+        else:
+            folders = [root]
+        for folder in folders:
             if all((folder / name).is_file() and (folder / name).stat().st_size > 0 for name in required):
-                return True
-    except OSError:
-        return False
-    return False
-
-
-
-
-def _hayai_processor_cache_complete(root: Path) -> bool:
-    """Return True when Hayai v2's SigLIP2 *image* processor is cached.
-
-    Upstream Hayai v2 loads ``AutoProcessor`` from
-    ``google/siglip2-base-patch16-naflex`` but loads the text tokenizer
-    separately from the selected Hayai OCR model repository.  Requiring a
-    tokenizer file inside the SigLIP2 snapshot therefore creates a false
-    negative after a perfectly successful Hayai download and makes the GUI
-    ask to install the model again on every run.  The worker only calls this
-    processor with ``images=...``; the image processor config is the required
-    offline asset here.
-    """
-    repo_name = _hf_repo_dir("google/siglip2-base-patch16-naflex")
-    candidates = _hayai_repo_candidates(root, repo_name)
-    try:
-        for candidate in candidates:
-            if not candidate.exists():
-                continue
-            for snapshot in candidate.rglob("preprocessor_config.json"):
-                folder = snapshot.parent
-                # AutoProcessor/SigLIP2 variants may also ship processor_config,
-                # but preprocessor_config.json is the canonical image-processor
-                # asset used by the upstream Hayai call path.
-                if snapshot.is_file() and snapshot.stat().st_size >= 2:
+                if (folder / "model.safetensors").stat().st_size >= 1_000_000:
                     return True
     except OSError:
         return False
     return False
 
 
-def _hayai_direct_processor_complete(root: Path) -> bool:
-    """Accept an explicitly materialized local SigLIP2 processor directory.
-
-    Cloud/offline bundles do not need to imitate Hugging Face's hashed cache
-    hierarchy.  A normal local ``from_pretrained(path, local_files_only=True)``
-    directory is equally valid and is how the validated cloud bundle stores
-    SigLIP2 next to the local Hayai model.
-    """
-    if not root.exists():
-        return False
+def _supernova_siglip_config_complete(root: Path) -> bool:
+    """Check the tiny SigLIP2 vision config imported by upstream v2.7 code."""
+    repo_name = _hf_repo_dir("google/siglip2-base-patch16-naflex")
     try:
-        config = root / "preprocessor_config.json"
-        return config.is_file() and config.stat().st_size >= 2
-    except OSError:
-        return False
-
-def _hayai_torch_cache_complete(root: Path) -> bool:
-    if not root.exists():
-        return False
-    try:
-        for config in root.rglob("config.json"):
-            folder = config.parent
-            tokenizer_ready = any((folder / name).is_file() for name in (
-                "tokenizer.json", "tokenizer_config.json", "special_tokens_map.json"
-            ))
-            weight_ready = _has_large_file(folder, 1_000_000, ("safetensors", "pytorch_model", "model"))
-            if tokenizer_ready and weight_ready:
-                return True
+        for candidate in _hayai_repo_candidates(root, repo_name):
+            if not candidate.exists():
+                continue
+            for config in candidate.rglob("config.json"):
+                if config.is_file() and config.stat().st_size >= 2:
+                    return True
     except OSError:
         return False
     return False
-
 
 
 def _model_cache_ready(component_id: str) -> tuple[bool, str]:
@@ -589,68 +477,26 @@ def _model_cache_ready(component_id: str) -> tuple[bool, str]:
             return False, f"48px AR 权重已下载 {partial_mb:.1f}/194.8 MiB，下次会断点续传"
         return False, "环境已安装，但 48px AR 权重尚未下载完整"
 
-    if component_id in {"hayai_ocr", "hayai_ocr_litert"}:
-        # Hayai's two backends share one venv but use different model repos.
-        # Probe every cache root the actual Hugging Face runtime may already be
-        # using.  This fixes the common case where the model is fully downloaded
-        # under ~/.cache/huggingface (or HF_HOME) but the project-local cache is
-        # empty, which previously caused a repeated "安装并继续" prompt.
-        cache_roots = _hayai_cache_roots()
-        if component_id == "hayai_ocr_litert":
-            repo_id = os.environ.get(
-                "NOVEL_FORMATTER_HAYAI_OCR_LITERT_REPO", "JustANormalTinkerer/hayai-ocr-v2-tflite"
-            ).strip() or "JustANormalTinkerer/hayai-ocr-v2-tflite"
-            repo_dir = _hf_repo_dir(repo_id)
-            candidates: list[Path] = []
-            local_override = os.environ.get("NOVEL_FORMATTER_HAYAI_OCR_LITERT_MODEL_PATH", "").strip()
-            if local_override:
-                candidates.append(Path(local_override).expanduser())
-            for cache_root in cache_roots:
-                candidates.extend((cache_root / "hub" / repo_dir, cache_root / repo_dir))
-            ready = any(_hayai_litert_cache_complete(path) for path in candidates)
-            return (True, "检测到完整 Hayai OCR LiteRT/TFLite 权重") if ready else (False, "环境已安装，但 Hayai OCR LiteRT/TFLite 权重不完整或尚未下载")
-
-        model_name = os.environ.get(
-            "NOVEL_FORMATTER_HAYAI_OCR_MODEL", "JustANormalTinkerer/hayai-ocr-v2.5-nova"
-        ).strip() or "JustANormalTinkerer/hayai-ocr-v2.5-nova"
+    if component_id == "hayai_ocr_supernova":
+        from adapters.hayai_ocr_adapter import SUPERNOVA_REVISION, _supernova_model_location
+        try:
+            model_name = _supernova_model_location()
+        except ValueError as exc:
+            return False, str(exc)
         local_model = Path(model_name).expanduser()
-        local_model_ready = local_model.exists() and _hayai_torch_cache_complete(local_model)
-        local_processor_candidates: list[Path] = []
-        processor_override = os.environ.get("NOVEL_FORMATTER_HAYAI_SIGLIP2_MODEL", "").strip()
-        if processor_override:
-            local_processor_candidates.append(Path(processor_override).expanduser())
-        if local_model.exists():
-            # Validated offline bundles keep the two local repositories as
-            # siblings under one runtime root.
-            local_processor_candidates.append(
-                local_model.parent / "siglip2-base-patch16-naflex-local"
+        if local_model.is_dir():
+            ready = (_supernova_cache_complete(local_model)
+                     and _supernova_siglip_config_complete(local_model.parent))
+            return (True, "完整 v2.7 本地模型、处理器和 SigLIP2 配置") if ready else (False, "v2.7 本地模型文件或 SigLIP2 配置不完整")
+        repo_dir = _hf_repo_dir(model_name)
+        for cache_root in _hayai_cache_roots():
+            model_ready = any(
+                _supernova_cache_complete(candidate, revision=SUPERNOVA_REVISION)
+                for candidate in _hayai_repo_candidates(cache_root, repo_dir)
             )
-        local_processor_ready = any(
-            _hayai_direct_processor_complete(path)
-            for path in local_processor_candidates
-        )
-        if local_model_ready and local_processor_ready:
-            return True, "检测到完整本地 Hayai OCR 权重与 SigLIP2 processor"
-        repo_dir = _hf_repo_dir(model_name) if not local_model.exists() else ""
-        any_model_ready = bool(local_model_ready)
-        any_processor_ready = bool(local_processor_ready)
-        for cache_root in cache_roots:
-            processor_ready = _hayai_processor_cache_complete(cache_root)
-            any_processor_ready = any_processor_ready or processor_ready
-            model_ready = bool(local_model_ready)
-            if repo_dir:
-                model_ready = any(
-                    _hayai_torch_cache_complete(path)
-                    for path in _hayai_repo_candidates(cache_root, repo_dir)
-                )
-            any_model_ready = any_model_ready or model_ready
-            if model_ready and processor_ready:
-                return True, f"检测到完整 Hayai OCR 权重与 SigLIP2 processor 缓存（{cache_root}）"
-        if any_model_ready and not any_processor_ready:
-            return False, "已检测到 Hayai OCR 权重，但 SigLIP2 processor 缓存尚未完成"
-        if any_processor_ready and not any_model_ready:
-            return False, "已检测到 SigLIP2 processor，但 Hayai OCR 权重尚未完成"
-        return False, "环境已安装，但 Hayai OCR PyTorch 权重不完整或尚未下载"
+            if model_ready and _supernova_siglip_config_complete(cache_root):
+                return True, f"完整 v2.7 Supernova 官方模型和 SigLIP2 配置缓存（{cache_root}）"
+        return False, "v2.7 Supernova 模型、处理器、模型代码或 SigLIP2 配置尚未完整缓存"
 
     if component_id == "ndlocr_lite":
         model_dir = ROOT / ".ocr-runtimes" / "ndlocr-lite" / "src" / "model"
@@ -760,8 +606,9 @@ def _runtime_python_exists(component_id: str) -> bool:
     """Check the effective runtime while preserving legacy test/plugin hooks."""
     if component_id == "manga_48px":
         return _manga_48px_effective_python()[0] is not None
-    if component_id in {"hayai_ocr", "hayai_ocr_litert"}:
-        return _hayai_effective_python(component_id)[0] is not None
+    if component_id == "hayai_ocr_supernova":
+        from adapters.hayai_ocr_adapter import _supernova_effective_python
+        return _supernova_effective_python()[0] is not None
     return _venv_python_exists(COMPONENTS[component_id].venv_dir)
 
 
@@ -788,18 +635,11 @@ def _state_marker_ready(component_id: str) -> bool:
         # PaddleOCR 运行时”签名，不再把 v6 medium 权重作为唯一 ready 条件。
         if component_id in {"paddle_ocr", "paddle_structure"}:
             return payload.get("runtime_signature") == PADDLE_RUNTIME_SIGNATURE
-        if component_id == "hayai_ocr":
-            version_matches = str(payload.get("version") or "") == HAYAI_OCR_RUNTIME_VERSION
-            backend_matches = str(payload.get("backend") or "torch").lower() != "litert"
-            # A marker is written only after the real Hayai worker has loaded its
-            # model successfully.  Do NOT let the static HF-cache scanner veto
-            # that stronger evidence: caches can be split across HF_HOME / hub /
-            # legacy Transformers locations even though upstream loads them fine.
-            return version_matches and backend_matches
-        if component_id == "hayai_ocr_litert":
-            version_matches = str(payload.get("version") or "") == HAYAI_OCR_RUNTIME_VERSION
-            backend_matches = str(payload.get("backend") or "").lower() == "litert"
-            return version_matches and backend_matches
+        if component_id == "hayai_ocr_supernova":
+            from adapters.hayai_ocr_adapter import SUPERNOVA_RUNTIME_VERSION
+            return (payload.get("version") == SUPERNOVA_RUNTIME_VERSION and
+                    payload.get("backend") == "supernova" and
+                    _model_cache_ready(component_id)[0])
         return True
     except Exception:
         return False
@@ -839,7 +679,7 @@ def clear_runtime_ready(component_id: str) -> None:
 
 def probe_runtime(component_id: str, *, deep: bool = False, refresh: bool = False) -> RuntimeProbe:
     if component_id not in COMPONENTS:
-        return RuntimeProbe(component_id, True, True, "系统组件可用", "system")
+        return RuntimeProbe(component_id, False, False, "未知或已移除的 OCR 组件", "unknown")
     key = (component_id, deep)
     if not refresh and key in _PROBE_CACHE:
         return _PROBE_CACHE[key]
@@ -926,8 +766,7 @@ def required_components(
     if engine == "paddle_ocr":
         return [{"ocr":"paddle_ocr","structure":"paddle_structure","vl":"paddle_vl"}.get(paddle_pipeline,"paddle_ocr")]
     if engine == "hayai_ocr":
-        backend = str((engine_options or {}).get("backend") or "torch").strip().lower()
-        return ["hayai_ocr_litert" if backend in {"litert", "tflite", "lite_rt"} else "hayai_ocr"]
+        return ["hayai_ocr_supernova"]
     if engine in {"ndlocr_lite","manga_48px"}:
         return [engine]
     return []
@@ -940,7 +779,7 @@ def missing_components(component_ids: list[str]) -> list[RuntimeComponent]:
             continue
         if runtime_ready(cid):
             continue
-        if cid in {"hayai_ocr", "hayai_ocr_litert"}:
+        if cid == "hayai_ocr_supernova":
             # Cached weights are more important than source-local environment
             # location.  A new source ZIP may only need its persistent venv
             # created/repaired; never prompt as if already-local weights must be
@@ -996,8 +835,11 @@ def installed_local_layout_engines() -> list[str]:
 
 
 def installed_local_recognition_engines() -> list[str]:
-    candidates = ["hayai_ocr", "manga_48px", "ndlocr_lite", "paddle_ocr"]
+    # The UI engine remains ``hayai_ocr``; the actual runtime is Supernova.
+    candidates = ["manga_48px", "ndlocr_lite", "paddle_ocr"]
     installed = [item for item in candidates if runtime_ready(item)]
+    if runtime_ready("hayai_ocr_supernova"):
+        installed.insert(0, "hayai_ocr")
     try:
         from adapters.windows_snipping_ocr_adapter import availability
         if availability()[0]:

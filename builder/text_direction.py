@@ -1,15 +1,27 @@
 # -*- coding: utf-8 -*-
 """Opt-in, publication-only vertical->horizontal EPUB conversion.
 
-Adapted from the goals of upstream PR #12 for the 2026-11-13 local tree.
-The default output never passes through this module. We only alter layout
-markup and Unicode vertical presentation forms; original document blocks,
-Ruby annotations, illustration paths and canonical adjudication remain intact.
+Adapted for the 2026-11-15 local tree:
+- Default output never passes through this module (`TextDirectionMode.KEEP`).
+- Preserves existing `<span class="tcy">` elements as inline spans while stripping
+  vertical CSS declarations so anchored Ruby and semantic IDs stay intact.
+- Provides `has_vertical_writing_mode()` and `ltr_stylesheet()` for EPUB export.
 """
 from __future__ import annotations
 
 import re
 from enum import Enum
+
+__all__ = [
+    "TextDirectionMode",
+    "VERTICAL_TO_HORIZONTAL_PUNCT",
+    "coerce_text_direction",
+    "normalize_punctuation_for_horizontal",
+    "convert_xhtml_to_ltr",
+    "convert_css_to_ltr",
+    "has_vertical_writing_mode",
+    "ltr_stylesheet",
+]
 
 
 class TextDirectionMode(str, Enum):
@@ -18,14 +30,18 @@ class TextDirectionMode(str, Enum):
 
 
 def coerce_text_direction(mode: TextDirectionMode | str | None) -> TextDirectionMode:
-    if mode is None or str(mode).strip() == '':
-        return TextDirectionMode.KEEP
     if isinstance(mode, TextDirectionMode):
         return mode
-    return TextDirectionMode(str(mode).strip().lower())
+    if mode is None or str(mode).strip() == '':
+        return TextDirectionMode.KEEP
+    key = str(mode).strip().lower()
+    try:
+        return TextDirectionMode(key)
+    except ValueError:
+        raise ValueError(f"Unknown text direction mode: {mode!r}") from None
 
 
-VERTICAL_TO_HORIZONTAL_PUNCT = {
+VERTICAL_TO_HORIZONTAL_PUNCT: dict[str, str] = {
     '\ufe10': '，', '\ufe11': '、', '\ufe12': '。', '\ufe13': '：', '\ufe14': '；',
     '\ufe15': '！', '\ufe16': '？', '\ufe17': '〖', '\ufe18': '〗', '\ufe19': '…',
     '\ufe30': '‥', '\ufe31': '—', '\ufe32': '–', '\ufe35': '（', '\ufe36': '）',
@@ -56,11 +72,33 @@ _DECL = re.compile(
 _LTR_MARK = '/* novel-formatter optional LTR */'
 
 
+def _is_vertical_writing_mode_value(value: str) -> bool:
+    return value.strip().lower().startswith(('vertical-', 'tb-', 'tb'))
+
+
+def has_vertical_writing_mode(css: str) -> bool:
+    """Return True when the stylesheet declares any vertical writing mode."""
+    for m in _DECL.finditer(str(css or '')):
+        prop = m.group('prop').lower()
+        val = m.group('value')
+        if 'writing-mode' in prop and _is_vertical_writing_mode_value(val):
+            return True
+    return False
+
+
+def ltr_stylesheet() -> str:
+    """Horizontal LTR root rules appended in place of the vertical ones."""
+    return (
+        _LTR_MARK
+        + '\nhtml,body{writing-mode:horizontal-tb;-webkit-writing-mode:horizontal-tb;-epub-writing-mode:horizontal-tb;direction:ltr;}\n'
+    )
+
+
 def _remove_vertical_css(css: str) -> str:
     def replacement(m):
         p, v = m.group('prop').lower(), m.group('value').strip().lower()
         if 'writing-mode' in p:
-            return '' if v.startswith(('vertical-', 'tb-', 'tb')) else m.group(0)
+            return '' if _is_vertical_writing_mode_value(v) else m.group(0)
         if 'text-orientation' in p or 'text-combine' in p:
             return ''
         return m.group(0)
@@ -72,7 +110,7 @@ def convert_css_to_ltr(css: str) -> str:
     if _LTR_MARK in css:
         return css
     css = _remove_vertical_css(css)
-    return css + '\n' + _LTR_MARK + '\nhtml,body{writing-mode:horizontal-tb;-webkit-writing-mode:horizontal-tb;-epub-writing-mode:horizontal-tb;direction:ltr;}\n'
+    return css + '\n' + ltr_stylesheet()
 
 
 # Regex only tokenizes top-level markup. It never attempts to parse HTML with
@@ -84,8 +122,6 @@ _TOKEN = re.compile(
 )
 _STYLE_ATTR = re.compile(r'(\sstyle\s*=\s*)(["\'])(.*?)\2', re.I | re.S)
 _DIR_ATTR = re.compile(r'(\sdir\s*=\s*)(["\'])(.*?)\2', re.I | re.S)
-_CLASS_ATTR = re.compile(r'\sclass\s*=\s*["\']([^"\']*)["\']', re.I)
-_TCY = {'tcy', 'tate-chu-yoko', 'tatechuyoko', 'text-combine'}
 
 
 def _set_dir_ltr(tag: str) -> str:

@@ -11,6 +11,8 @@ from PySide6.QtGui import QCursor
 from PySide6.QtWidgets import QHBoxLayout, QLabel, QPushButton, QVBoxLayout, QWidget
 
 from ui.common.styling import accent_button
+from ui.localization import translate_text
+from ui.localized_dialogs import current_ui_language
 from ui.navigation.flow import FLOW, flow_position, next_section, step_state
 from ui.theme.tokens import ACC_BG, ACC_TEXT, BG, CLICKABLE_HOVER, INK, MUTED, SUBTLE, SUCCESS
 
@@ -110,3 +112,17 @@ class PageHeader(QWidget):
         self._next_btn.setVisible(False)
         if target is not None:
             self._next_btn.setText(f"下一步：{_NEXT_LABEL[target]} →")
+        language = current_ui_language()
+        title, subtitle = info
+        sources = [(self._title, title), (self._sub, subtitle)]
+        for section, chip in self._chips.items():
+            prefix = "✓ " if step_state(section, index) == "done" else ""
+            sources.append((chip, prefix + dict(FLOW).get(section, "")))
+        if target is not None:
+            sources.append((self._next_btn, f"下一步：{_NEXT_LABEL[target]} →"))
+        for widget, source in sources:
+            translated = translate_text(source, language)
+            # Preserve the canonical source for InterfacePreferenceManager.
+            widget._nf_i18n_source_text = source
+            widget._nf_i18n_applied_text = translated
+            widget.setText(translated)

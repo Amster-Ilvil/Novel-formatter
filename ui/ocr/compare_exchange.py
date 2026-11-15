@@ -133,6 +133,8 @@ class OCRCompareExchangeService:
                 delete_flags=delete_flags,
                 ruby_overlay_source=self._ruby_overlay_doc,
             )
+            from ui.ocr.gui_roundtrip_authority import attach_gui_review_authority
+            attach_gui_review_authority(package, self._fusion_states)
             written = save_package(package, path)
         except Exception as exc:
             self.package_exported.emit({"kind": "multi_roundtrip", "status": "error", "path": str(path), "error": str(exc), "details": {}})
@@ -240,7 +242,11 @@ class OCRCompareExchangeService:
                     imported_comparison.rows,
                     auto_choose=False,
                 )
-                if len(lines) == len(fusion_states):
+                from ui.ocr.gui_roundtrip_authority import reapply_gui_review_authority
+                restored = reapply_gui_review_authority(package, fusion_states, lines)
+                if not restored and len(lines) == len(fusion_states):
+                    # Backward compatibility: older packages carry no review
+                    # authority manifest, so retain their existing semantics.
                     package_items = list(package.get("editable_items") or [])
                     for row_index, (state, text) in enumerate(zip(fusion_states, lines)):
                         delete_intentionally = (

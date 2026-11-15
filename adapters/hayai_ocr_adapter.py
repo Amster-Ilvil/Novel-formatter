@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import subprocess
 import tempfile
 import threading
@@ -36,33 +37,18 @@ from utils.apple_silicon_runtime import (
 )
 
 ROOT = Path(__file__).parent.parent
-VENV_DIR = persistent_venv_dir("hayai-ocr-v2.1")
+SUPERNOVA_VENV_DIR = persistent_venv_dir("hayai-ocr-v2.7-supernova")
+SUPERNOVA_MODEL = "JustANormalTinkerer/hayai-ocr-v2.7-supernova"
+SUPERNOVA_REVISION = "517bdeeb64b68c08939e12f7211e99943c1e1640"
+SUPERNOVA_RUNTIME_VERSION = f"v2.7-supernova@{SUPERNOVA_REVISION}"
 WORKER_SCRIPT = Path(__file__).parent / "hayai_ocr_worker.py"
-MODEL_CACHE = ROOT / ".model-cache" / "hayai-ocr"
-HAYAI_OCR_VERSION = "2.3.0"
-# Phase26 role-fit contract: Hayai v2.5-nova always uses the proven 512-patch
-# NaFlex budget.  Upstream nova currently defaults to 512 too, but making the
-# value explicit prevents an inherited HAYAI_MAX_NUM_PATCHES environment value
-# or a future upstream default change from silently altering OCR quality.
-HAYAI_TORCH_MAX_NUM_PATCHES = 512
-HAYAI_OCR_PACKAGE = os.environ.get(
-    "NOVEL_FORMATTER_HAYAI_OCR_PACKAGE", f"hayai-ocr=={HAYAI_OCR_VERSION}"
-)
-# Hayai v2 uses SigLIP2/Transformers 4 APIs. Keep the independent runtime out
-# of a future Transformers major-version migration until this adapter is
-# explicitly revalidated; this cannot affect any other OCR venv.
-HAYAI_TRANSFORMERS_PACKAGE = os.environ.get(
-    "NOVEL_FORMATTER_HAYAI_TRANSFORMERS_PACKAGE", "transformers>=4.49,<5"
-)
-# PyTorch 2.14 adds current Apple-Silicon/MPS kernel improvements. Keep the
-# pin scoped to the isolated Hayai environment and allow an explicit override.
-HAYAI_TORCH_PACKAGE = os.environ.get(
-    "NOVEL_FORMATTER_HAYAI_TORCH_PACKAGE", "torch>=2.14,<2.15"
-)
+SUPERNOVA_TORCH_MAX_NUM_PATCHES = 256
+SUPERNOVA_M6_TORCH_PACKAGE = os.environ.get("NOVEL_FORMATTER_HAYAI_TORCH_PACKAGE", "torch>=2.14,<2.15")
 
 
 def _normalise_backend(value: str | None) -> str:
-    return "litert" if str(value or "").strip().lower() in {"litert", "tflite", "lite_rt"} else "torch"
+    # Legacy saved backend values migrate to the supported v2.7 model.
+    return "supernova"
 
 
 def _safe_int(value, default: int, *, minimum: int, maximum: int) -> int:
@@ -81,123 +67,99 @@ def _safe_float(value, default: float, *, minimum: float, maximum: float) -> flo
     return max(minimum, min(maximum, parsed))
 
 
-def _normalise_litert_quant(value: str | None) -> str:
-    raw = str(value or "wi4").strip().lower().replace("-", "_")
-    aliases = {
-        "int4": "wi4",
-        "int8": "wi8_afp32",
-        "wi8": "wi8_afp32",
-        "float": "none",
-        "fp32": "none",
-        "dynamic_int4": "dynamic_wi4",
-        "dynamic_int8": "dynamic_wi8",
-    }
-    raw = aliases.get(raw, raw)
-    return raw if raw in {"none", "wi4", "wi8_afp32", "dynamic_wi4", "dynamic_wi8"} else "wi4"
-
-
-def _resolved_model_cache(backend: str = "torch") -> Path:
-    """Use the same already-populated cache root that runtime detection found.
-
-    Prefer the project-local cache for new downloads, but transparently reuse a
-    complete HF_HOME / ~/.cache/huggingface installation.  This keeps the model
-    detector and the actual Hayai worker from disagreeing about where the model
-    lives.
-    """
+def _resolved_model_cache(backend: str = "supernova") -> Path:
+    """Reuse a complete official v2.7 cache, never inspect old Hayai models."""
+    from adapters.ocr_runtime_catalog import (
+        _hayai_cache_roots, _hayai_repo_candidates, _hf_repo_dir,
+        _supernova_cache_complete, _supernova_siglip_config_complete,
+    )
+    model = _supernova_model_location()
+    local_model = Path(model).expanduser()
+    if local_model.is_dir():
+        return local_model.parent
+    repo_dir = _hf_repo_dir(model)
+    for root in _hayai_cache_roots():
+        if (any(_supernova_cache_complete(path, revision=SUPERNOVA_REVISION)
+                for path in _hayai_repo_candidates(root, repo_dir))
+                and _supernova_siglip_config_complete(root)):
+            return root
     override = os.environ.get("NOVEL_FORMATTER_HAYAI_OCR_CACHE_DIR", "").strip()
-    if override:
-        return Path(override).expanduser()
-    try:
-        from adapters.ocr_runtime_catalog import _hayai_cache_roots, _hayai_litert_cache_complete, _hayai_processor_cache_complete, _hayai_repo_candidates, _hayai_torch_cache_complete, _hf_repo_dir
-        roots = _hayai_cache_roots()
-        if _normalise_backend(backend) == "litert":
-            repo_id = os.environ.get(
-                "NOVEL_FORMATTER_HAYAI_OCR_LITERT_REPO", "JustANormalTinkerer/hayai-ocr-v2-tflite"
-            ).strip() or "JustANormalTinkerer/hayai-ocr-v2-tflite"
-            repo_dir = _hf_repo_dir(repo_id)
-            for root in roots:
-                if any(_hayai_litert_cache_complete(path) for path in _hayai_repo_candidates(root, repo_dir)):
-                    return root
-        else:
-            model_name = os.environ.get(
-                "NOVEL_FORMATTER_HAYAI_OCR_MODEL", "JustANormalTinkerer/hayai-ocr-v2.5-nova"
-            ).strip() or "JustANormalTinkerer/hayai-ocr-v2.5-nova"
-            local_model = Path(model_name).expanduser()
-            repo_dir = _hf_repo_dir(model_name) if not local_model.exists() else ""
-            for root in roots:
-                processor_ready = _hayai_processor_cache_complete(root)
-                model_ready = local_model.exists() and _hayai_torch_cache_complete(local_model)
-                if repo_dir:
-                    model_ready = any(
-                        _hayai_torch_cache_complete(path)
-                        for path in _hayai_repo_candidates(root, repo_dir)
-                    )
-                if model_ready and processor_ready:
-                    return root
-    except Exception:
-        pass
-    return MODEL_CACHE
+    return Path(override).expanduser() if override else ROOT / ".model-cache" / "hayai-supernova"
 
 
-def _current_interpreter_runtime() -> Path | None:
-    """Reuse an already-provisioned exact Hayai runtime without invoking pip.
-
-    This is primarily useful for offline/cloud bundles and system-managed app
-    environments.  It is deliberately conservative: the exact Hayai package
-    must be present and a local model path (or a previously verified offline
-    cache) must exist.  A merely importable package is not enough to suppress
-    the normal private-venv installer.
-    """
-    try:
-        from importlib.metadata import version
-        if version("hayai-ocr") != HAYAI_OCR_VERSION:
-            return None
-        transformers_version = version("transformers")
-        major, minor = (int(part) for part in transformers_version.split("+", 1)[0].split(".")[:2])
-        if major != 4 or minor < 49:
-            return None
-    except Exception:
-        return None
-
-    model_value = os.environ.get("NOVEL_FORMATTER_HAYAI_OCR_MODEL", "").strip()
-    local_model_ready = bool(model_value and Path(model_value).expanduser().exists())
-    cache_ready = False
-    try:
-        cache_ready = _offline_cache_ready("torch")
-    except Exception:
-        cache_ready = False
-    if not (local_model_ready or cache_ready):
-        return None
-    return Path(sys.executable).resolve()
+def _supernova_model_location() -> str:
+    """Only the official upstream repo or a local folder is permitted."""
+    model = os.environ.get("NOVEL_FORMATTER_HAYAI_SUPERNOVA_MODEL", SUPERNOVA_MODEL).strip() or SUPERNOVA_MODEL
+    if model != SUPERNOVA_MODEL and not Path(model).expanduser().is_dir():
+        raise ValueError("Supernova 模型来源必须是官方仓库或显式本地目录，拒绝未知远端代码：" + model)
+    return model
 
 
-def _project_runtime_python() -> Path:
-    return ROOT / ".venv-hayai-ocr" / ("Scripts/python.exe" if os.name == "nt" else "bin/python")
+def _project_supernova_python() -> Path:
+    return ROOT / ".venv-hayai-supernova" / ("Scripts/python.exe" if os.name == "nt" else "bin/python")
 
 
-def _probe_existing_runtime(python: Path, backend: str) -> bool:
-    """Check installed dependencies without repairing or downloading anything."""
+def _probe_supernova_runtime(python: Path) -> bool:
     if not python.is_file():
         return False
     marker = (
-        "import sys; assert (3,10) <= sys.version_info[:2] <= (3,13); "
-        "from hayai_ocr import HayaiOcr; from importlib.metadata import version; "
-        f"assert version('hayai-ocr') == {HAYAI_OCR_VERSION!r}; "
-        "v=version('transformers').split('+',1)[0].split('.'); "
-        "assert int(v[0]) == 4 and int(v[1]) >= 49"
+        "import sys; assert (3,10) <= sys.version_info[:2] <= (3,14); "
+        "import torch; from PIL import Image; from transformers import AutoModel, AutoProcessor; "
+        "from importlib.metadata import version; "
+        "assert 5 <= int(version('transformers').split('.')[0]) < 6"
     )
-    if backend == "litert":
-        marker += "; import ai_edge_litert"
-    elif is_m6():
-        marker += "; import torch; v=version('torch').split('+',1)[0].split('.'); assert tuple(map(int,v[:2])) >= (2,14)"
+    # Runtime imports determine CPU availability; device selection checks MPS separately.
+    # Do not mistake a Rosetta x86_64 interpreter for a working Apple MPS runtime.
+    from adapters.runtime_env import _host_is_apple_silicon
+    if _host_is_apple_silicon():
+        marker += "; import platform; assert platform.machine().lower() in ('arm64','aarch64')"
     try:
-        result = subprocess.run(
+        return subprocess.run(
             [str(python), "-c", marker], capture_output=True, timeout=60,
             env=dict(os.environ, HF_HUB_OFFLINE="1", TRANSFORMERS_OFFLINE="1", PIP_NO_INDEX="1"),
-        )
-        return result.returncode == 0
+        ).returncode == 0
     except (OSError, subprocess.TimeoutExpired):
         return False
+
+
+def _supernova_effective_python() -> tuple[Path | None, str]:
+    """Side-effect-free, fail-closed runtime selection for the v5 model."""
+    explicit = os.environ.get("NOVEL_FORMATTER_HAYAI_SUPERNOVA_PYTHON", "").strip()
+    if explicit:
+        path = Path(explicit).expanduser()
+        return (path, "explicit") if _probe_supernova_runtime(path) else (None, "invalid-explicit")
+    project = _project_supernova_python()
+    if _probe_supernova_runtime(project):
+        return project, "project"
+    private = SUPERNOVA_VENV_DIR / ("Scripts/python.exe" if os.name == "nt" else "bin/python")
+    if _probe_supernova_runtime(private):
+        return private, "private"
+    # Avoid treating an unrelated system installation as a managed OCR runtime.
+    return None, ""
+
+
+def _setup_supernova_venv(*, verbose: bool = True) -> Path:
+    _supernova_model_location()  # Reject unapproved custom model URLs before installs.
+    python, source = _supernova_effective_python()
+    if python is not None:
+        if verbose:
+            print(f"[Hayai v2.7] reuse {source} runtime: {python}", flush=True)
+        return python
+    if source == "invalid-explicit":
+        raise RuntimeError("Hayai v2.7 显式 Python 环境不可用；拒绝自动切换或安装")
+    if _offline_runtime_requested():
+        raise RuntimeError("Hayai v2.7 离线模式缺少可用 Transformers 5 独立环境；拒绝自动安装")
+    packages = ["torch>=2.2", "transformers>=5,<6", "accelerate", "Pillow", "safetensors", "huggingface_hub"]
+    if is_m6():
+        packages[0] = SUPERNOVA_M6_TORCH_PACKAGE
+    return ensure_venv(
+        SUPERNOVA_VENV_DIR, label="Hayai OCR v2.7 Supernova / Transformers 5",
+        marker_code=(
+            "import torch; from transformers import AutoModel, AutoProcessor; "
+            "from importlib.metadata import version; "
+            "assert 5 <= int(version('transformers').split('.')[0]) < 6"
+        ), packages=packages, verbose=verbose, min_minor=10, max_minor=14,
+    )
 
 
 def _offline_runtime_requested() -> bool:
@@ -214,80 +176,13 @@ def _offline_runtime_requested() -> bool:
     ) or os.environ.get("NOVEL_FORMATTER_MODEL_AUTO_DOWNLOAD", "").strip().lower() in no
 
 
-def setup_venv(*, verbose: bool = True, backend: str = "torch") -> Path:
-    backend = _normalise_backend(backend)
-    # Single selection order shared with the GUI runtime catalog:
-    # explicit > project > existing private > eligible current > installer.
-    # Never silently accept a broken explicit override or repair it via pip.
-    explicit = os.environ.get("NOVEL_FORMATTER_HAYAI_OCR_PYTHON", "").strip()
-    if explicit:
-        path = Path(explicit).expanduser()
-        if not _probe_existing_runtime(path, backend):
-            raise RuntimeError(
-                f"Hayai OCR 指定的 Python 环境不可用或版本不匹配：{path}。"
-                "已拒绝自动安装；请修正 NOVEL_FORMATTER_HAYAI_OCR_PYTHON。"
-            )
-        return path
-
-    project_python = _project_runtime_python()
-    if _probe_existing_runtime(project_python, backend):
-        if verbose:
-            print(f"[Hayai OCR] reuse installed project runtime: {project_python}", flush=True)
-        return project_python
-
-    private_python = VENV_DIR / ("Scripts/python.exe" if os.name == "nt" else "bin/python")
-    if str(private_python) != str(project_python) and _probe_existing_runtime(private_python, backend):
-        if verbose:
-            print(f"[Hayai OCR] reuse installed private runtime: {private_python}", flush=True)
-        return private_python
-
-    # Never claim a plain system interpreter is the runtime merely because it
-    # has the package: it must also have an already usable model/processor cache.
-    if backend == "torch":
-        current_python = _current_interpreter_runtime()
-        if current_python is not None and _probe_existing_runtime(current_python, backend):
-            if verbose:
-                print(f"[Hayai OCR] reuse current offline runtime: {current_python}", flush=True)
-            return current_python
-
-    package = HAYAI_OCR_PACKAGE
-    if backend == "litert" and "[litert]" not in package:
-        if "==" in package:
-            name, version = package.split("==", 1)
-            package = f"{name}[litert]=={version}"
-        else:
-            package = "hayai-ocr[litert]"
-    marker = (
-        "from hayai_ocr import HayaiOcr; "
-        "from importlib.metadata import version; "
-        f"assert version('hayai-ocr') == {HAYAI_OCR_VERSION!r}, version('hayai-ocr')"
-    )
-    if is_m6() and backend == "torch":
-        marker += (
-            "; v=version('torch').split('+',1)[0].split('.'); "
-            "n=tuple(int(''.join(c for c in p if c.isdigit()) or 0) for p in v[:2]); "
-            "assert n >= (2,14), 'M6 Hayai requires PyTorch 2.14+'"
-        )
-    if backend == "litert":
-        marker += "; import ai_edge_litert"
-    packages = [package, HAYAI_TRANSFORMERS_PACKAGE]
-    if is_m6() and backend == "torch":
-        packages.insert(0, HAYAI_TORCH_PACKAGE)
-    if _offline_runtime_requested():
-        raise RuntimeError("Hayai OCR 离线模式拒绝安装依赖：未找到可用的已安装环境；可通过 NOVEL_FORMATTER_HAYAI_OCR_PYTHON 指定已有 Python。")
-    return ensure_venv(
-        VENV_DIR,
-        label="Hayai OCR / PyTorch",
-        marker_code=marker,
-        packages=packages,
-        verbose=verbose,
-        min_minor=10,
-        max_minor=13,
-    )
+def setup_venv(*, verbose: bool = True, backend: str = "supernova") -> Path:
+    """Old saved backend options migrate to Supernova without old installs."""
+    return _setup_supernova_venv(verbose=verbose)
 
 
 def _offline_cache_ready(backend: str) -> bool:
-    component_id = "hayai_ocr_litert" if _normalise_backend(backend) == "litert" else "hayai_ocr"
+    component_id = "hayai_ocr_supernova"
     try:
         from adapters.ocr_runtime_catalog import (
             _environment_installed, _model_cache_ready, _read_ready_payload,
@@ -301,21 +196,20 @@ def _offline_cache_ready(backend: str) -> bool:
         if _state_marker_ready(component_id) and cache_ready:
             return True
 
-        # r3 and older column pipelines could overwrite Hayai's rich success
-        # marker with a bare {ready:true}.  Migrate that known legacy shape on
-        # first start, but only after independently verifying BOTH the exact
-        # pinned Hayai package and the complete local model/processor cache.
+        # Older column pipelines could overwrite a versioned v2.7 marker with
+        # bare {ready:true}. Migrate only after independently verifying the
+        # current Transformers 5 runtime and complete Supernova cache.
         # This lets an already-good installation become offline immediately
         # after upgrade without weakening the no-silent-download contract.
         payload = _read_ready_payload(component_id) or {}
         legacy_marker = bool(payload.get("ready")) and not str(payload.get("version") or "").strip()
         environment_ok = bool(_environment_installed(component_id, deep=False)[0]) if legacy_marker else False
         if legacy_marker and environment_ok and cache_ready:
-            normalized_backend = _normalise_backend(backend)
+            normalized_backend = "supernova"
             mark_runtime_ready(
                 component_id,
                 backend=normalized_backend,
-                version=HAYAI_OCR_VERSION,
+                version=SUPERNOVA_RUNTIME_VERSION,
                 cache_root=str(_resolved_model_cache(normalized_backend)),
                 verified_stage="legacy_ready_marker_migrated",
             )
@@ -325,44 +219,37 @@ def _offline_cache_ready(backend: str) -> bool:
         return False
 
 
-def _worker_env(backend: str = "torch") -> dict[str, str]:
-    env = torch_worker_env(os.environ.copy()) if backend == "torch" else os.environ.copy()
-    cache = _resolved_model_cache(backend)
+def _worker_env(backend: str = "supernova") -> dict[str, str]:
+    """Configure the sole supported v2.7 worker and its verified HF cache."""
+    env = torch_worker_env(os.environ.copy())
+    cache = _resolved_model_cache()
     cache.mkdir(parents=True, exist_ok=True)
-    # Pin the worker to the exact cache root selected by runtime detection.
-    # New downloads still prefer the project-local cache, while an already
-    # complete HF_HOME / ~/.cache/huggingface snapshot is reused without a
-    # second download or a repeated install-confirmation dialog.
+    from adapters.ocr_runtime_catalog import (
+        _hayai_repo_candidates, _hf_repo_dir, _supernova_cache_complete,
+    )
+    model_repo = _hf_repo_dir(SUPERNOVA_MODEL)
+    verified_snapshot = next((path for path in _hayai_repo_candidates(cache, model_repo)
+                              if _supernova_cache_complete(path, revision=SUPERNOVA_REVISION)), None)
+    # Reuse the verified cache namespace (hub/ or transformers/) containing
+    # the actual snapshot. Pinning a different empty namespace makes an offline
+    # installation look missing to Hugging Face even though readiness passed.
+    hub_cache = verified_snapshot.parent if verified_snapshot else cache / "hub"
     env["HF_HOME"] = str(cache)
-    env["HUGGINGFACE_HUB_CACHE"] = str(cache / "hub")
-    env["TRANSFORMERS_CACHE"] = str(cache / "transformers")
+    env["HF_HUB_CACHE"] = str(hub_cache)
+    env["HUGGINGFACE_HUB_CACHE"] = str(hub_cache)
+    env["TRANSFORMERS_CACHE"] = str(hub_cache)
     env.setdefault("TOKENIZERS_PARALLELISM", "false")
     env.setdefault("HF_HUB_DISABLE_SYMLINKS_WARNING", "1")
-    if backend == "torch":
-        # All platforms use the live hardware detector. Apple Silicon gets MPS/MLX
-        # tuning from the same helper, while Windows/Linux may choose CUDA/CPU.
-        env.setdefault("NOVEL_FORMATTER_HAYAI_OCR_BATCH", str(recommended_hayai_batch()))
-        env.setdefault("NOVEL_FORMATTER_HAYAI_OCR_THREADS", str(recommended_cpu_threads()))
-    # After one successful inference, keep the verified cached snapshot immutable
-    # during ordinary OCR starts.  This enforces the project's "no silent model
-    # update on startup" contract; explicit cache removal/manual maintenance is
-    # required before a new upstream snapshot can be fetched.
-    explicit_model = str(env.get("NOVEL_FORMATTER_HAYAI_OCR_MODEL") or "").strip()
-    explicit_local_model = bool(explicit_model and Path(explicit_model).expanduser().exists())
-    # A global offline request is stronger than the cache-ready heuristic.
-    # Forward it into the subprocess even if the static cache scanner failed.
+    env.setdefault("NOVEL_FORMATTER_HAYAI_OCR_BATCH", str(recommended_hayai_batch()))
+    env.setdefault("NOVEL_FORMATTER_HAYAI_OCR_THREADS", str(recommended_cpu_threads()))
+    explicit = str(env.get("NOVEL_FORMATTER_HAYAI_SUPERNOVA_MODEL") or "").strip()
+    is_local = bool(explicit and Path(explicit).expanduser().is_dir())
     if _offline_runtime_requested():
-        env["HF_HUB_OFFLINE"] = "1"
-        env["TRANSFORMERS_OFFLINE"] = "1"
-        env["PIP_NO_INDEX"] = "1"
-        env["NOVEL_FORMATTER_HAYAI_OFFLINE_ACTIVE"] = "1"
-    elif _offline_cache_ready(backend) or explicit_local_model:
-        # An explicitly local model is a no-network contract.  If its processor
-        # assets are incomplete, fail with a local-cache error rather than
-        # silently contacting Hugging Face during an OCR button click.
-        env["HF_HUB_OFFLINE"] = "1"
-        env["TRANSFORMERS_OFFLINE"] = "1"
-        env["NOVEL_FORMATTER_HAYAI_OFFLINE_ACTIVE"] = "1"
+        env.update(HF_HUB_OFFLINE="1", TRANSFORMERS_OFFLINE="1",
+                   PIP_NO_INDEX="1", NOVEL_FORMATTER_HAYAI_OFFLINE_ACTIVE="1")
+    elif _offline_cache_ready("supernova") or is_local:
+        env.update(HF_HUB_OFFLINE="1", TRANSFORMERS_OFFLINE="1",
+                   NOVEL_FORMATTER_HAYAI_OFFLINE_ACTIVE="1")
     return env
 
 
@@ -373,6 +260,11 @@ def validate_hayai_ocr_text(text: str, expected_chars: int) -> tuple[bool, float
         return False, 0.0, "Hayai OCR 返回空文本"
     expected = max(1, int(expected_chars or 1))
     ratio = len(value) / expected
+    # This model can emit a plausible Japanese prefix followed by a repeated
+    # hallucination. Keep that prefix for visual review instead of accepting
+    # the repeated tail as book text. Length checks alone miss shorter loops.
+    if len(value) >= 10 and re.search(r"(.{1,3})\1{5,}", value):
+        return False, 0.0, "Hayai OCR 疑似循环重复幻觉"
     if len(value) > max(56, int(expected * 2.35 + 10)):
         return False, 0.0, f"Hayai OCR 输出字数异常（识别 {len(value)} / 字形估计 {expected}）"
     if ratio < 0.26:
@@ -404,36 +296,32 @@ class HayaiOcrSession:
         self.effective_quantize = "none"
         self.startup_warning = ""
         self._request_id = 0
+        # Source-crop keyed rejected model responses. These are untrusted OCR
+        # candidates, NEVER automatically promoted to canonical book text.
+        # The orchestration layer retains them in column review metadata.
+        self.review_evidence: dict[str, list[dict]] = {}
         # Snapshot the transport batch before the worker/model consumes unified
         # memory.  Recomputing from live free memory after model load creates a
         # self-throttling loop on Apple Silicon: the model's own expected memory
         # footprint makes every later batch look like memory pressure.  Real OOM
         # protection remains in the worker and can still reduce effective_batch.
-        self._startup_segment_batch = 4 if self.backend == "litert" else max(1, recommended_hayai_batch())
+        self._startup_segment_batch = max(1, recommended_hayai_batch())
         self._batch_was_explicit = "NOVEL_FORMATTER_HAYAI_OCR_BATCH" in os.environ
 
     def __enter__(self):
         python = setup_venv(verbose=self.verbose, backend=self.backend)
-        quantize = str(self.options.get("quantize") or "none").strip().lower()
-        if quantize not in {"none", "int8", "int4"}:
-            quantize = "none"
-        self.requested_quantize = quantize
+        # v2.7 always uses non-quantized Supernova weights; old profile
+        # quantization values are deliberately ignored during migration.
+        self.requested_quantize = "none"
         device = str(self.options.get("device") or "auto").strip().lower()
         if device not in {"auto", "cpu", "cuda", "mps"}:
             device = "auto"
-        litert_quant = _normalise_litert_quant(self.options.get("litert_quant"))
-        litert_threads = _safe_int(self.options.get("litert_threads"), 0, minimum=0, maximum=256)
-        max_token_cap = 64 if self.backend == "litert" else 192
-        max_new_tokens = _safe_int(self.options.get("max_new_tokens"), 128, minimum=32, maximum=max_token_cap)
+        max_new_tokens = _safe_int(self.options.get("max_new_tokens"), 128, minimum=32, maximum=192)
         cmd = [
-            str(python), str(WORKER_SCRIPT), "--stream",
-            "--backend", self.backend,
+            str(python), str(WORKER_SCRIPT), "--stream", "--backend", "supernova",
             "--device", device,
-            "--quantize", quantize,
-            "--litert-quant", litert_quant,
-            "--litert-threads", str(litert_threads),
             "--max-new-tokens", str(max_new_tokens),
-            "--max-num-patches", str(HAYAI_TORCH_MAX_NUM_PATCHES if self.backend == "torch" else 256),
+            "--max-num-patches", str(SUPERNOVA_TORCH_MAX_NUM_PATCHES),
         ]
         from adapters.subprocess_watchdog import LinePump, isolated_process_kwargs
         worker_env = _worker_env(self.backend)
@@ -482,7 +370,7 @@ class HayaiOcrSession:
         # Match the proven fast pre-regression MPS operating point unless the
         # user explicitly overrides it.  A lower pre-load recommendation is
         # retained; worker-side OOM backoff can still lower it further.
-        if "mps" in self.device.lower() and not self._batch_was_explicit and self.backend != "litert":
+        if "mps" in self.device.lower() and not self._batch_was_explicit:
             self._startup_segment_batch = min(self._startup_segment_batch, 8)
         self.effective_quantize = str(ready.get("effective_quantize") or ready.get("quantize") or "none")
         self.startup_warning = str(ready.get("warning") or "").strip()
@@ -495,12 +383,12 @@ class HayaiOcrSession:
         # a Hayai model that has just proven it can load successfully.
         try:
             from adapters.ocr_runtime_catalog import mark_runtime_ready
-            component_id = "hayai_ocr_litert" if self.backend == "litert" else "hayai_ocr"
+            component_id = "hayai_ocr_supernova"
             mark_runtime_ready(
                 component_id,
                 backend=self.backend,
                 device=self.device,
-                version=HAYAI_OCR_VERSION,
+                version=SUPERNOVA_RUNTIME_VERSION,
                 cache_root=str(_resolved_model_cache(self.backend)),
                 requested_quantize=self.requested_quantize,
                 effective_quantize=self.effective_quantize,
@@ -610,7 +498,7 @@ class HayaiOcrSession:
         if "mps" in self.device.lower() and "NOVEL_FORMATTER_HAYAI_OCR_SOURCE_WINDOW" not in os.environ:
             source_window = max(24, recommended_hayai_segment_chars())
         source_window = max(2, min(48, source_window))
-        default_batch = 4 if self.backend == "litert" else self._startup_segment_batch
+        default_batch = self._startup_segment_batch
         try:
             segment_batch = int(os.environ.get("NOVEL_FORMATTER_HAYAI_OCR_BATCH", str(default_batch)) or default_batch)
         except ValueError:
@@ -776,34 +664,72 @@ class HayaiOcrSession:
                     offset += len(batch)
 
                 for source_path, segments, column_count, prepare_error in prepared:
-                    # A later batch transport failure must not discard source crops
-                    # whose complete segment set was already returned successfully.
+                    # v2.7 evidence-preserving guard: rejection of ONE segment
+                    # must not erase successfully decoded neighboring segments.
+                    # Unsafe output is always marked for review, not accepted as
+                    # authoritative text. A visible square marks missing text.
+                    self.review_evidence.pop(source_path, None)
                     failure = prepare_error
                     column_texts: dict[int, list[str]] = {}
                     confidences: list[float] = []
+                    rejected: list[dict] = []
                     if not failure:
                         for segment in segments:
                             data = returned.get(segment.path)
                             if data is None:
-                                failure = segment_errors.get(
+                                reason = segment_errors.get(
                                     segment.path, f"Hayai OCR 未返回分段: {Path(segment.path).name}"
                                 )
-                                break
-                            if not data.get("ok"):
-                                failure = str(data.get("error") or "未知错误")
-                                break
-                            blocks = data.get("blocks") or []
-                            text = "".join(
-                                str(item.get("text") or "").strip()
-                                for item in blocks
-                                if str(item.get("text") or "").strip()
-                            ).strip()
-                            valid, confidence, reason = validate_hayai_ocr_text(text, segment.expected_chars)
-                            if not valid:
-                                failure = reason
-                                break
-                            column_texts.setdefault(segment.column_index, []).append(compact_text(text))
-                            confidences.append(confidence)
+                                raw_text = ""
+                            elif not data.get("ok"):
+                                reason = str(data.get("error") or "未知错误")
+                                raw_text = ""
+                            else:
+                                blocks = data.get("blocks") or []
+                                raw_text = "".join(
+                                    str(item.get("text") or "").strip()
+                                    for item in blocks
+                                    if str(item.get("text") or "").strip()
+                                ).strip()
+                                valid, confidence, reason = validate_hayai_ocr_text(
+                                    raw_text, segment.expected_chars
+                                )
+                                if valid:
+                                    column_texts.setdefault(segment.column_index, []).append(compact_text(raw_text))
+                                    confidences.append(confidence)
+                                    continue
+                            compact = compact_text(raw_text)
+                            # Keep the unmodified model response for original-image
+                            # AI adjudication. An arbitrary length cap is reported,
+                            # not silently hidden. No private page data in stderr.
+                            rejected.append({
+                                "segment_index": int(segment.segment_index),
+                                "column_index": int(segment.column_index),
+                                "expected_chars": int(segment.expected_chars),
+                                "reason": str(reason),
+                                "raw_text": raw_text[:4096],
+                                "raw_truncated": len(raw_text) > 4096,
+                            })
+                            # A short but Japanese-looking response can contain a
+                            # valid beginning. Preserve it with explicit missing-
+                            # text marker, *never* as a complete high-confidence
+                            # candidate. Overlong/foreign/repetitive hallucination
+                            # is evidence only, not injected into output prose.
+                            plausible_prefix = bool(
+                                compact and len(compact) <= max(56, int(segment.expected_chars * 2.35 + 10))
+                                and japanese_ratio(compact) >= 0.42
+                                and 0 < len(compact) < max(1, segment.expected_chars * 0.26)
+                            )
+                            safe_prefix = compact if plausible_prefix else ""
+                            if "循环重复幻觉" in str(reason) and japanese_ratio(compact) >= 0.42:
+                                repeat = re.search(r"(.{1,3})\1{5,}", compact)
+                                if repeat is not None and repeat.start() >= 3:
+                                    safe_prefix = compact[:repeat.start()]
+                            guarded = safe_prefix + "□"
+                            column_texts.setdefault(segment.column_index, []).append(guarded)
+                            confidences.append(0.0)
+                    if rejected:
+                        self.review_evidence[source_path] = rejected
                     if failure:
                         results[source_path] = ("", 0.0, failure)
                     else:
@@ -813,11 +739,16 @@ class HayaiOcrSession:
                             if column_texts.get(index)
                         ]
                         text = ("\n" if column_count > 1 else "").join(ordered_columns).strip()
-                        results[source_path] = (
-                            text,
-                            min(confidences) if confidences else 0.0,
-                            None if text else "Hayai OCR 未返回有效文字",
-                        )
+                        # Placeholder-only crops must remain unresolved even
+                        # after a model returned an obviously unsafe response.
+                        if text and any(ch not in "□\n " for ch in text):
+                            results[source_path] = (
+                                text,
+                                0.0 if rejected else (min(confidences) if confidences else 0.0),
+                                None,
+                            )
+                        else:
+                            results[source_path] = ("", 0.0, rejected[0]["reason"] if rejected else "Hayai OCR 未返回有效文字")
                     completed += 1
                     if callable(progress_callback):
                         progress_callback(completed, total, source_path)
@@ -912,12 +843,12 @@ class HayaiOcrSession:
                 raise
         if exc is None:
             from adapters.ocr_runtime_catalog import mark_runtime_ready
-            component_id = "hayai_ocr_litert" if self.backend == "litert" else "hayai_ocr"
+            component_id = "hayai_ocr_supernova"
             mark_runtime_ready(
                 component_id,
                 backend=self.backend,
                 device=self.device,
-                version=HAYAI_OCR_VERSION,
+                version=SUPERNOVA_RUNTIME_VERSION,
                 cache_root=str(_resolved_model_cache(self.backend)),
                 requested_quantize=self.requested_quantize,
                 effective_quantize=self.effective_quantize,

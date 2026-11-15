@@ -39,7 +39,13 @@ from textwrap import dedent
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 from models.document import UnifiedDocument, Block, BlockType
-from builder.text_direction import TextDirectionMode, coerce_text_direction, convert_css_to_ltr, convert_xhtml_to_ltr
+from builder.text_direction import (
+    TextDirectionMode,
+    coerce_text_direction,
+    convert_css_to_ltr,
+    convert_xhtml_to_ltr,
+    has_vertical_writing_mode,
+)
 from utils.atomic_io import atomic_write_text
 from engine.illustration_spread import detect_likely_illustration_spreads
 
@@ -700,7 +706,9 @@ def build_epub(
     /手写的自定义排版），此时 css_template 只在 custom_css 为空时才生效。
     include_nav_in_spine: 兼容极少数旧阅读器；默认 False，避免目录被当作正文翻到。
     """
-    ltr = coerce_text_direction(text_direction) is TextDirectionMode.LTR
+    direction = coerce_text_direction(text_direction)
+    ltr = direction is TextDirectionMode.LTR
+    convert_vertical = ltr and vertical
     out = Path(output_path)
     tmp = out.parent / f"_epub_tmp_{out.stem}"
     tmp.mkdir(parents=True, exist_ok=True)
@@ -776,9 +784,6 @@ ruby { ruby-position: over; }
 ruby rt { ruby-position: over; -webkit-ruby-position: before; }
 """
 
-    if ltr:
-        css_content = convert_css_to_ltr(css_content)
-
     if not vertical:
         # 移除完整的 writing-mode 声明。旧正则只识别 -epub- 前缀，
         # 在 -webkit-writing-mode 上从中间开始匹配，留下无效的 "-webkit-"。
@@ -787,6 +792,9 @@ ruby rt { ruby-position: over; -webkit-ruby-position: before; }
             '',
             css_content,
         )
+
+    if ltr and (vertical or has_vertical_writing_mode(css_content)):
+        css_content = convert_css_to_ltr(css_content)
 
     (oebps / "styles" / "style.css").write_text(css_content, encoding="utf-8")
 
@@ -854,23 +862,46 @@ ruby rt { ruby-position: over; -webkit-ruby-position: before; }
         auto_spreads = detect_likely_illustration_spreads(doc)
     except Exception:
         auto_spreads = []
+    # 当竖排原书转换为横排 LTR 时，阅读器按左→右配对跨页插图：
+    # 将高置信度自动检测到的見開き（first=右半页, second=左半页）在导出队列中对调，
+    # 使左半页在前（page-spread-left）、右半页在后（page-spread-right）。
+    # 带有显式 page_spread 元数据的插图块保持原样不重排。
+    swap_pairs: list[tuple[int, int]] = []
     for pair in auto_spreads:
-        if vertical:
+        if convert_vertical:
+            first, second = pair.first_block_index, pair.second_block_index
+            if first in spread_by_block or second in spread_by_block:
+                continue
+            spread_by_block[first] = "right"
+            spread_by_block[second] = "left"
+            swap_pairs.append((first, second))
+        elif vertical:
             spread_by_block.setdefault(pair.first_block_index, "right")
             spread_by_block.setdefault(pair.second_block_index, "left")
         else:
             spread_by_block.setdefault(pair.first_block_index, "left")
             spread_by_block.setdefault(pair.second_block_index, "right")
+    export_blocks = list(doc.blocks)
+    for first, second in swap_pairs:
+        export_blocks[first], export_blocks[second] = export_blocks[second], export_blocks[first]
     if verbose and auto_spreads:
         print(f"  🖼️  跨页插图：检测到 {len(auto_spreads)} 组高置信度見開き，仅写入 page-spread 提示，不拼图")
 
     # ── 将 blocks 分组为章节 ─────────────────────────────────────────────────
     # chapter 0 = 书前（序言之前的内容）
     chapters: list[tuple[str, list[Block]]] = []
-    current_title = FRONT_MATTER_TITLE
+    # A true one-page OCR sample without a CHAPTER block is a publication
+    # sample, not front matter of a book.  Use its explicit document title in
+    # the EPUB navigation, without inserting fabricated text into the scan.
+    is_single_page_sample = (
+        len(doc.pages) == 1
+        and bool(str(title or "").strip())
+        and not any(b.type == BlockType.CHAPTER for b in export_blocks)
+    )
+    current_title = title if is_single_page_sample else FRONT_MATTER_TITLE
     current_blocks: list[Block] = []
 
-    for b in doc.blocks:
+    for b in export_blocks:
         if b.type == BlockType.IMAGE_REF:
             current_blocks.append(b)
             continue

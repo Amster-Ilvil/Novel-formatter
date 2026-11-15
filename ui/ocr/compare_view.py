@@ -11,7 +11,166 @@ from ui.ocr.compare_widgets import _FusionDecisionRow
 from ui.ocr.review_flow import candidate_for_key, step_pending
 
 
+def re_sub_font_size(style: str, size: int) -> str:
+    import re
+    if re.search(r'font-size:\s*\d+px', style):
+        return re.sub(r'font-size:\s*\d+px', f'font-size:{int(size)}px', style)
+    return style + f'QPlainTextEdit{{font-size:{int(size)}px;}}'
+
+
 class OCRCompareViewMixin:
+
+    def _review_font_size_changed(self, _index: int = -1) -> None:
+        size = int(self._review_font_size_combo.currentData() or 16)
+        for widget in list(getattr(self, '_fusion_widgets', {}).values()) + list(getattr(self, '_fusion_widget_cache', {}).values()):
+            for card in getattr(widget, '_cards', ()):
+                # Qt stylesheet font-size has precedence over setFont; edit the
+                # narrow QPlainTextEdit rule only, leaving diff highlights alone.
+                original = card.editor.styleSheet()
+                import re
+                card.editor.setStyleSheet(re.sub(r'font-size:\s*\d+px', f'font-size:{size}px', original))
+                card._fit_editor_height()
+        editor = getattr(self, '_manual_decision_editor', None)
+        if editor is not None:
+            editor.setStyleSheet(re_sub_font_size(editor.styleSheet(), size))
+            self._schedule_manual_decision_editor_fit()
+
+    def _toggle_page_column_view(self) -> None:
+        self._page_nav_preferred = not bool(getattr(self, '_page_nav_preferred', False))
+        self._sync_page_column_visibility()
+
+    def _sync_page_column_visibility(self) -> None:
+        page = getattr(self, '_page_nav_view', None)
+        if page is None:
+            return
+        decision = getattr(self, '_review_mode', '') == 'decision'
+        full_available = bool(page.image_path)
+        full_active = bool(getattr(self, '_page_nav_preferred', False) and decision and full_available)
+        page.setVisible(full_active)
+        info = getattr(self, '_page_nav_info', None)
+        if info is not None:
+            info.setVisible(full_active)
+        zoom = getattr(self, '_page_nav_zoom_btn', None)
+        if zoom is not None:
+            zoom.setVisible(full_active)
+            zoom.setEnabled(full_active and bool(page.active_regions))
+        controls = getattr(self, '_page_nav_zoom_controls', None)
+        if controls is not None:
+            controls.setVisible(full_active)
+        toggle = getattr(self, '_page_nav_toggle', None)
+        if toggle is not None:
+            toggle.setVisible(decision and full_available)
+            toggle.setText('切到裁片' if full_active else '切到全页')
+        mounted = getattr(self, '_mounted_reference_row', None)
+        if mounted is not None:
+            mounted._reference_preview.setVisible(decision and not full_active and bool(mounted._reference_path))
+
+    def _step_page_column(self, direction: int) -> None:
+        index = getattr(self, '_page_nav_index', None)
+        if index is None:
+            return
+        pages = index.pages_by_row.get(self._current_row(), ())
+        page = getattr(self, '_page_nav_current_page', 0)
+        if page not in pages:
+            return
+        position = pages.index(page) + int(direction)
+        if 0 <= position < len(pages):
+            self._page_nav_forced_page = pages[position]
+            self._refresh_page_column_link()
+
+    def _refresh_page_column_link(self) -> None:
+        view = getattr(self, '_page_nav_view', None)
+        comparison = getattr(self, '_comparison', None)
+        if view is None:
+            return
+        if comparison is None or not getattr(comparison, 'rows', ()):
+            view.set_page('')
+            self._sync_page_column_visibility()
+            return
+        from ui.ocr.page_column_navigator import PageColumnIndex
+        document = getattr(self, '_reference_doc', None) or getattr(self, '_primary_doc', None)
+        provider = getattr(self, '_recovery_page_image_provider', None)
+        try:
+            fallback = tuple(provider() or ()) if callable(provider) else ()
+        except Exception:
+            fallback = ()
+        key = (id(document), id(comparison), len(comparison.rows), fallback)
+        if key != getattr(self, '_page_nav_index_key', None):
+            self._page_nav_index = PageColumnIndex(document, comparison.rows, fallback)
+            self._page_nav_index_key = key
+        index = self._page_nav_index
+        row_number = self._current_row()
+        row = comparison.rows[row_number]
+        if row_number != getattr(self, '_page_nav_last_row', -1):
+            self._page_nav_forced_page = 0
+        preferred = (getattr(self, '_page_nav_forced_page', 0)
+                     or int(getattr(row, 'page', 0) or 0))
+        page, regions = index.location_for_row(row_number, preferred)
+        self._page_nav_current_page = page
+        self._page_nav_last_row = row_number
+        pages_for_row = index.pages_by_row.get(row_number, ())
+        position = pages_for_row.index(page) if page in pages_for_row else -1
+        for name, enabled in (('_page_nav_prev_btn', position > 0),
+                              ('_page_nav_next_btn', 0 <= position < len(pages_for_row) - 1)):
+            button = getattr(self, name, None)
+            if button is not None:
+                button.setEnabled(enabled)
+        path = index.paths.get(page, '')
+        view.set_page(path, index.regions_by_page.get(page, ()), (r.column_id for r in regions))
+        info = getattr(self, '_page_nav_info', None)
+        if info is not None:
+            if path and regions:
+                total_pages = len(index.paths)
+                info.setText(f'原图第 {page} 页（已载入 {total_pages} 页）· 句 {row_number + 1}/{len(comparison.rows)} · '
+                             f'定位 {len(regions)} 个物理列；点击列框切换候选')
+            elif path:
+                info.setText(f'第 {page} 页 · 无可确认的物理列几何坐标')
+            else:
+                info.setText('当前句缺少完整的原图/列框映射；已保留原有裁片入口')
+        self._sync_page_column_visibility()
+        progress = getattr(self, '_review_progress_label', None)
+        if progress is not None:
+            total = len(comparison.rows)
+            completed = sum(not bool(getattr(s, 'unresolved', False)) for s in self._fusion_states)
+            progress.setText(f'第 {row_number + 1:,} / {total:,} 句 · 已裁决 {completed:,}（{100 * completed / max(1, total):.1f}%）')
+
+    def _on_full_page_column_clicked(self, column_id: str) -> None:
+        index = getattr(self, '_page_nav_index', None)
+        if index is None:
+            return
+        target = index.row_for_column(column_id, self._current_row(), self._fusion_states)
+        if target is None:
+            return
+        # If one column belongs to a sentence continuing across two physical
+        # pages, preserve the clicked page rather than jumping back to the
+        # first page simply because the row identity changed.
+        clicked_page = getattr(self, '_page_nav_current_page', 0)
+        if clicked_page in index.pages_by_row.get(target, ()):
+            self._page_nav_forced_page = clicked_page
+        if getattr(self, '_show_resolved_history', False) and target not in self._resolved_history_rows():
+            self._resolved_history_check.setChecked(False)
+        self._select_row(target)
+        if clicked_page in index.pages_by_row.get(target, ()) and getattr(self, '_page_nav_current_page', 0) != clicked_page:
+            self._page_nav_forced_page = clicked_page
+            self._refresh_page_column_link()
+        view = getattr(self, '_page_nav_view', None)
+        if view is not None:
+            view.focus_column(column_id)
+            self._sync_page_column_visibility()
+
+    def _zoom_active_physical_column(self) -> None:
+        view = getattr(self, '_page_nav_view', None)
+        if view is None or not view.image_path or not view.active_regions:
+            return
+        from ui.ocr.reference_zoom_dialog import ReferenceZoomDialog
+        regions = view.active_regions
+        # Combine selected columns on the same page into one fitted ROI.
+        left = min(r.bbox[0] for r in regions)
+        top = min(r.bbox[1] for r in regions)
+        right = max(r.bbox[0] + r.bbox[2] for r in regions)
+        bottom = max(r.bbox[1] + r.bbox[3] for r in regions)
+        ReferenceZoomDialog(view.image_path, self, normalized_bbox=(left, top, right - left, bottom - top)).exec()
+
     def _set_compare_task_progress(
         self,
         visible: bool,
@@ -94,6 +253,8 @@ class OCRCompareViewMixin:
             return
         rows = getattr(getattr(self, "_comparison", None), "rows", ())
         reset = target.set_comparison(self._comparison, self._fusion_states, self._labels)
+        if reset and getattr(self, '_full_search_input', None) is not None:
+            self._apply_full_book_search()
         if reset and rows:
             from PySide6.QtCore import QItemSelectionModel
             current = min(max(0, int(getattr(self, "_current_row_index", 0))), len(rows) - 1)
@@ -104,11 +265,50 @@ class OCRCompareViewMixin:
         if note is not None:
             pending = sum(bool(state.unresolved) for state in self._fusion_states)
             conflicts = sum(target.model().row_disagrees(i) for i in range(len(rows)))
+            layout = getattr(self, "_full_overview_layout", "boxes")
+            mode = {
+                "boxes": "原版多模型框",
+                "table": "多模型对齐表格",
+                "fusion": "融合全文（只读）",
+            }.get(layout, "原版多模型框")
             note.setText(
-                f"多模型全文对照 · {len(rows)} 行 / {len(self._documents)} 模型 · "
+                f"{mode} · {len(rows)} 行 / {len(self._documents)} 模型 · "
                 f"模型不一致 {conflicts} 行 · 待裁决 {pending} 行"
-                " · 红色文字=字符差异，浅红底=行分歧；双击行进入逐句校对"
+                " · 双击行进入逐句校对；原始 OCR 与人工选择均不变"
             )
+
+    def _apply_full_book_search(self) -> None:
+        table = getattr(self, '_full_comparison_table', None)
+        entry = getattr(self, '_full_search_input', None)
+        if table is None or entry is None:
+            return
+        query = entry.text().strip()
+        all_models = bool(getattr(self, '_full_search_scope').currentData())
+        count = table.search_text(query, all_models=all_models)
+        status = getattr(self, '_full_search_count', None)
+        if status is not None:
+            status.setText((f'{count} 处匹配' if count else '未找到') if query else '')
+        self._full_find_prev_btn.setEnabled(bool(count))
+        self._full_find_next_btn.setEnabled(bool(count))
+
+    def _step_full_book_search(self, *, backward: bool = False) -> None:
+        # Force the latest input into the result set, even if the debounce
+        # timer has not fired before the user presses Enter.
+        if self._full_search_timer.isActive():
+            self._full_search_timer.stop()
+            self._apply_full_book_search()
+        row, ordinal, total = self._full_comparison_table.find_next(backward=backward)
+        if row is not None:
+            self._full_search_count.setText(f'{ordinal}/{total} · 第 {row + 1} 行')
+
+    def _step_full_book_difference(self, *, backward: bool = False) -> None:
+        row, ordinal, total = self._full_comparison_table.jump_difference(backward=backward)
+        if row is not None:
+            self._full_overview_note.setToolTip(
+                f'分歧 {ordinal}/{total} · 正文第 {row + 1} 行；双击进入对应图文裁决'
+            )
+        else:
+            self._full_overview_note.setToolTip('当前全文没有多模型差异')
 
     def _open_full_comparison_row(self, index) -> None:
         """Jump from a full-book difference to the same editable stable row."""
@@ -125,27 +325,67 @@ class OCRCompareViewMixin:
         self._select_row(row)
 
     def _set_full_only_view(self, checked: bool) -> None:
-        """Display-only switch: source texts, queue, drafts and verdicts persist."""
-        self._full_only_enabled = bool(checked)
+        """Backward-compatible proxy: checked selects table, off restores default boxes."""
+        self._set_full_layout_mode("table" if checked else "boxes")
+
+    def _set_full_layout_mode(self, mode: str) -> None:
+        """Switch between fused reading, aligned models and original model boxes.
+
+        In particular the original source editors must not be destroyed or
+        replaced by the new table: they are still useful for independent model
+        inspection and synchronized per-model scrolling.
+        """
+        if mode not in {"fusion", "table", "boxes"}:
+            return
+        if not self._multi_review_controls_available():
+            return
+        if self._review_mode != "full":
+            self._set_review_mode("full")
+        self._full_overview_layout = mode
+        self._full_overview_multimodel = mode == "table"
+        toggle = getattr(self, "_full_only_check", None)
+        if toggle is not None:
+            toggle.blockSignals(True)
+            toggle.setChecked(mode == "table")
+            toggle.blockSignals(False)
         self._sync_full_only_visibility()
 
     def _sync_full_only_visibility(self) -> None:
         panel = getattr(self, "_full_overview_panel", None)
         if panel is None:
             return
-        only = bool(
-            getattr(self, "_full_only_enabled", False)
-            and self._review_mode == "full"
-            and self._multi_review_controls_available()
-        )
-        if only:
+        full = bool(self._review_mode == "full" and self._multi_review_controls_available())
+        layout = getattr(self, "_full_overview_layout", "boxes")
+        if layout not in {"fusion", "table", "boxes"}:
+            layout = "boxes"
+        self._full_only_enabled = full
+        table_visible = full and layout != "boxes"
+        if table_visible:
             self._refresh_full_only_text()
-        panel.setVisible(only)
-        self._main_splitter.setVisible(not only)
+            self._full_comparison_table.set_fusion_only(layout == "fusion")
+        panel.setVisible(table_visible)
+        self._main_splitter.setVisible(not table_visible)
+        if full and layout == "boxes":
+            # The old independently scrollable per-OCR frames and the fusion
+            # candidate area are both present in the original splitter.
+            self._source_area.setVisible(True)
+            self._result_panel.setVisible(True)
+            self._main_splitter.setSizes([390, 610])
+        elif self._review_mode == "decision":
+            self._source_area.setVisible(False)
+        bar = getattr(self, "_full_layout_bar", None)
+        if bar is not None:
+            bar.setVisible(full)
+        for key, button in getattr(self, "_full_layout_buttons", {}).items():
+            button.setEnabled(full)
+            if button.isChecked() != (key == layout):
+                button.setChecked(key == layout)
         toggle = getattr(self, "_full_only_check", None)
         if toggle is not None:
-            toggle.setVisible(self._review_mode == "full")
-            toggle.setEnabled(self._multi_review_controls_available())
+            # Compatibility proxy kept functional for older automation, but
+            # three explicit options are now visible in the full mode bar.
+            toggle.setEnabled(full)
+            toggle.setVisible(False)
 
     def _multi_review_controls_available(self) -> bool:
         """Return whether a real multi-model comparison is currently active."""
@@ -170,8 +410,36 @@ class OCRCompareViewMixin:
         return available
 
 
+    def _show_default_full(self) -> None:
+        """Return to the default full overview with original model boxes."""
+        if not self._multi_review_controls_available():
+            return
+        self._full_overview_multimodel = False
+        self._full_overview_layout = "boxes"
+        toggle = getattr(self, "_full_only_check", None)
+        if toggle is not None:
+            toggle.blockSignals(True)
+            toggle.setChecked(False)
+            toggle.blockSignals(False)
+        self._set_review_mode("full")
+        self._sync_full_only_visibility()
+
+    def _show_fused_full(self) -> None:
+        """Explicitly select the fused-text-only full overview."""
+        if not self._multi_review_controls_available():
+            return
+        self._full_overview_multimodel = False
+        self._full_overview_layout = "fusion"
+        toggle = getattr(self, "_full_only_check", None)
+        if toggle is not None:
+            toggle.blockSignals(True)
+            toggle.setChecked(False)
+            toggle.blockSignals(False)
+        self._set_review_mode("full")
+        self._sync_full_only_visibility()
+
     def _show_multimodel_full(self) -> None:
-        """Visible '显示全文' must open the complete multi-model comparison."""
+        """Explicit full-model comparison remains available on user request."""
         if not self._multi_review_controls_available():
             return
         self._set_review_mode("full")
@@ -180,11 +448,11 @@ class OCRCompareViewMixin:
             toggle.setChecked(True)
 
     def _toggle_full_text_compare(self, checked: bool):
-        """Switch the legacy mode control to the same full-book display."""
+        """Legacy full-text switch returns to the default original model boxes."""
         if not self._sync_review_mode_controls():
             return
         if bool(checked):
-            self._show_multimodel_full()
+            self._show_default_full()
         else:
             self._set_review_mode("decision")
 
@@ -200,6 +468,16 @@ class OCRCompareViewMixin:
         # OCR documents or adjudication state.
         if not force and mode == self._review_mode:
             return
+        if mode == "decision":
+            # A later return to full overview always starts from the original
+            # model boxes, regardless of the last table/fusion layout.
+            self._full_overview_multimodel = False
+            self._full_overview_layout = "boxes"
+            toggle = getattr(self, "_full_only_check", None)
+            if toggle is not None:
+                toggle.blockSignals(True)
+                toggle.setChecked(False)
+                toggle.blockSignals(False)
         self._review_mode = mode
         title = getattr(self, "_compact_title_label", None)
         if title is not None:
@@ -245,6 +523,7 @@ class OCRCompareViewMixin:
             self._refresh_decision_queue(force=True)
         self._sync_full_only_visibility()
         self._sync_compact_compare_controls()
+        self._sync_page_column_visibility()
         if self._comparison is not None and self._fusion_states:
             # Navigation only: keep the exact stable row (including a resolved
             # row or unconfirmed draft), never jump to another queue item.
@@ -720,6 +999,12 @@ class OCRCompareViewMixin:
             rows = tuple(row for row in rows if self._row_is_threeway_disagreement(row))
         elif not history_mode and visible_scope == "broken":
             rows = tuple(row for row in rows if self._row_has_broken_candidate(row))
+        elif not history_mode and visible_scope in {"numeric", "rejection"}:
+            from ui.ocr.review_filters import has_numeric_date_disagreement, has_rejection_evidence
+            if visible_scope == "numeric":
+                rows = tuple(i for i in rows if has_numeric_date_disagreement(self._comparison.rows[i]))
+            else:
+                rows = tuple(i for i in rows if has_rejection_evidence(self._comparison.rows[i], self._fusion_states[i]))
         query_widget = getattr(self, "_decision_queue_search", None)
         query = str(query_widget.text() if query_widget is not None else "").strip().casefold()
         if query:
@@ -738,7 +1023,7 @@ class OCRCompareViewMixin:
         scope_combo = getattr(self, "_decision_queue_scope", None)
         if scope_combo is not None and not bool(getattr(self, "_syncing_queue_scope", False)):
             current_scope = str(scope_combo.currentData() or "pending")
-            wanted = "history" if history_mode else ("risk" if active_priority else (current_scope if current_scope in {"threeway", "broken"} else "pending"))
+            wanted = "history" if history_mode else ("risk" if active_priority else (current_scope if current_scope in {"threeway", "broken", "numeric", "rejection"} else "pending"))
             pos = scope_combo.findData(wanted)
             if pos >= 0 and scope_combo.currentIndex() != pos:
                 self._syncing_queue_scope = True
@@ -1006,6 +1291,9 @@ class OCRCompareViewMixin:
             widget.draft_requested.connect(self._stage_manual_candidate)
             widget.resolved.connect(self._fusion_row_resolved)
             widget.reopened.connect(self._fusion_row_reopened)
+            # Async single-crop loads must not surface over the active full-page
+            # navigator after a sentence switch.
+            widget.reference_ready.connect(lambda _key, _path: QTimer.singleShot(0, self._sync_page_column_visibility))
             if hasattr(self, "_history_service"):
                 widget.resolved.connect(self._history_service.commit_resolution)
                 widget.reopened.connect(self._history_service.commit_reopen)
@@ -1026,6 +1314,11 @@ class OCRCompareViewMixin:
                 page_images = ()
             reference_doc = getattr(self, "_reference_doc", None) or self._primary_doc
             widget.set_reference_source(reference_doc, self._comparison.rows[row_index], page_images)
+        # Keep the chosen UI reading size when a virtual candidate row is rebuilt.
+        chosen_font = int(getattr(getattr(self, '_review_font_size_combo', None), 'currentData', lambda: 16)() or 16)
+        for card in getattr(widget, '_cards', ()):
+            card.editor.setStyleSheet(re_sub_font_size(card.editor.styleSheet(), chosen_font))
+            card._fit_editor_height()
         widget.set_review_only_candidates(self._review_only_enabled)
         widget.set_history_mode(bool(getattr(self, "_show_resolved_history", False)))
         locked = bool(self._comparison is not None and len(self._documents) >= 2
@@ -1036,9 +1329,16 @@ class OCRCompareViewMixin:
             host.setVisible(show_reference)
             if show_reference:
                 widget._body_layout.removeWidget(widget._reference_preview)
-                self._proof_reference_layout.addWidget(widget._reference_preview, 1)
+                # The crop host has a bounded width; without explicit
+                # alignment Qt leaves it at the left of the evidence panel.
+                # Center the *whole crop image container* horizontally while
+                # retaining its expanding vertical space and fit-to-view rule.
+                self._proof_reference_layout.addWidget(
+                    widget._reference_preview, 1, Qt.AlignHCenter
+                )
                 widget.set_reference_visible(True)
                 self._mounted_reference_row = widget
+                self._sync_page_column_visibility()
             else:
                 # Full-text mode is for comparing complete OCR documents; its
                 # per-sentence source crop would only consume horizontal space.
@@ -1193,6 +1493,10 @@ class OCRCompareViewMixin:
         self._ruby_overlay_doc = None
         self._fusion_states = []
         self._full_only_enabled = False
+        self._full_overview_multimodel = False
+        self._full_overview_layout = "boxes"
+        if hasattr(self, "_full_layout_bar"):
+            self._full_layout_bar.setVisible(False)
         if hasattr(self, "_full_only_refresh_timer"):
             self._full_only_refresh_timer.stop()
         if hasattr(self, "_full_only_check"):
@@ -1222,6 +1526,13 @@ class OCRCompareViewMixin:
         if hasattr(self, "_next_group_btn"):
             self._next_group_btn.setText("下一分歧 →")
         self._image_review_overrides = {}
+        self._page_nav_index = None
+        self._page_nav_index_key = None
+        self._page_nav_last_row = -1
+        self._page_nav_forced_page = 0
+        self._page_nav_current_page = 0
+        if hasattr(self, '_page_nav_view'):
+            self._page_nav_view.set_page('')
         self._canonical_source_decisions = {}
         self._source_correction_import_history = []
         self._source_correction_imported_package_ids = set()
@@ -1310,6 +1621,13 @@ class OCRCompareViewMixin:
 
 
     def shutdown_cleanup(self) -> None:
+        """Cancel late GUI callbacks when the OCR tab or parent window closes.
+
+        Safe to call twice: MainWindow performs workspace cleanup as well, while
+        the standalone OCR tab can also be closed by a test or embedding host.
+        Qt timer callbacks must not repaint disposed full-book editors after an
+        async import/export. No model documents or committed decisions are changed.
+        """
         self._result_load_generation += 1
         self._ai_import_generation.invalidate()
         self._ai_import_signal_refs.clear()
@@ -1317,6 +1635,18 @@ class OCRCompareViewMixin:
         self._source_correction_signal_refs.clear()
         self._source_correction_busy = False
         self._source_correction_lock_workspace = False
+        self._pending_ai_import_apply = None
+        cancel = getattr(self, "_ai_adjudication_cancel_event", None)
+        if cancel is not None:
+            cancel.set()
+        for value in tuple(vars(self).values()):
+            if isinstance(value, QTimer):
+                value.stop()
+
+    def closeEvent(self, event) -> None:
+        """Close the standalone review surface, not just hide its widgets."""
+        self.shutdown_cleanup()
+        super().closeEvent(event)
 
 
     def _current_row(self) -> int:
@@ -1493,6 +1823,7 @@ class OCRCompareViewMixin:
         self._refresh_compare_overview_strip()
         if hasattr(self, "_sync_manual_decision_editor"):
             self._sync_manual_decision_editor()
+        self._refresh_page_column_link()
         self.current_row_changed.emit(int(row))
 
 

@@ -377,15 +377,15 @@ def _runtime_python_candidates() -> list[tuple[str, Path]]:
     # project-local .venv made Settings incorrectly report MPS=False even when
     # the actual Hayai worker used a different, MPS-capable interpreter.
     try:
-        from adapters.runtime_env import persistent_venv_dir, venv_python
-        candidates.append(("Hayai OCR", venv_python(persistent_venv_dir("hayai-ocr-v2.1"))))
+        from adapters.hayai_ocr_adapter import _supernova_effective_python
+        hayai_python, _source = _supernova_effective_python()
+        if hayai_python is not None:
+            candidates.append(("Hayai v2.7 Supernova", hayai_python))
     except Exception:
         pass
     for label, folder in (
         # wins whenever it exists.
-        # Legacy/project-local Hayai fallback. The persistent runtime candidate
-        # above wins when present; this keeps older installations diagnosable.
-        ("Hayai OCR", ".venv-hayai-ocr"),
+        ("Hayai v2.7 Supernova", ".venv-hayai-supernova"),
         ("48px AR", ".venv-manga-48px"),
         ("findtextCenterNet Ruby", ".venv-findtext-centernet"),
         ("NDLOCR-Lite", ".venv-ndlocr-lite"),

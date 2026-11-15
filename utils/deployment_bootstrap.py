@@ -442,13 +442,10 @@ def _ndlocr_ready() -> bool:
 
 
 def _hayai_ocr_ready() -> bool:
-    # Keep the legacy deployment helper aligned with the authoritative runtime
-    # catalog.  A model cache alone is not sufficient: the isolated environment
-    # must contain the pinned Hayai package and the Torch-specific cache must be
-    # complete as well.
+    # The dedicated Transformers 5 runtime and pinned v2.7 model must both be ready.
     try:
         from adapters.ocr_runtime_catalog import probe_runtime
-        return bool(probe_runtime("hayai_ocr", refresh=True).ready)
+        return bool(probe_runtime("hayai_ocr_supernova", refresh=True).ready)
     except Exception:
         return False
 
@@ -477,32 +474,38 @@ def _install_ndlocr(progress_callback: ProgressCallback | None) -> ComponentResu
 
 def _install_hayai_ocr(progress_callback: ProgressCallback | None) -> ComponentResult:
     if _hayai_ocr_ready():
-        return ComponentResult("hayai_ocr", "ready", "已安装；未检查更新")
-    _emit(progress_callback, "model", 0, 1, "准备 Hayai OCR 依赖和模型")
-    from adapters.hayai_ocr_adapter import WORKER_SCRIPT, _resolved_model_cache, setup_venv
+        return ComponentResult("hayai_ocr", "ready", "v2.7 Supernova 已安装；未检查更新")
+    _emit(progress_callback, "model", 0, 1, "准备 Hayai v2.7 Supernova 依赖和官方模型")
+    from adapters.hayai_ocr_adapter import WORKER_SCRIPT, _worker_env, setup_venv
 
-    python = setup_venv(verbose=True, backend="torch")
-    cache = _resolved_model_cache()
-    cache.mkdir(parents=True, exist_ok=True)
-    env = dict(os.environ)
-    env["HF_HOME"] = str(cache)
-    env["HUGGINGFACE_HUB_CACHE"] = str(cache / "hub")
-    env["TRANSFORMERS_CACHE"] = str(cache / "transformers")
+    python = setup_venv(verbose=True, backend="supernova")
+    env = _worker_env("supernova")
+    env["NOVEL_FORMATTER_HAYAI_STATUS"] = "1"
     proc = subprocess.run(
-        [str(python), str(WORKER_SCRIPT), "--stream", "--backend", "torch", "--device", "auto"],
+        [str(python), str(WORKER_SCRIPT), "--stream", "--backend", "supernova", "--device", "auto"],
         input=json.dumps({"command": "close"}, ensure_ascii=False) + "\n",
-        text=True,
-        capture_output=True,
-        env=env,
-        timeout=5400,
+        text=True, capture_output=True, env=env, timeout=5400,
     )
-    if proc.returncode != 0 or '"ready": true' not in (proc.stdout or "").lower():
-        raise RuntimeError("Hayai OCR 模型初始化失败：" + _redact(proc.stderr or proc.stdout))
+    ready = False
+    for row in (proc.stdout or "").splitlines():
+        try:
+            payload = json.loads(row)
+        except ValueError:
+            continue
+        if payload.get("ok") and payload.get("ready") and payload.get("backend") == "supernova":
+            ready = True
+            break
+    if proc.returncode != 0 or not ready:
+        raise RuntimeError("Hayai v2.7 Supernova 模型初始化失败：" + _redact(proc.stderr or proc.stdout))
+    # Only acknowledge readiness after the pinned runtime and real model cache
+    # both pass, never infer from a status marker or a stale v2.3 wheel.
+    from adapters.ocr_runtime_catalog import mark_runtime_ready
+    from adapters.hayai_ocr_adapter import SUPERNOVA_RUNTIME_VERSION
+    mark_runtime_ready("hayai_ocr_supernova", version=SUPERNOVA_RUNTIME_VERSION,
+                       backend="supernova", verified_stage="bootstrap_worker_load")
     if not _hayai_ocr_ready():
-        raise RuntimeError("Hayai OCR 下载结束后未检测到完整权重")
-    return ComponentResult("hayai_ocr", "installed", "首次部署安装完成")
-
-
+        raise RuntimeError("Hayai v2.7 模型初始化后仍未检测到完整权重或运行环境")
+    return ComponentResult("hayai_ocr", "installed", "v2.7 Supernova 首次部署安装完成")
 
 
 def _install_manga_48px(progress_callback: ProgressCallback | None) -> ComponentResult:

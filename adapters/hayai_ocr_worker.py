@@ -144,8 +144,6 @@ def _release_accelerator_cache() -> None:
         pass
 
 def _configure_runtime(recognizer) -> tuple[object, str]:
-    if bool(getattr(recognizer, "is_litert", False)):
-        return nullcontext, str(getattr(recognizer, "device", "cpu"))
     try:
         import torch
     except Exception:
@@ -232,37 +230,73 @@ def _recognize_batch(recognizer, inference_context, paths: list[str], max_new_to
             return [{"ok": False, "path": path, "error": str(exc or first_error)}], 1, True
 
 
-def _disable_unrequested_compilation(kwargs: dict, recognizer_class, device: str) -> None:
-    """Keep CPU/MPS Hayai starts free from unrequested torch.compile.
+class _SupernovaRecognizer:
+    """Official v2.7 Transformers 5 inference."""
 
-    Inspect only after the upstream class has been imported. Older Hayai
-    constructors without a public ``compile`` argument keep their legacy
-    fallback instead of receiving an unsupported keyword argument.
-    CUDA behaviour remains unchanged.
-    """
-    if device not in {"cpu", "mps"}:
-        return
-    try:
-        import inspect
-        supports_compile = "compile" in inspect.signature(recognizer_class).parameters
-    except (TypeError, ValueError):
-        supports_compile = False
-    if supports_compile:
-        kwargs["compile"] = False
-    else:
-        os.environ.setdefault("TORCHDYNAMO_DISABLE", "1")
+
+    def __init__(self, device: str, *, max_num_patches: int, requested_quantize: str):
+        from transformers import AutoModel, AutoProcessor
+        from adapters.hayai_ocr_adapter import (
+            SUPERNOVA_MODEL, SUPERNOVA_REVISION, _supernova_model_location,
+        )
+        import torch
+        source = _supernova_model_location()
+        local = Path(source).expanduser().is_dir()
+        opts = {"trust_remote_code": True}
+        if not local:
+            if source != SUPERNOVA_MODEL:
+                raise RuntimeError("拒绝载入未经批准的远端 Supernova 模型")
+            opts["revision"] = SUPERNOVA_REVISION
+            opts["code_revision"] = SUPERNOVA_REVISION
+        self.device = device
+        self.max_num_patches = max_num_patches
+        self.requested_quantize = requested_quantize
+        # Using a local model means remote code is loaded from that local path.
+        # When online, both code and weights are fixed to the same revision.
+        # MPS supports native half precision. Keep an explicit fp32 escape hatch
+        # for diagnosing numerical differences on future model revisions.
+        precision = os.environ.get("NOVEL_FORMATTER_HAYAI_MPS_DTYPE", "float16").strip().lower()
+        if device == "mps" and precision not in {"float16", "float32"}:
+            raise ValueError("NOVEL_FORMATTER_HAYAI_MPS_DTYPE must be float16 or float32")
+        if device == "mps":
+            opts["dtype"] = torch.float16 if precision == "float16" else torch.float32
+        self.model = AutoModel.from_pretrained(source, **opts).to(device).eval()
+        self.processor = AutoProcessor.from_pretrained(source, trust_remote_code=True,
+            **({"revision": SUPERNOVA_REVISION, "code_revision": SUPERNOVA_REVISION} if not local else {}))
+        if device != "cuda":
+            os.environ.setdefault("HAYAI_DISABLE_COMPILE", "1")
+
+    def __call__(self, images, *, max_new_tokens=128, repetition_penalty=1.0):
+        if repetition_penalty != 1.0:
+            raise ValueError("Supernova OCR requires repetition_penalty=1.0")
+        single = isinstance(images, (str, Path, Image.Image))
+        batch = [images] if single else list(images)
+        pil_images = []
+        for item in batch:
+            if isinstance(item, Image.Image):
+                pil_images.append(item.convert("RGB"))
+            else:
+                with Image.open(item) as src:
+                    pil_images.append(src.convert("RGB"))
+        # CUDA Graphs are upstream's optimized path; CPU/MPS use eager mode.
+        result = self.model.ocr(
+            pil_images if not single else pil_images[0], self.processor,
+            max_patches=self.max_num_patches,
+            max_new_tokens=max_new_tokens,
+            use_cuda_graph=self.device == "cuda",
+        )
+        return result
 
 
 def main() -> None:
+    from adapters.hayai_ocr_adapter import SUPERNOVA_REVISION, _supernova_model_location
+
     parser = argparse.ArgumentParser()
     parser.add_argument("--stream", action="store_true")
-    parser.add_argument("--backend", choices=("torch", "litert"), default="torch")
+    parser.add_argument("--backend", choices=("supernova",), default="supernova")
     parser.add_argument("--device", default="auto")
-    parser.add_argument("--quantize", choices=("none", "int8", "int4"), default="none")
-    parser.add_argument("--litert-quant", default="wi4")
-    parser.add_argument("--litert-threads", type=int, default=0)
     parser.add_argument("--max-new-tokens", type=int, default=128)
-    parser.add_argument("--max-num-patches", type=int, default=512)
+    parser.add_argument("--max-num-patches", type=int, default=256)
     args = parser.parse_args()
     if not args.stream:
         parser.error("Hayai worker currently requires --stream")
@@ -270,105 +304,44 @@ def main() -> None:
     status = _StatusEmitter()
     status.start("startup")
     try:
-        backend = str(args.backend or "torch").lower()
-        model_name = os.environ.get(
-            "NOVEL_FORMATTER_HAYAI_OCR_MODEL", "JustANormalTinkerer/hayai-ocr-v2.5-nova"
-        )
-        kwargs = {"backend": backend}
-        device_warning = ""
-        if backend == "torch":
-            status.phase("import_torch")
-            import torch
-            status.phase("resolve_device")
-            device_arg, effective_device_hint, device_warning = _resolve_torch_device(torch, args.device)
-            try:
-                mps_built = bool(torch.backends.mps.is_built())
-            except Exception:
-                mps_built = False
-            mps_available, mps_probe_detail = probe_torch_mps(torch)
-            if status.enabled:
-                import platform
-                status.send({
-                    "status": "device_resolved",
-                    "elapsed_seconds": 0,
-                    "requested_device": str(args.device or "auto"),
-                    "effective_device": effective_device_hint,
-                    "torch_version": str(getattr(torch, "__version__", "")),
-                    "machine": platform.machine(),
-                    "mps_built": mps_built,
-                    "mps_available": mps_available,
-                    "mps_probe_detail": mps_probe_detail,
-                    "offline_mode": os.environ.get("NOVEL_FORMATTER_HAYAI_OFFLINE_ACTIVE") == "1",
-                })
-            configure_torch_memory_safety(torch)
-            kwargs["pretrained_model_name_or_path"] = model_name
-            # Novel Formatter deliberately pins nova to 512 NaFlex patches for
-            # every torch role/run.  Do not inherit HAYAI_MAX_NUM_PATCHES.
-            kwargs["max_num_patches"] = max(1, int(args.max_num_patches or 512))
-            if device_arg is not None:
-                kwargs["device"] = device_arg
-            if args.quantize and args.quantize != "none":
-                kwargs["quantize"] = args.quantize
-        else:
-            kwargs["litert_quant"] = args.litert_quant or "wi4"
-            if args.litert_threads > 0:
-                kwargs["litert_threads"] = args.litert_threads
-            litert_repo = os.environ.get("NOVEL_FORMATTER_HAYAI_OCR_LITERT_REPO", "").strip()
-            if litert_repo:
-                kwargs["litert_repo"] = litert_repo
-            litert_model_path = os.environ.get("NOVEL_FORMATTER_HAYAI_OCR_LITERT_MODEL_PATH", "").strip()
-            if litert_model_path:
-                kwargs["litert_model_path"] = litert_model_path
-
-        status.phase("import_hayai")
-        from hayai_ocr import HayaiOcr
-        if backend == "torch":
-            _disable_unrequested_compilation(kwargs, HayaiOcr, effective_device_hint)
-
-        requested_quantize = args.quantize if backend == "torch" else args.litert_quant
-        effective_quantize = requested_quantize
-        startup_warning = device_warning
+        status.phase("import_torch")
+        import torch
+        status.phase("resolve_device")
+        device_arg, effective_device_hint, device_warning = _resolve_torch_device(torch, args.device)
+        if effective_device_hint in {"cpu", "mps"}:
+            os.environ.setdefault("HAYAI_DISABLE_COMPILE", "1")
         try:
-            # At this point Python imports and device selection are complete.
-            # Any long wait reported below is inside upstream cache/model
-            # resolution and weight construction, not an ambiguous "download".
-            status.phase("load_model")
-            recognizer = HayaiOcr(**kwargs)
-        except Exception as first_exc:
-            # torchao support differs by PyTorch/device builds. Quantization is an
-            # optimisation, not a correctness requirement, so retry unquantized
-            # instead of making an otherwise supported OCR backend unusable.
-            if backend != "torch" or args.quantize == "none" or "quantize" not in kwargs:
-                raise
-            kwargs.pop("quantize", None)
-            try:
-                import gc
-                gc.collect()
-                try:
-                    import torch
-                    if torch.cuda.is_available():
-                        torch.cuda.empty_cache()
-                except Exception:
-                    pass
-                status.phase("load_model_unquantized_retry")
-                recognizer = HayaiOcr(**kwargs)
-            except Exception:
-                raise first_exc
-            effective_quantize = "none"
-            quant_warning = (
-                f"请求的 {args.quantize.upper()} 量化在当前运行时不可用，已自动回退到非量化模式；"
-                "识别功能保持可用。"
-            )
-            startup_warning = " ".join(item for item in (startup_warning, quant_warning) if item)
+            mps_built = bool(torch.backends.mps.is_built())
+        except Exception:
+            mps_built = False
+        mps_available, mps_probe_detail = probe_torch_mps(torch)
+        if status.enabled:
+            import platform
+            status.send({
+                "status": "device_resolved",
+                "elapsed_seconds": 0,
+                "requested_device": str(args.device or "auto"),
+                "effective_device": effective_device_hint,
+                "torch_version": str(getattr(torch, "__version__", "")),
+                "machine": platform.machine(),
+                "mps_built": mps_built,
+                "mps_available": mps_available,
+                "mps_probe_detail": mps_probe_detail,
+                "offline_mode": os.environ.get("NOVEL_FORMATTER_HAYAI_OFFLINE_ACTIVE") == "1",
+            })
+        configure_torch_memory_safety(torch)
+        status.phase("import_hayai")
+        status.phase("load_model")
+        recognizer = _SupernovaRecognizer(
+            effective_device_hint,
+            max_num_patches=max(1, int(args.max_num_patches or 256)),
+            requested_quantize="none",
+        )
         status.phase("configure_runtime")
         inference_context, device_label = _configure_runtime(recognizer)
     except Exception as exc:
         status.pause()
-        status.send({
-            "ok": False,
-            "path": "",
-            "error": f"Hayai OCR 模型初始化失败: {exc}",
-        })
+        status.send({"ok": False, "path": "", "error": f"Hayai OCR 模型初始化失败: {exc}"})
         raise SystemExit(1)
 
     status.pause()
@@ -376,19 +349,19 @@ def main() -> None:
         "ok": True,
         "ready": True,
         "device": device_label,
-        "backend": backend,
-        "quantize": effective_quantize,
-        "requested_quantize": requested_quantize,
-        "effective_quantize": effective_quantize,
-        "warning": startup_warning,
-        "model": model_name if backend == "torch" else "JustANormalTinkerer/hayai-ocr-v2-tflite",
+        "backend": "supernova",
+        "quantize": "none",
+        "requested_quantize": "none",
+        "effective_quantize": "none",
+        "warning": device_warning,
+        "model": _supernova_model_location(),
+        "model_revision": SUPERNOVA_REVISION,
         "input_contract": "isolated-crop-batch",
-        "max_num_patches": int(getattr(recognizer, "max_num_patches", args.max_num_patches or 512)),
+        "max_num_patches": int(getattr(recognizer, "max_num_patches", args.max_num_patches)),
         "offline_mode": os.environ.get("NOVEL_FORMATTER_HAYAI_OFFLINE_ACTIVE") == "1",
     })
 
-    max_token_cap = 64 if backend == "litert" else 192
-    max_new_tokens = max(32, min(max_token_cap, int(args.max_new_tokens or 128)))
+    max_new_tokens = max(32, min(192, int(args.max_new_tokens or 128)))
     for line in sys.stdin:
         line = line.strip()
         if not line:

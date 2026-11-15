@@ -129,6 +129,12 @@ def _stage_task_visual_evidence(
     except Exception:
         Image = None
 
+    from functools import lru_cache
+    @lru_cache(maxsize=3)
+    def _load_rgb(path: str):
+        with Image.open(path) as original_image:
+            return original_image.convert("RGB")
+
     for position, row in enumerate(rows):
         if not isinstance(row, dict):
             continue
@@ -140,56 +146,65 @@ def _stage_task_visual_evidence(
             missing += 1
             continue
         target = evidence_dir / f"{_safe_row_stem(row, position)}.png"
+        # Resume an interrupted all-book preparation. A completed PNG already
+        # belongs to this stable task ID in this dedicated output directory.
+        if target.is_file() and target.stat().st_size > 20:
+            row["visual_evidence_status"] = "cropped_cached"
+            row["image_path"] = str(Path("evidence") / target.name)
+            staged += 1
+            cropped += 1
+            continue
         bbox = _normalized_xywh(row.get("source_bbox"))
         try:
-            with Image.open(source) as im:
-                im = im.convert("RGB")
-                width, height = im.size
-                crop_box = None
-                if bbox is not None:
-                    x, y, w, h = bbox
-                    # Round-trip source_bbox is normalized x/y/w/h.  Tolerate
-                    # pixel-space xywh as well for old/custom packages.
-                    normalized = max(abs(x), abs(y), abs(w), abs(h)) <= 1.5
-                    if normalized:
-                        left = x * width
-                        top = y * height
-                        right = (x + w) * width
-                        bottom = (y + h) * height
-                    else:
-                        left, top, right, bottom = x, y, x + w, y + h
-                    # Keep context around the sentence/columns.  Vertical OCR
-                    # benefits from more side context than top/bottom context.
-                    pad_x = max(12.0, (right - left) * 1.35, width * 0.012)
-                    pad_y = max(12.0, (bottom - top) * 0.035, height * 0.008)
-                    left = max(0, int(round(left - pad_x)))
-                    top = max(0, int(round(top - pad_y)))
-                    right = min(width, int(round(right + pad_x)))
-                    bottom = min(height, int(round(bottom + pad_y)))
-                    if right > left + 4 and bottom > top + 4:
-                        crop_box = (left, top, right, bottom)
-                if crop_box is not None:
-                    evidence = im.crop(crop_box)
-                    # Avoid huge page-height crops while keeping glyph detail.
-                    if evidence.height > 2200:
-                        new_h = 2200
-                        new_w = max(1, round(evidence.width * new_h / evidence.height))
-                        evidence = evidence.resize((new_w, new_h), Image.Resampling.LANCZOS)
-                    evidence.save(target, format="PNG", optimize=True)
-                    row["visual_evidence_status"] = "cropped"
-                    row["visual_evidence_crop_pixels"] = list(crop_box)
-                    cropped += 1
+            if Image is None:
+                raise ValueError("Pillow unavailable")
+            im = _load_rgb(str(source))
+            width, height = im.size
+            crop_box = None
+            if bbox is not None:
+                x, y, w, h = bbox
+                # Round-trip source_bbox is normalized x/y/w/h.  Tolerate
+                # pixel-space xywh as well for old/custom packages.
+                normalized = max(abs(x), abs(y), abs(w), abs(h)) <= 1.5
+                if normalized:
+                    left = x * width
+                    top = y * height
+                    right = (x + w) * width
+                    bottom = (y + h) * height
                 else:
-                    preview = im
-                    if max(width, height) > 2200:
-                        ratio = 2200 / max(width, height)
-                        preview = im.resize(
-                            (max(1, round(width * ratio)), max(1, round(height * ratio))),
-                            Image.Resampling.LANCZOS,
-                        )
-                    preview.save(target, format="PNG", optimize=True)
-                    row["visual_evidence_status"] = "full_page"
-                    full_page += 1
+                    left, top, right, bottom = x, y, x + w, y + h
+                # Keep context around the sentence/columns.  Vertical OCR
+                # benefits from more side context than top/bottom context.
+                pad_x = max(12.0, (right - left) * 1.35, width * 0.012)
+                pad_y = max(12.0, (bottom - top) * 0.035, height * 0.008)
+                left = max(0, int(round(left - pad_x)))
+                top = max(0, int(round(top - pad_y)))
+                right = min(width, int(round(right + pad_x)))
+                bottom = min(height, int(round(bottom + pad_y)))
+                if right > left + 4 and bottom > top + 4:
+                    crop_box = (left, top, right, bottom)
+            if crop_box is not None:
+                evidence = im.crop(crop_box)
+                # Avoid huge page-height crops while keeping glyph detail.
+                if evidence.height > 2200:
+                    new_h = 2200
+                    new_w = max(1, round(evidence.width * new_h / evidence.height))
+                    evidence = evidence.resize((new_w, new_h), Image.Resampling.LANCZOS)
+                evidence.save(target, format="PNG", optimize=False, compress_level=1)
+                row["visual_evidence_status"] = "cropped"
+                row["visual_evidence_crop_pixels"] = list(crop_box)
+                cropped += 1
+            else:
+                preview = im
+                if max(width, height) > 2200:
+                    ratio = 2200 / max(width, height)
+                    preview = im.resize(
+                        (max(1, round(width * ratio)), max(1, round(height * ratio))),
+                        Image.Resampling.LANCZOS,
+                    )
+                preview.save(target, format="PNG", optimize=False, compress_level=1)
+                row["visual_evidence_status"] = "full_page"
+                full_page += 1
         except Exception as exc:
             row["visual_evidence_status"] = "image_error"
             row["visual_evidence_error"] = str(exc)[:300]

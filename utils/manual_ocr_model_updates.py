@@ -79,7 +79,7 @@ _LABELS = {
     "apple_vision": "Apple OCR",
     "ndlocr_lite": "NDLOCR-Lite",
     "manga_48px": "48px AR OCR",
-    "hayai_ocr": "Hayai OCR",
+    "hayai_ocr": "Hayai OCR v2.7 Supernova",
     "paddle_ocr": "PaddleOCR / PP-OCR",
     "paddle_aistudio": "PaddleOCR · AI Studio API",
 }
@@ -88,7 +88,7 @@ _SOURCE_URLS = {
     "apple_vision": "x-apple.systempreferences:com.apple.Software-Update-Settings.extension",
     "ndlocr_lite": "https://github.com/ndl-lab/ndlocr-lite/releases",
     "manga_48px": "https://github.com/zyddnys/manga-image-translator/releases",
-    "hayai_ocr": "https://github.com/NopeNopeGuy/hayai-ocr",
+    "hayai_ocr": "https://huggingface.co/JustANormalTinkerer/hayai-ocr-v2.7-supernova",
     "paddle_ocr": "https://github.com/PaddlePaddle/PaddleOCR/releases",
     "paddle_aistudio": "https://aistudio.baidu.com/paddleocr",
 }
@@ -100,11 +100,11 @@ _GITHUB_LATEST = {
 }
 
 _HF_MODEL_API = {
+    "hayai_ocr": "https://huggingface.co/api/models/JustANormalTinkerer/hayai-ocr-v2.7-supernova",
 }
 
-_PYPI_API = {
-    "hayai_ocr": "https://pypi.org/pypi/hayai-ocr/json",
-}
+# Retained as an empty compatibility interface for unrelated OCR contract checks.
+_PYPI_API: dict[str, str] = {}
 
 
 class ModelUpdateError(RuntimeError):
@@ -387,8 +387,13 @@ def local_statuses() -> list[ModelUpdateStatus]:
         )
     )
 
-    hayai_local = _dist_version(ROOT / ".venv-hayai-ocr", "hayai-ocr")
-    hayai_pinned = _read_assignment(ROOT / "adapters" / "hayai_ocr_adapter.py", "HAYAI_OCR_VERSION")
+    # Hayai v2.7 ships as an official Transformers custom-code model, not
+    # the separately versioned legacy hayai-ocr PyPI wheel.
+    from adapters.hayai_ocr_adapter import SUPERNOVA_REVISION, SUPERNOVA_RUNTIME_VERSION
+    from adapters.ocr_runtime_catalog import probe_runtime
+    hayai_probe = probe_runtime("hayai_ocr_supernova", refresh=True)
+    hayai_local = SUPERNOVA_REVISION if hayai_probe.installed else "未安装"
+    hayai_ok = bool(hayai_probe.ready)
     statuses.append(
         ModelUpdateStatus(
             "hayai_ocr",
@@ -396,10 +401,11 @@ def local_statuses() -> list[ModelUpdateStatus]:
             "与 OCR 代码绑定",
             hayai_local,
             "未检查",
-            "compatibility_locked" if hayai_local != "未安装" else "not_installed",
-            f"当前适配器固定兼容 Hayai OCR {hayai_pinned or '2.3.0'}；Torch/LiteRT 与模型接口共同构成运行合同，不盲目升级。",
+            "compatibility_locked" if hayai_ok else "repair_required",
+            f"固定版本 {SUPERNOVA_RUNTIME_VERSION}；{hayai_probe.detail}。"
+            "仅支持官方仓库与此固定 revision，版本检查不执行模型替换。",
             False,
-            "首次使用自动安装" if hayai_local == "未安装" else "不可单独更新",
+            "不可单独更新" if hayai_ok else "首次使用时安装/修复",
             _SOURCE_URLS["hayai_ocr"],
         )
     )
@@ -445,10 +451,6 @@ def _remote_version(component_id: str, timeout: float) -> str:
     if component_id in _HF_MODEL_API:
         payload = _read_json_url(_HF_MODEL_API[component_id], timeout=timeout)
         return str(payload.get("sha") or payload.get("lastModified") or "").strip()
-    if component_id in _PYPI_API:
-        payload = _read_json_url(_PYPI_API[component_id], timeout=timeout)
-        info = payload.get("info") if isinstance(payload.get("info"), dict) else {}
-        return str(info.get("version") or "").strip()
     return ""
 
 

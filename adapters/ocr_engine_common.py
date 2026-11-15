@@ -739,7 +739,8 @@ def run_ocr_engine(
                     "column_ocr_failure_reason", "column_ocr_selected_variant",
                     "column_ocr_preprocess_used", "column_ocr_candidate_conflict",
                     "column_consensus_seeded",
-                    "column_ocr_candidates", "column_ocr_compare_mode",
+                    "column_ocr_candidates", "column_hayai_rejected_segments",
+                    "column_ocr_compare_mode",
                     "column_ocr_rescue_policy", "column_ocr_rescue_budget",
                     "column_ocr_rescue_used", "column_ocr_rescue_method",
                     "column_ocr_rescue_reason",
@@ -821,6 +822,10 @@ def run_ocr_engine(
                     "selected_variant": str(item_metadata.get("column_ocr_selected_variant", "") or ""),
                     "seeded_reuse": bool(item_metadata.get("column_consensus_seeded", False)),
                     "attempts": list(item_metadata.get("column_ocr_attempts", []) or []),
+                    # Source-aligned, untrusted recognizer responses rejected
+                    # by the model-output guard. Retain them for GPT visual
+                    # adjudication; they are never authoritative OCR text.
+                    "hayai_rejected_segments": list(item_metadata.get("column_hayai_rejected_segments", []) or []),
                 }
                 existing = dict(doc.metadata.column_ocr_input_records.get(column_id, {}) or {})
                 # A non-empty later value may add sentence/page provenance, but

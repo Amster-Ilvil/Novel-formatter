@@ -578,12 +578,11 @@ def build_ocr_model_settings(tab, top_row, ocr_adapters):
     hyv.setContentsMargins(10, 8, 10, 0)
     hyv.setSpacing(4)
     hy_backend_row = QHBoxLayout()
-    hy_backend_lbl = QLabel("Hayai 后端")
+    hy_backend_lbl = QLabel("Hayai 模型 / 后端")
     hy_backend_lbl.setStyleSheet(f"color: {MUTED}; font-size: 11px;")
     hy_backend_row.addWidget(hy_backend_lbl)
     self._hayai_backend_combo = NoWheelComboBox()
-    self._hayai_backend_combo.addItem("PyTorch（推荐：CUDA / MPS / CPU）", "torch")
-    self._hayai_backend_combo.addItem("LiteRT（CPU / 边缘端，实验）", "litert")
+    self._hayai_backend_combo.addItem("v2.7 Supernova（推荐 · PyTorch / Transformers 5）", "supernova")
     self._hayai_backend_combo.currentIndexChanged.connect(self._update_hayai_option_state)
     hy_backend_row.addWidget(self._hayai_backend_combo, 1)
     hyv.addLayout(hy_backend_row)
@@ -600,33 +599,10 @@ def build_ocr_model_settings(tab, top_row, ocr_adapters):
     hy_device_row.addWidget(self._hayai_device_combo, 1)
     hyv.addLayout(hy_device_row)
 
-    hy_quant_row = QHBoxLayout()
-    hy_quant_lbl = QLabel("Torch 量化")
-    hy_quant_lbl.setStyleSheet(f"color: {MUTED}; font-size: 11px;")
-    hy_quant_row.addWidget(hy_quant_lbl)
-    self._hayai_quant_combo = NoWheelComboBox()
-    self._hayai_quant_combo.addItem("不量化（默认 / 最高兼容）", "none")
-    self._hayai_quant_combo.addItem("INT8 weight-only（约 2× 降显存）", "int8")
-    self._hayai_quant_combo.addItem("INT4 weight-only（约 4× 降显存）", "int4")
-    hy_quant_row.addWidget(self._hayai_quant_combo, 1)
-    hyv.addLayout(hy_quant_row)
-
-    hy_litert_row = QHBoxLayout()
-    hy_litert_lbl = QLabel("LiteRT 量化")
-    hy_litert_lbl.setStyleSheet(f"color: {MUTED}; font-size: 11px;")
-    hy_litert_row.addWidget(hy_litert_lbl)
-    self._hayai_litert_quant_combo = NoWheelComboBox()
-    self._hayai_litert_quant_combo.addItem("WI4（默认）", "wi4")
-    self._hayai_litert_quant_combo.addItem("WI8 AFP32", "wi8_afp32")
-    self._hayai_litert_quant_combo.addItem("Dynamic WI4", "dynamic_wi4")
-    self._hayai_litert_quant_combo.addItem("Dynamic WI8", "dynamic_wi8")
-    self._hayai_litert_quant_combo.addItem("Float", "none")
-    hy_litert_row.addWidget(self._hayai_litert_quant_combo, 1)
-    hyv.addLayout(hy_litert_row)
-
     hy_hint = QLabel(
         "Hayai 只负责已经分离的文字 crop，不做整页文字检测。Novel Formatter 会复用固定正文框、"
-        "右→左物理列、Ruby 清理、共享 crop 与多模型融合；每段默认约 24 字，减少不必要的切段调用。"
+        "右→左物理列、Ruby 清理、共享 crop 与多模型融合；每段默认约 24 字。"
+        "v2.7 采用 Transformers 5 环境与 256 patches；旧配置自动迁移至 v2.7。"
     )
     hy_hint.setWordWrap(True)
     hy_hint.setStyleSheet(f"color: #5F7189; font-size: 10px;")

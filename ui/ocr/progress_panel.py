@@ -11,6 +11,7 @@ from ui.common.styling import ACC, BORDER, CARD, INK, MUTED, TONAL, LIGHT_LOG_ST
 from ui.responsive import preserve_button_text
 from ui.design.metrics import OCR_BOTTOM_HEIGHT
 from ui.design.components import DesignLogCollapseButton
+from ui.localized_dialogs import LocalizedLogView
 
 
 def build_ocr_progress_panel(tab, main_v):
@@ -155,7 +156,7 @@ def build_ocr_progress_panel(tab, main_v):
     body_layout.addWidget(self._progress_bar_wrap)
     body_layout.addWidget(self._phase_progress_lbl)
 
-    self._log_view = QPlainTextEdit()
+    self._log_view = LocalizedLogView()
     self._log_view.setReadOnly(True)
     self._log_view.setStyleSheet(LIGHT_LOG_STYLE)
     self._ocr_log_follow_tail = True

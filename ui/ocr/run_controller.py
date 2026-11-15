@@ -314,7 +314,7 @@ def _run_ocr_impl(
             runtime_backend_config[configured_engine].setdefault(
                 "backend",
                 {
-                    "hayai_ocr": "PyTorch or LiteRT",
+                    "hayai_ocr": "PyTorch / Transformers 5 Supernova",
                     "manga_48px": "PyTorch",
                     "paddle_ocr": str(options.get("pipeline") or "PaddleOCR"),
                 }[configured_engine],
@@ -1110,8 +1110,6 @@ def _run_ocr_impl(
                 key = str(engine_id or "").strip().lower()
                 if key == "hayai_ocr":
                     hayai_opts = frozen_engine_options.get("hayai_ocr", {})
-                    if str(hayai_opts.get("backend") or "torch").strip().lower() == "litert":
-                        return False
                     if str(hayai_opts.get("device") or "auto").strip().lower() == "cpu":
                         return False
                 return key in mps_heavy_engines

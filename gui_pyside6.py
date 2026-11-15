@@ -606,10 +606,8 @@ class OCRTab(QWidget):
             "vision_candidate_count": int_value("_vision_candidate_spin", 3),
             "vision_min_height": float_value("_vision_min_height_spin", 0.005),
             "shortcut_name": text_value("_shortcut_edit", "ExtractText") or "ExtractText",
-            "hayai_backend": combo_data("_hayai_backend_combo", "torch"),
+            "hayai_backend": combo_data("_hayai_backend_combo", "supernova"),
             "hayai_device": combo_data("_hayai_device_combo", "auto"),
-            "hayai_quantize": combo_data("_hayai_quant_combo", "none"),
-            "hayai_litert_quant": combo_data("_hayai_litert_quant_combo", "wi4"),
             "paddle_pipeline": combo_data("_paddle_model_combo", "ocr"),
             "paddle_vl_backend": combo_data("_paddle_vl_backend_combo", "auto"),
             "paddle_source": combo_data("_paddle_source_combo", "auto"),
@@ -737,10 +735,8 @@ class OCRTab(QWidget):
                 "vision_candidate_count": 3,
                 "vision_min_height": 0.005,
                 "shortcut_name": "ExtractText",
-                "hayai_backend": "torch",
+                "hayai_backend": "supernova",
                 "hayai_device": "auto",
-                "hayai_quantize": "none",
-                "hayai_litert_quant": "wi4",
                 "paddle_pipeline": "ocr",
                 "paddle_vl_backend": "auto",
                 "paddle_source": "auto",
@@ -819,16 +815,10 @@ class OCRTab(QWidget):
             getattr(self, "_vision_backend_combo", None), vision_backend,
         )
         self._set_combo_value(
-            getattr(self, "_hayai_backend_combo", None), state.get("hayai_backend", "torch")
+            getattr(self, "_hayai_backend_combo", None), state.get("hayai_backend", "supernova")
         )
         self._set_combo_value(
             getattr(self, "_hayai_device_combo", None), state.get("hayai_device", "auto")
-        )
-        self._set_combo_value(
-            getattr(self, "_hayai_quant_combo", None), state.get("hayai_quantize", "none")
-        )
-        self._set_combo_value(
-            getattr(self, "_hayai_litert_quant_combo", None), state.get("hayai_litert_quant", "wi4")
         )
         self._update_hayai_option_state()
         self._set_combo_value(
@@ -1276,7 +1266,7 @@ class OCRTab(QWidget):
                 except Exception as exc:
                     details.append(f"Apple Vision：检测失败（{exc}）")
                 for cid in (
-                    "hayai_ocr", "hayai_ocr_litert", "ndlocr_lite",
+                    "hayai_ocr_supernova", "ndlocr_lite",
                     "paddle_ocr", "paddle_structure", "paddle_vl", "manga_48px",
                 ):
                     probe = probe_runtime(cid, deep=deep, refresh=deep)
@@ -2225,15 +2215,9 @@ class OCRTab(QWidget):
             )
 
     def _update_hayai_option_state(self, *_args):
-        if not hasattr(self, "_hayai_backend_combo"):
-            return
-        is_litert = str(self._hayai_backend_combo.currentData() or "torch") == "litert"
-        self._hayai_device_combo.setEnabled(not is_litert)
-        self._hayai_quant_combo.setEnabled(not is_litert)
-        self._hayai_litert_quant_combo.setEnabled(is_litert)
-        if is_litert:
-            self._hayai_device_combo.setToolTip("LiteRT 当前由 CPU interpreter 执行。")
-        else:
+        # Supernova is the only model; device choice remains user-configurable.
+        if hasattr(self, "_hayai_device_combo"):
+            self._hayai_device_combo.setEnabled(True)
             self._hayai_device_combo.setToolTip("")
 
     def _on_vision_backend_changed(self):
@@ -2599,10 +2583,8 @@ class OCRTab(QWidget):
         elif engine_id == "hayai_ocr":
             from utils.apple_silicon_runtime import is_m6
             opts.update(
-                backend=str(self._hayai_backend_combo.currentData() or "torch"),
+                backend="supernova",
                 device=str(self._hayai_device_combo.currentData() or "auto"),
-                quantize=str(self._hayai_quant_combo.currentData() or "none"),
-                litert_quant=str(self._hayai_litert_quant_combo.currentData() or "wi4"),
                 max_new_tokens=128,
                 segment_max_chars=(30 if is_m6() else 24),
                 segment_max_aspect=18.0,
@@ -3196,6 +3178,9 @@ class OCRCompareTab(OCRCompareViewMixin, QWidget):
         self._review_mode = "full"
         # Presentation-only full-book reader; never enters persisted OCR state.
         self._full_only_enabled = False
+        # Full overview defaults to the original independent model text boxes.
+        self._full_overview_multimodel = False
+        self._full_overview_layout = "boxes"
         self._full_only_refresh_timer = QTimer(self)
         self._full_only_refresh_timer.setSingleShot(True)
         self._full_only_refresh_timer.setInterval(180)
@@ -4906,9 +4891,9 @@ class OCRCompareTab(OCRCompareViewMixin, QWidget):
         """Jump to the previous unresolved decision or filtered adjudication history."""
         if self._comparison is None or not self._fusion_states:
             return
-        rows = tuple(i for i, row in enumerate(self._comparison.rows) if row.is_conflict)
+        rows = tuple(getattr(self._decision_queue_model, "rows", ()) or ())
         if not rows:
-            message = "当前筛选没有已裁决句。" if self._show_resolved_history else "所有不一致候选均已完成选择；没有上一组待判断内容。"
+            message = "当前筛选没有已裁决句。" if self._show_resolved_history else "当前筛选没有待判断句。"
             self._summary.setText(message)
             if not self._show_resolved_history:
                 self._show_no_pending_decisions()
@@ -4949,7 +4934,7 @@ class OCRCompareTab(OCRCompareViewMixin, QWidget):
     def _jump_next_group_from(self, row_index: int):
         if self._comparison is None or not self._fusion_states:
             return
-        rows = tuple(i for i, row in enumerate(self._comparison.rows) if row.is_conflict)
+        rows = tuple(getattr(self._decision_queue_model, "rows", ()) or ())
         if not rows:
             if self._show_resolved_history:
                 self._show_no_pending_decisions("当前筛选没有已裁决句")

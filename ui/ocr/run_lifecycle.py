@@ -4,7 +4,7 @@ import html
 import time
 
 from PySide6.QtCore import QTimer
-from PySide6.QtWidgets import QMessageBox
+from ui.localized_dialogs import LocalizedMessageBox as QMessageBox
 
 from ui.dialogs import show_error_dialog
 

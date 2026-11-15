@@ -7755,6 +7755,10 @@ def _iter_column_pages(
         # may consume more than one image (for example ``short_blocks``), so
         # preserve the ordered list instead of inventing a single synthetic hash.
         rescue_input_hashes: dict[tuple[str, int], dict[str, list[str]]] = {}
+        # Evidence rejected by Hayai's hallucination/length gate travels with
+        # the immutable physical-column ID into UnifiedDocument/AI review.
+        hayai_review_evidence: dict[tuple[str, int], list[dict]] = {}
+        recognizer_path_to_target = dict(crop_to_target)
         selection_meta: dict[tuple[str, int], dict] = {}
         sentence_reocr_meta: dict[tuple[str, int], dict] = {}
         rescue_decisions: dict[tuple[str, int], _ColumnRescueDecision] = {}
@@ -7929,13 +7933,27 @@ def _iter_column_pages(
                     recognition_metrics["calls"] += 1
                     recognition_metrics["items"] += miss_count
 
+                if str(recognition_engine).lower() == "hayai_ocr":
+                    hayai_session = getattr(session, "_hayai", None)
+                    evidence_map = getattr(hayai_session, "review_evidence", {})
+                    for path in misses:
+                        target = recognizer_path_to_target.get(path)
+                        if target is None:
+                            continue
+                        for evidence in (evidence_map.get(path) or []):
+                            hayai_review_evidence.setdefault(target, []).append({
+                                "method": str(label), **dict(evidence),
+                            })
                 for path in misses:
                     result = live.get(path, ("", 0.0, "识字进程未返回该图像"))
                     results[path] = result
-                    segment_cache.save(
-                        path, str(label), result,
-                        image_sha256=digest_by_path.get(path),
-                    )
+                    # Never memoize a review-required partial result as a
+                    # clean success. Re-OCR must retain its evidence metadata.
+                    if "□" not in str(result[0] or "") and "�" not in str(result[0] or ""):
+                        segment_cache.save(
+                            path, str(label), result,
+                            image_sha256=digest_by_path.get(path),
+                        )
             elif callable(progress_callback):
                 # All-cache-hit batches still finish the stage at 100%.
                 progress_callback(total, total, ordered_paths[-1])
@@ -7950,6 +7968,7 @@ def _iter_column_pages(
         def record_recognizer_input(
             target: tuple[str, int], method: str, path: str | Path
         ) -> str:
+            recognizer_path_to_target[str(path)] = target
             try:
                 digest = _file_sha256(Path(path))
             except Exception:
@@ -9527,6 +9546,10 @@ def _iter_column_pages(
                 else:
                     text, confidence, _error = result
                     text_recognized_count += 1
+                    if "□" in text or "�" in text:
+                        # Mixed real prefix + placeholder is not finished OCR.
+                        manual_pending_count += 1
+                        confidence = 0.0
                 column_id = f"p{page_index:05d}:c{column_index + 1:03d}"
                 selected_meta = selection_meta.get(target_key, {})
                 selected_method = str(selected_meta.get("selected_method", "") or "")
@@ -9624,6 +9647,7 @@ def _iter_column_pages(
                     "column_ocr_candidate_conflict": bool(selected_meta.get("conflict", False)),
                     "column_consensus_seeded": bool(selected_meta.get("consensus_seeded", False)),
                     "column_ocr_candidates": list(selected_meta.get("candidates", [])),
+                    "column_hayai_rejected_segments": list(hayai_review_evidence.get(target_key, [])),
                     "column_ocr_compare_mode": compare_mode,
                     "column_auto_filter_ruby": bool(auto_filter_ruby),
                     "column_filter_fragments": bool(filter_fragments),
@@ -9660,6 +9684,11 @@ def _iter_column_pages(
                     "column_ocr_transport": transport,
                 }
                 block.update(sentence_meta)
+                if not is_unresolved and ("□" in text or "�" in text):
+                    block.update({
+                        "column_requires_handwriting": True,
+                        "column_ocr_failure_reason": "hayai_partial_output_requires_visual_review",
+                    })
                 if is_unresolved:
                     block.update({
                         "column_ocr_empty": True,

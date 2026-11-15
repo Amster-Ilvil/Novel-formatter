@@ -235,6 +235,13 @@ def _structure_projection(document_dict: dict) -> dict:
                 "replacement_extra_chars",
             }:
                 metadata.pop(key, None)
+    metadata = value.get("metadata")
+    if isinstance(metadata, dict):
+        records = metadata.get("column_ocr_input_records")
+        if isinstance(records, dict):
+            for record in records.values():
+                if isinstance(record, dict):
+                    record.pop("hayai_rejected_segments", None)
     for block in value.get("blocks", []) if isinstance(value.get("blocks"), list) else []:
         if not isinstance(block, dict):
             continue
@@ -251,6 +258,7 @@ def _structure_projection(document_dict: dict) -> dict:
                     "last_column_text",
                     "candidate_texts",
                     "column_ocr_candidates",
+                    "column_hayai_rejected_segments",
                     "multi_ocr_candidates",
                 }:
                     meta.pop(key, None)
@@ -716,6 +724,11 @@ def export_multi_package(
         physical_column_text_snapshot(doc) for doc in docs
     ]
     geometry_snapshots: list[dict[str, dict]] = [_column_geometry_snapshot(doc) for doc in docs]
+    # Per-source evidence stays separate from accepted text and geometry.
+    rejected_snapshots = [
+        getattr(getattr(doc, "metadata", None), "column_ocr_input_records", {}) or {}
+        for doc in docs
+    ]
     for item in items:
         column_ids = [str(value) for value in (item.get("column_ids") or [])]
         item["physical_column_candidates"] = []
@@ -737,6 +750,15 @@ def export_multi_package(
                 "column_texts": fragments,
                 "column_text_sha256": _sha256(fragments),
                 "column_geometry": geometry,
+                "rejected_ocr_segments": [
+                    {"column_id": column_id, "segments": copy.deepcopy(
+                        (rejected_snapshots[model_index].get(column_id) or {}).get("hayai_rejected_segments")
+                    )}
+                    for column_id in column_ids
+                    if isinstance(rejected_snapshots[model_index], dict)
+                    and isinstance(rejected_snapshots[model_index].get(column_id), dict)
+                    and (rejected_snapshots[model_index][column_id].get("hayai_rejected_segments") or [])
+                ],
             })
         item["column_geometry"] = copy.deepcopy(
             [geometry_snapshots[0].get(column_id) for column_id in column_ids if geometry_snapshots and geometry_snapshots[0].get(column_id)]

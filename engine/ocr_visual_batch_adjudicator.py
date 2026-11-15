@@ -379,6 +379,14 @@ def _route_item(item: dict, routing_mode: str) -> tuple[bool, str, int]:
     alignment_repaired = bool(item.get("alignment_repaired", False))
     model_texts = _model_texts(item)
 
+    # A rejected Hayai response remains untrusted provenance, but it is an
+    # explicit visual-review signal even when two other models agree. Never
+    # make the vision-first transcription see the rejected text itself.
+    if any(
+        isinstance(candidate, dict) and candidate.get("rejected_ocr_segments")
+        for candidate in item.get("physical_column_candidates") or []
+    ):
+        return True, "hayai_rejected_segment_requires_visual_review", 3
     if local_reocr:
         return True, "local_reocr_recommended", 3
     if warnings or alignment_repaired:
