@@ -22,6 +22,34 @@ def _compact(value: str) -> str:
     return _SPACE_RE.sub("", unicodedata.normalize("NFKC", str(value or ""))).casefold()
 
 
+def _read_glossary_text(source: Path) -> str:
+    """Read a user-selected glossary without losing characters on Windows.
+
+    UTF-8 is authoritative for new files.  Excel/legacy Notepad on Chinese
+    Windows can produce GBK/GB18030 "ANSI" glossaries; support those only if
+    strict UTF-8 decoding fails.  Keep JSON and TXT handling identical.
+    """
+    raw = source.read_bytes()
+    if raw.startswith((b"\xff\xfe", b"\xfe\xff")):
+        # BOM is necessary: guessing UTF-16 from NUL bytes can mask corruption.
+        return raw.decode("utf-16")
+    if b"\x00" in raw:
+        raise ValueError(
+            f"术语表包含 NUL 字节，可能是 UTF-16（无 BOM）或非文本文件：{source}。"
+            "请将其另存为 UTF-8 文本后重试。"
+        )
+    try:
+        return raw.decode("utf-8-sig")
+    except UnicodeDecodeError as utf8_error:
+        try:
+            return raw.decode("gb18030")
+        except UnicodeDecodeError as legacy_error:
+            raise ValueError(
+                f"术语表编码无法识别：{source}。仅支持 UTF-8、带 BOM 的 UTF-16、"
+                "GBK/GB18030；请将术语表另存为 UTF-8 文本后重试。"
+            ) from legacy_error
+
+
 def load_glossary(path: str | Path | None) -> list[tuple[str, str]]:
     raw_path = str(path or "").strip()
     if not raw_path:
@@ -32,7 +60,7 @@ def load_glossary(path: str | Path | None) -> list[tuple[str, str]]:
 
     pairs: list[tuple[str, str]] = []
     if source.suffix.lower() == ".json":
-        data = json.loads(source.read_text(encoding="utf-8-sig"))
+        data = json.loads(_read_glossary_text(source))
         if isinstance(data, dict):
             values = list(data.items())
         elif isinstance(data, list):
@@ -52,7 +80,7 @@ def load_glossary(path: str | Path | None) -> list[tuple[str, str]]:
             if left and right:
                 pairs.append((left, right))
     else:
-        for raw in source.read_text(encoding="utf-8-sig").splitlines():
+        for raw in _read_glossary_text(source).splitlines():
             line = raw.strip()
             if not line or line.startswith("#"):
                 continue
