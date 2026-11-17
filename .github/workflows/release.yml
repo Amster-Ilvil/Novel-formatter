@@ -328,15 +328,14 @@ jobs:
 
           本 Release 直接由当前 main 提交 **${GITHUB_SHA}** 在 GitHub Actions 干净环境中构建。
 
-          ### v2.2 更新（相对 v2.1）
-          - **macOS 凭据安全**：通过系统 Security.framework Keychain API 保存、更新和删除 AI/OCR 密钥，避免把密钥放进 security(1) 命令的进程参数。
-          - **Python 下载校验**：Mac/Windows 可从镜像下载运行时，但 SHA256SUMS 只能从官方 astral-sh GitHub Release 获取；无法取到官方校验文件时拒绝安装。
-          - **Linux 构建链加固**：AppImageKit 构建工具绑定固定的官方 GitHub 资产 ID、大小和更新时间，下载前后核验；检测到更换即拒绝执行。上游未提供独立 SHA-256，资产身份锁定不等于文件哈希签名校验。
-          - **CI 审计**：GitHub Actions 使用固定提交 SHA，发布前执行 Keychain/下载来源安全回归与隐私审计。
-          - **OCR 运行改进**：Hayai 优先复用既有环境并统一 GUI/Worker 选择，离线拒绝重复安装；Hayai、48px、NDLOCR 增加可选的独立 Worker 缓存。
-          - **导入及 EPUB**：支持 CBZ/ZIP 漫画、WebP 和基于文件签名的图片导入；补齐 OCR WebP 参考预览，增加可选 LTR 横排 EPUB。
-          - **质量与兼容性**：增强 Pillow 备用分栏、OpenVINO 模型哈希检查、Ruby 离线保护和自绘侧边栏的语言切换。
-
+          ### v2.3 更新（相对 v2.2）
+          - **OCR 图文复核工作区**：加强整本逐句、多模型候选与原扫描页／物理列之间的定位和联动，增加复核筛选、参考图局部放大等界面组件。
+          - **裁决往返与工作区**：完善 GUI 导入导回状态同步、扫描证据关联和工作区文件恢复路径。
+          - **Hayai OCR 环境**：调整 Hayai 后端选择与运行环境复用逻辑，改善本地已安装运行时检测及独立 Worker 缓存。
+          - **AI 术语表兼容**：扩展旧版术语表编码读取，降低 Windows 等环境下的解码失败风险。
+          - **EPUB 与界面**：改善横排文字方向支持、国际化界面文本及错误反馈。
+          
+          本版从 GitHub main 的 VERSION=2.3 提交构建；并非来源于本地 v2.5 实验 ZIP。
           ### 安全及验证说明
           - 发布包不内置任何 OCR 权重或用户数据。首次运行可能下载安装独立 Python 和主程序依赖；请勿在不信任网络中使用自动安装。
           - 模型上游、镜像、在线 AI 服务和未经独立校验的第三方依赖仍属于供应链与隐私边界；本版本不宣称不存在所有潜在后门。
@@ -360,8 +359,8 @@ jobs:
           EOF
 
           if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
-            # A v2.2 rebuild must retarget the existing lightweight tag to the
-            # exact new commit, or the tag would refer to stale v2.2 packages.
+            # Rebuilds may retarget the existing lightweight tag to the
+            # exact new commit, or the tag would refer to stale packages.
             # Never force a non-fast-forward tag move.
             CURRENT_TAG_SHA="$(gh api "repos/${GITHUB_REPOSITORY}/git/ref/tags/${RELEASE_TAG}" --jq .object.sha)"
             if [[ "$CURRENT_TAG_SHA" != "$GITHUB_SHA" ]]; then
