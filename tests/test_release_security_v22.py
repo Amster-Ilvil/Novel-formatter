@@ -115,7 +115,7 @@ class SecurityTests(unittest.TestCase):
 
     def test_version_matches_application_metadata(self):
         version = (ROOT / "VERSION").read_text(encoding="utf-8").strip()
-        self.assertRegex(version, r"^[0-9]+\\.[0-9]+(?:\\.[0-9]+)?$".replace("\\\\", "\\"))
+        self.assertRegex(version, r"^[0-9]+\.[0-9]+(?:\.[0-9]+)?$")
         self.assertIn(f'VERSION = "{version}"', (ROOT / "core/app_meta.py").read_text(encoding="utf-8"))
         self.assertIn('self._make_card(f"Novel Formatter {VERSION}")', (ROOT / "ui/settings/tab.py").read_text(encoding="utf-8"))
 
