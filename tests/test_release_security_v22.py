@@ -1,4 +1,4 @@
-"""Offline v2.2 release-security regression tests (stdlib only)."""
+"""Offline release-security regression tests (stdlib only)."""
 from __future__ import annotations
 
 import ctypes
@@ -113,10 +113,11 @@ class SecurityTests(unittest.TestCase):
                 proc = subprocess.run(["bash", "-c", command], capture_output=True, text=True)
                 self.assertEqual(proc.returncode == 0, should_pass, proc.stderr)
 
-    def test_version_is_22(self):
-        self.assertEqual((ROOT / "VERSION").read_text().strip(), "2.2")
-        self.assertIn('VERSION = "2.2"', (ROOT / "core/app_meta.py").read_text())
-        self.assertIn('self._make_card(f"Novel Formatter {VERSION}")', (ROOT / "ui/settings/tab.py").read_text())
+    def test_version_matches_application_metadata(self):
+        version = (ROOT / "VERSION").read_text(encoding="utf-8").strip()
+        self.assertRegex(version, r"^[0-9]+\\.[0-9]+(?:\\.[0-9]+)?$".replace("\\\\", "\\"))
+        self.assertIn(f'VERSION = "{version}"', (ROOT / "core/app_meta.py").read_text(encoding="utf-8"))
+        self.assertIn('self._make_card(f"Novel Formatter {VERSION}")', (ROOT / "ui/settings/tab.py").read_text(encoding="utf-8"))
 
 
 if __name__ == "__main__":
