@@ -11,7 +11,7 @@ permissions:
   contents: read
 
 concurrency:
-  group: novel-formatter-release-${{ github.ref }}
+  group: novel-formatter-release-arm26-${{ github.ref }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
@@ -104,7 +104,7 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - os: macos-15
+          - os: macos-26
             label: AppleSilicon
             arch: arm64
           - os: macos-15-intel
