@@ -17,7 +17,9 @@ import time
 from http.client import HTTPSConnection, IncompleteRead
 from pathlib import Path
 from urllib.error import HTTPError, URLError
-from urllib.request import HTTPSHandler, Request, build_opener, urlopen
+from urllib.request import HTTPSHandler, Request, build_opener
+
+from .http_transport import RejectRedirects, open_direct
 
 from ai.config import validate_api_key
 from ai.gemini_free_tier import DEFAULT_RPD, DEFAULT_RPM, DEFAULT_TPM, OCR_MODEL, SharedModelQuota
@@ -246,7 +248,7 @@ class GeminiJsonTransport:
         request.add_unredirected_header("x-goog-api-key", key)
         max_attempts = 1 if single_attempt else self.max_retries + 1
         open_request = self.request_fn or (
-            build_opener(_GeminiHTTPSHandler()).open if single_attempt else urlopen
+            build_opener(RejectRedirects(), _GeminiHTTPSHandler()).open if single_attempt else open_direct
         )
 
         def report(event: dict) -> None:
@@ -295,6 +297,7 @@ class GeminiJsonTransport:
                 return raw
             except HTTPError as exc:
                 # Keep HTTP error messages credential-free (some backends echo headers).
+                exc.close()
                 retryable = exc.code in _RETRYABLE_HTTP_STATUS
                 if exc.code == 429 and not single_attempt and self._fallback is not None:
                     try:

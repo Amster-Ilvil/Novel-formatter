@@ -10,8 +10,10 @@ import json
 import os
 import re
 from pathlib import Path
-from urllib.request import Request, urlopen
-from urllib.error import HTTPError
+from urllib.request import Request
+from urllib.error import HTTPError, URLError
+
+from .http_transport import open_direct
 
 from ai.config import validate_api_key
 from ai.gemini_ocr_transport import DEFAULT_MODEL, OCR_SCHEMA, GeminiJsonTransport, response_text, safe_model, validate_items
@@ -104,14 +106,18 @@ def make_request_bodies(folder: Path, manifest: dict) -> list[dict]:
 
 def _api_call(path: str, *, api_key: str, payload: dict | None = None) -> dict:
     key = validate_api_key(api_key)
-    headers = {"x-goog-api-key": key, "Content-Type": "application/json"}
+    headers = {"Content-Type": "application/json"}
     req = Request(API + path, headers=headers, method="POST" if payload is not None else "GET",
                   data=json.dumps(payload).encode("utf8") if payload is not None else None)
+    req.add_unredirected_header("x-goog-api-key", key)
     try:
-        with urlopen(req, timeout=120) as stream:
+        with open_direct(req, timeout=120) as stream:
             return json.loads(stream.read().decode("utf8"))
     except HTTPError as exc:
+        exc.close()
         raise RuntimeError(f"Gemini Batch API HTTP {exc.code}") from None
+    except (URLError, TimeoutError):
+        raise RuntimeError("Gemini Batch API 网络请求失败") from None
 
 
 def submit(folder: Path, *, api_key: str, allow_paid_batch: bool = False) -> dict:

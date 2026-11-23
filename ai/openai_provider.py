@@ -10,6 +10,7 @@ from __future__ import annotations
 from .base import AIProvider
 from .config import validate_api_key
 from .glm_compat import is_glm53_flash, looks_always_thinking_error
+from .http_transport import safe_sdk_error, validate_service_url
 import itertools
 import logging
 import threading
@@ -45,16 +46,16 @@ class OpenAIProvider(AIProvider):
             raw_key = validate_api_key(raw_key)
         keys = [x.strip() for x in raw_key.split(",") if x.strip()] or ["not-required"]
         timeout = float(self.kwargs.get("request_timeout", 180) or 180)
+        base_url = validate_service_url(self.base_url or "https://api.openai.com/v1")
         limits = httpx.Limits(max_connections=128, max_keepalive_connections=64, keepalive_expiry=60.0)
         for key in keys:
             client_kwargs = {
                 "api_key": key,
                 "timeout": timeout,
                 "max_retries": 0,
-                "http_client": httpx.Client(limits=limits, timeout=timeout),
+                "http_client": httpx.Client(limits=limits, timeout=timeout, follow_redirects=False),
+                "base_url": base_url,
             }
-            if self.base_url:
-                client_kwargs["base_url"] = self.base_url
             self._clients.append(OpenAI(**client_kwargs))
         self._client_cycle = itertools.cycle(self._clients)
 
@@ -99,8 +100,8 @@ class OpenAIProvider(AIProvider):
                 raise RuntimeError(
                     "GLM-5.3 Flash 本身无法关闭思考。Novel Formatter 已发送 "
                     f"thinking=enabled + reasoning_effort={effort}，但服务端仍拒绝请求。"
-                    "请确认 Base URL / 模型 ID / 网关实现。原始错误：" + str(exc)
-                ) from exc
+                    "请确认 Base URL / 模型 ID / 网关实现。"
+                ) from None
             else:
                 unsupported_json = status in (400, 404, 422) and any(
                     marker in message for marker in ("response_format", "json mode", "json_object", "unsupported parameter")
@@ -128,10 +129,19 @@ class OpenAIProvider(AIProvider):
         return content or ""
 
     def _call_llm(self, prompt: str, temperature: float) -> str:
-        return self._request(prompt, temperature, json_mode=False)
+        return self._call_sdk(prompt, temperature, json_mode=False)
 
     def call_json(self, prompt: str, temperature: float) -> str:
-        return self._request(prompt, temperature, json_mode=True)
+        return self._call_sdk(prompt, temperature, json_mode=True)
+
+    def _call_sdk(self, prompt: str, temperature: float, *, json_mode: bool) -> str:
+        try:
+            return self._request(prompt, temperature, json_mode=json_mode)
+        except Exception as exc:
+            safe = safe_sdk_error(exc, str(self.api_key or ""))
+            if safe is exc:
+                raise
+            raise safe from None
 
     def close(self) -> None:
         """Close all SDK/httpx clients and make cleanup safe to call repeatedly."""

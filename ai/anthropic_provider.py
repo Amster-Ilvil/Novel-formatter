@@ -6,6 +6,7 @@ import logging
 import threading
 
 from .base import AIProvider
+from .http_transport import safe_sdk_error, validate_service_url
 
 
 class AnthropicProvider(AIProvider):
@@ -30,12 +31,13 @@ class AnthropicProvider(AIProvider):
         if not keys:
             raise ValueError("Anthropic API Key 不能为空")
         timeout = float(self.kwargs.get("request_timeout", 180) or 180)
-        base_url = str(self.kwargs.get("base_url", "") or "").strip() or None
+        base_url = validate_service_url(str(self.kwargs.get("base_url", "") or "").strip() or "https://api.anthropic.com")
         for key in keys:
             client_kwargs = {
                 "api_key": key,
                 "timeout": timeout,
                 "max_retries": 0,
+                "base_url": base_url,
                 "http_client": httpx.Client(
                     limits=httpx.Limits(
                         max_connections=128,
@@ -43,10 +45,9 @@ class AnthropicProvider(AIProvider):
                         keepalive_expiry=60.0,
                     ),
                     timeout=timeout,
+                    follow_redirects=False,
                 ),
             }
-            if base_url:
-                client_kwargs["base_url"] = base_url
             self._clients.append(Anthropic(**client_kwargs))
         self._client_cycle = itertools.cycle(self._clients)
 
@@ -67,7 +68,13 @@ class AnthropicProvider(AIProvider):
         }
         if self.kwargs.get("top_p") is not None:
             params["top_p"] = float(self.kwargs.get("top_p"))
-        response = self._next_client().messages.create(**params)
+        try:
+            response = self._next_client().messages.create(**params)
+        except Exception as exc:
+            safe = safe_sdk_error(exc, str(self.api_key or ""))
+            if safe is exc:
+                raise
+            raise safe from None
         usage = getattr(response, "usage", None)
         input_tokens = getattr(usage, "input_tokens", 0) if usage else 0
         output_tokens = getattr(usage, "output_tokens", 0) if usage else 0

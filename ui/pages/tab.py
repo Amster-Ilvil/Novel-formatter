@@ -34,7 +34,7 @@ from ui.common.styling import (
 from ui.pages.preview import PageImagePreviewDialog
 from ui.pages.types import PAGE_TYPES, TYPE_COLOR, TYPE_LABEL
 
-
+_PAGE_FILTER_LABELS = {"all": "全部", **{key: label for key, label, _ in PAGE_TYPES}}
 
 _STRONG_PAGE_TYPE_PATTERNS = (
     ("cover", re.compile(r"(?:^|[_\-\s])(cover|frontcover|front_cover)(?:$|[_\-\s])", re.I)),
@@ -227,7 +227,6 @@ class _PageThumbnailCard(QWidget):
         compact_color = {
             "cover": "#3478F6",
             "illustration": "#7894B8",
-            "color_illus": "#7894B8",
             "paragraph": "#17A46B",
         }.get(self._page_type, color)
         label = TYPE_LABEL.get(self._page_type, "?")
@@ -442,15 +441,15 @@ class PageManagerTab(QWidget):
         action_row.addWidget(more_btn)
 
         action_row.addStretch(1)
-        filter_labels = (("all", "全部"), ("text", "正文"), ("illustration", "插图"), ("cover", "封面"))
-        for ttype, label in filter_labels:
+        filter_row = FlowLayout(hspacing=6, vspacing=6)
+        for ttype, label in _PAGE_FILTER_LABELS.items():
             btn = QPushButton(label)
             btn.setCheckable(True)
             btn.setAutoExclusive(True)
             btn.setProperty("pageFilter", True)
             btn.clicked.connect(partial(self._set_filter, ttype))
             self._filter_btns[ttype] = btn
-            action_row.addWidget(btn)
+            filter_row.addWidget(btn)
         self._filter_btns["all"].setChecked(True)
 
         self._search_edit = QLineEdit()
@@ -461,6 +460,7 @@ class PageManagerTab(QWidget):
         self._search_edit.setVisible(False)
         action_row.addWidget(self._search_edit)
         card_layout.addLayout(action_row)
+        card_layout.addLayout(filter_row)
 
         def _show_page_search():
             self._search_edit.setVisible(True)
@@ -705,15 +705,15 @@ class PageManagerTab(QWidget):
         info = self.project_manager.project_context()
         name = re.sub(r"[\\/:*?\"<>|]+", "_", str(info.get("name") or Path(project).name)).strip() or "project"
         default_dir = self.project_manager.package_export_dir or Path(project)
-        default = default_dir / f"{name}_完整项目备份_{time.strftime('%Y%m%d-%H%M%S')}.zip"
+        default = default_dir / f"{name}_项目备份_{time.strftime('%Y%m%d-%H%M%S')}.zip"
         path, _ = QFileDialog.getSaveFileName(
-            self, "导出完整项目备份", str(default), "Novel Formatter 项目备份 (*.zip)",
+            self, "导出项目备份", str(default), "Novel Formatter 项目备份 (*.zip)",
         )
         if not path:
             return
         try:
             output = self.project_manager.export_project_archive(path)
-            self._project_status.setText(f"完整项目备份已保存：{output}")
+            self._project_status.setText(f"项目备份已保存（不含运行日志）：{output}")
             notify(self, f"项目备份已保存：\n{output}", "success")
         except Exception as exc:
             show_error_dialog(self, "项目备份失败", str(exc))
@@ -1606,7 +1606,14 @@ class PageManagerTab(QWidget):
             QTimer.singleShot(0, release_old_pdf_cache)
 
     def _ptype(self, page_no):
-        return self.page_overrides.get(page_no, "unknown")
+        page_type = self.page_overrides.get(page_no, "unknown")
+        return "illustration" if page_type == "color_illus" else page_type
+
+    def _matches_page_filter(self, page_no: int, path: str | Path) -> bool:
+        return (
+            (self._current_filter == "all" or self._ptype(page_no) == self._current_filter)
+            and (not self._search_text or self._search_text in Path(path).name.casefold())
+        )
 
     def _render(self):
         self._grid_build_generation += 1
@@ -1618,19 +1625,11 @@ class PageManagerTab(QWidget):
                 item.widget().hide()
                 item.widget().deleteLater()
 
-        filtered_specs = []
-        query = self._search_text
-        filter_types = {
-            "text": {"paragraph"},
-            "illustration": {"illustration", "color_illus"},
-            "cover": {"cover"},
-        }.get(self._current_filter)
-        for page_no, path in enumerate(self.page_images, start=1):
-            if filter_types is not None and self._ptype(page_no) not in filter_types:
-                continue
-            if query and query not in Path(path).name.casefold():
-                continue
-            filtered_specs.append((Path(path), page_no))
+        filtered_specs = [
+            (Path(path), page_no)
+            for page_no, path in enumerate(self.page_images, start=1)
+            if self._matches_page_filter(page_no, path)
+        ]
 
         self._thumb_labels = {}
         self._page_frames = {}
@@ -1727,22 +1726,11 @@ class PageManagerTab(QWidget):
             return int(getattr(self, "_rendered_grid_cols", 0) or 0)
         cell_w, gap = 148, 16
         visible_count = len(self.page_images)
-        if self._current_filter != "all":
-            filter_types = {
-                "text": {"paragraph"},
-                "illustration": {"illustration", "color_illus"},
-                "cover": {"cover"},
-            }.get(self._current_filter, {self._current_filter})
+        if self._current_filter != "all" or self._search_text:
             visible_count = sum(
-                1 for index, _path in enumerate(self.page_images)
-                if self._ptype(index + 1) in filter_types
+                1 for page_no, path in enumerate(self.page_images, start=1)
+                if self._matches_page_filter(page_no, path)
             )
-        if self._search_text:
-            query = self._search_text
-            visible_count = sum(
-                1 for path in self.page_images
-                if query in Path(path).name.casefold()
-            ) if self._current_filter == "all" else visible_count
         if visible_count <= 0:
             return 0
         return max(1, min(12, visible_count, (width + gap) // (cell_w + gap)))
@@ -2049,7 +2037,17 @@ class PageManagerTab(QWidget):
         self.pages_loaded.emit([str(path) for path in self.page_images])
 
     def _refresh_page_type_styles(self, page_numbers) -> None:
-        """Update only changed page badges/counts; never rebuild the thumbnail grid."""
+        """Rebuild only when a type change affects the active filter."""
+        if self._current_filter != "all" and page_numbers:
+            displayed = {page_no for _, page_no in self._grid_build_specs}
+            if any(
+                (page_no in displayed) != self._matches_page_filter(
+                    page_no, self.page_images[page_no - 1]
+                )
+                for page_no in page_numbers
+            ):
+                self._render()
+                return
         for raw_page_no in page_numbers or ():
             try:
                 page_no = int(raw_page_no)
@@ -2135,15 +2133,9 @@ class PageManagerTab(QWidget):
         total = len(self.page_images)
         for t, lbl in self._filter_counts.items():
             lbl.setText(str(total if t == "all" else counts.get(t, 0)))
-        compact_counts = {
-            "all": total,
-            "text": counts.get("paragraph", 0),
-            "illustration": counts.get("illustration", 0) + counts.get("color_illus", 0),
-            "cover": counts.get("cover", 0),
-        }
-        compact_labels = {"all": "全部", "text": "正文", "illustration": "插图", "cover": "封面"}
         for t, btn in self._filter_btns.items():
-            btn.setText(f"{compact_labels.get(t, t)} {compact_counts.get(t, 0)}")
+            count = total if t == "all" else counts.get(t, 0)
+            btn.setText(f"{_PAGE_FILTER_LABELS[t]} {count}")
             btn.setChecked(t == self._current_filter)
         # Apply the same selected-state styling on the first render/load.
         for t, btn in self._filter_btns.items():

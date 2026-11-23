@@ -24,6 +24,7 @@ import csv
 import io
 from typing import Iterable, Mapping, Any
 
+from ai.redaction import redact_json_credentials, redact_secrets
 from utils.atomic_io import atomic_write_bytes, atomic_write_text
 from utils.safe_archive import safe_extract_zip
 from core.ocr_segment_cache import OcrSegmentCache
@@ -301,7 +302,7 @@ class ProjectWorkspaceManager:
         return self.open_project(target)
 
     def export_project_archive(self, target_zip: str | Path) -> Path:
-        """Create a complete portable project backup ZIP."""
+        """Create a portable project backup without local run diagnostics."""
         project = self._require_project()
         target = Path(target_zip).expanduser()
         if target.suffix.lower() != ".zip":
@@ -319,13 +320,21 @@ class ProjectWorkspaceManager:
             "project_id": self.project_context().get("project_id", ""),
             "project_name": self.project_context().get("name", project.name),
             "audit": audit,
+            "includes_run_logs": False,
         }
         temp_target = target.with_name(f".{target.name}.{uuid.uuid4().hex[:8]}.tmp")
         compression = zipfile.ZIP_DEFLATED
         try:
             with zipfile.ZipFile(temp_target, "w", compression=compression, allowZip64=True) as archive:
                 root_name = _safe_component(project.name, "project")
+                if redact_secrets(root_name) != root_name:
+                    raise ValueError("项目名称中含有疑似凭据，无法安全导出备份。")
                 for file in sorted(project.rglob("*")):
+                    relative = file.relative_to(project)
+                    if relative.parts[0] == "logs":
+                        continue
+                    if file.is_symlink():
+                        raise ValueError("项目中含有符号链接，无法安全导出备份。")
                     if not file.is_file():
                         continue
                     try:
@@ -333,8 +342,46 @@ class ProjectWorkspaceManager:
                             continue
                     except OSError:
                         pass
-                    rel = file.relative_to(project).as_posix()
+                    rel = relative.as_posix()
                     if rel == "metadata/backup_manifest.json":
+                        continue
+                    # A previous backup may contain diagnostics from an older
+                    # version. Do not nest backups from the project's exports.
+                    if relative.parts[0] == "exports" and file.suffix.casefold() == ".zip":
+                        try:
+                            with zipfile.ZipFile(file) as candidate:
+                                if any(
+                                    member.count("/") == 2 and member.endswith("/metadata/backup_manifest.json")
+                                    for member in candidate.namelist()
+                                ):
+                                    continue
+                        except zipfile.BadZipFile:
+                            pass
+                    name = file.name.casefold()
+                    if (
+                        name in {"ai_settings.json", "credentials.json", "service_account.json",
+                                 ".netrc", "_netrc", "id_rsa", "id_ed25519", "id_ecdsa"}
+                        or name == ".env" or name.startswith(".env.")
+                        or file.suffix.casefold() in {".pem", ".key", ".p12", ".pfx", ".keychain"}
+                        or redact_secrets(rel) != rel
+                    ):
+                        raise ValueError("项目中含有疑似凭据文件，无法安全导出备份。")
+                    if rel == PROJECT_FILE:
+                        payload = redact_json_credentials(self._read_project_payload(project))
+                        for entry in payload.get("source_imports") or []:
+                            if isinstance(entry, dict):
+                                entry.pop("source_path", None)
+                        archive.writestr(f"{root_name}/{rel}", json.dumps(payload, ensure_ascii=False, indent=2) + "\n")
+                        continue
+                    if relative.parts[0] in {"pipeline", "metadata"} and file.suffix.casefold() == ".json":
+                        raw = file.read_bytes()
+                        try:
+                            data = json.loads(raw)
+                        except ValueError:
+                            raise ValueError(f"项目配置无法解析，无法安全导出备份：{rel}") from None
+                        if redact_json_credentials(data) != data:
+                            raise ValueError(f"项目配置含有疑似凭据，无法安全导出备份：{rel}")
+                        archive.writestr(f"{root_name}/{rel}", raw)
                         continue
                     archive.write(
                         file,
@@ -343,7 +390,7 @@ class ProjectWorkspaceManager:
                     )
                 archive.writestr(
                     f"{root_name}/metadata/backup_manifest.json",
-                    json.dumps(manifest, ensure_ascii=False, indent=2) + "\n",
+                    json.dumps(redact_json_credentials(manifest), ensure_ascii=False, indent=2) + "\n",
                 )
             os.replace(temp_target, target)
         finally:
@@ -1483,6 +1530,7 @@ class ProjectWorkspaceManager:
             "error": {},
             "artifacts": {},
         }
+        payload = redact_json_credentials(payload)
         self._write_run_payload(project, payload)
         self.rebuild_run_history_index()
         self._update_last_run(project, payload)
@@ -1501,7 +1549,8 @@ class ProjectWorkspaceManager:
     ) -> Path:
         """Finalize a run atomically and persist optional human/perf diagnostics."""
         project = self._require_project()
-        path = project / "logs" / "runs" / f"{run_id}.json"
+        file_id = _safe_component(run_id, "run")
+        path = project / "logs" / "runs" / f"{file_id}.json"
         if path.exists():
             try:
                 payload = _require_run_log_schema(
@@ -1545,14 +1594,14 @@ class ProjectWorkspaceManager:
         run_artifacts = dict(payload.get("artifacts") or {})
         run_artifacts.update(dict(artifacts or {}))
         if log_text is not None:
-            log_path = project / "logs" / "runs" / f"{run_id}.log"
+            log_path = project / "logs" / "runs" / f"{file_id}.log"
             atomic_write_text(log_path, self._redact_log_text(log_text).rstrip() + "\n")
             run_artifacts["text_log"] = log_path.name
         if performance is not None:
-            perf_path = project / "logs" / "runs" / f"{run_id}.performance.json"
+            perf_path = project / "logs" / "runs" / f"{file_id}.performance.json"
             atomic_write_text(
                 perf_path,
-                json.dumps(dict(performance), ensure_ascii=False, indent=2, sort_keys=True) + "\n",
+                json.dumps(redact_json_credentials(performance), ensure_ascii=False, indent=2, sort_keys=True) + "\n",
             )
             run_artifacts["performance"] = perf_path.name
             # Prefer the performance trace wall time when available: it is
@@ -1564,6 +1613,7 @@ class ProjectWorkspaceManager:
             if perf_elapsed > 0:
                 payload["duration_seconds"] = round(perf_elapsed, 6)
         payload["artifacts"] = run_artifacts
+        payload = redact_json_credentials(payload)
         self._write_run_payload(project, payload)
         self.rebuild_run_history_index()
         self._update_last_run(project, payload)
@@ -1593,7 +1643,7 @@ class ProjectWorkspaceManager:
                     invalid = True
                     continue
                 if isinstance(row, dict) and row.get("run_id"):
-                    rows.append(row)
+                    rows.append(redact_json_credentials(row))
         if invalid:
             self.rebuild_run_history_index()
             return self.list_run_history(limit=limit, stages=stages, statuses=statuses)
@@ -1614,12 +1664,12 @@ class ProjectWorkspaceManager:
         raw = _require_run_log_schema(
             json.loads(path.read_text(encoding="utf-8")), f"logs/runs/{path.name}"
         )
-        return dict(raw)
+        return redact_json_credentials(raw)
 
     def load_run_text_log(self, run_id: str) -> str:
         project = self._require_project()
         path = project / "logs" / "runs" / f"{_safe_component(run_id, 'run')}.log"
-        return path.read_text(encoding="utf-8", errors="replace") if path.exists() else ""
+        return self._redact_log_text(path.read_text(encoding="utf-8", errors="replace")) if path.exists() else ""
 
     def export_run_history(self, target: str | Path) -> Path:
         """Export all current run summaries as CSV or JSON without source text."""
@@ -1675,7 +1725,7 @@ class ProjectWorkspaceManager:
             except Exception as exc:
                 raise ValueError(f"当前 run log 损坏或版本不匹配：{exc}") from exc
             if raw.get("run_id"):
-                rows.append(self._run_history_summary(raw))
+                rows.append(self._run_history_summary(redact_json_credentials(raw)))
         rows.sort(key=lambda item: (str(item.get("started_at") or item.get("timestamp") or ""), str(item.get("run_id") or "")))
         text = "".join(json.dumps(row, ensure_ascii=False, separators=(",", ":")) + "\n" for row in rows)
         target = runs_dir / "history.jsonl"
@@ -2188,17 +2238,8 @@ class ProjectWorkspaceManager:
 
     @staticmethod
     def _redact_log_text(value: str) -> str:
-        """Remove common credential spellings before logs become portable backups."""
-        text = str(value or "")
-        patterns = (
-            (r"(?i)(api[_ -]?key\s*[:=]\s*)([^\s,;]+)", r"\1***REDACTED***"),
-            (r"(?i)(authorization\s*[:=]\s*bearer\s+)([^\s]+)", r"\1***REDACTED***"),
-            (r"(?i)(access[_ -]?token\s*[:=]\s*)([^\s,;]+)", r"\1***REDACTED***"),
-            (r"(?i)(secret\s*[:=]\s*)([^\s,;]+)", r"\1***REDACTED***"),
-        )
-        for pattern, replacement in patterns:
-            text = re.sub(pattern, replacement, text)
-        return text
+        """Remove common credentials from text diagnostics."""
+        return redact_secrets(value).replace("<REDACTED>", "***REDACTED***")
 
     def _write_run_payload(self, project: Path, payload: Mapping[str, Any]) -> Path:
         run_id = _safe_component(str(payload.get("run_id") or "run"), "run")

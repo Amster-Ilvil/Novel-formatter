@@ -18,6 +18,7 @@ from typing import Iterable
 
 from .config import AISettings, validate_api_key
 from .glm_compat import is_glm53_flash, looks_always_thinking_error, looks_image_payload_error
+from .http_transport import safe_sdk_error, validate_service_url
 from .request_limiter import retry_delay_seconds
 
 
@@ -239,8 +240,8 @@ class MultimodalClient:
                 if self._looks_capability_error(exc):
                     raise MultimodalCapabilityError(
                         "当前接口或模型拒绝了图片输入。请在 AI 设置中改用真正支持图片的模型，"
-                        "或使用自定义 OpenAI 兼容接口。原始错误：" + str(exc)
-                    ) from exc
+                        "或使用自定义 OpenAI 兼容接口。"
+                    ) from None
                 # GLM-5.3 Flash is already sent with always-on thinking and an
                 # explicit reasoning_effort. If a gateway still emits the stock
                 # "cannot disable thinking" message, expose the real route/model
@@ -256,15 +257,18 @@ class MultimodalClient:
                         "GLM-5.3 Flash 本身无法关闭思考。Novel Formatter 已按当前模型要求发送 "
                         f"thinking=enabled + reasoning_effort={effort}，但服务端仍拒绝请求。"
                         "请确认模型 ID、Base URL 与网关是否支持 GLM-5.3 Flash 的 reasoning_effort。"
-                        "原始错误：" + str(exc)
-                    ) from exc
+                    ) from None
                 if self._looks_image_payload_error(exc):
                     raise MultimodalImageInputError(
                         "接口鉴权/路由已到达服务端，但图片内容未被成功解析。"
                         "Novel Formatter 会发送本地 PNG/JPEG 的 Base64 Data URL；"
-                        "请优先使用“测试图片能力”验证当前 Base URL + 模型组合。原始错误：" + str(exc)
-                    ) from exc
+                        "请优先使用“测试图片能力”验证当前 Base URL + 模型组合。"
+                    ) from None
                 if attempt + 1 >= max_attempts or not self._looks_transient_error(exc):
+                    if provider != "gemini":
+                        safe = safe_sdk_error(exc, str(self.settings.api_key or ""))
+                        if safe is not exc:
+                            raise safe from None
                     raise
                 # Share the same Retry-After-aware bounded backoff used by the
                 # text provider stack. Re-entering a pooled provider path also
@@ -319,6 +323,7 @@ class MultimodalClient:
             base_url = "https://api.deepseek.com"
         if self.provider == "custom" and not base_url:
             raise ValueError("自定义 Provider 必须填写 Base URL")
+        base_url = validate_service_url(base_url or "https://api.openai.com/v1")
 
         timeout = float(settings.request_timeout or 180)
         for item in keys:
@@ -326,13 +331,13 @@ class MultimodalClient:
                 "api_key": item,
                 "timeout": timeout,
                 "max_retries": 0,
+                "base_url": base_url,
                 "http_client": httpx.Client(
                     limits=httpx.Limits(max_connections=32, max_keepalive_connections=16, keepalive_expiry=60.0),
                     timeout=timeout,
+                    follow_redirects=False,
                 ),
             }
-            if base_url:
-                kwargs["base_url"] = base_url
             self._clients.append(OpenAI(**kwargs))
         self._client_cycle = itertools.cycle(self._clients)
 
@@ -452,7 +457,7 @@ class MultimodalClient:
         if not keys:
             raise ValueError("Anthropic API Key 不能为空")
         timeout = float(self.settings.request_timeout or 180)
-        base_url = str(self.settings.base_url or "").strip()
+        base_url = validate_service_url(str(self.settings.base_url or "").strip() or "https://api.anthropic.com")
         clients = []
         try:
             for key in keys:
@@ -460,6 +465,7 @@ class MultimodalClient:
                     "api_key": key,
                     "timeout": timeout,
                     "max_retries": 0,
+                    "base_url": base_url,
                     "http_client": httpx.Client(
                         limits=httpx.Limits(
                             max_connections=32,
@@ -467,10 +473,9 @@ class MultimodalClient:
                             keepalive_expiry=60.0,
                         ),
                         timeout=timeout,
+                        follow_redirects=False,
                     ),
                 }
-                if base_url:
-                    kwargs["base_url"] = base_url
                 clients.append(Anthropic(**kwargs))
         except Exception:
             for client in clients:

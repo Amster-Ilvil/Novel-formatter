@@ -89,6 +89,7 @@ class AISettingsDialog(QDialog):
         model_layout.addWidget(self.model, 1)
         model_layout.addWidget(self.refresh_models_btn)
         self.base_url=QLineEdit(self._settings.base_url)
+        self.base_url.setToolTip("填写自定义地址时，API 密钥及提交的内容会发送给所填地址的服务商。")
         self.glossary_path = QLineEdit(str(getattr(self._settings, "glossary_path", "") or ""))
         self.glossary_path.setPlaceholderText("可选：全书术语白名单（TXT / JSON）")
         glossary_row = QWidget(); glossary_layout = QHBoxLayout(glossary_row)
@@ -510,14 +511,16 @@ class AISettingsDialog(QDialog):
         self.status.setText("正在用本地测试图验证图片输入……" if vision else "正在连接……")
 
         def worker():
+            from ai.redaction import redact_secrets
+
             payload = {"request_id": request_id, "provider": settings.provider, "vision": vision}
             try:
                 from ai.provider_factory import probe_multimodal_provider, test_provider
                 probe = probe_multimodal_provider if vision else test_provider
-                payload["reply"] = probe(settings)
+                payload["reply"] = redact_secrets(probe(settings), secrets=(settings.api_key,))
             except Exception:
                 import traceback
-                payload["error"] = traceback.format_exc()
+                payload["error"] = redact_secrets(traceback.format_exc(), secrets=(settings.api_key,))
             signals.finished.emit(payload)
 
         signals = self._test_signals = WorkerSignals()

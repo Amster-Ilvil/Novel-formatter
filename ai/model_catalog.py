@@ -12,9 +12,10 @@ import json
 from typing import Any
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlsplit, urlunsplit
-from urllib.request import Request, urlopen
+from urllib.request import Request
 
 from .config import provider_defaults, validate_api_key
+from .http_transport import open_direct, validate_service_url
 
 
 class ModelCatalogError(RuntimeError):
@@ -43,30 +44,25 @@ def _ollama_tags_url(base_url: str) -> str:
 
 
 def _request_json(url: str, headers: dict[str, str], timeout: int) -> dict[str, Any]:
-    gemini_key = headers.get("x-goog-api-key")
     request = Request(
-        url,
+        validate_service_url(url),
         headers={
             "Accept": "application/json",
             "User-Agent": "NovelFormatter/2.0 model-catalog",
-            **{name: value for name, value in headers.items() if name != "x-goog-api-key"},
         },
         method="GET",
     )
-    if gemini_key:
-        request.add_unredirected_header("x-goog-api-key", gemini_key)
+    for name, value in headers.items():
+        request.add_unredirected_header(name, value)
     try:
-        with urlopen(request, timeout=max(5, int(timeout))) as response:
+        with open_direct(request, timeout=max(5, int(timeout))) as response:
             raw = response.read()
     except HTTPError as exc:
-        try:
-            detail = exc.read().decode("utf-8", errors="replace")[:500]
-        except Exception:
-            detail = ""
-        suffix = f"：{detail}" if detail else ""
-        raise ModelCatalogError(f"模型列表请求失败（HTTP {exc.code}）{suffix}") from exc
-    except URLError as exc:
-        raise ModelCatalogError(f"无法连接模型列表接口：{exc.reason}") from exc
+        exc.close()
+        hint = "，请填写服务的最终 Base URL" if 300 <= exc.code < 400 else ""
+        raise ModelCatalogError(f"模型列表请求失败（HTTP {exc.code}）{hint}") from None
+    except URLError:
+        raise ModelCatalogError("无法连接模型列表接口") from None
     except TimeoutError as exc:
         raise ModelCatalogError("读取模型列表超时") from exc
 
