@@ -13,6 +13,8 @@ from PySide6.QtWidgets import (
     QDialog, QHBoxLayout, QLabel, QPushButton, QScrollArea, QVBoxLayout,
 )
 
+from ui.ocr.review_button_style import style_review_button
+
 
 class _ZoomScrollArea(QScrollArea):
     def __init__(self, parent=None):
@@ -79,11 +81,8 @@ class ReferenceZoomDialog(QDialog):
         self._zoom_status.setAlignment(Qt.AlignCenter)
         for btn in (self._fit_btn, self._actual_btn, self._out_btn, self._in_btn):
             btn.setMinimumHeight(31)
-            btn.setStyleSheet(
-                'QPushButton{background:#FFFFFF;border:1px solid #D5E0EF;'
-                'border-radius:7px;padding:4px 10px;color:#24436D;}'
-                'QPushButton:hover{background:#EFF5FE;border-color:#8EAFDF;}'
-            )
+            btn.setStyleSheet("QPushButton{border-radius:7px;padding:4px 10px;}")
+            style_review_button(btn)
             header.addWidget(btn)
         header.addWidget(self._zoom_status)
         root.addLayout(header)

@@ -7,9 +7,11 @@ from PySide6.QtCore import Qt
 from PySide6.QtWidgets import QApplication, QCheckBox, QDialog, QHBoxLayout, QLabel, QLineEdit, QPushButton, QVBoxLayout
 
 from ui.common.editor_controls import NoWheelComboBox
+from ui.common.styling import accent_button
 from ui.common.toast import notify
 from ui.dialogs import show_error_dialog
 from ui.localized_dialogs import LocalizedFileDialog as QFileDialog, LocalizedMessageBox as QMessageBox
+from ui.ocr.review_button_style import style_review_buttons
 
 
 class OCRComparePublicationService:
@@ -169,10 +171,11 @@ class OCRComparePublicationService:
         buttons = QHBoxLayout()
         buttons.addStretch(1)
         cancel = QPushButton("取消")
-        confirm = QPushButton("开始导出")
+        confirm = accent_button("开始导出")
         buttons.addWidget(cancel)
         buttons.addWidget(confirm)
         layout.addLayout(buttons)
+        style_review_buttons(dialog)
         cancel.clicked.connect(dialog.reject)
 
         def accept_dialog():

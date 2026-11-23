@@ -14,6 +14,7 @@ from PySide6.QtWidgets import (
 from ui.common.editor_controls import MouseWheelPlainTextEdit, NoWheelSpinBox
 from ui.common.styling import EDITOR_SCROLLBAR_STYLE, accent_button
 from ui.localized_dialogs import LocalizedFileDialog, LocalizedMessageBox
+from ui.ocr.review_button_style import style_review_button, style_review_buttons
 from ui.theme.tokens import SUCCESS, SUCCESS_BG
 
 # Preserve the GUI module's localized native-dialog behaviour after extraction.
@@ -245,10 +246,9 @@ class _FusionCandidateCard(QFrame):
         self._draft = QPushButton("作为底稿")
         self._draft.setCursor(QCursor(Qt.PointingHandCursor))
         self._draft.setStyleSheet(
-            "QPushButton{color:#2559E0;font-weight:700;border:1px solid #BFD3F7;"
-            "background:#F7FAFF;border-radius:9px;padding:5px 10px;}"
-            "QPushButton:hover{background:#EAF1FF;}"
+            "QPushButton{font-weight:650;border-radius:9px;padding:5px 10px;}"
         )
+        style_review_button(self._draft)
         self._draft.setToolTip(
             f"Alt+{candidate_index + 1}：复制到手动编辑框；不会完成裁决，也不会跳转"
             if candidate_index < 9 else "复制到手动编辑框；不会完成裁决，也不会跳转"
@@ -260,11 +260,10 @@ class _FusionCandidateCard(QFrame):
         self.check = QCheckBox("直接采用")
         self.check.setCursor(QCursor(Qt.PointingHandCursor))
         self.check.setStyleSheet(
-            "QCheckBox{color:#2F6BFF;font-weight:700;border:1px solid #E2E5E9;"
-            "background:#F4F5F7;border-radius:9px;padding:5px 10px;}"
-            "QCheckBox:checked{color:#FFFFFF;background:#2F6BFF;border-color:#2F6BFF;}"
-            "QCheckBox::indicator{width:0;height:0;border:none;background:transparent;}"
+            "QCheckBox{font-weight:650;border-radius:9px;padding:5px 10px;}"
+            "QCheckBox::indicator{width:0;height:0;border:none;}"
         )
+        style_review_button(self.check)
         self.check.setToolTip(
             f"Ctrl+Alt+{candidate_index + 1}：直接采用并完成当前裁决"
             if candidate_index < 9 else "直接采用并完成当前裁决"
@@ -484,6 +483,7 @@ class _FusionDecisionRow(QFrame):
         header.addWidget(self._state)
         header.addStretch(1)
         self._reopen = QPushButton("重新选择")
+        style_review_button(self._reopen)
         self._reopen.setVisible(False)
         self._reopen.setMaximumHeight(25)
         self._reopen.clicked.connect(self.reopen)
@@ -510,6 +510,7 @@ class _FusionDecisionRow(QFrame):
         self._reference_preview_text.setToolTip("完整参考裁片；点击原尺寸查看可放大阅读。")
         preview_layout.addWidget(self._reference_preview_text)
         self._reference_open = QPushButton("原尺寸查看")
+        style_review_button(self._reference_open)
         self._reference_open.setEnabled(False)
         self._reference_open.clicked.connect(self._open_reference_image)
         self._reference_preview_text.original_image_requested.connect(self._open_reference_image)
@@ -1133,10 +1134,11 @@ class OCRAIAdjudicationDialog(QDialog):
 
         buttons = QHBoxLayout(); buttons.addStretch(1)
         cancel = QPushButton("取消"); cancel.clicked.connect(self.reject); buttons.addWidget(cancel)
-        start = accent_button("开始裁决", color="#7C3AED")
+        start = accent_button("开始裁决")
         start.clicked.connect(self._accept_checked)
         buttons.addWidget(start)
         layout.addLayout(buttons)
+        style_review_buttons(self)
 
     def _refresh_provider_state(self):
         try:

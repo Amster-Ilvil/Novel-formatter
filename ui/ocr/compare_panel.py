@@ -14,11 +14,12 @@ from ui.common.editor_controls import MouseWheelPlainTextEdit
 from ui.common.window_state import bind_splitter
 from ui.common.styling import (
     BG,
-    CARD, BORDER, INK, MUTED, SUBTLE, SUCCESS, LIGHT_PREVIEW_STYLE, EDITOR_SCROLLBAR_STYLE,
+    CARD, BORDER, INK, MUTED, SUBTLE, LIGHT_PREVIEW_STYLE, EDITOR_SCROLLBAR_STYLE,
     accent_button, make_separator,
 )
 from ui.responsive import configure_combo
 from ui.ocr.compare_widgets import DecisionQueueListModel, DecisionQueueDelegate
+from ui.ocr.review_button_style import style_review_buttons
 from ui.ocr.sentence_strip import SentenceStrip
 
 
@@ -52,7 +53,7 @@ def build_ocr_compare_panel(self):
     self._adjudication_redo_btn.clicked.connect(self._history_service.redo)
     self._adjudication_redo_btn.setEnabled(False)
     title_row.addWidget(self._adjudication_redo_btn)
-    self._auto_btn = accent_button("⚙ 自动选优", color="#0E7490")
+    self._auto_btn = QPushButton("⚙ 自动选优")
     self._auto_btn.clicked.connect(self._auto_select_all)
     self._auto_btn.setEnabled(False)
     title_row.addWidget(self._auto_btn)
@@ -71,7 +72,7 @@ def build_ocr_compare_panel(self):
     self._restore_btn.clicked.connect(self._restore_initial)
     self._restore_btn.setEnabled(False)
     title_row.addWidget(self._restore_btn)
-    self._unicode_normalize_btn = accent_button("无损标准化", color="#0F766E")
+    self._unicode_normalize_btn = QPushButton("无损标准化")
     self._unicode_normalize_btn.setToolTip(
         "正文只修复不会改变字义的组合浊音、半角假名和竖排兼容标点；"
         "不删除任何 OCR 内容，不替换汉字/异体字，不改破折号和标点风格。"
@@ -105,8 +106,7 @@ def build_ocr_compare_panel(self):
         button.setMinimumHeight(30)
         button.setMaximumHeight(32)
         button.setStyleSheet(
-            "QPushButton{font-size:9px;padding:2px 8px;border:1px solid #CDD3DA;border-radius:6px;}"
-            "QPushButton:checked{background:#E4EEFF;color:#2559E0;font-weight:700;border-color:#2F6BFF;}"
+            "QPushButton{font-size:9px;padding:2px 8px;border-radius:6px;}"
         )
         button.clicked.connect(partial(self._set_review_mode, mode_key))
         self._review_mode_group.addButton(button)
@@ -139,16 +139,11 @@ def build_ocr_compare_panel(self):
     self._full_text_compare_check.setMinimumHeight(30)
     self._full_text_compare_check.setMaximumHeight(32)
     self._full_text_compare_check.setStyleSheet(
-        "QPushButton{font-size:9px;padding:2px 8px;border:1px solid #CDD3DA;"
-        "border-radius:6px;background:#FAFAFB;}"
-        "QPushButton:hover{border-color:#2F6BFF;background:#F7F8FA;}"
-        "QPushButton:checked{background:#E4EEFF;color:#2559E0;font-weight:700;"
-        "border-color:#2F6BFF;}"
-        "QPushButton:disabled{color:#5F7189;background:#E6EEF8;border-color:#D0D5DD;}"
+        "QPushButton{font-size:9px;padding:2px 8px;border-radius:6px;}"
     )
     self._full_text_compare_check.toggled.connect(self._toggle_full_text_compare)
     title_row.insertWidget(2, self._full_text_compare_check)
-    self._ai_adjudicate_btn = accent_button("✦ AI裁决", color="#6D28D9")
+    self._ai_adjudicate_btn = accent_button("✦ AI裁决")
     self._ai_adjudicate_btn.setToolTip(
         "把真正 OCR 分歧的原图裁切批量拼成证据板，一次提交几十到上百条给多模态模型；"
         "AI 默认只选择 A/B/C/D，不重做整页 OCR，不改写原始模型结果。"
@@ -170,7 +165,7 @@ def build_ocr_compare_panel(self):
     self._more_actions_btn.setToolTip("展开低频 AI 包、OCR 裁决、恢复会话和骨架 EPUB 操作。")
     self._more_actions_btn.setMinimumHeight(30)
     self._more_actions_btn.setMaximumHeight(32)
-    self._more_actions_btn.setStyleSheet("font-size:9px;padding:2px 7px;")
+    self._more_actions_btn.setStyleSheet("QToolButton{font-size:9px;padding:2px 7px;}")
     title_row.addWidget(self._more_actions_btn)
     hl.addLayout(title_row)
 
@@ -180,7 +175,7 @@ def build_ocr_compare_panel(self):
     self._single_source_state = QLabel("单 OCR：暂无可载入结果")
     self._single_source_state.setStyleSheet("color:#2F6BFF;font-size:10px;font-weight:600;")
     source_inbox_row.addWidget(self._single_source_state)
-    self._load_single_from_ocr_btn = accent_button("＋ 从 OCR 识别载入", color="#2F6BFF")
+    self._load_single_from_ocr_btn = accent_button("＋ 从 OCR 识别载入")
     self._load_single_from_ocr_btn.setToolTip(
         "OCR 识别页完成单模型 OCR 后，只登记为可用来源；点击这里才载入本页。"
         "多模型 OCR 仍会自动载入，不会与单结果混合。"
@@ -193,14 +188,14 @@ def build_ocr_compare_panel(self):
     self._return_multi_btn.setVisible(False)
     self._return_multi_btn.clicked.connect(self._restore_suspended_multi)
     source_inbox_row.addWidget(self._return_multi_btn)
-    self._single_export_btn = accent_button("⇩ 导出单OCR AI包", color="#7C3AED")
+    self._single_export_btn = QPushButton("⇩ 导出单OCR AI包")
     self._single_export_btn.setToolTip(
         "导出当前载入的单 OCR 原格式校对包；完整保留封面、插图、目录、坐标、列 ID 和块顺序。"
     )
     self._single_export_btn.setEnabled(False)
     self._single_export_btn.clicked.connect(self._export_single_roundtrip_package)
     source_inbox_row.addWidget(self._single_export_btn)
-    self._single_import_btn = accent_button("⇧ 导入单OCR AI包", color="#0F766E")
+    self._single_import_btn = QPushButton("⇧ 导入单OCR AI包")
     self._single_import_btn.setToolTip(
         "按稳定 block ID 导入单 OCR 校对结果。导入后更新同一来源并直接应用，不新增重复副本。"
     )
@@ -221,7 +216,7 @@ def build_ocr_compare_panel(self):
         button.setVisible(False)
         button.setMinimumHeight(30)
         button.setMaximumHeight(32)
-        button.setStyleSheet("font-size:9px;padding:1px 6px;")
+        button.setStyleSheet("QPushButton{font-size:9px;padding:1px 6px;}")
         button.clicked.connect(partial(self._choose_current_from_model, index))
         choose_row.addWidget(button)
         self._choose_buttons.append(button)
@@ -230,12 +225,12 @@ def build_ocr_compare_panel(self):
     choose_row.addWidget(self._row_state)
     choose_row.addStretch(1)
 
-    self._export_texts_btn = accent_button("⇩ 分别导出文本…", color="#A16207")
+    self._export_texts_btn = QPushButton("⇩ 分别导出文本…")
     self._export_texts_btn.setToolTip("选择文件夹，将当前 2～6 份 OCR 文本分别导出为 UTF-8 TXT；全部裁决后同时导出融合稿。")
     self._export_texts_btn.setEnabled(False)
     self._export_texts_btn.clicked.connect(self._export_separate_texts)
     choose_row.addWidget(self._export_texts_btn)
-    self._apply_btn = accent_button("✓ 应用融合稿", color=SUCCESS)
+    self._apply_btn = accent_button("✓ 应用融合稿")
     self._apply_btn.setEnabled(False)
     self._apply_btn.clicked.connect(self._apply_result)
     choose_row.addWidget(self._apply_btn)
@@ -256,7 +251,7 @@ def build_ocr_compare_panel(self):
     multi_package_label = QLabel("多模型包：")
     multi_package_label.setStyleSheet("font-size:10px;color:#5B6B80;")
     multi_package_row.addWidget(multi_package_label)
-    self._export_ai_package_btn = accent_button("⇩ 单独导出融合JSON", color="#7C3AED")
+    self._export_ai_package_btn = QPushButton("⇩ 单独导出融合JSON")
     self._export_ai_package_btn.setToolTip(
         "仅单独导出当前融合稿与全部 OCR 候选 JSON。通常直接使用右侧“导出AI修复包”，"
         "它会把同一份完整融合 JSON 一并装入 AI 修复包，同时生成最终出版图片、干净资源框架和硬审计说明。"
@@ -270,7 +265,7 @@ def build_ocr_compare_panel(self):
     source_correction_label = QLabel("OCR 裁决：")
     source_correction_label.setStyleSheet("font-size:10px;color:#5B6B80;")
     source_correction_row.addWidget(source_correction_label)
-    self._export_source_correction_btn = accent_button("⇩ 导出 AI OCR 裁决包", color="#9333EA")
+    self._export_source_correction_btn = QPushButton("⇩ 导出 AI OCR 裁决包")
     self._export_source_correction_btn.setToolTip(
         "导出 AI OCR 裁决包。当前全部原始 OCR 永久只读；此前已接受的冲突裁决会作为只读参考重新开放复审，"
         "AI 可保留此前当前格式结果，也可提交更好的 final_text；精确一致/共同候选仍按当前策略锁定。"
@@ -278,7 +273,7 @@ def build_ocr_compare_panel(self):
     self._export_source_correction_btn.setEnabled(False)
     self._export_source_correction_btn.clicked.connect(self._export_model_source_correction_package)
     source_correction_row.addWidget(self._export_source_correction_btn)
-    self._import_source_correction_btn = accent_button("⇧ 导入 AI OCR 裁决", color="#0D9488")
+    self._import_source_correction_btn = QPushButton("⇧ 导入 AI OCR 裁决")
     self._import_source_correction_btn.setToolTip(
         "仅导入当前格式 AI OCR 裁决 JSON/ZIP。后导入的已接受结果可改进同一稳定句；"
         "缺失/未决行不会抹掉前一包的好结果，且绝不改写原始 OCR。"
@@ -293,7 +288,7 @@ def build_ocr_compare_panel(self):
     )
     self._restore_source_session_btn.clicked.connect(self._restore_model_source_correction_session)
     source_correction_row.addWidget(self._restore_source_session_btn)
-    self._export_fusion_skeleton_btn = accent_button("⇩ 融合结果＋骨架EPUB", color="#2559E0")
+    self._export_fusion_skeleton_btn = QPushButton("⇩ 融合结果＋骨架EPUB")
     self._export_fusion_skeleton_btn.setToolTip(
         "导出当前全部模型候选、人工融合结果、逐源纠错审计和干净稳定 ID 骨架 EPUB。"
     )
@@ -304,7 +299,7 @@ def build_ocr_compare_panel(self):
     self._source_correction_state.setStyleSheet("font-size:9px;color:#5B6B80;")
     source_correction_row.addWidget(self._source_correction_state)
     source_correction_row.addStretch(1)
-    self._export_ai_repair_epub_btn = accent_button("⇩ 导出AI修复包", color="#4338CA")
+    self._export_ai_repair_epub_btn = QPushButton("⇩ 导出AI修复包")
     self._export_ai_repair_epub_btn.setToolTip(
         "导出当前 V5 多模型分歧裁决包：只开放当前策略判定需要外部裁决的稳定句，"
         "完整保留角色、独立执行/seeded reuse、物理列与视觉证据；本地已完成裁决保持冻结。"
@@ -312,14 +307,14 @@ def build_ocr_compare_panel(self):
     self._export_ai_repair_epub_btn.setEnabled(False)
     self._export_ai_repair_epub_btn.clicked.connect(self._export_ai_repair_epub)
     multi_package_row.addWidget(self._export_ai_repair_epub_btn)
-    self._import_ai_repair_result_btn = accent_button("⇧ 导入AI修复结果", color="#047857")
+    self._import_ai_repair_result_btn = QPushButton("⇧ 导入AI修复结果")
     self._import_ai_repair_result_btn.setToolTip(
         "只导入当前 V5 decisions.json 或包含该文件的 ZIP。package_id、structure_sha256 和可编辑 ID 必须与当前会话完全一致。"
     )
     self._import_ai_repair_result_btn.setEnabled(False)
     self._import_ai_repair_result_btn.setVisible(False)
     self._import_ai_repair_result_btn.clicked.connect(self._import_ai_repair_result)
-    self._import_ai_package_btn = accent_button("⇧ 导入AI融合包", color="#0F766E")
+    self._import_ai_package_btn = QPushButton("⇧ 导入AI融合包")
     self._import_ai_package_btn.setToolTip(
         "严格按 row ID 导入外部大模型融合结果，完整替换当前融合正文并直接应用；"
         "缺行、重复 ID 或结构改变会拒绝导入。"
@@ -710,8 +705,7 @@ def build_ocr_compare_panel(self):
     self._manual_decision_toggle.setCheckable(True)
     suggestion_header.addWidget(self._manual_decision_toggle)
     ai_settings_btn = QPushButton("AI 服务…")
-    ai_settings_btn.setFlat(True)
-    ai_settings_btn.setStyleSheet(f"color:#2F6BFF;border:none;background:transparent;font-weight:650;")
+    ai_settings_btn.setStyleSheet("QPushButton{padding:3px 8px;}")
     suggestion_header.addWidget(ai_settings_btn)
     suggestion_layout.addLayout(suggestion_header)
 
@@ -772,19 +766,20 @@ def build_ocr_compare_panel(self):
     self._manual_decision_state.setWordWrap(True)
     manual_actions.addWidget(self._manual_decision_state, 1)
     self._manual_decision_discard_btn = QPushButton("放弃草稿")
-    self._manual_decision_discard_btn.setFixedHeight(28)
     self._manual_decision_discard_btn.clicked.connect(self._discard_manual_decision_draft)
     manual_actions.addWidget(self._manual_decision_discard_btn)
     self._manual_decision_confirm_btn = accent_button("确认裁决")
-    self._manual_decision_confirm_btn.setFixedHeight(28)
     self._manual_decision_confirm_btn.setToolTip("确认当前手动文本；停留在本句")
     self._manual_decision_confirm_btn.clicked.connect(self._commit_manual_decision_editor)
     manual_actions.addWidget(self._manual_decision_confirm_btn)
     self._manual_decision_confirm_next_btn = QPushButton("确认并下一分歧")
-    self._manual_decision_confirm_next_btn.setFixedHeight(28)
     self._manual_decision_confirm_next_btn.setToolTip("Ctrl+Shift+Enter：确认后进入下一分歧")
     self._manual_decision_confirm_next_btn.clicked.connect(self._commit_manual_decision_and_next)
     manual_actions.addWidget(self._manual_decision_confirm_next_btn)
+    for button in (self._manual_decision_discard_btn, self._manual_decision_confirm_btn,
+                   self._manual_decision_confirm_next_btn):
+        button.setFixedHeight(28)
+        button.setStyleSheet(button.styleSheet() + "QPushButton{min-height:0;padding:3px 9px;}")
     manual_layout.addLayout(manual_actions)
 
     self._manual_decision_syncing = False
@@ -860,6 +855,7 @@ def build_ocr_compare_panel(self):
     self._page_nav_next_btn = QPushButton('›')
     for button in (self._page_nav_prev_btn, self._page_nav_next_btn):
         button.setFixedSize(24, 25)
+        button.setStyleSheet("QPushButton{padding:0;}")
         button.setToolTip('同一句跨页时切换有该句物理列的源页')
         button.setEnabled(False)
     self._page_nav_prev_btn.clicked.connect(lambda: self._step_page_column(-1))
@@ -879,6 +875,7 @@ def build_ocr_compare_panel(self):
     self._page_nav_zoom_text = QLabel('适窗', self._page_nav_zoom_controls)
     for control in (self._page_nav_zoom_out, self._page_nav_zoom_fit, self._page_nav_zoom_in):
         control.setFixedHeight(24)
+        control.setStyleSheet("QPushButton{min-height:0;padding:2px 8px;}")
         nav_zoom_layout.addWidget(control)
     nav_zoom_layout.addWidget(self._page_nav_zoom_text, 1)
     self._page_nav_zoom_out.clicked.connect(lambda: self._page_nav_view.zoom_by(1 / 1.25))
@@ -971,10 +968,7 @@ def build_ocr_compare_panel(self):
         "原版多模型框是全文总览默认布局，不改变 OCR 候选或裁决。"
     )
     self._full_only_check.setStyleSheet(
-        "QPushButton{font-size:10px;padding:5px 12px;border:1px solid #D7E3F4;"
-        "border-radius:7px;background:#FFFFFF;}"
-        "QPushButton:checked{background:#E4EEFF;color:#2559E0;"
-        "border-color:#2F6BFF;font-weight:700;}"
+        "QPushButton{font-size:10px;padding:5px 12px;border-radius:7px;}"
     )
     self._full_only_check.toggled.connect(self._set_full_only_view)
     # Compatibility switch for older sessions/tests. The real three-way
@@ -1001,7 +995,7 @@ def build_ocr_compare_panel(self):
     compact_row.addWidget(compact_image_review)
     self._compact_image_review_btn = compact_image_review
 
-    compact_ai = accent_button("AI 裁决", color="#6D28D9")
+    compact_ai = accent_button("AI 裁决")
     compact_ai.clicked.connect(self._ai_adjudicate_btn.click)
     compact_row.addWidget(compact_ai)
     self._compact_ai_btn = compact_ai
@@ -1164,10 +1158,7 @@ def build_ocr_compare_panel(self):
         button.setToolTip(hint)
         button.setMinimumHeight(29)
         button.setStyleSheet(
-            "QPushButton{font-size:11px;padding:4px 11px;"
-            "border:1px solid #D7E3F4;border-radius:7px;background:white;}"
-            "QPushButton:checked{color:#245BCE;background:#E4EEFF;"
-            "border-color:#2F6BFF;font-weight:700;}"
+            "QPushButton{font-size:11px;padding:4px 11px;border-radius:7px;}"
         )
         self._full_layout_group.addButton(button)
         button.clicked.connect(lambda _checked=False, selected=mode: self._set_full_layout_mode(selected))
@@ -1238,9 +1229,7 @@ def build_ocr_compare_panel(self):
                 self._full_diff_prev_btn, self._full_diff_next_btn):
         btn.setMinimumHeight(32)
         btn.setStyleSheet(
-            "QPushButton{background:#FFFFFF;color:#24354B;padding:5px 9px;"
-            "border:1px solid #D7E3F4;border-radius:7px;font-size:11px;}"
-            "QPushButton:hover{background:#EEF5FF;border-color:#8EB0EC;}"
+            "QPushButton{padding:5px 9px;border-radius:7px;font-size:11px;}"
         )
         search_bar.addWidget(btn)
     only_layout.addLayout(search_bar)
@@ -1266,5 +1255,6 @@ def build_ocr_compare_panel(self):
     only_layout.addWidget(self._full_comparison_table, 1)
     self._full_overview_panel.setVisible(False)
     root.addWidget(self._full_overview_panel, 1)
+    style_review_buttons(self)
     bind_splitter(main_splitter, "compare_main")
     QTimer.singleShot(0, lambda: self._set_review_mode("full", force=True))

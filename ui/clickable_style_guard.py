@@ -27,10 +27,14 @@ _FORBIDDEN_BACKGROUND: Final[re.Pattern[str]] = re.compile(
     r"(?i)(background(?:-color)?\s*:\s*)"
     r"(?:transparent\b|rgba?\(\s*255\s*,\s*255\s*,\s*255\s*,\s*0(?:\.0+)?\s*\))"
 )
+# Match the foreground declaration itself, including in inline styles.
+# A word boundary alone also matches the suffix of "background-color".
+_FOREGROUND_DECLARATION: Final[str] = r"(?<![\w-])color\s*:"
 _LIGHT_TEXT: Final[re.Pattern[str]] = re.compile(
-    r"(?i)(color\s*:\s*)(?:white\b|#fff(?:fff)?\b|rgb\(\s*255\s*,\s*255\s*,\s*255\s*\))"
+    rf"(?i)({_FOREGROUND_DECLARATION}\s*)(?:white\b|#fff(?:fff)?\b|"
+    r"rgb\(\s*255\s*,\s*255\s*,\s*255\s*\))"
 )
-_EXPLICIT_TEXT_COLOR: Final[re.Pattern[str]] = re.compile(r"(?i)\bcolor\s*:")
+_EXPLICIT_TEXT_COLOR: Final[re.Pattern[str]] = re.compile(_FOREGROUND_DECLARATION, re.I)
 
 _CLICKABLE_BG: Final[str] = "#FFFFFF"
 _CLICKABLE_LABEL_BG: Final[str] = "#F7F8FA"

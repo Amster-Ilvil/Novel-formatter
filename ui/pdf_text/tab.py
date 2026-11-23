@@ -193,14 +193,22 @@ class PdfTextLayerTab(QWidget):
 
         right = QFrame()
         right.setObjectName("pdfCard")
-        right.setStyleSheet(card_css)
+        right.setStyleSheet(
+            f"QFrame#pdfCard{{background:{CARD};border:1px solid {BORDER};border-radius:16px;}}"
+            "QFrame#pdfCard QLabel{border:none;background:transparent;}"
+        )
         right.setMinimumWidth(520)
         right.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
         rl = QVBoxLayout(right)
         rl.setContentsMargins(20, 16, 20, 18)
         rl.setSpacing(10)
         log_hdr = QLabel("提取日志")
-        log_hdr.setStyleSheet(f"color:{INK};font-size:14px;font-weight:700;background:none;border:none;")
+        log_hdr.setStyleSheet(
+            f"color:{INK};font-size:14px;font-weight:700;background:none;border:none;"
+        )
+        log_hdr.setSizePolicy(QSizePolicy.Minimum, QSizePolicy.Fixed)
+        log_hdr.setMinimumSize(88, 30)
+        log_hdr.setContentsMargins(2, 2, 2, 2)
         rl.addWidget(log_hdr)
         self._prog = QProgressBar()
         self._prog.setFixedHeight(8)

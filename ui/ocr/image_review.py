@@ -30,6 +30,7 @@ from ui.design.metrics import (
 from ui.dialogs import show_error_dialog
 from ui.localized_dialogs import LocalizedMessageBox
 from ui.ocr.proofread_widgets import OCRProofreadImageLabel, OCRVerticalColumnTextWidget
+from ui.ocr.review_button_style import style_review_buttons
 from ui.ocr.sentence_strip import SentenceStrip
 from ui.theme.tokens import SUCCESS, SUCCESS_BG
 from ui.common.window_state import bind_splitter
@@ -66,11 +67,13 @@ class _ImageReviewFusionCandidateCard(QFrame):
         self._draft = QPushButton("作为底稿")
         self._draft.setMinimumHeight(28)
         self._draft.setMaximumHeight(28)
+        self._draft.setStyleSheet("QPushButton{min-height:0;padding:3px 9px;}")
         self._draft.setToolTip("复制到手动编辑框；不会保存、不会跳转")
         self._draft.clicked.connect(self._emit_drafted)
         self._choose = QPushButton("直接采用并下一条")
         self._choose.setMinimumHeight(28)
         self._choose.setMaximumHeight(28)
+        self._choose.setStyleSheet("QPushButton{min-height:0;padding:3px 9px;}")
         self._choose.setToolTip("直接完成当前裁决并进入下一条 OCR 分歧")
         self._choose.clicked.connect(self._emit_chosen)
         head = QHBoxLayout()
@@ -99,6 +102,7 @@ class _ImageReviewFusionCandidateCard(QFrame):
         self._selected_for_review = False
         self._draft_for_review = False
         self.set_selected(False)
+        style_review_buttons(self)
 
     def _emit_drafted(self) -> None:
         self.drafted.emit(self.candidate_index, self.candidate_text)
@@ -357,6 +361,8 @@ class OCRImageTextReviewTab(QWidget):
         self._left_columns_btn.setToolTip("查看当前裁决稿对应的完整物理竖列。")
         self._left_columns_btn.clicked.connect(lambda: self._set_left_review_panel_mode("columns"))
         columns_header.addWidget(self._left_columns_btn)
+        for button in (self._left_queue_btn, self._left_columns_btn):
+            button.setStyleSheet("QToolButton{font-size:9px;padding:2px 5px;border-radius:6px;}")
         self._columns_state = QLabel("", left_panel)
         self._columns_state.setStyleSheet(f"color: {MUTED}; font-size: 9px;")
         self._columns_state.setVisible(False)
@@ -372,6 +378,8 @@ class OCRImageTextReviewTab(QWidget):
         self._column_right_btn.setToolTip("定位右侧物理列（⌥⇧→）")
         self._column_right_btn.clicked.connect(lambda: self._move_active_column(-1))
         columns_header.addWidget(self._column_right_btn)
+        for button in (self._column_left_btn, self._column_right_btn):
+            button.setStyleSheet("QToolButton{padding:0;}")
         left_layout.addLayout(columns_header)
         self._review_queue_filters = QWidget(left_panel)
         queue_filters_layout = QVBoxLayout(self._review_queue_filters)
@@ -721,6 +729,7 @@ class OCRImageTextReviewTab(QWidget):
         self._column_right_shortcut.setContext(Qt.WidgetWithChildrenShortcut)
         self._column_right_shortcut.activated.connect(lambda: self._move_active_column(-1))
         self._set_controls_enabled(False)
+        style_review_buttons(self)
 
     def _activate_physical_column(
         self, column_index: int, *, scrub_position: float | None = None, source: str = "列定位"
@@ -832,10 +841,6 @@ class OCRImageTextReviewTab(QWidget):
         )
         self._left_queue_btn.setChecked(not columns)
         self._left_columns_btn.setChecked(columns)
-        active = "QToolButton{font-size:9px;padding:2px 5px;border:1px solid #B9D0F4;border-radius:6px;background:#EAF1FF;color:#2559E0;font-weight:700;}"
-        idle = "QToolButton{font-size:9px;padding:2px 5px;border:1px solid transparent;border-radius:6px;background:transparent;color:#607086;} QToolButton:hover{background:#F2F4F7;}"
-        self._left_queue_btn.setStyleSheet(active if not columns else idle)
-        self._left_columns_btn.setStyleSheet(active if columns else idle)
         self._columns_state.setVisible(columns and bool(self._columns_state.text()))
         if hasattr(self, "_review_queue_filters"):
             self._review_queue_filters.setVisible(not columns)
