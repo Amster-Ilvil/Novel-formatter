@@ -31,6 +31,7 @@ from ui.dialogs import show_error_dialog
 from ui.localized_dialogs import LocalizedMessageBox
 from ui.ocr.proofread_widgets import OCRProofreadImageLabel, OCRVerticalColumnTextWidget
 from ui.ocr.sentence_strip import SentenceStrip
+from ui.theme.tokens import SUCCESS, SUCCESS_BG
 from ui.common.window_state import bind_splitter
 from ui.responsive import configure_combo
 from utils.async_generation import GenerationGuard
@@ -95,6 +96,8 @@ class _ImageReviewFusionCandidateCard(QFrame):
         root.addWidget(self._body, 1)
         self.set_candidate(candidate_index, caption, text, confidence=confidence)
         self.set_reference_text("")
+        self._selected_for_review = False
+        self._draft_for_review = False
         self.set_selected(False)
 
     def _emit_drafted(self) -> None:
@@ -166,26 +169,35 @@ class _ImageReviewFusionCandidateCard(QFrame):
         super().resizeEvent(event)
         QTimer.singleShot(0, self._fit_body_height)
 
-    def set_draft_source(self, active: bool) -> None:
-        self._draft.setText("✓ 手动编辑底稿" if active else "作为底稿")
+    def set_draft_source(self, active: bool, *, system: bool = False) -> None:
+        self._draft_for_review = active
+        self._draft.setText(("✓ 系统预选" if system else "✓ 手动编辑底稿") if active else "作为底稿")
+        self._refresh_candidate_border()
+
+    def _refresh_candidate_border(self) -> None:
+        if self._selected_for_review or self._draft_for_review:
+            style = (
+                f"QFrame#imageReviewFusionCard{{background:{SUCCESS_BG};border:2px solid {SUCCESS};"
+                "border-radius:10px;}"
+            )
+        else:
+            style = "QFrame#imageReviewFusionCard{background:#F7F8FA;border:1px solid #D8DDE3;border-radius:10px;}"
+        if self.styleSheet() != style:
+            self.setStyleSheet(style)
 
     def set_selected(self, selected: bool) -> None:
+        self._selected_for_review = selected
         if selected:
-            self.setStyleSheet(
-                "QFrame#imageReviewFusionCard{background:#E4EEFF;border:2px solid #2F6BFF;border-radius:10px;}"
-            )
             self._draft.setText("作为底稿")
             self._draft.setEnabled(True)
             self._choose.setText("✓ 已采用")
             self._choose.setEnabled(False)
         else:
-            self.setStyleSheet(
-                "QFrame#imageReviewFusionCard{background:#F7F8FA;border:1px solid #D8DDE3;border-radius:10px;}"
-            )
             self._draft.setText("作为底稿")
             self._draft.setEnabled(True)
             self._choose.setText("直接采用并下一条")
             self._choose.setEnabled(True)
+        self._refresh_candidate_border()
 
 
 class OCRImageTextReviewTab(QWidget):
@@ -1901,19 +1913,19 @@ class OCRImageTextReviewTab(QWidget):
                 card.chosen.connect(self._accept_fusion_candidate)
                 self._fusion_candidate_buttons.append(card)
             card.set_reference_text(reference_text)
-            card.set_selected(
+            is_selected = (
                 bool(getattr(entry, "reviewed", False))
                 and (selected in group["indices"] or (selected < 0 and group["text"] == entry.text))
             )
+            card.set_selected(is_selected)
             baseline = getattr(self, "_draft_candidate_sources", {}).get(id(entry))
-            card.set_draft_source(
-                baseline in group["indices"] if baseline is not None else group["text"] == reference_text
-            )
+            draft_match = baseline in group["indices"] if baseline is not None else group["text"] == entry.text
+            card.set_draft_source(not entry.reviewed and draft_match, system=baseline is None)
             row = (candidate_number - 1) // columns
             column = (candidate_number - 1) % columns
             self._fusion_candidate_grid.addWidget(card, row, column)
             self._fusion_candidate_grid.setRowStretch(row, 0)
-            card._choose.setEnabled(not self._entry_consensus_locked(entry))
+            card._choose.setEnabled(not is_selected and not self._entry_consensus_locked(entry))
             card.show()
         for column in range(4):
             self._fusion_candidate_grid.setColumnStretch(column, 1 if column < columns else 0)
@@ -1933,7 +1945,7 @@ class OCRImageTextReviewTab(QWidget):
             f"候选 {int(candidate_index) + 1} 已作为手动底稿 · 尚未完成裁决，修改后点“确认裁决”"
         )
         for card in self._fusion_candidate_buttons:
-            card.set_draft_source(card.candidate_index == int(candidate_index))
+            card.set_draft_source(not entry.reviewed and card.candidate_index == int(candidate_index))
         self._editor.setFocus()
 
     def _accept_fusion_candidate(self, candidate_index: int, text: str) -> None:

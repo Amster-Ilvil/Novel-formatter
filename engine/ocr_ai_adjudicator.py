@@ -32,6 +32,7 @@ from ai.request_limiter import retry_delay_seconds
 from ai.redaction import redact_secrets
 from ai.token_counter import estimate_tokens
 from engine.ai_document_processor import parse_json_reply
+from engine.ai_glossary import _read_glossary_text as read_glossary_text
 from engine.reference_assist import ReferenceCorpus, normalise_reference_content
 
 
@@ -236,7 +237,7 @@ def load_reference_source(path: str | Path | None) -> ReferenceSource:
 
     lines: list[str] = []
     if source.suffix.lower() in {".txt", ".md", ".markdown"}:
-        raw_text = source.read_text(encoding="utf-8-sig")
+        raw_text = read_glossary_text(source)
         for raw in raw_text.replace("\r\n", "\n").replace("\r", "\n").split("\n"):
             text = re.sub(r"^#{1,6}\s*", "", raw.strip()).strip()
             text = _strip_ruby_markup(text)
@@ -270,7 +271,7 @@ def load_glossary(path: str | Path | None) -> list[tuple[str, str]]:
         raise FileNotFoundError(f"术语表不存在：{source}")
     pairs: list[tuple[str, str]] = []
     if source.suffix.lower() == ".json":
-        data = json.loads(source.read_text(encoding="utf-8-sig"))
+        data = json.loads(read_glossary_text(source))
         if isinstance(data, dict):
             values = data.items()
         elif isinstance(data, list):
@@ -287,7 +288,7 @@ def load_glossary(path: str | Path | None) -> list[tuple[str, str]]:
             if left and right:
                 pairs.append((left, right))
     else:
-        for raw in source.read_text(encoding="utf-8-sig").splitlines():
+        for raw in read_glossary_text(source).splitlines():
             line = raw.strip()
             if not line or line.startswith("#"):
                 continue

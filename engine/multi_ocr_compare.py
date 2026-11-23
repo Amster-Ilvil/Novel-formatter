@@ -748,6 +748,7 @@ class _ColumnExtraction:
     records: list[_ColumnRecord]
     sentence_candidates: dict[tuple[str, ...], str]
     terminal_candidate_end_ids: set[str]
+    standalone_layout_ids: dict[str, str]
     used_primary_texts: bool = False
 
 
@@ -1315,6 +1316,8 @@ def _extract_column_records(doc: UnifiedDocument) -> _ColumnExtraction | None:
     records: list[_ColumnRecord] = []
     sentence_candidates: dict[tuple[str, ...], str] = {}
     terminal_candidate_end_ids: set[str] = set()
+    standalone_layout_ids: dict[str, str] = {}
+    source_engine = str(getattr(doc.metadata, "source_engine", "") or "").lower()
     used_primary_texts = False
     seen: set[str] = set()
     for block_index, block in enumerate(doc.blocks):
@@ -1346,6 +1349,11 @@ def _extract_column_records(doc: UnifiedDocument) -> _ColumnExtraction | None:
         raw_flags = metadata.get("source_column_terminal_flags") or []
         terminal_flags = [bool(value) for value in raw_flags] if isinstance(raw_flags, list) else []
         atomic_title = bool(block.type in _TITLE_TYPES or metadata.get("chapter_title_atomic"))
+        if "gemini_ocr" in source_engine and len(column_ids) == 1:
+            if metadata.get("flush_reason") == "field_list_item":
+                standalone_layout_ids[column_ids[0]] = BlockType.PARAGRAPH.value
+            elif metadata.get("section_marker_atomic"):
+                standalone_layout_ids[column_ids[0]] = BlockType.SECTION.value
         for position, (column_id, text) in enumerate(zip(column_ids, comparison_texts)):
             if not column_id or column_id in seen:
                 return None
@@ -1375,6 +1383,7 @@ def _extract_column_records(doc: UnifiedDocument) -> _ColumnExtraction | None:
         records=records,
         sentence_candidates=sentence_candidates,
         terminal_candidate_end_ids=terminal_candidate_end_ids,
+        standalone_layout_ids=standalone_layout_ids,
         used_primary_texts=used_primary_texts,
     )
 
@@ -1483,6 +1492,11 @@ def _compare_by_shared_columns(
         ))
 
     numeric_chapter_ids = _numeric_chapter_column_ids(primary_records)
+    standalone_layout_ids = {
+        column_id: kind
+        for extraction in bundles
+        for column_id, kind in extraction.standalone_layout_ids.items()
+    }
 
     index = 0
     while index < len(primary_records):
@@ -1492,6 +1506,14 @@ def _compare_by_shared_columns(
                 emit(pending)
                 pending = []
             emit([record], atomic=True, block_type_override=BlockType.CHAPTER.value)
+            index += 1
+            continue
+        layout_type = standalone_layout_ids.get(record.column_id)
+        if layout_type:
+            if pending:
+                emit(pending)
+                pending = []
+            emit([record], atomic=True, block_type_override=layout_type)
             index += 1
             continue
         if record.atomic_title:

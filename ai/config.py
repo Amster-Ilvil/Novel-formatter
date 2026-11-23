@@ -9,9 +9,12 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 
 from utils.atomic_io import atomic_write_json
-from ai.secure_store import delete_secret, load_secret, persistence_available, save_secret
+from ai.gemini_free_tier import DEFAULT_RPD, OCR_MODEL
+from ai.secure_store import delete_secret, load_named_secret, load_secret, persistence_available, save_secret
 
 APP_DIR_NAME = "NovelFormatter"
+GEMINI_OCR_SECRET_NAME = "Gemini.OCR"
+_SESSION_GEMINI_OCR_KEY = ""
 
 
 class APIKeyValidationError(ValueError):
@@ -98,17 +101,21 @@ class AISettings:
     ocr_repair_mode: str = "readability"  # readability | strict
     glossary_path: str = ""
     performance_profile_version: int = 4
+    gemini_free_mode: bool = True
+    gemini_rpd_limit: int = DEFAULT_RPD
 
     @property
     def requires_key(self) -> bool:
         # Local/custom OpenAI-compatible gateways may intentionally run without
         # authentication. Cloud-managed providers still require a real key.
-        return self.provider not in {"ollama", "custom"}
+        return self.provider not in {"ollama", "custom", "chatgpt_subscription"}
 
     @property
     def configured(self) -> bool:
         if not self.provider or not self.model:
             return False
+        if self.provider == "chatgpt_subscription":
+            return True  # OAuth status is validated by the SDK at request time.
         if self.provider == "custom":
             if not str(self.base_url or "").strip():
                 return False
@@ -124,6 +131,8 @@ class AISettings:
             "concurrency": self.concurrency,
             "rpm_limit": self.rpm_limit,
             "tpm_limit": self.tpm_limit,
+            "gemini_free_mode": self.gemini_free_mode,
+            "gemini_rpd_limit": self.gemini_rpd_limit,
             "ai_batch_chars": self.batch_chars,
             "ai_batch_tokens": self.batch_tokens,
             "request_timeout": self.request_timeout,
@@ -143,8 +152,9 @@ class AISettings:
 def provider_defaults(provider: str) -> tuple[str, str]:
     return {
         "openai": ("gpt-4o", "https://api.openai.com/v1"),
+        "chatgpt_subscription": ("", ""),
         "anthropic": ("claude-sonnet-4-5", ""),
-        "gemini": ("gemini-2.0-flash", ""),
+        "gemini": (OCR_MODEL, ""),
         "deepseek": ("deepseek-v4-flash", "https://api.deepseek.com"),
         "zhipu": ("glm-5.3-flash", "https://open.bigmodel.cn/api/paas/v4"),
         "zai": ("glm-5.3-flash", "https://api.z.ai/api/paas/v4/"),
@@ -162,6 +172,15 @@ def set_session_api_key(api_key: str) -> None:
 
 def clear_session_api_key() -> None:
     set_session_api_key("")
+
+
+def set_session_gemini_ocr_key(api_key: str) -> None:
+    global _SESSION_GEMINI_OCR_KEY
+    _SESSION_GEMINI_OCR_KEY = normalise_api_key(api_key)
+
+
+def load_gemini_ocr_key() -> str:
+    return _SESSION_GEMINI_OCR_KEY or load_named_secret(GEMINI_OCR_SECRET_NAME)
 
 
 def load_ai_settings() -> AISettings:
@@ -230,6 +249,8 @@ def load_ai_settings() -> AISettings:
         deepseek_user_id=str(data.get("deepseek_user_id", "novel_formatter") or "novel_formatter"),
         ocr_repair_mode=(str(data.get("ocr_repair_mode", "readability") or "readability") if str(data.get("ocr_repair_mode", "readability") or "readability") in {"readability", "strict"} else "readability"),
         glossary_path=str(data.get("glossary_path", os.environ.get("NOVEL_FORMATTER_AI_GLOSSARY", "")) or ""),
+        gemini_free_mode=bool(data.get("gemini_free_mode", True)),
+        gemini_rpd_limit=int(data.get("gemini_rpd_limit") or DEFAULT_RPD),
         performance_profile_version=4,
     )
 
@@ -268,7 +289,11 @@ def save_ai_settings(settings: AISettings, persist_api_key: bool = True) -> Path
         key = validate_api_key(key)
 
     stored = False
-    if persist_api_key and key:
+    if settings.provider == "chatgpt_subscription":
+        # Login is owned by the official SDK. Do not overwrite/delete existing
+        # API Key provider credentials when switching to subscription mode.
+        payload["api_key_storage"] = "unchanged"
+    elif persist_api_key and key:
         stored = save_secret(key)
         if stored:
             clear_session_api_key()

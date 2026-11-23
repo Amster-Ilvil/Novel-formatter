@@ -175,6 +175,7 @@ class OCRCompareExchangeService:
         self._ai_adjudication_cancel_btn.setVisible(running_adjudication)
         self._ai_adjudication_cancel_btn.setEnabled(running_adjudication)
         self._ai_adjudication_progress.setVisible(running_adjudication)
+        self._sync_compact_compare_controls()
         if busy:
             if running_adjudication:
                 self._set_compare_task_progress(
@@ -244,6 +245,21 @@ class OCRCompareExchangeService:
                 )
                 from ui.ocr.gui_roundtrip_authority import reapply_gui_review_authority
                 restored = reapply_gui_review_authority(package, fusion_states, lines)
+                checkpoint_authority = package.get("adjudication_checkpoint_authority")
+                if isinstance(checkpoint_authority, dict):
+                    package_items = package["editable_items"]
+                    for item, state, text in zip(package_items, fusion_states, lines):
+                        decision = checkpoint_authority.get(item["row_id"], {})
+                        if decision.get("unresolved"):
+                            state.requires_confirmation = True
+                            state.reopen()
+                        elif decision.get("selection_origin"):
+                            upsert_external_candidate(
+                                state, text, display_label="已保存裁决", select=True,
+                                allow_empty=item.get("delete_intentionally") is True,
+                                selection_origin=decision["selection_origin"],
+                            )
+                    restored = True
                 if not restored and len(lines) == len(fusion_states):
                     # Backward compatibility: older packages carry no review
                     # authority manifest, so retain their existing semantics.
@@ -415,111 +431,43 @@ class OCRCompareExchangeService:
         adjudication_report = result.get("ai_adjudication_report")
         adjudication_paths = result.get("ai_adjudication_paths")
         self._set_ai_import_busy(False)
-        if isinstance(adjudication_report, dict):
-            stats = adjudication_report.get("stats") or {}
-            schema = str(adjudication_report.get("schema", "") or "")
-            is_gpt_grade = schema == "novel_formatter.ocr_gpt_grade_adjudication.v1"
-            if is_gpt_grade:
-                visual_report = adjudication_report.get("visual") if isinstance(adjudication_report.get("visual"), dict) else {}
-                contextual_report = adjudication_report.get("contextual") if isinstance(adjudication_report.get("contextual"), dict) else {}
-                visual_stats = visual_report.get("stats") if isinstance(visual_report.get("stats"), dict) else {}
-                contextual_stats = contextual_report.get("stats") if isinstance(contextual_report.get("stats"), dict) else {}
-                visual_usage = visual_report.get("usage") if isinstance(visual_report.get("usage"), dict) else {}
-                contextual_usage = contextual_report.get("usage") if isinstance(contextual_report.get("usage"), dict) else {}
-                targets = int(stats.get("target_items", 0) or 0)
-                visual_applied = int(stats.get("visual_applied_changes", 0) or 0)
-                contextual_applied = int(stats.get("contextual_applied_changes", 0) or 0)
-                uncertain = int(stats.get("final_uncertain_items", 0) or 0)
-                state_stats = dict(result.get("ai_adjudication_state_stats") or {})
-                confirmed_unchanged = int(state_stats.get("confirmed_unchanged", 0) or 0)
-                visual_requests = int(stats.get("visual_request_count", 0) or 0)
-                contextual_batches = int(stats.get("contextual_request_batches", 0) or 0)
-                peak_concurrency = int(visual_stats.get("concurrency_peak", 0) or 0)
-                token_total = int(visual_usage.get("total_tokens", 0) or 0) + int(contextual_usage.get("total_tokens", 0) or 0)
-                token_note = f"；API 用量 {token_total / 1000:.1f}k tokens" if token_total else ""
-                context_error = str(adjudication_report.get("contextual_error", "") or "")
-                pass_note = "出版级·视觉抄写→上下文裁决→独立审计" if contextual_report else "出版级·视觉阶段（上下文阶段未完成）"
-                speed_parts = []
-                if visual_requests:
-                    speed_parts.append(f"视觉 {visual_requests} 次 API")
-                if contextual_batches:
-                    speed_parts.append(f"上下文 {contextual_batches} 批")
-                if peak_concurrency:
-                    speed_parts.append(f"视觉峰值并发 {peak_concurrency}")
-                speed_note = f"；{'，'.join(speed_parts)}" if speed_parts else ""
-                error_note = "；上下文阶段失败，已保留通过安全闸门的视觉结果" if context_error else ""
-                self._summary.setText(
-                    f"✅ 出版级 AI 裁决完成：风险条目 {targets}，视觉阶段采用 {visual_applied}，"
-                    f"上下文二次改判 {contextual_applied}，AI确认原文无需修改 {confirmed_unchanged}，"
-                    f"最终保留人工复核 {uncertain}；{pass_note}{speed_note}{token_note}{error_note}。"
-                    "原始 OCR、物理列与结构未改变。"
-                )
-            else:
-                usage = adjudication_report.get("usage") or {}
-                applied = int(stats.get("applied_changes", 0) or 0)
-                uncertain = int(stats.get("uncertain_items", 0) or 0)
-                targets = int(stats.get("target_items", 0) or 0)
-                skipped = int(stats.get("skipped_low_risk", 0) or 0)
-                token_total = int(usage.get("total_tokens", 0) or 0)
-                token_note = f"；API 用量 {token_total / 1000:.1f}k tokens" if token_total else ""
-                mode = str(adjudication_report.get("mode", "") or "")
-                routing_mode = str(adjudication_report.get("routing_mode", "smart") or "smart")
-                routing_note = {"smart":"智能均衡", "exhaustive":"出版全部", "lean":"极速高风险"}.get(routing_mode, routing_mode)
-                requests = int(stats.get("request_count", 0) or 0)
-                peak_concurrency = int(stats.get("concurrency_peak", 0) or 0)
-                mode_note = "出版参考真值模式" if mode == "reference_truth" else f"批量视觉裁决·{routing_note}"
-                speed_note = f"；{requests} 次 API，请求峰值并发 {peak_concurrency}" if requests else ""
-                self._summary.setText(
-                    f"✅ AI 审定完成：风险条目 {targets}，自动采用 {applied}，保留人工复核 {uncertain}，"
-                    f"跳过低风险项 {skipped}；{mode_note}{speed_note}{token_note}。结构与物理列未改变。"
-                )
-        else:
-            self._summary.setText(
-                f"✅ 已严格导入外部大模型融合包：{len(lines)} 句均按 row ID 完整覆盖；"
-                f"原始多模型候选、封面、插图、目录、坐标和列 ID 保持不变{repair_note}{empty_note}。"
-            )
         if fused is not None:
             self.doc_applied.emit(fused)
 
         if isinstance(adjudication_report, dict):
             stats = adjudication_report.get("stats") or {}
-            paths = list(adjudication_paths or []) if isinstance(adjudication_paths, (list, tuple)) else []
-            schema = str(adjudication_report.get("schema", "") or "")
-            if schema == "novel_formatter.ocr_gpt_grade_adjudication.v1":
-                visual = adjudication_report.get("visual") if isinstance(adjudication_report.get("visual"), dict) else {}
-                contextual = adjudication_report.get("contextual") if isinstance(adjudication_report.get("contextual"), dict) else {}
-                visual_stats = visual.get("stats") if isinstance(visual.get("stats"), dict) else {}
-                context_error = str(adjudication_report.get("contextual_error", "") or "")
-                detail_lines = [
-                    f"出版级链路处理 {int(stats.get('target_items', 0) or 0)} 个真实分歧：先独立视觉抄写，再做候选/物理列/前后文裁决，最后独立审计。",
-                    f"视觉阶段采用 {int(stats.get('visual_applied_changes', 0) or 0)} 处；上下文阶段二次改判 {int(stats.get('contextual_applied_changes', 0) or 0)} 处；最终 {int(stats.get('final_uncertain_items', 0) or 0)} 处保留人工复核。",
-                    f"视觉 API {int(stats.get('visual_request_count', 0) or 0)} 次，峰值并发 {int(visual_stats.get('concurrency_peak', 0) or 0)}；上下文请求批次 {int(stats.get('contextual_request_batches', 0) or 0)}；独立审计失败 {int(stats.get('contextual_audit_failures', 0) or 0)} 处。",
-                    "第二阶段只允许输出稀疏 edited_text；原始 OCR 候选只读，row ID、block ID、页码、坐标、物理列、封面、插图、目录和 EPUB 结构均由程序锁定。",
-                    "默认未读取文库电子版作为答案：参考电子版仍用于事后 benchmark，避免把参考答案泄漏给裁决模型。",
-                ]
-                if context_error:
-                    detail_lines.append(f"上下文阶段未完成：{context_error}；已保留通过本地安全闸门的视觉裁决，不把失败批次伪装成出版级完整结果。")
-                elif contextual:
-                    detail_lines.append("上下文裁决与独立审计均已完成；仍未通过本地安全闸门的条目不会自动写回。")
-            else:
-                detail_lines = [
-                    f"AI 仅处理了 {int(stats.get('target_items', 0) or 0)} 个路由后风险条目；"
-                    f"{int(stats.get('skipped_low_risk', 0) or 0)} 个低风险条目未发送，节省 tokens。",
-                    f"API 请求 {int(stats.get('request_count', 0) or 0)} 次；并发 {int(stats.get('concurrency_start', 0) or 0)}→峰值 {int(stats.get('concurrency_peak', 0) or 0)}→结束 {int(stats.get('concurrency_end', 0) or 0)}；"
-                    f"漏回缩批补跑 {int(stats.get('incomplete_retry_batches', 0) or 0)} 次。",
-                    f"自动写入 {int(stats.get('applied_changes', 0) or 0)} 处；"
-                    f"{int(stats.get('uncertain_items', 0) or 0)} 处证据不足或审计失败，仍保留原融合稿等待人工复核。",
-                    "校订模型只返回稀疏 edited_text；独立审计不读取第一遍解释，且所有结果均通过本地长度、语言和来源覆盖检查。",
-                    "row ID、block ID、页码、坐标、物理列、封面、插图、目录和 EPUB 结构均由程序锁定。",
-                ]
-            if paths:
-                detail_lines.append(f"审定融合包：{paths[0]}")
-                if len(paths) > 1:
-                    detail_lines.append(f"审计报告：{paths[1]}")
-            if adjudication_report.get("mode") != "reference_truth" and schema != "novel_formatter.ocr_gpt_grade_adjudication.v1":
-                detail_lines.append("未提供出版版真值：本结果只称为高精度融合候选，不声称出版级或 100% 准确。")
-            notify(self, "\n".join(detail_lines), "success")
+            state_stats = result.get("ai_adjudication_state_stats") or {}
+            targets = int(stats.get("target_items", 0) or 0)
+            requests = int(stats.get("request_count", 0) or 0)
+            changed = int(state_stats.get("changed", 0) or 0)
+            confirmed = int(state_stats.get("confirmed_unchanged", 0) or 0)
+            uncertain = int(stats.get("uncertain_items", 0) or 0)
+            failed = int(stats.get("network_failed_rows", 0) or 0)
+            label = "AI 组合图裁决请求失败" if failed and failed == targets else "AI 组合图裁决完成"
+            summary = (
+                f"{label} · {targets} 条复核 · API 请求 {requests} 次 · "
+                f"改字 {changed} 条 · 确认原文 {confirmed} 条 · 待复核 {uncertain} 条"
+                if targets else "当前没有待裁决的分歧 · API 请求 0 次"
+            )
+            self._summary.setText(summary)
+            detail_lines = [summary]
+            tokens = int((adjudication_report.get("usage") or {}).get("total_tokens", 0) or 0)
+            if tokens:
+                detail_lines.append(f"模型报告用量 {tokens:,} tokens。")
+            if failed:
+                detail_lines.append(f"其中 {failed} 条因网络或服务故障留待复核。")
+                detail_lines.extend(str(error) for error in (adjudication_report.get("request_errors") or [])[:3])
+            quota_blocked = int(stats.get("quota_blocked_rows", 0) or 0)
+            if quota_blocked:
+                detail_lines.append(f"其中 {quota_blocked} 条因本地额度限制未发送。")
+            for label, path in zip(("裁决变更包", "裁决报告"), adjudication_paths or ()):
+                detail_lines.append(f"{label}：{path}")
+            notify(self, "\n".join(detail_lines), "warning" if uncertain else "success")
         else:
+            self._summary.setText(
+                f"✅ 已严格导入外部大模型融合包：{len(lines)} 句均按 row ID 完整覆盖；"
+                f"原始多模型候选、封面、插图、目录、坐标和列 ID 保持不变{repair_note}{empty_note}。"
+            )
             detail_lines = [
                 "大模型结果已完全替换融合正文并进入 Formatter、OCR 对比和 EPUB。",
                 "JSON 读取、结构校验和候选状态构建均在后台完成；模型栏按事件循环分批刷新。",

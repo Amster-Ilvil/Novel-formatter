@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Novel Formatter — PySide6 GUI
+Novel Formatter 2.5 — PySide6 GUI
 七个主功能区：工作区 / 页面管理 / OCR 识别 / 格式处理 / 文字校对 / EPUB生成 / 设置。
 OCR/PDF 仍使用紧凑模式切换；文字校对由全文总览与图文对照在页内互切，macOS 简约风格，完整功能保留。
 
@@ -1556,6 +1556,7 @@ class OCRTab(QWidget):
         # physical-column geometry internally, but it must never toggle or
         # overwrite the single-model "启用日文物理分列" preference.
         plan = self._selected_multi_ocr_role_plan()
+        self._update_gemini_ocr_settings_visibility(multi_enabled, plan.selected_engines)
         needs_geometry = bool(multi_enabled)
         try:
             from adapters.ocr_profiles import get_ocr_profile
@@ -2124,10 +2125,19 @@ class OCRTab(QWidget):
         self._hayai_widget.setVisible(aid == "hayai_ocr")
         self._paddle_aistudio_widget.setVisible(aid == "paddle_aistudio")
         self._vision_backend_widget.setVisible(aid == "apple_vision")
+        self._update_gemini_ocr_settings_visibility(
+            self._multi_ocr_check.isChecked(), self._selected_multi_ocr_role_plan().selected_engines,
+        )
         if aid == "apple_vision":
             self._on_vision_backend_changed()
         else:
             self._update_shortcut_widget_visibility()
+
+    def _update_gemini_ocr_settings_visibility(self, multi_enabled: bool, multi_engines):
+        panel = getattr(self, "_gemini_ocr_settings", None)
+        if panel is not None:
+            engines = multi_engines if multi_enabled else (self._active_adapter,)
+            panel.set_selected("gemini_ocr" in engines)
 
     def _load_paddle_aistudio_token(self) -> None:
         edit = getattr(self, "_paddle_aistudio_token_edit", None)
@@ -2589,6 +2599,18 @@ class OCRTab(QWidget):
                 segment_max_chars=(30 if is_m6() else 24),
                 segment_max_aspect=18.0,
             )
+        elif engine_id == "gemini_ocr":
+            from adapters.gemini_ocr_adapter import DEFAULT_BATCH_ITEMS
+            from ai.config import load_ai_settings
+            ai_settings = load_ai_settings()
+            panel = getattr(self, "_gemini_ocr_settings", None)
+            opts.update(
+                batch_items=DEFAULT_BATCH_ITEMS, concurrency=2, cache=True,
+                request_timeout=ai_settings.request_timeout,
+                rpm_limit=ai_settings.rpm_limit, tpm_limit=ai_settings.tpm_limit,
+            )
+            if panel is not None:
+                opts.update(panel.engine_options())
         elif engine_id == "ndlocr_lite":
             opts.update(
                 device="cpu",
@@ -2779,7 +2801,7 @@ class OCRTab(QWidget):
         # independent decision paths and cannot silently rewrite each other's
         # column/full-page choice here.  In particular, single-model + unchecked
         # "启用日文物理分列" means genuine whole-page input for every engine.
-        use_column_mask = bool(use_column_mask and profile.allow_column_pipeline)
+        use_column_mask = bool((use_column_mask or engine_id == "gemini_ocr") and profile.allow_column_pipeline)
         if use_column_mask:
             if shared_column_prepare_dir:
                 opts["column_shared_prepare_dir"] = shared_column_prepare_dir
@@ -2796,6 +2818,9 @@ class OCRTab(QWidget):
                 phase_callback=phase_callback,
                 **common_kwargs,
             )
+        if engine_id == "gemini_ocr":
+            from adapters.gemini_ocr_adapter import run as ocr_run
+            return ocr_run(engine_options=opts, **common_kwargs)
         if engine_id == "paddle_ocr":
             from adapters.paddle_ocr_adapter import run as ocr_run
             return ocr_run(
@@ -3908,15 +3933,12 @@ class OCRCompareTab(OCRCompareViewMixin, QWidget):
     def _manual_decision_seed_text(self, state, row_index: int) -> str:
         """Return the human-edit baseline without mutating any OCR source.
 
-        Prefer the latest explicit human decision, then a strict raw-model majority.
-        If no strict majority exists, keep the currently selected fusion output
-        or the comparison row's deterministic fallback.  A previous explicit
-        human edit remains visible so revisiting a row never discards user work.
+        Keep a confirmed selection. For pending rows, use the raw-model majority
+        when available and otherwise use the comparison fallback.
         """
-        origin = str(getattr(state, "selection_origin", "") or "")
         current = str(state.output_text() or "").strip()
         selected_index = getattr(state, "selected_index", None)
-        if origin.startswith("human_") and selected_index is not None:
+        if selected_index is not None:
             return current
         try:
             row = self._comparison.rows[int(row_index)]
@@ -3953,6 +3975,7 @@ class OCRCompareTab(OCRCompareViewMixin, QWidget):
             locked = bool(
                 valid and len(self._documents) >= 2
                 and not self._comparison.rows[row_index].is_conflict
+                and not self._fusion_states[row_index].unresolved
             )
             editor.setReadOnly(locked)
             value = ""
@@ -3968,8 +3991,11 @@ class OCRCompareTab(OCRCompareViewMixin, QWidget):
         widget = getattr(self, "_fusion_widgets", {}).get(row_index)
         if widget is not None and valid:
             baseline = getattr(self, "_manual_decision_draft_candidates", {}).get(row_index)
+            state = self._fusion_states[row_index]
+            system_pick = baseline is None and row_index not in drafts and state.selected_index is None
             for index, card in enumerate(widget._cards):
-                card.set_draft_source(index == baseline if baseline is not None else card.editor.toPlainText() == value)
+                draft_match = index == baseline if baseline is not None else card.editor.toPlainText() == value
+                card.set_draft_source(state.selected_index is None and draft_match, system=system_pick)
 
         state_label = getattr(self, "_manual_decision_state", None)
         if state_label is not None:
@@ -4041,7 +4067,11 @@ class OCRCompareTab(OCRCompareViewMixin, QWidget):
             return
         if row_index != int(getattr(self, "_current_row_index", -1)):
             self._select_row(row_index)
-        if len(self._documents) >= 2 and not self._comparison.rows[row_index].is_conflict:
+        if (
+            len(self._documents) >= 2
+            and not self._comparison.rows[row_index].is_conflict
+            and not self._fusion_states[row_index].unresolved
+        ):
             return
         value = str(text or "")
         self._manual_decision_drafts[row_index] = value
@@ -4074,6 +4104,7 @@ class OCRCompareTab(OCRCompareViewMixin, QWidget):
     def _discard_manual_decision_draft(self) -> None:
         row_index = int(getattr(self, "_current_row_index", -1))
         getattr(self, "_manual_decision_drafts", {}).pop(row_index, None)
+        getattr(self, "_manual_decision_draft_candidates", {}).pop(row_index, None)
         getattr(self, "_manual_decision_draft_sources", {}).pop(row_index, None)
         getattr(self, "_manual_decision_draft_candidates", {}).pop(row_index, None)
         self._refresh_manual_draft_queue_row(row_index)
@@ -4116,7 +4147,11 @@ class OCRCompareTab(OCRCompareViewMixin, QWidget):
         row_index = int(getattr(self, "_current_row_index", -1))
         if not 0 <= row_index < len(self._fusion_states):
             return False
-        if len(self._documents) >= 2 and not self._comparison.rows[row_index].is_conflict:
+        if (
+            len(self._documents) >= 2
+            and not self._comparison.rows[row_index].is_conflict
+            and not self._fusion_states[row_index].unresolved
+        ):
             return False
         text = editor.toPlainText().replace("\r\n", "\n").replace("\r", "\n").strip("\n")
         state = self._fusion_states[row_index]
@@ -4147,16 +4182,11 @@ class OCRCompareTab(OCRCompareViewMixin, QWidget):
         self._sync_canonical_authority_from_states([row_index])
         self._publish_fusion_decision(row_index, origin="ocr_compare")
         self._remove_decision_queue_rows((row_index,))
-        remaining_pending = (
-            self._decision_queue_model.rowCount()
-            if self._decision_queue_model is not None and not self._show_resolved_history
-            else sum(1 for item in self._fusion_states if item.unresolved)
-        )
-        self._update_unresolved_summary(refresh_queue=False, known_unresolved=remaining_pending)
         if history is not None:
             history.commit_resolution(row_index)
         getattr(self, "_manual_decision_drafts", {}).pop(row_index, None)
         getattr(self, "_manual_decision_draft_sources", {}).pop(row_index, None)
+        self._update_unresolved_summary(refresh_queue=False)
         self._render_fusion_window(row_index, force=True)
         self._row_state.setText(
             f"当前句：{row_index + 1}/{len(self._comparison.rows)} · 人工编辑 · 已确定"
@@ -4245,12 +4275,7 @@ class OCRCompareTab(OCRCompareViewMixin, QWidget):
         # row from the virtual queue and update counters; do not rebuild 1k-4k
         # rows and do not repaint the OCR comparison window when 图文 is active.
         self._remove_decision_queue_rows((row_index,))
-        remaining_pending = (
-            self._decision_queue_model.rowCount()
-            if self._decision_queue_model is not None and not self._show_resolved_history
-            else sum(1 for state in self._fusion_states if state.unresolved)
-        )
-        self._update_unresolved_summary(refresh_queue=False, known_unresolved=remaining_pending)
+        self._update_unresolved_summary(refresh_queue=False)
         if refresh:
             # Only a visible OCR compare surface needs its current-row widgets
             # repainted.  Cross-workspace synchronization stays data-only.
@@ -4752,6 +4777,7 @@ class OCRCompareTab(OCRCompareViewMixin, QWidget):
         # Atomic external repairs are selected as one transaction. Choosing a
         # non-transaction candidate in any member invalidates the old group
         # selection instead of leaving a partially applied boundary repair.
+        reopened_rows = set()
         if not getattr(self, "_atomic_selection_sync", False) and 0 <= row_index < len(self._fusion_states):
             state = self._fusion_states[row_index]
             selected_index = state.selected_index
@@ -4790,6 +4816,8 @@ class OCRCompareTab(OCRCompareViewMixin, QWidget):
                                 member_state.selected_index = None
                                 member_state.selection_origin = ""
                                 member_state.review_indices = member_state._build_review_indices()
+                                if member_index != row_index and member_state.unresolved:
+                                    reopened_rows.add(member_index)
                     # Keep the user's explicit non-transaction selection on this row.
                     state.selected_index = selected_index
             finally:
@@ -4800,7 +4828,7 @@ class OCRCompareTab(OCRCompareViewMixin, QWidget):
         # original worker comparison immutable so “恢复初始” stays O(1).
         # Publish every member whose selection may have changed as part of an
         # atomic transaction, not just the clicked row.
-        affected_rows = {int(row_index)}
+        affected_rows = {int(row_index)} | reopened_rows
         if 0 <= row_index < len(self._fusion_states):
             chosen = self._fusion_states[row_index]
             if chosen.selected_index is not None and 0 <= chosen.selected_index < len(chosen.candidates):
@@ -4817,13 +4845,13 @@ class OCRCompareTab(OCRCompareViewMixin, QWidget):
 
         # High-throughput review: one click removes only the affected queue rows.
         # No 1k-4k item reconstruction and no full unresolved-priority recompute.
-        self._remove_decision_queue_rows(affected_rows)
+        self._remove_decision_queue_rows(affected_rows - reopened_rows)
+        self._update_unresolved_summary(refresh_queue=bool(reopened_rows))
         remaining_pending = (
             self._decision_queue_model.rowCount()
             if self._decision_queue_model is not None and not self._show_resolved_history
             else sum(1 for state in self._fusion_states if state.unresolved)
         )
-        self._update_unresolved_summary(refresh_queue=False, known_unresolved=remaining_pending)
         if (
             self._review_only_enabled
             and not self._show_resolved_history
@@ -5258,6 +5286,8 @@ class OCRCompareTab(OCRCompareViewMixin, QWidget):
             )
         if refresh_queue:
             self._refresh_decision_queue(force=False)
+        else:
+            self._refresh_decision_queue_stats()
         if hasattr(self, "_prev_group_btn"):
             self._prev_group_btn.setEnabled(bool(history_rows) if self._show_resolved_history else unresolved > 0)
         if hasattr(self, "_next_group_btn"):
@@ -5459,20 +5489,16 @@ class MainWindow(MainWindowControllerMixin, QMainWindow):
     def _install_ocr_workspace(self, tab: OCRTab) -> None:
         self._replace_reference_tab(self._ocr_section, 0, tab, "图片 OCR")
         self._register_loaded_workspace("ocr", tab)
-        ocr_actions = getattr(tab, "_ocr_log_header", None)
+        ocr_actions = getattr(tab, "_ocr_run_actions", None)
         if ocr_actions is None:
             raise RuntimeError("OCRTab 缺少底部操作栏，无法放置清空 OCR 按钮")
-        rerun_index = ocr_actions.indexOf(tab._rerun_btn)
         self._ocr_clear_button = create_workspace_clear_button(
             tab, "OCR", self._clear_ocr_workspace,
             target_layout=ocr_actions,
-            target_index=max(0, rerun_index + 1),
+            target_index=0,
             target_height=tab._rerun_btn.minimumHeight(),
         )
-        # The Phase-22 reference footer contains only Stop + Start OCR.  Keep
-        # the destructive clear action available from the Start button context
-        # menu instead of permanently adding a third visual action.
-        self._ocr_clear_button.setVisible(True)   # 破坏性操作也要有明确入口，右键菜单仅作补充
+        self._ocr_clear_button.setVisible(True)
         clear_action = QAction("清空 OCR", tab._run_btn)
         # Reuse the visible clear button path so the context action keeps the
         # same confirmation dialog and never forwards QAction.triggered(bool)
@@ -5726,7 +5752,6 @@ class MainWindow(MainWindowControllerMixin, QMainWindow):
         root_layout.addWidget(right, 1)
 
         self._sidebar.section_changed.connect(self._goto)
-        self._sidebar.section_changed.connect(self._page_header.set_section)
         self._page_header.navigate.connect(self._goto)
         self._page_header.set_section(self._stack.currentIndex())
         self._sidebar.command_palette_requested.connect(self._open_command_palette)
@@ -5746,6 +5771,7 @@ class MainWindow(MainWindowControllerMixin, QMainWindow):
         self._tab_pages.types_changed.connect(self._on_page_types_changed)
         self._tab_pages.project_changed.connect(self._on_project_changed)
         self._tab_workspace.resume_requested.connect(self._open_named_workspace)
+        self._tab_workspace.reset_local_ocr_requested.connect(self._reset_project_local_ocr)
         self._workspace_coordinator.stable_row_changed.connect(self._on_coordinated_row_changed)
         self._pending_image_review_source_row = 0
         self._restore_reference_navigation()

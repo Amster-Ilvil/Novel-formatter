@@ -372,6 +372,7 @@ def _run_ocr_impl(
                 "manga_48px": "manga_48px_adapter.py",
                 "paddle_ocr": "paddle_ocr_adapter.py",
                 "paddle_aistudio": "paddle_aistudio_adapter.py",
+                "gemini_ocr": "gemini_ocr_adapter.py",
             }
             source_root = PROJECT_ROOT
             # Model cache safety is intentionally conservative.  Adapter
@@ -399,7 +400,7 @@ def _run_ocr_impl(
                     files.append(source_root / "adapters" / adapter_name)
                 # Column transport is part of the effective implementation
                 # whenever any physical-column path can be used.
-                if multi_role_enabled or self._column_split_check.isChecked():
+                if engine_id == "gemini_ocr" or multi_role_enabled or self._column_split_check.isChecked():
                     files.append(source_root / "adapters" / "column_ocr_adapter.py")
                 adapter_impl = project_manager.implementation_fingerprint(files)
                 engine_impl[str(engine_id)] = f"{shared_ocr_impl}:{adapter_impl}"
@@ -3193,7 +3194,7 @@ def _run_ocr_impl(
                         )
                     raise_if_cancelled()
                     if apply_column_reflow and not handwriting_review:
-                        signals.log.emit("\n🧩 OCR 后处理：只按每列末尾判断并接续；同列内部不拆分…")
+                        signals.log.emit("\n🧩 OCR 后处理：保留独立版面条目，并按列尾接续正文…")
                         emit_overall_progress(
                             progress_estimator.update_final_stage(
                                 1,

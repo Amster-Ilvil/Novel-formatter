@@ -8,7 +8,8 @@ from PySide6.QtWidgets import (
     QLineEdit, QCheckBox, QDoubleSpinBox, QSpinBox, QFileDialog, QMessageBox,
     QScrollArea, QFrame,
 )
-from PySide6.QtCore import QSettings, QTimer
+from PySide6.QtCore import QTimer, Slot, QUrl
+from PySide6.QtGui import QDesktopServices
 
 from ui.dialogs import show_error_dialog
 from ui.common.signals import WorkerSignals
@@ -48,14 +49,15 @@ class AISettingsDialog(QDialog):
         content.addWidget(note_card)
 
         form = QFormLayout()
+        self._siwc_form = form
         form.setHorizontalSpacing(14)
         form.setVerticalSpacing(9)
         self.provider = QComboBox()
-        for key, label in (("openai","OpenAI"),("anthropic","Claude / Anthropic"),("gemini","Google Gemini"),("deepseek","DeepSeek"),("zhipu","智谱 BigModel / GLM（国内）"),("zai","Z.AI / GLM（国际）"),("openrouter","OpenRouter"),("ollama","Ollama（本地）"),("custom","自定义 OpenAI 兼容接口")):
+        for key, label in (("openai","OpenAI"),("chatgpt_subscription","ChatGPT 订阅登录（官方 DevKit / 文本与视觉）"),("anthropic","Claude / Anthropic"),("gemini","Google Gemini"),("deepseek","DeepSeek"),("zhipu","智谱 BigModel / GLM（国内）"),("zai","Z.AI / GLM（国际）"),("openrouter","OpenRouter"),("ollama","Ollama（本地）"),("custom","自定义 OpenAI 兼容接口")):
             self.provider.addItem(label,key)
         idx=self.provider.findData(self._settings.provider); self.provider.setCurrentIndex(max(0,idx)); self.provider.currentIndexChanged.connect(self._provider_changed)
-        self.key = QLineEdit(self._settings.api_key); self.key.setEchoMode(QLineEdit.Password)
-        key_row=QWidget(); kl=QHBoxLayout(key_row); kl.setContentsMargins(0,0,0,0); kl.addWidget(self.key,1)
+        self.key = QLineEdit("" if self._settings.provider == "chatgpt_subscription" else self._settings.api_key); self.key.setEchoMode(QLineEdit.Password)
+        key_row=QWidget(); self.key_row=key_row; kl=QHBoxLayout(key_row); kl.setContentsMargins(0,0,0,0); kl.addWidget(self.key,1)
         show=QCheckBox("显示"); show.toggled.connect(lambda on:self.key.setEchoMode(QLineEdit.Normal if on else QLineEdit.Password)); kl.addWidget(show)
         self.persist_key = QCheckBox("保存密钥到本机")
         try:
@@ -127,9 +129,34 @@ class AISettingsDialog(QDialog):
         content.addWidget(form_card)
         self._text_test_state = "未测试"
         self._vision_test_state = "未测试"
-        self._text_test_detail = ""
-        self._vision_test_detail = ""
-        self._settings_store = QSettings("NovelFormatter", "NovelFormatter")
+        # Official Sign in with ChatGPT uses its own OS-encrypted OAuth store.
+        # The GUI is only a safe control surface; it never receives credentials.
+        self.siwc_panel = QFrame()
+        self.siwc_panel.setObjectName("nfSiwcPanel")
+        self.siwc_panel.setStyleSheet(f"QFrame#nfSiwcPanel{{background:{CARD};border:1px solid {BORDER};border-radius:12px;}}")
+        siwc_layout = QVBoxLayout(self.siwc_panel)
+        siwc_layout.setContentsMargins(14, 12, 14, 12)
+        self.siwc_status = QLabel("ChatGPT 状态：未查询")
+        self.siwc_status.setWordWrap(True)
+        siwc_layout.addWidget(self.siwc_status)
+        self.siwc_help = QLabel("需先在 Mac 上执行 siwc_bridge/install_macos.sh 安装官方 DevKit。仅用于文本纠错、翻译与文本裁决；视觉 OCR 请使用 Gemini / OpenAI API Key。")
+        self.siwc_help.setWordWrap(True)
+        self.siwc_help.setStyleSheet(f"color:{MUTED};")
+        siwc_layout.addWidget(self.siwc_help)
+        siwc_buttons = QHBoxLayout()
+        self.siwc_login = QPushButton("登录 ChatGPT")
+        self.siwc_login.clicked.connect(lambda: self._siwc_action("login"))
+        self.siwc_logout = QPushButton("退出登录")
+        self.siwc_logout.clicked.connect(lambda: self._siwc_action("logout"))
+        self.siwc_check = QPushButton("查询状态")
+        self.siwc_check.clicked.connect(lambda: self._siwc_action("session"))
+        self.siwc_usage = QPushButton("订阅额度")
+        self.siwc_usage.clicked.connect(lambda: QDesktopServices.openUrl(QUrl("https://chatgpt.com/settings/usage")))
+        for ctrl in (self.siwc_login, self.siwc_logout, self.siwc_check, self.siwc_usage):
+            siwc_buttons.addWidget(ctrl)
+        siwc_layout.addLayout(siwc_buttons)
+        content.addWidget(self.siwc_panel)
+        content.insertWidget(1, self.siwc_panel)  # Login remains visible above the long settings form.
         self.provider_state=QLabel("")
         self.provider_state.setWordWrap(True)
         self.provider_state.setStyleSheet(f"color:{MUTED};")
@@ -142,10 +169,12 @@ class AISettingsDialog(QDialog):
         content.addStretch(1)
         self.key.editingFinished.connect(lambda: self._load_models(show_errors=False))
         self.base_url.editingFinished.connect(lambda: self._load_models(show_errors=False))
-        self.model.currentTextChanged.connect(lambda _=None: self._reset_test_states())
         buttons=QHBoxLayout(); self.test_btn=QPushButton("测试连接"); self.test_btn.setToolTip("只验证当前 Provider / API Key / Base URL / 文本路由是否可达；不验证图片输入。") ; self.test_btn.clicked.connect(self._test); buttons.addWidget(self.test_btn)
         self.test_vision_btn=QPushButton("测试图片能力"); self.test_vision_btn.setToolTip("生成一张本地 NF42 测试图，以与 AI 图文处理相同的 Base64 Data URL 方式验证当前模型是否真的读取图片")
         self.test_vision_btn.clicked.connect(self._test_vision); buttons.addWidget(self.test_vision_btn); buttons.addStretch()
+        self.key.textChanged.connect(self._invalidate_test_results)
+        self.base_url.textChanged.connect(self._invalidate_test_results)
+        self.model.currentTextChanged.connect(self._invalidate_test_results)
         cancel=QPushButton("取消"); cancel.clicked.connect(self.reject); buttons.addWidget(cancel)
         save=accent_button("保存设置",color=ACC); save.clicked.connect(self._save); buttons.addWidget(save); root.addLayout(buttons)
         self._last_provider=str(self.provider.currentData()); self._provider_changed(initial=True); self._reset_test_states()
@@ -160,7 +189,7 @@ class AISettingsDialog(QDialog):
 
     def _current(self):
         from ai.config import AISettings, normalise_api_key
-        return AISettings(provider=str(self.provider.currentData()),api_key=normalise_api_key(self.key.text()),model=self.model.currentText().strip(),base_url=self.base_url.text().strip(),temperature=self.temperature.value(),max_tokens=self.max_tokens.value(),concurrency=self.concurrency.value(),rpm_limit=self.rpm_limit.value(),tpm_limit=self.tpm_limit.value(),batch_chars=self.batch_chars.value(),batch_tokens=self.batch_tokens.value(),request_timeout=self.request_timeout.value(),json_mode=self.json_mode.isChecked(),glm_thinking=self.glm_thinking.isChecked(),deepseek_thinking=self.deepseek_thinking.isChecked(),deepseek_reasoning_effort=str(self.deepseek_effort.currentData() or "high"),deepseek_user_id="novel_formatter",ocr_repair_mode=str(self.ocr_repair_mode.currentData() or "readability"),glossary_path=self.glossary_path.text().strip())
+        return AISettings(provider=str(self.provider.currentData()),api_key="" if self.provider.currentData()=="chatgpt_subscription" else normalise_api_key(self.key.text()),model=self.model.currentText().strip(),base_url=self.base_url.text().strip(),temperature=self.temperature.value(),max_tokens=self.max_tokens.value(),concurrency=self.concurrency.value(),rpm_limit=self.rpm_limit.value(),tpm_limit=self.tpm_limit.value(),batch_chars=self.batch_chars.value(),batch_tokens=self.batch_tokens.value(),request_timeout=self.request_timeout.value(),json_mode=self.json_mode.isChecked(),glm_thinking=self.glm_thinking.isChecked(),deepseek_thinking=self.deepseek_thinking.isChecked(),deepseek_reasoning_effort=str(self.deepseek_effort.currentData() or "high"),deepseek_user_id="novel_formatter",ocr_repair_mode=str(self.ocr_repair_mode.currentData() or "readability"),glossary_path=self.glossary_path.text().strip())
 
     def _replace_model_items(self, models, preferred=""):
         preferred = str(preferred or self.model.currentText() or "").strip()
@@ -192,6 +221,8 @@ class AISettingsDialog(QDialog):
     def _provider_route_hint(provider: str, base_url: str) -> str:
         provider = str(provider or "").strip().lower()
         base_url = str(base_url or "").strip()
+        if provider == "chatgpt_subscription":
+            return "官方 ChatGPT 订阅授权 · 文本及图片 Responses · 视觉功能取决于所选模型"
         if provider == "zhipu":
             return f"当前 Provider 路由：智谱 BigModel（国内） · {base_url or 'https://open.bigmodel.cn/api/paas/v4'}"
         if provider == "zai":
@@ -214,7 +245,7 @@ class AISettingsDialog(QDialog):
 
     def _refresh_provider_state(self):
         st = self._current()
-        configured = "已配置" if st.configured else "未配置"
+        configured = ("使用 OAuth（不需要 API Key）" if st.provider == "chatgpt_subscription" else ("已配置" if st.configured else "未配置"))
         self.provider_state.setText(
             f"当前 Provider：{st.provider or '未配置'} · 模型：{st.model or '未选模型'} · 密钥状态：{configured}\n"
             f"{self._provider_route_hint(st.provider, st.base_url)}\n"
@@ -225,6 +256,12 @@ class AISettingsDialog(QDialog):
         self._text_test_state = "未测试"
         self._vision_test_state = "未测试"
         self._refresh_provider_state()
+
+    @Slot()
+    def _invalidate_test_results(self):
+        self._cancel_test_request()
+        self._reset_test_states()
+        self.status.clear()
 
     def _cancel_test_request(self):
         self._test_request_id = int(getattr(self, "_test_request_id", 0)) + 1
@@ -251,7 +288,7 @@ class AISettingsDialog(QDialog):
         provider = str(self.provider.currentData() or "")
         key = self.key.text().strip()
         base_url = self.base_url.text().strip()
-        if provider != "ollama" and key:
+        if provider not in {"ollama", "chatgpt_subscription"} and key:
             from ai.config import api_key_validation_error, normalise_api_key
             key = normalise_api_key(key)
             key_error = api_key_validation_error(key)
@@ -260,7 +297,7 @@ class AISettingsDialog(QDialog):
                 if show_errors:
                     QMessageBox.warning(self, "API Key 无效", key_error)
                 return
-        if provider != "ollama" and not key:
+        if provider not in {"ollama", "chatgpt_subscription"} and not key:
             if show_errors:
                 QMessageBox.warning(self, "缺少 API Key", "请先输入 API Key，再刷新模型列表。")
             return
@@ -336,7 +373,40 @@ class AISettingsDialog(QDialog):
             if not current_model or current_model == old_model:
                 self._replace_model_items([model] if model else [], model)
             if not self.base_url.text().strip() or self.base_url.text().strip()==old_url:self.base_url.setText(url)
+        if provider == "chatgpt_subscription" and not initial:
+            self.model.blockSignals(True)
+            self.model.clear()
+            self.model.setEditText("")
+            self.model.blockSignals(False)
         self._last_provider=provider
+        is_siwc = provider == "chatgpt_subscription"
+        self.siwc_panel.setVisible(is_siwc)
+        for widget in (self.key_row, self.persist_key, self.base_url,
+                       self.glm_thinking, self.deepseek_thinking, self.deepseek_effort):
+            widget.setVisible(not is_siwc)
+            label_widget = self._siwc_form.labelForField(widget)
+            if label_widget is not None:
+                label_widget.setVisible(not is_siwc)
+        self.key_row.setEnabled(not is_siwc)
+        self.persist_key.setEnabled(not is_siwc)
+        self.base_url.setEnabled(not is_siwc)
+        self.max_tokens.setEnabled(not is_siwc)
+        self.json_mode.setEnabled(not is_siwc)
+        self.rpm_limit.setEnabled(not is_siwc)
+        self.tpm_limit.setEnabled(not is_siwc)
+        self.test_vision_btn.setEnabled(True)
+        if is_siwc:
+            if not initial:
+                self._api_key_before_siwc = self.key.text()
+                self._concurrency_before_siwc = self.concurrency.value()
+                self.concurrency.setValue(1)
+            self.key.clear()
+            self.key.setPlaceholderText("订阅登录无需 API Key")
+            self.status.setText("请点“登录 ChatGPT”，浏览器授权后点击“刷新模型”；此通道不支持图片。")
+            QTimer.singleShot(0, lambda: self._siwc_action("session"))
+        elif old == "chatgpt_subscription" and not initial:
+            self.key.setText(getattr(self, "_api_key_before_siwc", ""))
+            self.concurrency.setValue(getattr(self, "_concurrency_before_siwc", 0))
         if provider == "ollama":
             self.key.setPlaceholderText("本地 Ollama 无需 API Key")
         elif provider == "custom":
@@ -348,6 +418,8 @@ class AISettingsDialog(QDialog):
         self.glm_thinking.setEnabled(is_glm)
         self.deepseek_thinking.setEnabled(is_deepseek)
         self._sync_deepseek_controls(self.deepseek_thinking.isChecked())
+        if is_siwc:
+            self.temperature.setEnabled(False)  # Official subscription preview rejects temperature.
         if is_deepseek:
             if not initial and self.max_tokens.value()==24000:self.max_tokens.setValue(48000)
             self.status.setText("DeepSeek 默认使用 V4-Flash 非思考模式；系统会固定静态提示前缀以提高缓存命中，并自动采用高并发批处理。")
@@ -359,7 +431,7 @@ class AISettingsDialog(QDialog):
             self.status.setText("")
         self._refresh_provider_state()
         if not initial and provider=="ollama": self.concurrency.setValue(1)
-        if not initial and (provider == "ollama" or self.key.text().strip()):
+        if not initial and (provider == "ollama" or (provider != "chatgpt_subscription" and self.key.text().strip())):
             QTimer.singleShot(0, lambda: self._load_models(show_errors=False))
 
     def _validate(self, require_key=True):
@@ -374,43 +446,85 @@ class AISettingsDialog(QDialog):
         if st.glossary_path and not Path(st.glossary_path).expanduser().is_file():return "术语白名单文件不存在"
         return ""
 
-    def _test(self):
-        error=self._validate(require_key=True)
-        if error: QMessageBox.warning(self,"配置不完整",error); return
-        self._test_request_id = int(getattr(self, "_test_request_id", 0)) + 1
-        request_id = self._test_request_id
-        provider = str(self.provider.currentData() or "")
-        self.test_btn.setEnabled(False); self.status.setText("正在连接……"); st=self._current()
+    def _siwc_action(self, action: str) -> None:
+        if self.provider.currentData() != "chatgpt_subscription":
+            return
+        self.siwc_login.setEnabled(False)
+        self.siwc_logout.setEnabled(False)
+        self.siwc_check.setEnabled(False)
+        self.siwc_status.setText("ChatGPT：正在打开授权或读取连接状态……" if action == "login" else "ChatGPT：正在检查连接……")
+        signals = WorkerSignals()
+        self._siwc_signals = signals
+        signals.finished.connect(lambda data, a=action: self._siwc_finished(a, data))
+        signals.error.connect(self._siwc_failed)
+
         def worker():
             try:
-                from ai.provider_factory import test_provider
-                signals.finished.emit({"reply": test_provider(st), "request_id": request_id, "provider": provider})
-            except Exception:
-                import traceback; signals.error.emit(traceback.format_exc())
-        signals=self._test_signals=WorkerSignals()
-        signals.finished.connect(self._on_test_finished)
-        signals.error.connect(lambda err, rid=request_id: self._on_test_failed(err, rid))
-        threading.Thread(target=worker,daemon=True).start()
+                from ai.chatgpt_subscription import chatgpt_subscription_request
+                data = chatgpt_subscription_request(action, timeout=640 if action == "login" else 90)
+                signals.finished.emit(data)
+            except Exception as exc:
+                # The Python bridge only exposes sanitized errors.
+                signals.error.emit(str(exc))
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _siwc_finished(self, action, data):
+        if self.provider.currentData() != "chatgpt_subscription":
+            return
+        self.siwc_login.setEnabled(True)
+        self.siwc_logout.setEnabled(True)
+        self.siwc_check.setEnabled(True)
+        if not isinstance(data, dict):
+            self.siwc_status.setText("ChatGPT：无法识别连接状态")
+            return
+        connected = data.get("status") == "connected"
+        sharing = data.get("sharing") is True
+        label = str(data.get("profileLabel") or "")[:80]
+        self.siwc_status.setText(f"ChatGPT：{'已连接' if connected else '未连接'} · 订阅调用：{'已授权' if sharing else '未授权'}" + (f" · {label}" if label else ""))
+        if action == "login" and connected and sharing:
+            self._load_models(show_errors=False)
+
+    def _siwc_failed(self, message):
+        self.siwc_login.setEnabled(True)
+        self.siwc_logout.setEnabled(True)
+        self.siwc_check.setEnabled(True)
+        self.siwc_status.setText("ChatGPT：" + str(message)[:280])
+
+    def _test(self):
+        self._start_test(vision=False)
 
     def _test_vision(self):
-        error=self._validate(require_key=True)
-        if error: QMessageBox.warning(self,"配置不完整",error); return
+        self._start_test(vision=True)
+
+    def _start_test(self, *, vision: bool):
+        error = self._validate(require_key=True)
+        if error:
+            QMessageBox.warning(self, "配置不完整", error)
+            return
         self._test_request_id = int(getattr(self, "_test_request_id", 0)) + 1
         request_id = self._test_request_id
-        provider = str(self.provider.currentData() or "")
-        self.test_btn.setEnabled(False); self.test_vision_btn.setEnabled(False)
-        self.status.setText("正在用本地测试图验证图片输入……"); st=self._current()
-        def worker():
-            try:
-                from ai.provider_factory import probe_multimodal_provider
-                signals.finished.emit({"reply": probe_multimodal_provider(st), "request_id": request_id, "provider": provider, "vision": True})
-            except Exception:
-                import traceback; signals.error.emit(traceback.format_exc())
-        signals=self._test_signals=WorkerSignals()
-        signals.finished.connect(self._on_test_finished)
-        signals.error.connect(lambda err, rid=request_id: self._on_test_failed(err, rid))
-        threading.Thread(target=worker,daemon=True).start()
+        settings = self._current()
+        self.test_btn.setEnabled(False)
+        self.test_vision_btn.setEnabled(False)
+        self.status.setText("正在用本地测试图验证图片输入……" if vision else "正在连接……")
 
+        def worker():
+            payload = {"request_id": request_id, "provider": settings.provider, "vision": vision}
+            try:
+                from ai.provider_factory import probe_multimodal_provider, test_provider
+                probe = probe_multimodal_provider if vision else test_provider
+                payload["reply"] = probe(settings)
+            except Exception:
+                import traceback
+                payload["error"] = traceback.format_exc()
+            signals.finished.emit(payload)
+
+        signals = self._test_signals = WorkerSignals()
+        signals.finished.connect(self._on_test_finished)
+        threading.Thread(target=worker, daemon=True).start()
+
+    @Slot(object)
     def _on_test_finished(self, payload):
         request_id = int(payload.get("request_id", -1))
         provider = str(payload.get("provider", ""))
@@ -420,31 +534,22 @@ class AISettingsDialog(QDialog):
             return
         self.test_btn.setEnabled(True)
         self.test_vision_btn.setEnabled(True)
-        if payload.get("vision"):
-            self._vision_test_state = "通过"
-            self._remember_test_result("vision", "通过", str(payload.get('reply', '') or ""))
+        vision = bool(payload.get("vision"))
+        error = payload.get("error")
+        state = "失败" if error else "通过"
+        if vision:
+            self._vision_test_state = state
+        else:
+            self._text_test_state = state
+        self._refresh_provider_state()
+        if error:
+            title = "图片能力测试失败" if vision else "AI 连接失败"
+            self.status.setText(title)
+            show_error_dialog(self, title, error)
+        elif vision:
             self.status.setText(f"✓ 图片输入成功：{payload.get('reply', '')}")
         else:
-            self._text_test_state = "通过"
-            self._remember_test_result("text", "通过", str(payload.get('reply', '') or ""))
             self.status.setText(f"✓ 连接成功：{payload.get('reply', '')}；AI 图文模式还建议点“测试图片能力”。")
-        self._reset_test_states()
-
-    def _on_test_failed(self, details: str, request_id: int):
-        if request_id != int(getattr(self, "_test_request_id", 0)):
-            return
-        self.test_btn.setEnabled(True)
-        self.test_vision_btn.setEnabled(True)
-        lowered = str(details or "").lower()
-        if "图片" in details or "image" in lowered or "nf42" in lowered:
-            self._vision_test_state = "失败"
-            self._remember_test_result("vision", "失败", details)
-        else:
-            self._text_test_state = "失败"
-            self._remember_test_result("text", "失败", details)
-        self._reset_test_states()
-        self.status.setText("连接/图片能力测试失败")
-        show_error_dialog(self,"AI 连接失败",details)
 
     def _save(self):
         error=self._validate(require_key=False)
@@ -452,7 +557,9 @@ class AISettingsDialog(QDialog):
         from ai.config import api_key_storage_backend, save_ai_settings
         st=self._current()
         path=save_ai_settings(st, persist_api_key=self.persist_key.isChecked())
-        if st.api_key and not self.persist_key.isChecked():
+        if st.provider == "chatgpt_subscription":
+            self.status.setText("已保存订阅后端设置；原有 API Key 凭据保持不变。")
+        elif st.api_key and not self.persist_key.isChecked():
             self.status.setText("设置已保存；API Key 仅在本次程序运行期间保存在内存中")
         elif not st.api_key:
             self.status.setText("设置已保存；本地旧 API Key 已彻底移除")

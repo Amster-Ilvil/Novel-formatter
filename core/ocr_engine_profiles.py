@@ -67,6 +67,11 @@ _PROFILES: dict[str, OcrEngineProfile] = {
         "macos_ocr", "apple-vision-context-v1", "column", "context", "native_vision",
         0.85, 0.50, 18, 14,
     ),
+    "gemini_ocr": OcrEngineProfile(
+        "gemini_ocr", "gemini-anchored-column-v1", "column", "context", "remote_model",
+        0.70, 0.40, 16, 12,
+        notes="Gemini reads only locally detected and masked physical columns; no page scan.",
+    ),
     "hayai_ocr": OcrEngineProfile(
         "hayai_ocr", "hayai-tight-native-v2", "column", "compact", "mps_model",
         0.36, 0.22, 10, 8,

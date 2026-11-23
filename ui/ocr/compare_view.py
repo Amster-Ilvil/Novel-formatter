@@ -943,10 +943,12 @@ class OCRCompareViewMixin:
     def _row_is_threeway_disagreement(self, row_index: int) -> bool:
         if self._comparison is None or not 0 <= int(row_index) < len(self._comparison.rows):
             return False
+        row = self._comparison.rows[int(row_index)]
+        seeded = set(getattr(row, "consensus_seeded_models", ()) or ())
         values = {
             str(value or "").strip()
-            for value in (getattr(self._comparison.rows[int(row_index)], "texts", ()) or ())
-            if str(value or "").strip()
+            for index, value in enumerate(getattr(row, "texts", ()) or ())
+            if index not in seeded and str(value or "").strip()
         }
         return len(values) >= 3
 
@@ -1019,7 +1021,7 @@ class OCRCompareViewMixin:
             str(getattr(self, "_resolved_history_group", "all") or "all") if history_mode else "",
             "priority" if active_priority else "source_order",
         )
-        self._decision_queue_count.setText(str(len(rows)))
+        self._set_decision_queue_count(len(rows))
         scope_combo = getattr(self, "_decision_queue_scope", None)
         if scope_combo is not None and not bool(getattr(self, "_syncing_queue_scope", False)):
             current_scope = str(scope_combo.currentData() or "pending")
@@ -1031,9 +1033,6 @@ class OCRCompareViewMixin:
                     scope_combo.setCurrentIndex(pos)
                 finally:
                     self._syncing_queue_scope = False
-        if hasattr(self, "_decision_queue_title"):
-            title = "已裁决历史" if history_mode else "分歧队列"
-            self._decision_queue_title.setText(f"{title} · {len(rows)}")
         # Qt's item model makes a full row reset cheap and lazy.  Single-row
         # adjudication normally never reaches this branch because the resolved
         # row is removed incrementally by _remove_decision_queue_rows().
@@ -1051,12 +1050,17 @@ class OCRCompareViewMixin:
         self._refresh_decision_queue_stats()
 
 
+    def _set_decision_queue_count(self, count: int) -> None:
+        self._decision_queue_count.setText(str(count))
+        title = "已裁决历史" if self._show_resolved_history else "分歧队列"
+        self._decision_queue_title.setText(f"{title} · {count}")
+
     def _remove_decision_queue_rows(self, row_indices) -> int:
         if self._decision_queue_model is None or self._show_resolved_history:
             return 0
         removed = self._decision_queue_model.remove_row_indices(row_indices)
         if removed:
-            self._decision_queue_count.setText(str(self._decision_queue_model.rowCount()))
+            self._set_decision_queue_count(self._decision_queue_model.rowCount())
             self._publish_disagreement_queue_order(self._decision_queue_model.rows)
         return removed
 
@@ -1566,7 +1570,8 @@ class OCRCompareViewMixin:
                 selection.clearSelection()
                 selection.clearCurrentIndex()
             self._decision_queue.setCurrentIndex(QModelIndex())
-            self._decision_queue_count.setText("0")
+            self._set_decision_queue_count(0)
+            self._refresh_decision_queue_stats()
         self._virtual_hint.setText("")
         self._source_area.setVisible(False)
         self._workspace_title.setText("OCR 对比 · 结果收件箱")

@@ -51,7 +51,9 @@ class OCRComparePublicationService:
                 value = comparison.rows[row_index].output_text
             result_lines.append(str(value or ""))
             delete_flags.append(state.output_delete_intentionally())
-        from engine.ocr_roundtrip_package import export_multi_package
+        from engine.ocr_compare_view_model import is_explicit_fusion_selection_origin
+        from engine.ocr_roundtrip_package import _seal_package, _sha256, export_multi_package
+        from engine.targeted_retry_adjudicator import build_local_adjudication_freeze_map
         package = export_multi_package(
             self._documents,
             self._labels,
@@ -80,7 +82,26 @@ class OCRComparePublicationService:
             if primary_raw.get("multi_ocr_role_schema"):
                 package["multi_ocr_role_schema"] = int(primary_raw.get("multi_ocr_role_schema") or 0)
         package.pop("publication_reference", None)
-        return package, comparison
+        package["local_adjudication"] = build_local_adjudication_freeze_map(
+            package, self._canonical_source_decisions.values()
+        )
+        package["confirmed_review_rows"] = {
+            item["row_id"]: state.selection_origin
+            for item, state in zip(package["editable_items"], self._fusion_states)
+            if state.selected_index is not None
+            and is_explicit_fusion_selection_origin(state.selection_origin)
+            and item["row_id"] not in package["local_adjudication"]
+        }
+        # Export and import rebuild the same session identity from the same
+        # evidence. Edits to decisions or OCR sources invalidate stale results.
+        package["package_id"] = _sha256({
+            "structure": package["structure_sha256"],
+            "editable": package["editable_structure_sha256"],
+            "delete_flags": delete_flags,
+            "confirmed": package["confirmed_review_rows"],
+            "local": package["local_adjudication"],
+        })
+        return _seal_package(package), comparison
     def _choose_ai_repair_reference_option(self, package: dict):
         self = self._tab
         """Choose package profile and optional publication evidence explicitly."""
@@ -89,8 +110,7 @@ class OCRComparePublicationService:
         dialog.setModal(True)
         layout = QVBoxLayout(dialog)
         note = QLabel(
-            "当前开发版只导出 V5 多模型分歧裁决包。真正分歧交给外部 AI，"
-            "本地已完成裁决会冻结；普通两模型共同候选默认继续 Lean 保留。"
+            "V5 裁决包包含有分歧的条目和需要看图的一致项。已确认的裁决会保留。"
         )
         note.setWordWrap(True)
         layout.addWidget(note)
@@ -195,11 +215,6 @@ class OCRComparePublicationService:
         if package_mode == "disagreement_v5":
             # Freeze every authoritative local retry verdict so external AI
             # cannot overwrite a same-model retry-confirmed strict majority.
-            from engine.targeted_retry_adjudicator import build_local_adjudication_freeze_map
-            local_map = build_local_adjudication_freeze_map(
-                package, self._canonical_source_decisions.values()
-            )
-            package["local_adjudication"] = local_map
             package["local_adjudication_policy"] = {
                 "resolved_rows_are_frozen_for_external_adjudication": True,
                 "unresolved_rows_are_exportable_for_llm": True,
@@ -213,6 +228,8 @@ class OCRComparePublicationService:
                     package["targeted_retry_adjudication"] = copy.deepcopy(retry_report)
                 elif hasattr(retry_report, "to_dict"):
                     package["targeted_retry_adjudication"] = retry_report.to_dict()
+            from engine.ocr_roundtrip_package import _seal_package
+            _seal_package(package)
         parent = QFileDialog.getExistingDirectory(
             self,
             "选择 AI 修复包的保存位置",
@@ -319,6 +336,13 @@ class OCRComparePublicationService:
                 if audit_flags:
                     reason = (reason + "；审计：" + "、".join(str(value) for value in audit_flags)).strip("；")
                 state = self._fusion_states[row_index]
+                if update.get("source_uncertain"):
+                    state.requires_confirmation = True
+                    state.local_reocr_recommended = True
+                    state.fusion_reason = reason or "外部 AI 无法从原图确认"
+                    state.reopen()
+                    review_only += 1
+                    continue
                 previous_selected = state.selected_index
                 confidence_value = update.get("confidence", 0.0)
                 confidence_labels = {

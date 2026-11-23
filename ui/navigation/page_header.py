@@ -96,8 +96,9 @@ class PageHeader(QWidget):
         index = int(index)
         self._section = index
         info = PAGE_INFO.get(index)
-        self.setVisible(info is not None and index not in HEADERLESS)   # 工作区有项目横幅、OCR 页有分区页签
-        if not info:
+        visible = info is not None and index not in HEADERLESS
+        self.setVisible(visible)
+        if not visible:
             return
         self._title.setText(info[0])
         self._sub.setText(info[1])

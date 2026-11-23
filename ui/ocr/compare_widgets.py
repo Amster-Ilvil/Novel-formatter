@@ -14,6 +14,7 @@ from PySide6.QtWidgets import (
 from ui.common.editor_controls import MouseWheelPlainTextEdit, NoWheelSpinBox
 from ui.common.styling import EDITOR_SCROLLBAR_STYLE, accent_button
 from ui.localized_dialogs import LocalizedFileDialog, LocalizedMessageBox
+from ui.theme.tokens import SUCCESS, SUCCESS_BG
 
 # Preserve the GUI module's localized native-dialog behaviour after extraction.
 QFileDialog = LocalizedFileDialog
@@ -170,11 +171,13 @@ class _FusionCandidateCard(QFrame):
             "border-radius:11px;}"
         )
         self._selected_style = (
-            f"QFrame#fusionCandidate{{background:#EEF4FF;border:2px solid #4F7CFF;"
+            f"QFrame#fusionCandidate{{background:{SUCCESS_BG};border:2px solid {SUCCESS};"
             "border-radius:11px;}"
         )
         self.setObjectName("fusionCandidate")
         self.setStyleSheet(self._normal_style)
+        self._selected_for_review = False
+        self._draft_for_review = False
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(14, 10, 14, 10)
@@ -397,15 +400,23 @@ class _FusionCandidateCard(QFrame):
                     QTimer.singleShot(0, self._fit_editor_height)
         return super().eventFilter(watched, event)
 
-    def set_draft_source(self, active: bool) -> None:
-        self._draft.setText("✓ 手动编辑底稿" if active else "作为底稿")
+    def set_draft_source(self, active: bool, *, system: bool = False) -> None:
+        self._draft_for_review = active
+        self._draft.setText(("✓ 系统预选" if system else "✓ 手动编辑底稿") if active else "作为底稿")
+        self._refresh_candidate_border()
+
+    def _refresh_candidate_border(self) -> None:
+        style = self._selected_style if self._selected_for_review or self._draft_for_review else self._normal_style
+        if self.styleSheet() != style:
+            self.setStyleSheet(style)
 
     def set_selected(self, selected: bool):
+        self._selected_for_review = selected
         self.check.blockSignals(True)
         self.check.setChecked(selected)
         self.check.setText("✓ 已采用" if selected else "直接采用")
         self.check.blockSignals(False)
-        self.setStyleSheet(self._selected_style if selected else self._normal_style)
+        self._refresh_candidate_border()
 
     def set_history_read_only(self, enabled: bool) -> None:
         """Freeze interactive controls while OCR adjudication history is being browsed."""
@@ -1032,16 +1043,15 @@ class OCRAIAdjudicationDialog(QDialog):
 
     def __init__(self, parent=None):
         super().__init__(parent)
-        self.setWindowTitle("出版级 AI 裁决")
+        self.setWindowTitle("AI 组合图裁决")
         self.setMinimumWidth(680)
         layout = QVBoxLayout(self)
         layout.setContentsMargins(16, 14, 16, 14)
         layout.setSpacing(10)
 
         note = QLabel(
-            "出版级模式会先让当前已配置的视觉 AI 在看不到 A/B/C 的情况下独立逐字抄写，"
-            "再把视觉结果、全部 OCR 候选、物理列、前后文和已保存术语交给第二阶段上下文裁决，"
-            "最后由独立审计器反查。支持 OpenAI、Gemini、DeepSeek、GLM、Claude、OpenRouter 等已配置服务。"
+            "按原图核对分歧和有异常的一致项。普通裁片合批识别，疑难修改在本轮用高清图复核。"
+            "可确认的原文按编号填入融合稿，证据不足的条目留待人工复核。"
         )
         note.setWordWrap(True)
         note.setStyleSheet("color:#5B6B80;background:#F7F8FA;border:1px solid #C7D7FE;border-radius:8px;padding:8px;")
@@ -1056,6 +1066,37 @@ class OCRAIAdjudicationDialog(QDialog):
         provider_btn.clicked.connect(self._open_ai_settings)
         provider_row.addWidget(provider_btn)
         layout.addLayout(provider_row)
+
+        from ai.gemini_free_tier import ADJUDICATION_MODEL, DEFAULT_RPD, DEFAULT_RPM, DEFAULT_TPM, KNOWN_CHOICES
+
+        self._gemini_settings = QWidget()
+        gemini_form = QFormLayout(self._gemini_settings)
+        gemini_form.setContentsMargins(0, 0, 0, 0)
+        self.gemini_model = QComboBox()
+        self.gemini_model.setEditable(True)
+        self.gemini_model.addItems(KNOWN_CHOICES)
+        self.gemini_model.setCurrentText(ADJUDICATION_MODEL)
+        gemini_form.addRow("Gemini 裁决模型", self.gemini_model)
+        self.gemini_free_mode = QCheckBox("启用本地额度保护")
+        self.gemini_free_mode.setChecked(True)
+        gemini_form.addRow(self.gemini_free_mode)
+        limits = QHBoxLayout()
+        self.gemini_rpm = NoWheelSpinBox()
+        self.gemini_tpm = NoWheelSpinBox()
+        self.gemini_rpd = NoWheelSpinBox()
+        for label, widget, minimum, maximum, default in (
+            ("RPM", self.gemini_rpm, 1, 100_000, DEFAULT_RPM),
+            ("TPM", self.gemini_tpm, 1_000, 10_000_000, DEFAULT_TPM),
+            ("RPD", self.gemini_rpd, 1, 1_000_000, DEFAULT_RPD),
+        ):
+            widget.setRange(minimum, maximum)
+            widget.setValue(default)
+            limits.addWidget(QLabel(label))
+            limits.addWidget(widget)
+            widget.setEnabled(self.gemini_free_mode.isChecked())
+            self.gemini_free_mode.toggled.connect(widget.setEnabled)
+        gemini_form.addRow("本地额度", limits)
+        layout.addWidget(self._gemini_settings)
         self._refresh_provider_state()
 
         form = QFormLayout()
@@ -1063,91 +1104,38 @@ class OCRAIAdjudicationDialog(QDialog):
         form.setHorizontalSpacing(8)
         form.setVerticalSpacing(8)
 
-        self.adjudication_mode = QComboBox()
-        self.adjudication_mode.addItem("出版级 AI · 视觉抄写 + 上下文裁决 + 独立审计（推荐）", "gpt_grade")
-        self.adjudication_mode.addItem("纯视觉 · 独立抄写 + 候选比较（更快）", "visual_only")
-        form.addRow("裁决模式：", self.adjudication_mode)
-
-        preset_row = QWidget(); preset_layout = QHBoxLayout(preset_row)
-        preset_layout.setContentsMargins(0,0,0,0); preset_layout.setSpacing(8)
-        self.preset = QComboBox()
-        self.preset.addItem("出版精细 · 16 条/请求（推荐）", 16)
-        self.preset.addItem("均衡 · 24 条/请求", 24)
-        self.preset.addItem("快速 · 32 条/请求", 32)
-        preset_layout.addWidget(self.preset)
-        self.batch_items = NoWheelSpinBox(); self.batch_items.setRange(4,32); self.batch_items.setValue(16)
-        preset_layout.addWidget(QLabel("实际批量")); preset_layout.addWidget(self.batch_items)
-        preset_layout.addStretch(1)
-        self.preset.currentIndexChanged.connect(lambda _=None: self.batch_items.setValue(int(self.preset.currentData() or 16)))
-        form.addRow("批量：", preset_row)
-
-        self.routing = QComboBox()
-        self.routing.addItem("智能均衡 · 保留实质 2:1 分歧，仅跳过高置信标点/空格差异", "smart")
-        self.routing.addItem("出版全部 · 所有分歧/低置信都送视觉裁决", "exhaustive")
-        self.routing.addItem("极速高风险 · 可跳过干净高置信 2:1", "lean")
-        form.addRow("裁决范围：", self.routing)
+        self.batch_items = NoWheelSpinBox()
+        self.batch_items.setRange(4, 12)
+        self.batch_items.setValue(12)
+        form.addRow("每图条目上限", self.batch_items)
 
         concurrency_row = QWidget(); concurrency_layout = QHBoxLayout(concurrency_row)
         concurrency_layout.setContentsMargins(0,0,0,0); concurrency_layout.setSpacing(8)
         self.concurrency = NoWheelSpinBox(); self.concurrency.setRange(0,16); self.concurrency.setValue(0)
-        self.concurrency.setToolTip("0=自动：在线模型从 4 路起步；稳定时逐步增加，检测到传输重试则减半。Ollama 默认单路。")
+        self.concurrency.setToolTip("0=自动。在线模型同时处理最多 4 张组合图，自定义和本地模型默认逐张处理。")
         concurrency_layout.addWidget(self.concurrency)
         concurrency_layout.addWidget(QLabel("0=自动（推荐）"))
         concurrency_layout.addStretch(1)
         form.addRow("并发请求：", concurrency_row)
 
-        self.reasoning = QComboBox()
-        self.reasoning.addItem("low · 快速", "low")
-        self.reasoning.addItem("high · 出版裁决推荐", "high")
-        self.reasoning.addItem("max · 极少数疑难页", "max")
-        self.reasoning.setCurrentIndex(1)
-        form.addRow("视觉思考：", self.reasoning)
-
-        context_row = QWidget(); context_layout = QHBoxLayout(context_row)
-        context_layout.setContentsMargins(0,0,0,0); context_layout.setSpacing(8)
-        self.context_pages = NoWheelSpinBox(); self.context_pages.setRange(10,30); self.context_pages.setValue(20)
-        context_layout.addWidget(self.context_pages)
-        context_layout.addWidget(QLabel("页/批；自动带前后 2 页锚点"))
-        context_layout.addStretch(1)
-        form.addRow("上下文窗口：", context_row)
-
         self.output_dir = QLineEdit()
         desktop = Path.home() / "Desktop"
-        self.output_dir.setText(str(desktop if desktop.is_dir() else Path.home()))
+        project_dir = getattr(parent, "_project_package_dir", "")
+        self.output_dir.setText(project_dir or str(desktop if desktop.is_dir() else Path.home()))
         output_row = QWidget(); output_layout = QHBoxLayout(output_row)
         output_layout.setContentsMargins(0,0,0,0); output_layout.setSpacing(6)
         output_layout.addWidget(self.output_dir, 1)
         output_btn = QPushButton("选择…")
         output_btn.clicked.connect(self._choose_output)
         output_layout.addWidget(output_btn)
-        form.addRow("审计报告：", output_row)
+        form.addRow("裁决报告目录", output_row)
         layout.addLayout(form)
-
-        self.risk_only = QCheckBox("只发送真正分歧、低置信、疑似缺失/重复条目（推荐）")
-        self.risk_only.setChecked(True)
-        self.allow_novel = QCheckBox("允许 X：所有本地候选都错时，AI 可返回少量精确新字；仍需本地防改写校验")
-        self.allow_novel.setChecked(True)
-        self.retry_incomplete = QCheckBox("AI 漏回较多编号时，只把缺失项缩小批次自动补跑一次（推荐）")
-        self.retry_incomplete.setChecked(True)
-        self.independent_audit = QCheckBox("出版级模式完成后再用独立审计器反查缺字、重复、邻列粘连、数字/否定/专名（推荐）")
-        self.independent_audit.setChecked(True)
-        layout.addWidget(self.risk_only)
-        layout.addWidget(self.allow_novel)
-        layout.addWidget(self.retry_incomplete)
-        layout.addWidget(self.independent_audit)
-
-        warning = QLabel(
-            "证据规则：图片必须覆盖该行声明的全部物理列和页面；有图片文件不等于证据完整。"
-            "上下文只能用于消歧，不能凭语法润色或续写；模型置信度不参与自动放行。"
-            "本地安全闸门或独立审计失败的条目会保留人工复核。"
-        )
-        warning.setWordWrap(True)
-        warning.setStyleSheet("color:#92400E;background:#FFF8E7;border:1px solid #F2D18A;border-radius:8px;padding:8px;")
-        layout.addWidget(warning)
 
         buttons = QHBoxLayout(); buttons.addStretch(1)
         cancel = QPushButton("取消"); cancel.clicked.connect(self.reject); buttons.addWidget(cancel)
-        start = accent_button("开始出版级 AI 裁决", color="#7C3AED"); start.clicked.connect(self._accept_checked); buttons.addWidget(start)
+        start = accent_button("开始裁决", color="#7C3AED")
+        start.clicked.connect(self._accept_checked)
+        buttons.addWidget(start)
         layout.addLayout(buttons)
 
     def _refresh_provider_state(self):
@@ -1160,8 +1148,12 @@ class OCRAIAdjudicationDialog(QDialog):
                 "openrouter": "OpenRouter", "ollama": "Ollama（本地）", "custom": "自定义 OpenAI 兼容接口",
             }
             name = names.get(str(st.provider or "").lower(), str(st.provider or "未配置"))
-            self._provider_state.setText(f"当前 AI：{name} · {str(st.model or '未选模型')}")
+            is_gemini = str(st.provider or "").lower() == "gemini"
+            self._gemini_settings.setVisible(is_gemini)
+            suffix = "" if is_gemini else f" · {st.model or '未选模型'}"
+            self._provider_state.setText(f"当前 AI：{name}{suffix}")
         except Exception:
+            self._gemini_settings.hide()
             self._provider_state.setText("当前 AI：未配置")
 
     def _open_ai_settings(self):
@@ -1185,17 +1177,22 @@ class OCRAIAdjudicationDialog(QDialog):
 
     def values(self) -> dict:
         return {
-            "adjudication_mode": str(self.adjudication_mode.currentData() or "gpt_grade"),
             "output_dir": self.output_dir.text().strip(),
             "batch_items": self.batch_items.value(),
-            "risk_only": self.risk_only.isChecked(),
-            "allow_novel_text": self.allow_novel.isChecked(),
-            "reasoning_effort": str(self.reasoning.currentData() or "low"),
-            "routing_mode": str(self.routing.currentData() or "smart"),
             "concurrency": int(self.concurrency.value()),
-            "retry_incomplete": self.retry_incomplete.isChecked(),
-            "context_pages": int(self.context_pages.value()),
-            "independent_audit": self.independent_audit.isChecked(),
+        }
+
+    def gemini_options(self) -> dict:
+        from ai.gemini_ocr_transport import safe_model
+        from ai.gemini_free_tier import ADJUDICATION_MODEL
+
+        protected = self.gemini_free_mode.isChecked()
+        return {
+            "model": safe_model(self.gemini_model.currentText().strip() or ADJUDICATION_MODEL),
+            "gemini_free_mode": protected,
+            "rpm_limit": self.gemini_rpm.value() if protected else 0,
+            "tpm_limit": self.gemini_tpm.value() if protected else 0,
+            "gemini_rpd_limit": self.gemini_rpd.value(),
         }
 
 

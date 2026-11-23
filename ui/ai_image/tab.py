@@ -291,7 +291,7 @@ class AIImageProcessingTab(QWidget):
             "deepseek": "优先选择账号内明确支持图片输入的模型；不要只看 provider 名称，务必做图片能力测试。",
             "openai": "优先选择 GPT-4.1 / GPT-4o 一类明确支持图片的模型；文本模型只会通过连接测试，不代表能吃图。",
             "anthropic": "优先选择 Claude 3.5 / 3.7 等支持视觉输入的模型，并控制单页像素避免不必要的图像成本。",
-            "gemini": "优先选择 Gemini 1.5 / 2.x 系列支持图片输入的模型；跑书前先测图片能力。",
+            "gemini": "优先使用当前 API Key 实际可用的 Gemini 图文模型；跑书前先测图片能力。",
             "openrouter": "优先选择路由中明确标注 Vision / Multimodal 的模型；不同上游的图片能力差异很大。",
             "ollama": "优先选择本地已安装的视觉模型；纯文本模型会连接成功，但无法完成 AI 图文处理。",
             "custom": "请选择接口方明确支持 image_url / 多模态聊天的模型，并确认 Base URL 真的是 OpenAI 兼容聊天端点。",

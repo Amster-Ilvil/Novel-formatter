@@ -46,7 +46,7 @@ _PROFILES = {
         paddle_lang="japan",
         compatible_engines=frozenset({
             "apple_vision", "windows_snipping_ocr", "paddle_ocr", "ndlocr_lite",
-            "manga_48px", "hayai_ocr", "paddle_aistudio",
+            "manga_48px", "hayai_ocr", "gemini_ocr", "paddle_aistudio",
         }),
         allow_column_pipeline=True,
         allow_japanese_handwriting=True,

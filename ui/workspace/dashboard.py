@@ -81,6 +81,7 @@ class ProjectWorkspaceDashboard(QWidget):
     """
 
     resume_requested = Signal(str)
+    reset_local_ocr_requested = Signal()
 
     def __init__(self, page_manager, parent=None):
         super().__init__(parent)
@@ -268,6 +269,7 @@ class ProjectWorkspaceDashboard(QWidget):
             ("检查项目", self._page_manager._audit_active_project),
             ("优化存储", self._page_manager._optimize_active_project_storage),
             ("项目目录", self._page_manager._open_active_project_folder),
+            ("恢复未识别状态", self.reset_local_ocr_requested.emit),
         ]
         for idx, (text, callback) in enumerate(actions):
             btn = QPushButton(text)
@@ -281,7 +283,7 @@ class ProjectWorkspaceDashboard(QWidget):
         delete_btn.setProperty("role", "danger")
         delete_btn.clicked.connect(self._page_manager._delete_active_project)
         self._project_tool_buttons.append(delete_btn)
-        tool_grid.addWidget(delete_btn, 2, 1)
+        tool_grid.addWidget(delete_btn, 3, 1)
         tools_layout.addLayout(tool_grid)
         tools_layout.addStretch(1)
         lower.addWidget(tools, 2)
@@ -295,8 +297,10 @@ class ProjectWorkspaceDashboard(QWidget):
         self.refresh()
 
     def set_workspace_active(self, active: bool) -> None:
-        if active:
-            self.request_refresh(immediate=True)
+        if not active:
+            self._refresh_timer.stop()
+        elif self._refresh_dirty and not self._refresh_timer.isActive():
+            self._refresh_timer.start()
 
     def set_runtime_task(self, task) -> None:
         self._runtime_task = task

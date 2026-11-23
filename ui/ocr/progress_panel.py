@@ -1,13 +1,13 @@
 from __future__ import annotations
 
 from PySide6.QtWidgets import (
-    QWidget, QVBoxLayout, QHBoxLayout, QGridLayout, QLabel, QPushButton,
-    QCheckBox, QSizePolicy, QProgressBar, QPlainTextEdit, QTextEdit, QStyle,
+    QWidget, QVBoxLayout, QHBoxLayout, QGridLayout, QLabel, QPushButton, QFrame,
+    QCheckBox, QSizePolicy, QProgressBar, QTextEdit, QStyle,
 )
 from PySide6.QtCore import Qt, QSize
 from PySide6.QtGui import QAction
 
-from ui.common.styling import ACC, BORDER, CARD, INK, MUTED, TONAL, LIGHT_LOG_STYLE, accent_button, make_separator
+from ui.common.styling import ACC, BORDER, CARD, INK, MUTED, TONAL, LIGHT_LOG_STYLE, accent_button
 from ui.responsive import preserve_button_text
 from ui.design.metrics import OCR_BOTTOM_HEIGHT
 from ui.design.components import DesignLogCollapseButton
@@ -17,13 +17,14 @@ from ui.localized_dialogs import LocalizedLogView
 def build_ocr_progress_panel(tab, main_v):
     self = tab
     # ── 底部：常驻 OCR 日志；加高面板，让日志位置整体上移 ────────────────
-    bottom = QWidget()
+    bottom = QFrame()
+    bottom.setObjectName("ocrFooter")
     self._ocr_log_panel = bottom
     self._ocr_log_expanded_height = OCR_BOTTOM_HEIGHT
     self._ocr_log_collapsed_height = 54
     bottom.setFixedHeight(self._ocr_log_expanded_height)
     bottom.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
-    bottom.setStyleSheet(f"background: {CARD}; border: none;")
+    bottom.setStyleSheet(f"QFrame#ocrFooter {{ background: {CARD}; border-top: 1px solid {BORDER}; }}")
     rl = QVBoxLayout(bottom)
     rl.setContentsMargins(0, 0, 0, 0)
     rl.setSpacing(0)
@@ -77,8 +78,8 @@ def build_ocr_progress_panel(tab, main_v):
     bottom.setContextMenuPolicy(Qt.ActionsContextMenu)
     self._progress_bar_text = QLabel("总进度 0.0% · 已用 0秒 · 预计剩余：计算中")
     self._progress_bar_text.setAlignment(Qt.AlignCenter)
-    self._progress_bar_text.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
-    self._progress_bar_text.setAttribute(Qt.WA_TransparentForMouseEvents, True)
+    self._progress_bar_text.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Fixed)
+    self._progress_bar_text.setWordWrap(True)
     self._progress_bar_text.setStyleSheet(
         f"color: {MUTED}; background: none; border: none; padding: 0 8px; "
         "font-size: 11px; font-weight: 600;"
@@ -89,8 +90,6 @@ def build_ocr_progress_panel(tab, main_v):
     progress_header_layout = QHBoxLayout(progress_header_space)
     progress_header_layout.setContentsMargins(0, 0, 0, 0)
     progress_header_layout.addWidget(self._progress_bar_text)
-    log_header.addWidget(progress_header_space, 1)
-
     self._progress_display_cb = QCheckBox("显示实时进度")
     self._progress_display_cb.setChecked(True)
     self._progress_display_cb.setToolTip(
@@ -99,6 +98,18 @@ def build_ocr_progress_panel(tab, main_v):
     )
     self._progress_display_cb.toggled.connect(self._toggle_progress_display)
     log_header.addWidget(self._progress_display_cb)
+    log_header.addWidget(progress_header_space, 1)
+
+    run_actions = QHBoxLayout()
+    run_actions.setSpacing(6)
+    self._ocr_run_actions = run_actions
+
+    self._rerun_btn = QPushButton("重新 OCR")
+    self._rerun_btn.setProperty("role", "secondary")
+    preserve_button_text(self._rerun_btn)
+    self._rerun_btn.setVisible(False)
+    self._rerun_btn.clicked.connect(self._re_ocr)
+    run_actions.addWidget(self._rerun_btn)
 
     self._pause_btn = QPushButton("停止 OCR")
     self._pause_btn.setObjectName("ocrStopButton")
@@ -107,27 +118,19 @@ def build_ocr_progress_panel(tab, main_v):
     self._pause_btn.setIconSize(QSize(15, 15))
     self._pause_btn.setAccessibleName("停止 OCR")
     preserve_button_text(self._pause_btn)
-    self._pause_btn.setMinimumWidth(112)
     self._pause_btn.setMinimumHeight(36)
     self._pause_btn.setVisible(True)
     self._pause_btn.setEnabled(False)
     self._pause_btn.clicked.connect(self._toggle_pause)
-    log_header.addWidget(self._pause_btn)
+    run_actions.addWidget(self._pause_btn)
 
     self._run_btn = accent_button("▶  开始 OCR")
     self._run_btn.setObjectName("ocrRunButtonBesideProgress")
     self._run_btn.setMinimumHeight(36)
     preserve_button_text(self._run_btn)
     self._run_btn.clicked.connect(self._run_ocr)
-    log_header.addWidget(self._run_btn)
-
-    self._rerun_btn = QPushButton("重新 OCR")
-    self._rerun_btn.setProperty("role", "secondary")
-    preserve_button_text(self._rerun_btn)
-    self._rerun_btn.setVisible(False)
-    self._rerun_btn.clicked.connect(self._re_ocr)
-    log_header.addWidget(self._rerun_btn)
-    self._ocr_log_header = log_header
+    run_actions.addWidget(self._run_btn)
+    log_header.addLayout(run_actions)
 
     rl.addLayout(log_header)
 

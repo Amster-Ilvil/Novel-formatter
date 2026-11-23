@@ -14,6 +14,7 @@ import math
 import re
 import unicodedata
 from typing import Sequence
+from engine.ocr_adjudication_quality_risks import consensus_scan_reasons, independently_executed
 
 _PLACEHOLDERS = ("□", "�")
 _BRACKETS = (("「", "」"), ("『", "』"), ("（", "）"), ("【", "】"), ("〈", "〉"), ("《", "》"))
@@ -37,7 +38,7 @@ def _body(text: str) -> str:
 def _independent_texts(row: dict) -> list[str]:
     out: list[str] = []
     for item in row.get("model_evidence", []) or []:
-        if not isinstance(item, dict) or not bool(item.get("independently_executed", True)):
+        if not isinstance(item, dict) or not independently_executed(item):
             continue
         text = str(item.get("text", "") or "")
         if text and text not in out:
@@ -106,7 +107,7 @@ def _consensus_text(row: dict) -> str:
     # keep the model-index fallback for older packages/tests without IDs.
     observations: dict[str, str] = {}
     for index, item in enumerate(row.get("model_evidence", []) or []):
-        if not isinstance(item, dict) or not bool(item.get("independently_executed", True)):
+        if not isinstance(item, dict) or not independently_executed(item):
             continue
         value = _raw(item.get("text", ""))
         if not value or not _body(value):
@@ -363,6 +364,11 @@ def select_common_mode_risks(
         if not text:
             continue
         reasons = _structural_reasons(text)
+        narrow_alerts = [
+            reason for reason in consensus_scan_reasons(text)
+            if reason in {"possible_shared_glyph_error", "short_number_or_page_marker"}
+        ]
+        reasons.extend(narrow_alerts)
         sequence_reason = _sequence_omission_reason(consensus, row_index)
         if sequence_reason:
             reasons.append(sequence_reason)
@@ -370,7 +376,7 @@ def select_common_mode_risks(
             continue
         selected[row_index] = {
             "row_index": row_index,
-            "score": 1000.0 + 10.0 * len(reasons),
+            "score": 1000.0 + 10.0 * len(reasons) + (100.0 if narrow_alerts else 0.0),
             "reasons": reasons,
             "kind": "structural",
         }

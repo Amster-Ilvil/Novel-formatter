@@ -10,6 +10,8 @@ OCR_ADAPTERS = [
      "复用系统截图工具 Snipping Tool 自带 OneOCR；本地离线，不下载或打包 Microsoft DLL/模型", True),
     ("paddle_ocr",   "PaddleOCR",        "跨平台", "#C0542F",
      "百度 PaddleOCR，坐标为像素值数组（首次使用会自动创建独立环境并下载模型）", True),
+    ("gemini_ocr", "Gemini OCR", "云端", "#2855A6",
+     "Google Gemini 图文 OCR；使用本地固定分列和坐标锚定。可在识别引擎下方设置 API 密钥和默认模型。", True),
     ("paddle_aistudio", "PaddleOCR · AI Studio API", "云端", "#2B6CB0",
      "百度 AI Studio PaddleOCR 云端服务；支持模型页同步 API 与官方异步 v2 jobs，整页调用不走分栏扇出", True),
     ("ndlocr_lite",  "NDLOCR-Lite",      "图书OCR", "#0F766E",

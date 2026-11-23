@@ -334,6 +334,12 @@ class PageManagerTab(QWidget):
         self._scan_signal_refs: dict[int, WorkerSignals] = {}
         self._project_settings = QSettings("NovelFormatter", "NovelFormatter1")
         stored_root = str(self._project_settings.value("workspace/root", "") or "").strip()
+        # Temporary GUI verification paths must not become the durable workspace.
+        if (any(part.startswith("novel-native-ui-") for part in Path(stored_root).parts)
+                or Path(stored_root).name == "recovered-workspace"):
+            stored_root = str(Path.home() / "Documents" / "Novel Formatter Workspace")
+            self._project_settings.setValue("workspace/root", stored_root)
+            self._project_settings.remove("workspace/last_project")
         self.project_manager = ProjectWorkspaceManager(stored_root or None)
         self._project_combo_sync = False
         self._project_restore_in_progress = False
@@ -860,6 +866,11 @@ class PageManagerTab(QWidget):
 
     def restore_last_project(self) -> None:
         path = str(self._project_settings.value("workspace/last_project", "") or "").strip()
+        if any(part.startswith("novel-native-ui-") for part in Path(path).parts):
+            path = ""
+        if not path or not (Path(path) / "project.json").is_file():
+            projects = self.project_manager.list_projects()
+            path = projects[0].path if projects else ""
         if not path:
             return
         try:
@@ -1737,6 +1748,8 @@ class PageManagerTab(QWidget):
         return max(1, min(12, visible_count, (width + gap) // (cell_w + gap)))
 
     def _reflow_grid_after_resize(self) -> None:
+        if not self.isVisible():
+            return
         desired = self._desired_grid_columns()
         if desired and desired != int(getattr(self, "_rendered_grid_cols", 0) or 0):
             self._render()
@@ -1752,6 +1765,8 @@ class PageManagerTab(QWidget):
         timer = getattr(self, "_visible_thumb_timer", None)
         if timer is not None:
             timer.start()
+        if self.page_images:
+            self._grid_reflow_timer.start()
 
     # ── 异步缩略图加载 ────────────────────────────────────────────────────
     #
@@ -1824,7 +1839,7 @@ class PageManagerTab(QWidget):
         self._visible_thumb_timer.start()
 
     def _load_visible_thumbnails(self) -> None:
-        if self._thumb_closed or not self._thumb_labels:
+        if self._thumb_closed or not self.isVisible() or not self._thumb_labels:
             return
         scrollbar = self._page_scroll.verticalScrollBar()
         top = int(scrollbar.value())
@@ -1858,9 +1873,12 @@ class PageManagerTab(QWidget):
         while len(self.thumb_cache) > int(self._thumb_cache_limit):
             self.thumb_cache.popitem(last=False)
 
-    def _refresh_selection_styles(self):
+    def _refresh_selection_styles(self, page_numbers=None):
         """只用轻量绘制刷新选中边框，避免点击时重套 Qt 样式表。"""
-        for page_no, frame in self._page_frames.items():
+        for page_no in self._page_frames if page_numbers is None else page_numbers:
+            frame = self._page_frames.get(page_no)
+            if frame is None:
+                continue
             try:
                 frame.set_selected(page_no in self.selected_pages)
             except RuntimeError:
@@ -1873,7 +1891,7 @@ class PageManagerTab(QWidget):
                 self.selected_pages.discard(page_no)
             else:
                 self.selected_pages.add(page_no)
-            self._refresh_selection_styles()
+            self._refresh_selection_styles((page_no,))
 
     def _on_thumb_double_click(self, page_no, event):
         if event.button() == Qt.LeftButton:

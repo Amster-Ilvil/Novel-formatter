@@ -4,11 +4,31 @@ import math
 from collections import OrderedDict
 from pathlib import Path
 
-from PySide6.QtWidgets import QLabel, QFrame, QRubberBand
+from PySide6.QtWidgets import QLabel, QFrame, QRubberBand, QWidget
 from PySide6.QtCore import Qt, QRect, QPoint
-from PySide6.QtGui import QPixmap, QImage, QPainter, QCursor
+from PySide6.QtGui import QColor, QPixmap, QImage, QPainter, QCursor, QPen
 
 from ui.common.styling import ACC
+
+DETECTOR_BOX_COLOR = "#A35D17"
+DETECTOR_LABEL_BG = "#FFF4E4"
+INPUT_BOX_COLOR = "#087F83"
+
+
+class _CharacterBoxOverlay(QWidget):
+    def __init__(self, parent):
+        super().__init__(parent)
+        self.setAttribute(Qt.WA_TransparentForMouseEvents)
+        self.boxes: list[QRect] = []
+        self.hide()
+
+    def paintEvent(self, event):
+        painter = QPainter(self)
+        painter.setPen(QPen(QColor(22, 119, 255, 225), 2))
+        painter.setBrush(QColor(22, 119, 255, 5))
+        for box in self.boxes:
+            painter.drawRoundedRect(box, 2, 2)
+        painter.end()
 
 LIGHT_IMAGE_PREVIEW_STYLE = f"""
 background: transparent;
@@ -63,17 +83,19 @@ class OCRCropPreview(QLabel):
         self._column_overlays: list[QFrame] = []
         self._column_labels: list[QLabel] = []
         # Final native-pixel OCR reveal boxes are deliberately separate from
-        # detector boxes: red marks detected columns, green marks source pixels
+        # detector boxes: amber marks detected columns, teal marks source pixels
         # preserved for OCR before Ruby is blanked and white context is added.
         self._input_rects_norm: list[tuple[float, float, float, float]] = []
         self._input_overlays: list[QFrame] = []
+        self.detector_box_color = DETECTOR_BOX_COLOR
+        self.input_box_color = INPUT_BOX_COLOR
         self._show_detector_boxes = True
         self._show_input_boxes = True
         # Review-only one-character frames. They are independent from the
         # physical-column boxes and are only populated while the user has
         # explicitly enabled the per-character review controls.
         self._character_rects_norm: list[tuple[float, float, float, float]] = []
-        self._character_overlays: list[QFrame] = []
+        self._character_overlay = _CharacterBoxOverlay(self)
 
 
     @staticmethod
@@ -126,10 +148,8 @@ class OCRCropPreview(QLabel):
 
     def _clear_character_overlays(self):
         self._character_rects_norm = []
-        for overlay in self._character_overlays:
-            overlay.hide()
-            overlay.deleteLater()
-        self._character_overlays = []
+        self._character_overlay.boxes.clear()
+        self._character_overlay.hide()
 
     def clear_column_boxes(self):
         self._clear_column_overlays()
@@ -140,13 +160,25 @@ class OCRCropPreview(QLabel):
     def clear_character_boxes(self):
         self._clear_character_overlays()
 
+    def set_overlay_colors(self, detector_color: str, input_color: str):
+        if detector_color != self.detector_box_color:
+            self.detector_box_color = detector_color
+            self._set_column_rects(tuple(self._column_rects_norm))
+        if input_color != self.input_box_color:
+            self.input_box_color = input_color
+            self._set_input_rects(tuple(self._input_rects_norm))
+        self._update_overlay_geometry()
+
     def set_detector_boxes_visible(self, visible: bool):
         self._show_detector_boxes = bool(visible)
         self._update_column_overlay_geometry()
+        self._update_character_overlay_geometry()
 
     def set_input_boxes_visible(self, visible: bool):
         self._show_input_boxes = bool(visible)
         self._update_input_overlay_geometry()
+        self._update_column_overlay_geometry()
+        self._update_character_overlay_geometry()
 
     def clear_preview(self):
         """Clear both the displayed image and every non-document overlay."""
@@ -171,7 +203,7 @@ class OCRCropPreview(QLabel):
             self._column_rects_norm.append((left, top, right, bottom))
             frame = QFrame(self)
             frame.setStyleSheet(
-                "background: transparent; border: 2px solid rgb(220,38,38);"
+                f"background: transparent; border: 2px dashed {self.detector_box_color};"
             )
             frame.setAttribute(Qt.WA_TransparentForMouseEvents)
             self._column_overlays.append(frame)
@@ -179,14 +211,14 @@ class OCRCropPreview(QLabel):
             label = QLabel(str(index), self)
             label.setAlignment(Qt.AlignCenter)
             label.setStyleSheet(
-                "background: rgba(255,255,255,230); border: 1px solid rgb(220,38,38); "
-                "color: rgb(220,38,38); font-size: 11px; font-weight: 700; padding: 0 3px;"
+                f"background: {DETECTOR_LABEL_BG}; border: 1px solid {self.detector_box_color}; "
+                f"border-radius: 7px; color: {self.detector_box_color}; "
+                "font-size: 10px; font-weight: 700; padding: 0 3px;"
             )
             label.adjustSize()
-            label.setFixedSize(max(18, label.sizeHint().width()), 18)
+            label.setFixedSize(max(16, label.sizeHint().width()), 16)
             label.setAttribute(Qt.WA_TransparentForMouseEvents)
             self._column_labels.append(label)
-        self._update_column_overlay_geometry()
 
     def _set_input_rects(self, rects):
         self._clear_input_overlays()
@@ -206,12 +238,10 @@ class OCRCropPreview(QLabel):
             self._input_rects_norm.append((left, top, right, bottom))
             overlay = QFrame(self)
             overlay.setStyleSheet(
-                "background: rgba(34,197,94,3); "
-                "border: 2px solid rgb(34,197,94); border-radius: 2px;"
+                f"background: transparent; border: 1px solid {self.input_box_color};"
             )
             overlay.setAttribute(Qt.WA_TransparentForMouseEvents)
             self._input_overlays.append(overlay)
-        self._update_input_overlay_geometry()
 
     def _set_character_rects(self, rects):
         self._clear_character_overlays()
@@ -229,14 +259,6 @@ class OCRCropPreview(QLabel):
             if right - left <= 0.0001 or bottom - top <= 0.0001:
                 continue
             self._character_rects_norm.append((left, top, right, bottom))
-            overlay = QFrame(self)
-            overlay.setStyleSheet(
-                "background: rgba(22,119,255,5); "
-                "border: 2px solid rgba(22,119,255,225); border-radius: 2px;"
-            )
-            overlay.setAttribute(Qt.WA_TransparentForMouseEvents)
-            self._character_overlays.append(overlay)
-        self._update_character_overlay_geometry()
 
     def set_image(self, path: str):
         pm = self._load_cached_history_pixmap(path)
@@ -309,9 +331,6 @@ class OCRCropPreview(QLabel):
         super().resizeEvent(event)
         self._rescale()
         self._update_overlay_geometry()
-        self._update_input_overlay_geometry()
-        self._update_column_overlay_geometry()
-        self._update_character_overlay_geometry()
 
     def _rescale(self):
         if self._orig_pixmap is None:
@@ -389,21 +408,18 @@ class OCRCropPreview(QLabel):
         self._update_overlay_geometry()
 
     def _update_overlay_geometry(self):
-        if not self._rect_norm:
-            self._overlay.hide()
-            return
         geo = self._display_geometry()
-        if not geo:
+        if not self._rect_norm or not geo:
             self._overlay.hide()
-            return
-        dx, dy, dw, dh = geo
-        x0, y0, x1, y1 = self._rect_norm
-        self._overlay.setGeometry(QRect(
-            int(dx + x0 * dw), int(dy + y0 * dh),
-            int((x1 - x0) * dw), int((y1 - y0) * dh),
-        ))
-        self._overlay.show()
-        self._overlay.raise_()
+        else:
+            dx, dy, dw, dh = geo
+            x0, y0, x1, y1 = self._rect_norm
+            self._overlay.setGeometry(QRect(
+                int(dx + x0 * dw), int(dy + y0 * dh),
+                int((x1 - x0) * dw), int((y1 - y0) * dh),
+            ))
+            self._overlay.show()
+            self._overlay.raise_()
         self._update_input_overlay_geometry()
         self._update_column_overlay_geometry()
         self._update_character_overlay_geometry()
@@ -472,23 +488,25 @@ class OCRCropPreview(QLabel):
                     int((frame_left + frame_right - label.width()) / 2),
                 ),
             )
-            label.setGeometry(label_x, common_label_y, label.width(), label.height())
+            label.setGeometry(int(label_x), common_label_y, label.width(), label.height())
             label.show()
             label.raise_()
 
     def _update_character_overlay_geometry(self):
         geo = self._display_geometry()
+        overlay = self._character_overlay
         if not geo or not self._character_rects_norm:
-            for overlay in self._character_overlays:
-                overlay.hide()
+            overlay.hide()
             return
         dx, dy, dw, dh = geo
-        for overlay, (x0, y0, x1, y1) in zip(
-            self._character_overlays, self._character_rects_norm
-        ):
-            overlay.setGeometry(QRect(
+        overlay.boxes = [
+            QRect(
                 int(dx + x0 * dw), int(dy + y0 * dh),
                 max(3, int((x1 - x0) * dw)), max(3, int((y1 - y0) * dh)),
-            ))
-            overlay.show()
-            overlay.raise_()
+            )
+            for x0, y0, x1, y1 in self._character_rects_norm
+        ]
+        overlay.setGeometry(self.rect())
+        overlay.show()
+        overlay.raise_()
+        overlay.update()

@@ -163,7 +163,7 @@ def _column_geometry_snapshot(doc: UnifiedDocument) -> dict[str, dict]:
         if not ids:
             continue
 
-        region_by_column: dict[str, dict] = {}
+        region_by_column: dict[str, tuple[int, dict]] = {}
         regions = metadata.get("ocr_review_regions") or []
         if isinstance(regions, dict):
             regions = [regions]
@@ -181,14 +181,18 @@ def _column_geometry_snapshot(doc: UnifiedDocument) -> dict[str, dict]:
                     continue
                 if w <= 0.0 or h <= 0.0:
                     continue
-                region_by_column[column_id] = {"x": x, "y": y, "w": w, "h": h}
+                region_page = _finite_float(region.get("page"), 0)
+                region_by_column[column_id] = (
+                    int(region_page) if region_page > 0 else 0,
+                    {"x": x, "y": y, "w": w, "h": h},
+                )
 
         fallback_bbox = _bbox_dict(block)
         for column_id in ids:
-            bbox = region_by_column.get(column_id) or fallback_bbox
+            region_page, bbox = region_by_column.get(column_id, (0, fallback_bbox))
             if bbox is None:
                 continue
-            raw.append((int(getattr(block, "page", 0) or 0), column_id, bbox, str(getattr(block, "id", "") or "")))
+            raw.append((region_page or int(getattr(block, "page", 0) or 0), column_id, bbox, str(getattr(block, "id", "") or "")))
     by_page: dict[int, list[tuple[int, str, dict, str]]] = {}
     for entry in raw:
         by_page.setdefault(entry[0], []).append(entry)
@@ -771,7 +775,7 @@ def export_multi_package(
             value.get("bbox") for value in item["column_geometry"]
             if isinstance(value, dict) and isinstance(value.get("bbox"), (list, tuple)) and len(value.get("bbox")) >= 4
         ]
-        if geometry_boxes:
+        if geometry_boxes and len({value["page"] for value in item["column_geometry"]}) == 1:
             left = min(float(box[0]) for box in geometry_boxes)
             top = min(float(box[1]) for box in geometry_boxes)
             right = max(float(box[0]) + float(box[2]) for box in geometry_boxes)
@@ -1502,7 +1506,11 @@ def load_package(path: str | Path) -> dict:
     text = source.read_text(encoding="utf-8-sig", errors="strict")
     if source.suffix.lower() in {".md", ".markdown"}:
         return package_from_markdown(text)
-    return _loose_json(text)
+    data = _loose_json(text)
+    from engine.ocr_adjudication_checkpoint import CHECKPOINT_SCHEMA, restore_checkpoint
+    if data.get("schema") == CHECKPOINT_SCHEMA:
+        return restore_checkpoint(data, source.parent)
+    return data
 
 
 def save_package(package: dict, path: str | Path) -> Path:

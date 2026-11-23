@@ -9,7 +9,7 @@ import sys
 from pathlib import Path
 from functools import partial
 
-from PySide6.QtCore import QEvent, QTimer
+from PySide6.QtCore import QEvent, QTimer, Qt
 from PySide6.QtWidgets import QApplication
 
 from models.document import UnifiedDocument
@@ -24,6 +24,7 @@ from ui.navigation.sidebar import (
     SECTION_PROOF, SECTION_EPUB, SECTION_SYSTEM,
 )
 from utils.clear_manager import ClearManager
+from utils.qt_gc import mark_gui_navigation
 from core.project_workspace import ProjectWorkspaceManager
 
 QFileDialog = LocalizedFileDialog
@@ -480,6 +481,9 @@ class MainWindowControllerMixin:
         QTimer.singleShot(0, self._hydrate_visible_project_workspace)
 
     def _hydrate_visible_project_workspace(self) -> None:
+        timer = getattr(self, "_section_activation_timer", None)
+        if timer is not None and timer.isActive():
+            return
         idx = self._stack.currentIndex() if hasattr(self, "_stack") else -1
         if idx == SECTION_FORMAT:
             self._ensure_project_document_hydrated("formatter")
@@ -495,12 +499,16 @@ class MainWindowControllerMixin:
             return
         stage, doc = pending
         source_kind = "pdf_text" if str(getattr(doc.metadata, "source_engine", "") or "") == "pdf_text_layer" else (stage or "ocr")
-        if key == "formatter":
-            self._tab_fmt.set_doc(doc)
-        elif key == "epub":
-            self._tab_epub.set_doc(doc, source_kind)
-        elif key == "ocr_compare":
-            self._ensure_project_multi_ocr_hydrated()
+        try:
+            if key == "formatter":
+                self._tab_fmt.set_doc(doc)
+            elif key == "epub":
+                self._tab_epub.set_doc(doc, source_kind)
+            elif key == "ocr_compare":
+                self._ensure_project_multi_ocr_hydrated()
+                return
+        except Exception as exc:
+            self.statusBar().showMessage(f"正文载入失败：{exc}", 9000)
             return
         self._pending_project_hydrated.add(key)
 
@@ -519,7 +527,7 @@ class MainWindowControllerMixin:
         appended while the worker is saving are preserved.
         """
         manager = self._tab_pages.project_manager
-        if manager.active_project is None:
+        if manager.active_project is None or getattr(self, "_ocr_project_reset_signals", None) is not None:
             return None
         try:
             workspace_root = str(manager.workspace_root.resolve())
@@ -717,7 +725,95 @@ class MainWindowControllerMixin:
             compare.reset_for_new_book()
         self._pending_single_compare_result = None
         self._pending_ocr_inputs = ()
-        ClearManager.clear_ocr(tab)
+        if tab is not None:
+            ClearManager.clear_ocr(tab)
+
+    def _reset_project_local_ocr(self) -> None:
+        manager = self._tab_pages.project_manager
+        project = manager.active_project
+        if project is None or getattr(self, "_ocr_project_reset_signals", None) is not None:
+            return
+        if (self._source_update_has_active_jobs()
+                or getattr(self._tab_pages, "_project_restore_in_progress", False)
+                or getattr(self._tab_pages, "_storage_opt_running", False)
+                or getattr(self._lazy_workspace_if_loaded("ocr"), "_ocr_run_active", False)
+                or getattr(self._lazy_workspace_if_loaded("ocr_compare"), "_multi_result_load_pending", False)):
+            notify(self, "当前有任务正在运行，请等任务结束后再重置。", "warning")
+            return
+        if QMessageBox.question(
+            self, "恢复未识别状态",
+            "归档当前正文、裁决状态和 OCR 缓存，使下次 OCR 从头识别。"
+            "原图、页面标签和已导出的文件会保留。确定继续？",
+            QMessageBox.Yes | QMessageBox.No, QMessageBox.No,
+        ) != QMessageBox.Yes or manager.active_project != project:
+            return
+
+        project_path = str(project.resolve())
+        self._project_restore_generation += 1
+        self._project_stage_save_generation.invalidate()
+        self._ocr_handoff_generation.invalidate()
+        with self._project_stage_persist_lock:
+            for key in tuple(self._project_stage_persist_latest):
+                if key[0] == project_path:
+                    self._project_stage_persist_latest.pop(key)
+        with self._project_adjudication_persist_lock:
+            self._project_adjudication_persist_latest.pop(project_path, None)
+
+        signals = WorkerSignals()
+        self._ocr_project_reset_signals = signals
+        signals.finished.connect(self._finish_project_local_ocr_reset, Qt.QueuedConnection)
+        signals.error.connect(self._fail_project_local_ocr_reset, Qt.QueuedConnection)
+        self.setEnabled(False)
+        self.statusBar().showMessage("正在归档 OCR 结果和缓存…")
+        workspace_root = manager.workspace_root
+
+        def worker():
+            try:
+                with self._project_stage_save_lock, self._project_adjudication_save_lock:
+                    writer = ProjectWorkspaceManager(workspace_root)
+                    writer.active_project = project
+                    archive = writer.reset_local_ocr()
+                signals.finished.emit((project_path, archive))
+            except Exception as exc:
+                signals.error.emit(str(exc))
+
+        threading.Thread(target=worker, name="project-ocr-reset", daemon=True).start()
+
+    def _fail_project_local_ocr_reset(self, message: str) -> None:
+        self._ocr_project_reset_signals = None
+        self.setEnabled(True)
+        self._project_multi_restore_inflight = False
+        self.statusBar().showMessage(f"恢复未识别状态失败：{message}", 10000)
+
+    def _finish_project_local_ocr_reset(self, result) -> None:
+        project_path, archive = result
+        self._ocr_project_reset_signals = None
+        self.setEnabled(True)
+        active_project = self._tab_pages.project_manager.active_project
+        if active_project is None or active_project.resolve() != Path(project_path):
+            return
+        self._snapshot_registry.clear()
+        self._doc = None
+        self._current_stage = ""
+        self._pending_project_document = None
+        self._pending_project_hydrated.clear()
+        self._pending_project_multi_restore = None
+        self._project_multi_restore_inflight = False
+        self._pending_image_review_source_row = 0
+        self._ocr_fusion_export_stale = False
+        self._workspace_coordinator.reset_navigation()
+        ocr = self._lazy_workspace_if_loaded("ocr")
+        self._clear_ocr_workspace(ocr)
+        images = tuple(self._tab_pages.page_images)
+        self._pending_ocr_inputs = images
+        if ocr is not None:
+            ocr.set_inputs(images)
+        for key, method in (("formatter", "reset_for_new_book"), ("epub", "clear_doc")):
+            workspace = self._lazy_workspace_if_loaded(key)
+            if workspace is not None:
+                getattr(workspace, method)()
+        self._tab_workspace.set_runtime_task(None)
+        self.statusBar().showMessage(f"已恢复未识别状态。归档位置：{archive}", 12000)
 
     def _source_update_has_active_jobs(self) -> bool:
         """Conservative write gate used only by the program source updater.
@@ -848,10 +944,17 @@ class MainWindowControllerMixin:
 
     def closeEvent(self, event):
         """Invalidate every workspace task and release retained temporary files."""
+        if getattr(self, "_ocr_project_reset_signals", None) is not None:
+            event.ignore()
+            return
         if hasattr(self, "_tab_system") and self._tab_system.source_update_in_progress():
             event.ignore()
             notify(self, "请等待 Git 检查/更新完成后再关闭窗口，以免中断事务更新。", "warning")
             return
+        timer = getattr(self, "_section_activation_timer", None)
+        if timer is not None and timer.isActive():
+            timer.stop()
+            self._ui_settings.setValue("reference_ui/last_section", self._stack.currentIndex())
         try:
             # Manual adjudication is already crash-safe in the append-only
             # project journal.  Never rebuild/compress the 50-100 MB full OCR
@@ -1013,19 +1116,14 @@ class MainWindowControllerMixin:
             self._ocr_section.set_current_index(subtab)
         elif section == SECTION_PROOF:
             self._proof_section.set_current_index(0)
+            self._requested_proof_mode = "decision" if subtab == "decision" else "full"
         self._goto(section)
-        if section == SECTION_PROOF:
-            self._tab_ocr_compare._set_review_mode(
-                "decision" if subtab == "decision" else "full"
-            )
 
     def _on_ocr_subtab_changed(self, index: int) -> None:
         if self._tab_system.remember_subtabs_enabled():
             self._ui_settings.setValue("reference_ui/ocr_subtab", int(index))
         if self._stack.currentIndex() == SECTION_OCR:
-            self._ensure_ocr_subworkspace(index)
-            key = {0: "ocr", 1: "pdf_text", 2: "ai_image"}.get(int(index), "ocr")
-            self._workspace_coordinator.set_active((key,))
+            self._schedule_section_activation()
 
     def _on_ocr_compare_decision_changed(self, payload: dict) -> None:
         # One same-widget adjudication authority for full overview and image/text
@@ -1043,14 +1141,8 @@ class MainWindowControllerMixin:
             pass
 
     def _on_proof_subtab_changed(self, index: int) -> None:
-        # Only a single hosted tab exists now. Switching between full and
-        # sentence display is performed by OCRCompareTab._set_review_mode().
         if self._stack.currentIndex() == SECTION_PROOF:
-            compare = self._ensure_proof_subworkspace(0)
-            self._workspace_coordinator.set_active(("ocr_compare",))
-            self._ensure_project_document_hydrated("ocr_compare")
-            if compare is not None:
-                QTimer.singleShot(0, compare.ensure_latest_single_result_loaded)
+            self._schedule_section_activation()
 
     def _goto(self, idx: int):
         """六主功能区统一切换；融合页签与侧栏高亮始终同步。"""
@@ -1060,32 +1152,53 @@ class MainWindowControllerMixin:
             return
         if idx < 0 or idx >= self._stack.count():
             return
-        self._ensure_section_workspace(idx)
+        if idx != self._stack.currentIndex():
+            mark_gui_navigation(QApplication.instance())
+            self._workspace_coordinator.set_active(())
         self._stack.setCurrentIndex(idx)
         self._sidebar.select(idx)
         header = getattr(self, "_page_header", None)
         if header is not None:
             header.set_section(idx)
-        # OCR 按钮只属于 OCR 工作区；文字校对区不会创建或复用该按钮。
+        if idx != SECTION_PROOF:
+            self._requested_proof_mode = None
+        self._schedule_section_activation()
+
+    def _schedule_section_activation(self) -> None:
+        timer = getattr(self, "_section_activation_timer", None)
+        if timer is None:
+            timer = self._section_activation_timer = QTimer(self)
+            timer.setSingleShot(True)
+            timer.setInterval(16)
+            timer.timeout.connect(self._activate_visible_section)
+        timer.start()
+
+    def _activate_visible_section(self) -> None:
+        idx = self._stack.currentIndex()
+        self._ensure_section_workspace(idx)
         self._ui_settings.setValue("reference_ui/last_section", idx)
-        if idx == SECTION_WORKSPACE:
-            self._workspace_coordinator.set_active(("workspace",))
-        elif idx == SECTION_PAGE:
-            self._workspace_coordinator.set_active(("pages",))
-        elif idx == SECTION_OCR:
-            self._on_ocr_subtab_changed(self._ocr_section.current_index())
-        elif idx == SECTION_FORMAT:
-            self._workspace_coordinator.set_active(("formatter",))
-            self._ensure_project_document_hydrated("formatter")
-        elif idx == SECTION_PROOF:
-            if self._proof_section.current_index() > 0:
-                self._proof_section.set_current_index(0)
-            self._on_proof_subtab_changed(self._proof_section.current_index())
-        elif idx == SECTION_EPUB:
-            self._workspace_coordinator.set_active(("epub",))
-            self._ensure_project_document_hydrated("epub")
-        elif idx == SECTION_SYSTEM:
-            self._workspace_coordinator.set_active(("system",))
+        if idx == SECTION_OCR:
+            subtab = self._ocr_section.current_index()
+            key = {0: "ocr", 1: "pdf_text", 2: "ai_image"}.get(subtab, "ocr")
+        else:
+            key = {
+                SECTION_WORKSPACE: "workspace",
+                SECTION_PAGE: "pages",
+                SECTION_FORMAT: "formatter",
+                SECTION_PROOF: "ocr_compare",
+                SECTION_EPUB: "epub",
+                SECTION_SYSTEM: "system",
+            }.get(idx)
+        self._workspace_coordinator.set_active((key,) if key else ())
+        self._hydrate_visible_project_workspace()
+        if idx == SECTION_PROOF:
+            compare = self._lazy_workspace_if_loaded("ocr_compare")
+            mode = getattr(self, "_requested_proof_mode", None)
+            self._requested_proof_mode = None
+            if compare is not None:
+                if mode is not None:
+                    compare._set_review_mode(mode)
+                compare.ensure_latest_single_result_loaded()
 
     def _confirmed_page_overrides(self):
         pm = self._tab_pages
@@ -1167,6 +1280,7 @@ class MainWindowControllerMixin:
         def done(_payload=None):
             self._project_stage_save_signal_refs.pop(token, None)
             if self._project_stage_save_generation.is_current(token):
+                self._tab_workspace.refresh_project_state()
                 self.statusBar().showMessage("单模型 OCR 已写入当前工作区", 3500)
 
         def failed(message):
@@ -1222,6 +1336,7 @@ class MainWindowControllerMixin:
         def done(_payload=None):
             self._project_stage_save_signal_refs.pop(token, None)
             if self._project_stage_save_generation.is_current(token):
+                self._tab_workspace.refresh_project_state()
                 self.statusBar().showMessage("多模型 OCR 已写入当前工作区", 3500)
 
         def failed(message):
@@ -1259,6 +1374,8 @@ class MainWindowControllerMixin:
         *,
         record_project_run: bool = True,
     ):
+        self._pending_project_document = None
+        self._pending_project_hydrated.clear()
         # Stage history is an immutable snapshot registry.  Workspaces may keep
         # their own editable clones, but no later metadata/text edit is allowed
         # to retroactively mutate an OCR/Formatter snapshot.
@@ -1616,43 +1733,21 @@ class MainWindowControllerMixin:
             self._persist_single_ocr_stage_async(doc, pipeline_state=pipeline_state)
 
             source_label = source_engine or "单模型 OCR"
-            self._tab_ocr_compare.set_available_single_result(doc, source_label)
+            self._pending_single_compare_result = (doc, source_label)
+            compare = self._lazy_workspace_if_loaded("ocr_compare")
+            if compare is not None:
+                compare.set_available_single_result(doc, source_label)
             self._schedule_single_ocr_downstream_handoff(doc, source_kind)
             return
 
     def _schedule_single_ocr_downstream_handoff(self, doc, source_kind: str) -> None:
-        token = self._ocr_handoff_generation.begin()
+        self._ocr_handoff_generation.invalidate()
+        self._pending_project_document = ("ocr", doc)
+        self._pending_project_hydrated.clear()
         source_label = "PDF 文字层" if source_kind == "pdf_text" else "OCR"
-        self.statusBar().showMessage(f"{source_label}已完成，正在同步到 Formatter 与 EPUB…", 7000)
+        count = len(getattr(doc, "blocks", []) or [])
+        self.statusBar().showMessage(f"{source_label}正文已输出：{count} 块", 7000)
         self._goto(SECTION_FORMAT)
-
-        def current() -> bool:
-            return self._ocr_handoff_generation.is_current(token) and self._doc is doc
-
-        def feed_formatter():
-            if not current():
-                return
-            try:
-                self._tab_fmt.set_doc(doc)
-            except Exception as exc:
-                self.statusBar().showMessage(f"Formatter 接收 OCR 正文失败：{exc}", 9000)
-                return
-            QTimer.singleShot(0, feed_epub)
-
-        def feed_epub():
-            if not current():
-                return
-            try:
-                self._tab_epub.set_doc(doc, source_kind)
-            except Exception as exc:
-                self.statusBar().showMessage(f"EPUB 区接收 OCR 正文失败：{exc}", 9000)
-                return
-            self.statusBar().showMessage(
-                f"{source_label}正文已输出：{len(getattr(doc, 'blocks', []) or [])} 块；Formatter / EPUB 已同步。",
-                7000,
-            )
-
-        QTimer.singleShot(0, feed_formatter)
 
     def _on_single_ocr_compare_applied(self, doc):
         """Apply a manually loaded/imported single OCR result without labeling it as multi fusion."""

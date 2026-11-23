@@ -12,6 +12,7 @@ class ProjectWorkspaceTab(QWidget):
     """Independent project/workspace surface with durable flow overview."""
 
     resume_requested = Signal(str)
+    reset_local_ocr_requested = Signal()
 
     def __init__(self, page_manager: PageManagerTab, parent=None):
         super().__init__(parent)
@@ -34,6 +35,7 @@ class ProjectWorkspaceTab(QWidget):
         scroll.setFrameShape(QFrame.NoFrame)
         self._dashboard = ProjectWorkspaceDashboard(page_manager)
         self._dashboard.resume_requested.connect(self.resume_requested.emit)
+        self._dashboard.reset_local_ocr_requested.connect(self.reset_local_ocr_requested.emit)
         scroll.setWidget(self._dashboard)
         layout.addWidget(scroll, 1)
         root.addWidget(surface, 1)

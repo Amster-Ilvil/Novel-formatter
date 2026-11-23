@@ -9,6 +9,7 @@ first so expensive human attention is spent on the most uncertain evidence.
 from dataclasses import dataclass
 import re
 from typing import Sequence
+from engine.ocr_adjudication_quality_risks import consensus_scan_reasons, sensitive_contrast
 
 _SENSITIVE = re.compile(r"(?:[0-9０-９]+|[A-Z]{2,}|Lv\.?\s*[0-9０-９]+|HP|MP|ランク|スキル|技能|装備)", re.I)
 
@@ -32,7 +33,11 @@ def _candidate_texts(state) -> list[str]:
 
 
 def review_priority(row, state) -> ReviewPriority:
-    texts = _candidate_texts(state)
+    seeded = set(getattr(row, "consensus_seeded_models", ()) or ())
+    row_texts = getattr(row, "texts", ()) or ()
+    texts = [str(value or "") for index, value in enumerate(row_texts) if index not in seeded]
+    if not texts:
+        texts = _candidate_texts(state)
     nonempty = [value for value in texts if value.strip()]
     reasons: list[str] = []
     score = 0
@@ -60,6 +65,15 @@ def review_priority(row, state) -> ReviewPriority:
     if any(_SENSITIVE.search(value) for value in nonempty):
         score += 18
         reasons.append("numeric_or_structured_content")
+    if nonempty and any(sensitive_contrast(nonempty[0], value) for value in nonempty[1:]):
+        score += 20
+        reasons.append("sensitive_glyph_disagreement")
+    if any(consensus_scan_reasons(value) for value in nonempty):
+        score += 14
+        reasons.append("requires_scan_evidence")
+    if bool(getattr(state, "local_reocr_recommended", False)):
+        score += 24
+        reasons.append("visual_review_still_required")
 
     difficulty = str(getattr(row, "consensus_entropy_difficulty", "") or "")
     if difficulty == "high":

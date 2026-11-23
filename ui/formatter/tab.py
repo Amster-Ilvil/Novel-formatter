@@ -2339,6 +2339,8 @@ class FormatterTab(QWidget):
 
 
     def _materialize_visible_surface(self) -> None:
+        if not self.isVisible():
+            return
         if getattr(self, "_pdf_format_view", None) is not None and self._pdf_format_view.isVisible():
             self._materialize_pdf_preview()
         elif self._advanced_editors_visible():

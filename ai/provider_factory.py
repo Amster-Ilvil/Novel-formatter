@@ -5,11 +5,16 @@ from .openai_provider import OpenAIProvider
 from .deepseek_provider import DeepSeekProvider
 from .gemini_provider import GeminiProvider
 from .anthropic_provider import AnthropicProvider
+from .chatgpt_subscription import ChatGPTSubscriptionProvider
 
 
 def create_provider(settings: AISettings):
     name = settings.provider.lower().strip()
     kwargs = settings.provider_kwargs()
+    if name == "chatgpt_subscription":
+        # OAuth is handled entirely by the official Node SDK. Do not read or
+        # validate the API Key left by any other provider.
+        return ChatGPTSubscriptionProvider("", settings.model, **kwargs)
     api_key = settings.api_key
     if settings.requires_key:
         api_key = validate_api_key(api_key)
@@ -59,7 +64,6 @@ def probe_multimodal_provider(settings: AISettings, *, client_factory=None) -> s
     """
     import tempfile
     from pathlib import Path
-
     try:
         from PIL import Image, ImageDraw, ImageFont
     except ImportError as exc:

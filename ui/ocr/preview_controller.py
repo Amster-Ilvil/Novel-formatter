@@ -11,7 +11,7 @@ from PySide6.QtWidgets import QApplication, QDialog, QLabel, QMessageBox, QPushB
 
 from ui.common.styling import MUTED
 from ui.dialogs import show_error_dialog
-from ui.ocr.preview import OCRCropPreview
+from ui.ocr.preview import DETECTOR_LABEL_BG, OCRCropPreview
 from ui.localization import LANG_ZH, normalize_language, translate_text
 
 
@@ -555,7 +555,7 @@ class OCRPreviewController:
             top = max(0, min(height - 1, top)); bottom = max(top + 1, min(height, bottom))
             # Retained live-preview rectangles are now tight detector ink
             # envelopes. Rebuild the internal physical slot as full-height while
-            # preserving that tight y-span solely for green-box diagnostics.
+            # preserving that tight y-span for the OCR input preview.
             columns.append(DetectedColumn(
                 left=left, top=0, right=right, bottom=height,
                 hard_left=left, hard_right=right, ink_score=0.0,
@@ -630,11 +630,9 @@ class OCRPreviewController:
                     source = src.convert("RGB")
                 annotated = source.copy()
                 draw = ImageDraw.Draw(annotated)
-                # Draw the two geometry layers that matter when diagnosing
-                # omissions.  Red = detector box.  Green = the larger native-
-                # pixel source reveal actually preserved for OCR before Ruby is
-                # blanked and recognizer-specific white context is added.
-                line_width = 1
+                line_width = max(2, round(min(annotated.size) / 900))
+                dash_length = 3 * line_width
+                dash_step = 5 * line_width
                 preview_outset = max(2, round(min(annotated.size) / 900))
                 column_frames = []
                 for index, column in enumerate(columns, start=1):
@@ -645,7 +643,7 @@ class OCRPreviewController:
                     input_bottom = min(annotated.height - 1, int(in_bottom) - 1 + preview_outset)
                     draw.rectangle(
                         (input_left, input_top, input_right, input_bottom),
-                        outline=(34, 197, 94),
+                        outline=self._preview.input_box_color,
                         width=line_width,
                     )
                     det_left, det_top, det_right, det_bottom = _column_detector_preview_bounds(column)
@@ -663,11 +661,14 @@ class OCRPreviewController:
                     - 16,
                 )
                 for index, frame_left, frame_top, frame_right, frame_bottom in column_frames:
-                    draw.rectangle(
-                        (frame_left, frame_top, frame_right, frame_bottom),
-                        outline=(220, 38, 38),
-                        width=line_width,
-                    )
+                    for x in range(frame_left, frame_right + 1, dash_step):
+                        end_x = min(x + dash_length, frame_right)
+                        for y in (frame_top, frame_bottom):
+                            draw.line((x, y, end_x, y), fill=self._preview.detector_box_color, width=line_width)
+                    for y in range(frame_top, frame_bottom + 1, dash_step):
+                        end_y = min(y + dash_length, frame_bottom)
+                        for x in (frame_left, frame_right):
+                            draw.line((x, y, x, end_y), fill=self._preview.detector_box_color, width=line_width)
                     label_text = str(index)
                     label_box = draw.textbbox((0, 0), label_text)
                     label_width = label_box[2] - label_box[0]
@@ -677,12 +678,16 @@ class OCRPreviewController:
                         frame_left + (frame_right - frame_left - label_width) // 2,
                     ))
                     label_y = common_label_y
-                    draw.rectangle(
+                    draw.rounded_rectangle(
                         (label_x - 2, label_y - 1,
                          label_x + label_width + 2, label_y + label_height + 1),
-                        fill=(255, 255, 255),
+                        radius=3,
+                        fill=DETECTOR_LABEL_BG,
                     )
-                    draw.text((label_x, label_y), label_text, fill=(220, 38, 38))
+                    draw.text(
+                        (label_x - label_box[0], label_y - label_box[1]),
+                        label_text, fill=self._preview.detector_box_color,
+                    )
                 runtime_options = self._column_runtime_options_snapshot()
                 preserve_body_pixels = bool(
                     runtime_options.get("column_preserve_body_pixels", False)
@@ -780,9 +785,8 @@ class OCRPreviewController:
                 info.setText(
                     _trf_ui(
                         "页面：{page_name}。{sync_note}"
-                        "左侧红色实线为检测框、绿色实线为 OCR 输入原像素范围，按日文阅读顺序从右到左编号，共 {column_count} 列；"
-                        "右侧展示当前实际输入：{mode_label}，尺寸 {width}×{height}。"
-                        "绿色输入框之外仍可存在纯白安全槽上下文；目标正文保持原始像素，其他列与 Ruby 均被纸白色隔离。",
+                        "左侧虚线为检测框，实线为 OCR 输入原像素范围，共 {column_count} 列。\n"
+                        "右侧为当前列的实际输入：{mode_label}，尺寸 {width}×{height}。",
                         page_name=page_name,
                         sync_note=sync_note,
                         column_count=len(columns),

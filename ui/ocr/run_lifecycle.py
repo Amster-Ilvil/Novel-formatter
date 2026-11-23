@@ -217,6 +217,7 @@ class OCRRunLifecycleController:
         eta_text = OCRProgressEstimator.format_duration(eta)
         text = f"总进度 {percent:.1f}% · 已用 {elapsed_text} · 预计剩余：{eta_text}"
         self._progress_bar_text.setText(text)
+        self._progress_bar_text.setToolTip(text)
         # Hidden mirror and tooltip keep the same information available to
         # accessibility tools and to narrow-window users.
         self._progress_lbl.setText(text)

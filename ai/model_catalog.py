@@ -11,7 +11,7 @@ from __future__ import annotations
 import json
 from typing import Any
 from urllib.error import HTTPError, URLError
-from urllib.parse import urlencode, urlsplit, urlunsplit
+from urllib.parse import urlsplit, urlunsplit
 from urllib.request import Request, urlopen
 
 from .config import provider_defaults, validate_api_key
@@ -43,15 +43,18 @@ def _ollama_tags_url(base_url: str) -> str:
 
 
 def _request_json(url: str, headers: dict[str, str], timeout: int) -> dict[str, Any]:
+    gemini_key = headers.get("x-goog-api-key")
     request = Request(
         url,
         headers={
             "Accept": "application/json",
             "User-Agent": "NovelFormatter/2.0 model-catalog",
-            **headers,
+            **{name: value for name, value in headers.items() if name != "x-goog-api-key"},
         },
         method="GET",
     )
+    if gemini_key:
+        request.add_unredirected_header("x-goog-api-key", gemini_key)
     try:
         with urlopen(request, timeout=max(5, int(timeout))) as response:
             raw = response.read()
@@ -145,6 +148,13 @@ def fetch_available_models(
     """
     provider = str(provider or "").strip().lower()
     api_key = str(api_key or "").strip()
+    if provider == "chatgpt_subscription":
+        from .chatgpt_subscription import chatgpt_subscription_request
+        values = chatgpt_subscription_request("models", timeout=timeout)
+        models = _normalise_ids([str(v.get("slug") or "") for v in values if isinstance(v, dict)]) if isinstance(values, list) else []
+        if not models:
+            raise ModelCatalogError("当前授权账号没有可用订阅模型，或尚未授予使用订阅的权限")
+        return models
     if provider != "ollama":
         api_key = validate_api_key(api_key)
     default_model, default_url = provider_defaults(provider)
@@ -156,9 +166,7 @@ def fetch_available_models(
     if provider == "gemini":
         root = base_url or "https://generativelanguage.googleapis.com/v1beta"
         url = _append_path(root, "models")
-        separator = "&" if "?" in url else "?"
-        url += separator + urlencode({"key": api_key})
-        models = _gemini_models(_request_json(url, {}, timeout))
+        models = _gemini_models(_request_json(url, {"x-goog-api-key": api_key}, timeout))
     elif provider == "anthropic":
         root = base_url or "https://api.anthropic.com/v1"
         url = _append_path(root, "models")

@@ -903,7 +903,7 @@ def _save_png_atomic(image: Image.Image, output: Path) -> None:
             pass
 
 
-def render_review_image(entry: OCRReviewEntry, output_path: str | Path) -> str:
+def render_review_image(entry: OCRReviewEntry, output_path: str | Path, *, source_pixels: bool = False) -> str:
     """Return an existing exact sentence image or lazily compose source regions.
 
     Region order follows Japanese reading order: the first logical column is
@@ -911,7 +911,7 @@ def render_review_image(entry: OCRReviewEntry, output_path: str | Path) -> str:
     Corrupt preferred/cache files are ignored and rebuilt from immutable source
     regions instead of leaving the GUI paired with the previous sentence image.
     """
-    preferred = Path(entry.preferred_image_path) if entry.preferred_image_path else None
+    preferred = Path(entry.preferred_image_path) if entry.preferred_image_path and not source_pixels else None
     if preferred is not None and _is_readable_image(preferred):
         return str(preferred)
     if not entry.regions:
@@ -920,7 +920,7 @@ def render_review_image(entry: OCRReviewEntry, output_path: str | Path) -> str:
     # One-column review can hand the GUI the exact model input path directly.
     # This avoids even a lossless re-encode and makes visual QA byte-identical
     # to the canonical PNG used by the recognizer.
-    if len(entry.regions) == 1 and isinstance(entry.regions[0], dict):
+    if not source_pixels and len(entry.regions) == 1 and isinstance(entry.regions[0], dict):
         region = entry.regions[0]
         canonical_path = _existing_file(region.get("canonical_image_path"))
         expected_sha = str(region.get("canonical_input_sha256", "") or "").strip().lower()
@@ -954,7 +954,10 @@ def render_review_image(entry: OCRReviewEntry, output_path: str | Path) -> str:
             # sent to OCR.  Earlier code loosely re-cropped the original page
             # with extra context, which could visually re-introduce Ruby that the
             # recognizer never saw.  Prefer the exact prepared PNG first.
-            canonical_path = _existing_file(region.get("canonical_image_path"))
+            original_path = _existing_file(region.get("page_path"))
+            canonical_path = (
+                "" if source_pixels and original_path else _existing_file(region.get("canonical_image_path"))
+            )
             canonical_sha = str(region.get("canonical_input_sha256", "") or "").strip().lower()
             if canonical_path:
                 try:
@@ -989,7 +992,7 @@ def render_review_image(entry: OCRReviewEntry, output_path: str | Path) -> str:
             # Restored workspaces normally lose the transient temp PNG. Rebuild
             # it from the persisted detector geometry and the same transport
             # functions instead of approximating the crop from bbox coordinates.
-            geometry = region.get("column_geometry")
+            geometry = None if source_pixels else region.get("column_geometry")
             if isinstance(geometry, dict):
                 try:
                     from adapters.column_ocr_adapter import (
@@ -1062,20 +1065,23 @@ def render_review_image(entry: OCRReviewEntry, output_path: str | Path) -> str:
             if not all(math.isfinite(value) for value in (x, y, w, h)):
                 incomplete = True
                 continue
+            if source_pixels and (w <= 0 or h <= 0 or x < 0 or y < 0 or x + w > 1.0001 or y + h > 1.0001):
+                incomplete = True
+                continue
             left = max(0, min(source.width - 1, round(x * source.width)))
             top = max(0, min(source.height - 1, round(y * source.height)))
             right = max(left + 1, min(source.width, round((x + w) * source.width)))
             bottom = max(top + 1, min(source.height, round((y + h) * source.height)))
             width = max(1, right - left)
-            context_x = max(8, round(width * 0.18))
-            context_y = max(12, round(width * 0.55))
+            context_x = 1 if source_pixels else max(8, round(width * 0.18))
+            context_y = 1 if source_pixels else max(12, round(width * 0.55))
             crop = source.crop((
                 max(0, left - context_x),
                 max(0, top - context_y),
                 min(source.width, right + context_x),
                 min(source.height, bottom + context_y),
             )).convert("RGB")
-            if any((
+            if not source_pixels and any((
                 bool(region.get("column_auto_filter_ruby", False)),
                 bool(region.get("column_filter_fragments", False)),
                 bool(region.get("column_smart_crop", False)),

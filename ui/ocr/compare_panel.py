@@ -159,12 +159,11 @@ def build_ocr_compare_panel(self):
     self._ai_adjudicate_btn.setStyleSheet(self._ai_adjudicate_btn.styleSheet() + "QPushButton{font-size:9px;padding:2px 8px;}")
     self._ai_adjudicate_btn.clicked.connect(self._run_ai_adjudication)
     title_row.insertWidget(5, self._ai_adjudicate_btn)
-    self._ai_adjudication_cancel_btn = QPushButton("停止AI裁决")
+    self._ai_adjudication_cancel_btn = QPushButton("停止裁决")
     self._ai_adjudication_cancel_btn.setVisible(False)
     self._ai_adjudication_cancel_btn.setMinimumHeight(30)
     self._ai_adjudication_cancel_btn.setMaximumHeight(32)
     self._ai_adjudication_cancel_btn.clicked.connect(self._cancel_ai_adjudication)
-    title_row.insertWidget(6, self._ai_adjudication_cancel_btn)
     self._more_actions_btn = QToolButton()
     self._more_actions_btn.setText("更多操作 ▾")
     self._more_actions_btn.setCheckable(True)
@@ -706,6 +705,10 @@ def build_ocr_compare_panel(self):
     )
     suggestion_header.addWidget(self._ai_provider_badge)
     suggestion_header.addStretch(1)
+    self._manual_decision_toggle = QToolButton()
+    self._manual_decision_toggle.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextBesideIcon)
+    self._manual_decision_toggle.setCheckable(True)
+    suggestion_header.addWidget(self._manual_decision_toggle)
     ai_settings_btn = QPushButton("AI 服务…")
     ai_settings_btn.setFlat(True)
     ai_settings_btn.setStyleSheet(f"color:#2F6BFF;border:none;background:transparent;font-weight:650;")
@@ -735,9 +738,22 @@ def build_ocr_compare_panel(self):
     ai_settings_btn.clicked.connect(open_ai_settings)
     self._refresh_ai_provider_badge = refresh_ai_provider_badge
     refresh_ai_provider_badge()
+    self._manual_decision_body = QWidget(self._proof_suggestion_card)
+    manual_layout = QVBoxLayout(self._manual_decision_body)
+    manual_layout.setContentsMargins(0, 0, 0, 0)
+    manual_layout.setSpacing(9)
+    suggestion_layout.addWidget(self._manual_decision_body)
+
+    def toggle_manual_decision(expanded: bool):
+        self._manual_decision_body.setVisible(expanded)
+        self._manual_decision_toggle.setText("收起" if expanded else "展开")
+        self._manual_decision_toggle.setArrowType(Qt.ArrowType.DownArrow if expanded else Qt.ArrowType.RightArrow)
+
+    self._manual_decision_toggle.toggled.connect(toggle_manual_decision)
+    self._manual_decision_toggle.setChecked(True)
     manual_label = QLabel("手动编辑当前裁决文本")
     manual_label.setStyleSheet("font-size:11px;font-weight:700;")
-    suggestion_layout.addWidget(manual_label)
+    manual_layout.addWidget(manual_label)
     self._manual_decision_editor = MouseWheelPlainTextEdit()
     self._manual_decision_editor.setPlaceholderText("可直接输入最终文本；不会覆盖任何 OCR 模型原文。")
     self._manual_decision_editor.setMinimumHeight(68)
@@ -747,7 +763,7 @@ def build_ocr_compare_panel(self):
         f"QPlainTextEdit{{background:{CARD};border:1px solid {BORDER};border-radius:9px;"
         f"padding:8px;color:{INK};}}" + EDITOR_SCROLLBAR_STYLE
     )
-    suggestion_layout.addWidget(self._manual_decision_editor)
+    manual_layout.addWidget(self._manual_decision_editor)
     manual_actions = QHBoxLayout()
     manual_actions.setContentsMargins(0, 0, 0, 0)
     manual_actions.setSpacing(7)
@@ -769,7 +785,7 @@ def build_ocr_compare_panel(self):
     self._manual_decision_confirm_next_btn.setToolTip("Ctrl+Shift+Enter：确认后进入下一分歧")
     self._manual_decision_confirm_next_btn.clicked.connect(self._commit_manual_decision_and_next)
     manual_actions.addWidget(self._manual_decision_confirm_next_btn)
-    suggestion_layout.addLayout(manual_actions)
+    manual_layout.addLayout(manual_actions)
 
     self._manual_decision_syncing = False
     self._manual_decision_drafts = {}
@@ -1099,7 +1115,10 @@ def build_ocr_compare_panel(self):
     more.setMenu(more_menu)
     compact_row.addWidget(more)
     self._compact_compare_more_btn = more
-    compact_layout.addWidget(self._compact_task_progress)
+    task_row = QHBoxLayout()
+    task_row.addWidget(self._compact_task_progress, 1)
+    task_row.addWidget(self._ai_adjudication_cancel_btn)
+    compact_layout.addLayout(task_row)
     # The supplied proofing master goes straight from the sub-tab row into the
     # queue/candidate workspace.  Keep all proxy buttons alive as hidden
     # backends, and surface only the unobtrusive overflow menu beside

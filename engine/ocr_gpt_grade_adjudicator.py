@@ -120,6 +120,29 @@ def _prefixed(callback: Callable[[dict], None] | None, prefix: str):
     return emit
 
 
+def _merge_final_items(visual_items, contextual_items) -> list[dict]:
+    """Keep all visual decisions and let contextual decisions override them.
+
+    The contextual pass is sparse: it can omit rows whose text it confirmed as
+    unchanged. Replacing the visual list with that sparse list loses those
+    explicit decisions, leaving the rows unresolved in the OCR review queue.
+    """
+    merged: dict[str, dict] = {}
+    order: list[str] = []
+    for source in (visual_items or (), contextual_items or ()):
+        for entry in source:
+            if not isinstance(entry, dict):
+                continue
+            item_id = str(entry.get("item_id", "") or "")
+            if not item_id:
+                continue
+            if item_id not in merged:
+                order.append(item_id)
+                merged[item_id] = {}
+            merged[item_id].update(entry)
+    return [merged[item_id] for item_id in order]
+
+
 def adjudicate_gpt_grade(
     multimodal_client,
     text_provider,
@@ -155,7 +178,10 @@ def adjudicate_gpt_grade(
     contextual_report: dict = {}
     contextual_error = ""
     final_package = enriched
-    if opts.contextual_pass:
+    visual_stats = dict(visual_report.get("stats") or {})
+    network_failed_rows = int(visual_stats.get("network_failed_rows", 0) or 0)
+    quota_blocked_rows = int(visual_stats.get("quota_blocked_rows", 0) or 0)
+    if opts.contextual_pass and not (network_failed_rows or quota_blocked_rows):
         if cancel_check and cancel_check():
             raise AdjudicationCancelled("AI 审定已取消。")
         try:
@@ -179,13 +205,23 @@ def adjudicate_gpt_grade(
             contextual_error = str(exc)
             final_package = enriched
 
+    visual_items = list(visual_report.get("items") or [])
+    contextual_items = list(contextual_report.get("items") or []) if contextual_report else []
+    final_items = _merge_final_items(visual_items, contextual_items)
     visual_low = set(str(v) for v in (visual_report.get("low_uncertain") or []) if str(v))
-    if contextual_report:
-        final_low = set(str(v) for v in (contextual_report.get("low_uncertain") or []) if str(v))
-    else:
-        final_low = visual_low
+    contextual_low = set(str(v) for v in (contextual_report.get("low_uncertain") or []) if str(v))
+    contextual_ids = {
+        str(item.get("item_id", "") or "")
+        for item in contextual_items if isinstance(item, dict)
+    }
+    # Context can supersede a visual decision only when it returned that row.
+    final_low = (visual_low - contextual_ids) | contextual_low
+    final_low.update(
+        str(item.get("item_id", "") or "")
+        for item in final_items
+        if item.get("needs_human_review") and str(item.get("item_id", "") or "")
+    )
 
-    visual_stats = dict(visual_report.get("stats") or {})
     contextual_stats = dict(contextual_report.get("stats") or {}) if contextual_report else {}
     report = {
         "schema": SCHEMA,
@@ -205,13 +241,17 @@ def adjudicate_gpt_grade(
             "visual_applied_changes": int(visual_stats.get("applied_changes", 0) or 0),
             "contextual_applied_changes": int(contextual_stats.get("applied_changes", 0) or 0),
             "final_uncertain_items": len(final_low),
+            "network_failed_rows": network_failed_rows,
+            "quota_blocked_rows": quota_blocked_rows,
+            "visual_transport_attempts": int(visual_stats.get("transport_attempts", 0) or 0),
+            "visual_transport_retries": int(visual_stats.get("transport_retries", 0) or 0),
             "visual_request_count": int(visual_stats.get("request_count", 0) or visual_report.get("request_count", 0) or 0),
             "contextual_request_batches": int(contextual_stats.get("request_batches", 0) or 0),
             "contextual_audit_failures": int(contextual_stats.get("audit_failures", 0) or 0),
         },
-        # Compatibility view consumed by OCRCompareTab: final contextual rows
-        # when available, otherwise the guarded visual rows.
-        "items": list((contextual_report.get("items") if contextual_report else visual_report.get("items")) or []),
+        # Compatibility view consumed by OCRCompareTab: all visual decisions,
+        # with contextual entries overriding only rows they actually reviewed.
+        "items": final_items,
         "low_uncertain": sorted(final_low),
         "visual": visual_report,
         "contextual": contextual_report,

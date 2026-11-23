@@ -17,6 +17,7 @@ RECOGNITION_ENGINES = {
     "macos_ocr": "Apple OCR",
     "windows_snipping_ocr": "Windows Snipping OCR",
     "hayai_ocr": "Hayai OCR",
+    "gemini_ocr": "Gemini OCR",
     "manga_48px": "48px AR OCR",
     "ndlocr_lite": "NDLOCR-Lite",
     "paddle_ocr": "PaddleOCR",
@@ -330,6 +331,13 @@ def recognizer_iterator(
     if engine == "windows_snipping_ocr":
         from adapters.windows_snipping_ocr_adapter import _run_worker
         yield from _run_worker(image_paths, cancel_check=cancel_check, verbose=verbose)
+        return
+    if engine == "gemini_ocr":
+        from adapters.gemini_ocr_adapter import recognize_crops
+        yield from recognize_crops(
+            image_paths, manifest_path, cancel_check=cancel_check, verbose=verbose,
+            engine_options=options, input_metadata=input_metadata,
+        )
         return
     if engine == "hayai_ocr":
         from adapters.hayai_ocr_adapter import recognize_crops

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from functools import partial
 
 from ui.ocr.catalog import adapter_available_on_current_platform
@@ -7,17 +8,197 @@ from ui.ocr.catalog import adapter_available_on_current_platform
 from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QGridLayout, QFormLayout, QLabel,
     QCheckBox, QLineEdit, QPushButton, QRadioButton, QScrollArea, QFrame,
-    QSizePolicy, QSpinBox, QTabWidget, QToolButton, QComboBox, QLayout,
+    QSizePolicy, QSpinBox, QTabBar, QTabWidget, QToolButton, QComboBox, QLayout,
 )
 from PySide6.QtCore import Qt
 from PySide6.QtGui import QCursor, QAction
 
 from ui.common.editor_controls import NoWheelComboBox, NoWheelDoubleSpinBox, NoWheelSpinBox
-from ui.common.styling import BG, BORDER, CARD, CLICKABLE_BG, MUTED, ACC, ACC_TEXT, INK, TONAL, accent_button, make_badge, make_separator
+from ui.common.styling import BG, BORDER, CARD, MUTED, ACC, ACC_TEXT, INK, TONAL, accent_button, make_badge, make_separator
 from ui.responsive import configure_combo, preserve_button_text
 from ui.widgets import ColorSwatch
 from ui.design.components import DesignSwitch
 from ui.design.metrics import OCR_LEFT_WIDTH, OCR_LEFT_MIN, OCR_LEFT_MAX, OCR_ENGINE_CARD_HEIGHT
+from ui.theme.tokens import DISABLED_FG, TONAL_HOVER
+
+
+class _EqualWidthSettingsTabBar(QTabBar):
+    def tabSizeHint(self, index):
+        size = super().tabSizeHint(index)
+        if self.count():
+            size.setWidth(max(1, self.width() // self.count()))
+        return size
+
+    def minimumTabSizeHint(self, index):
+        return self.tabSizeHint(index)
+
+
+class _OCRSettingsTabs(QTabWidget):
+    def __init__(self):
+        super().__init__()
+        self.setTabBar(_EqualWidthSettingsTabBar(self))
+
+    def resizeEvent(self, event):
+        self.tabBar().setFixedWidth(self.contentsRect().width())
+        super().resizeEvent(event)
+
+    def tabInserted(self, index):
+        super().tabInserted(index)
+        self.setTabToolTip(index, self.tabText(index))
+
+    def setTabText(self, index, text):
+        super().setTabText(index, text)
+        self.setTabToolTip(index, text)
+
+
+class GeminiOcrSettings(QWidget):
+    MODEL_SETTING = "ocr/gemini_default_model"
+
+    def __init__(self, settings, parent=None):
+        super().__init__(parent)
+        from adapters.gemini_ocr_adapter import DEFAULT_BATCH_ITEMS
+        from ai.gemini_ocr_transport import DEFAULT_MODEL
+
+        self._settings = settings
+        self._key_loaded = False
+        self._default_model = os.environ.get("NOVEL_FORMATTER_GEMINI_OCR_MODEL", "").strip() or DEFAULT_MODEL
+        self.setObjectName("geminiOcrSettings")
+        layout = QFormLayout(self)
+        layout.setContentsMargins(0, 4, 0, 0)
+
+        self.key_edit = QLineEdit()
+        self.key_edit.setEchoMode(QLineEdit.EchoMode.Password)
+        self.key_edit.setPlaceholderText("输入 Gemini API 密钥")
+        layout.addRow("API 密钥", self.key_edit)
+        from ai.gemini_free_tier import KNOWN_CHOICES, DEFAULT_RPM, DEFAULT_TPM, DEFAULT_RPD
+        self.model_edit = QComboBox()
+        self.model_edit.setEditable(True)
+        self.model_edit.addItems(KNOWN_CHOICES)
+        self.model_edit.setCurrentText(str(settings.value(self.MODEL_SETTING, "") or self._default_model))
+        layout.addRow("OCR 模型", self.model_edit)
+        self.batch_items = NoWheelSpinBox()
+        self.batch_items.setRange(4, 30)
+        try:
+            self.batch_items.setValue(int(settings.value("ocr/gemini_batch_items", DEFAULT_BATCH_ITEMS)))
+        except (TypeError, ValueError):
+            self.batch_items.setValue(DEFAULT_BATCH_ITEMS)
+        self.batch_items.setToolTip("不同页的列片可合在一张图里。遇到大列片时按原始像素尺寸提前分批。")
+        layout.addRow("每图列片上限", self.batch_items)
+        self.fallback_model = QComboBox()
+        self.fallback_model.addItem("选择备用模型", "")
+        for model_id in KNOWN_CHOICES:
+            self.fallback_model.addItem(model_id, model_id)
+        previous_fallback = str(settings.value("ocr/gemini_fallback_model", "") or "")
+        selected_fallback = self.fallback_model.findData(previous_fallback)
+        self.fallback_model.setCurrentIndex(max(0, selected_fallback))
+        self.allow_fallback = QCheckBox("主模型遇到 429 时尝试一次备用模型")
+        self.allow_fallback.setChecked(str(settings.value("ocr/gemini_enable_fallback", "false")).lower() == "true")
+        layout.addRow("备用 OCR 模型", self.fallback_model)
+        layout.addRow(self.allow_fallback)
+        self.free_mode = QCheckBox("启用本地额度保护")
+        self.free_mode.setChecked(str(settings.value("ocr/gemini_free_mode", "true")).lower() != "false")
+        layout.addRow(self.free_mode)
+        limits = QHBoxLayout()
+        self.rpm = NoWheelSpinBox()
+        self.tpm = NoWheelSpinBox()
+        self.rpd = NoWheelSpinBox()
+        self.tpm.setSingleStep(10_000)
+        for field, widget, minimum, maximum, default in (
+            ("rpm", self.rpm, 1, 100_000, DEFAULT_RPM),
+            ("tpm", self.tpm, 1_000, 10_000_000, DEFAULT_TPM),
+            ("rpd", self.rpd, 1, 1_000_000, DEFAULT_RPD),
+        ):
+            widget.setRange(minimum, maximum)
+            try:
+                widget.setValue(int(settings.value("ocr/gemini_" + field, default)))
+            except (ValueError, TypeError):
+                widget.setValue(default)
+            limits.addWidget(QLabel(field.upper()))
+            limits.addWidget(widget)
+            widget.setEnabled(self.free_mode.isChecked())
+            self.free_mode.toggled.connect(widget.setEnabled)
+        layout.addRow("按模型配额", limits)
+        info = QLabel("按 Google AI Studio 项目额度设置本地上限。TPM 按输入估算。")
+        info.setWordWrap(True)
+        layout.addRow(info)
+
+        buttons = QHBoxLayout()
+        save_key = QPushButton("保存密钥")
+        save_model = QPushButton("保存模型和额度")
+        buttons.addWidget(save_key)
+        buttons.addWidget(save_model)
+        layout.addRow(buttons)
+        self.status = QLabel()
+        self.status.setWordWrap(True)
+        self.status.setStyleSheet(f"color: {MUTED}; font-size: 11px;")
+        layout.addRow(self.status)
+
+        from ai.config import set_session_gemini_ocr_key
+        self.key_edit.textChanged.connect(set_session_gemini_ocr_key)
+        self.key_edit.textChanged.connect(self.status.clear)
+        self.model_edit.currentTextChanged.connect(self.status.clear)
+        for widget in (self.rpm, self.tpm, self.rpd, self.batch_items):
+            widget.valueChanged.connect(self.status.clear)
+        save_key.clicked.connect(self._save_key)
+        save_model.clicked.connect(self._save_model)
+        self.hide()
+
+    def set_selected(self, selected: bool):
+        if selected and not self._key_loaded:
+            from ai.config import load_gemini_ocr_key
+            self.key_edit.setText(load_gemini_ocr_key())
+            self._key_loaded = True
+        self.setVisible(selected)
+
+    def model(self) -> str:
+        return str(self.model_edit.currentText()).strip() or self._default_model
+
+    def engine_options(self) -> dict:
+        protected = self.free_mode.isChecked()
+        return {
+            "model": self.model(),
+            "batch_items": self.batch_items.value(),
+            "free_mode": protected,
+            "rpm_limit": self.rpm.value() if protected else 0,
+            "tpm_limit": self.tpm.value() if protected else 0,
+            "rpd_limit": self.rpd.value(),
+            "fallback_model": str(self.fallback_model.currentData() or ""),
+            "enable_fallback": self.allow_fallback.isChecked(),
+        }
+
+    def _save_model(self):
+        from ai.gemini_ocr_transport import safe_model
+        try:
+            model = safe_model(self.model())
+        except ValueError as exc:
+            self.status.setText(str(exc))
+            return
+        self.model_edit.setCurrentText(model)
+        self._settings.setValue(self.MODEL_SETTING, model)
+        self._settings.setValue("ocr/gemini_batch_items", self.batch_items.value())
+        self._settings.setValue("ocr/gemini_free_mode", str(self.free_mode.isChecked()).lower())
+        self._settings.setValue("ocr/gemini_enable_fallback", str(self.allow_fallback.isChecked()).lower())
+        self._settings.setValue("ocr/gemini_fallback_model", str(self.fallback_model.currentData() or ""))
+        for field, widget in (("rpm", self.rpm), ("tpm", self.tpm), ("rpd", self.rpd)):
+            self._settings.setValue("ocr/gemini_" + field, widget.value())
+        self._settings.sync()
+        if self._settings.status() == self._settings.Status.NoError:
+            self.status.setText(f"已保存模型与额度：{model}")
+        else:
+            self.status.setText("默认模型保存失败")
+
+    def _save_key(self):
+        from ai.config import GEMINI_OCR_SECRET_NAME, api_key_validation_error, normalise_api_key
+        from ai.secure_store import save_named_secret
+
+        key = normalise_api_key(self.key_edit.text())
+        error = api_key_validation_error(key)
+        if error:
+            self.status.setText(error)
+        elif save_named_secret(GEMINI_OCR_SECRET_NAME, key, label="Novel Formatter Gemini OCR API Key"):
+            self.status.setText("密钥已保存到系统凭据库")
+        else:
+            self.status.setText("无法保存到系统凭据库，密钥仅在本次运行中可用")
 
 
 def _build_reference_engine_panel(self, ocr_adapters):
@@ -86,7 +267,6 @@ def _build_reference_engine_panel(self, ocr_adapters):
 def build_ocr_model_settings(tab, top_row, ocr_adapters):
     # Legacy source-contract marker: ll.addWidget(mode_picker)
     # Legacy source-contract marker: ll.addWidget(engine_picker)
-    # Legacy source-contract marker: ll.addWidget(self._ocr_settings_tabs)
     self = tab
     PAGE_STYLE = f"QWidget#ocrSettingPage{{background:{CARD};border:1px solid {BORDER};border-radius:12px;}}"
     left_container = QWidget()
@@ -171,23 +351,38 @@ def build_ocr_model_settings(tab, top_row, ocr_adapters):
     )
     engine_picker_layout.addWidget(self._active_adapter_summary)
     self._active_adapter_summary.setVisible(False)
+    self._gemini_ocr_settings = GeminiOcrSettings(self._ocr_mode_settings, engine_picker)
+    engine_picker_layout.addWidget(self._gemini_ocr_settings)
     top_card_layout.addWidget(engine_picker)
     ll.addWidget(top_card)
 
-    self._ocr_settings_tabs = QTabWidget()
+    self._ocr_settings_tabs = _OCRSettingsTabs()
+    self._ocr_settings_tabs.setObjectName("ocrSettingsTabs")
     self._ocr_settings_tabs.setDocumentMode(True)
     self._ocr_settings_tabs.setTabPosition(QTabWidget.North)
-    self._ocr_settings_tabs.tabBar().setDrawBase(False)
+    settings_tab_bar = self._ocr_settings_tabs.tabBar()
+    settings_tab_bar.setObjectName("ocrSettingsTabBar")
+    settings_tab_bar.setDrawBase(False)
+    settings_tab_bar.setExpanding(True)
+    settings_tab_bar.setFocusPolicy(Qt.StrongFocus)
     self._ocr_settings_tabs.setUsesScrollButtons(False)
-    self._ocr_settings_tabs.setElideMode(Qt.ElideNone)
+    self._ocr_settings_tabs.setElideMode(Qt.ElideRight)
     self._ocr_settings_tabs.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.MinimumExpanding)
     self._ocr_settings_tabs.setStyleSheet(
-        f"QTabWidget{{background:{CARD};border:none;}}"
-        f"QTabBar{{background:{CARD};border:none;}}"
-        "QTabBar::tab { min-width: 82px; padding: 7px 10px; margin: 0; border-radius: 0; background: transparent; border: none; border-bottom: 1px solid #E2E5E9; }"
-        f"QTabBar::tab:selected {{ background:{CARD}; color:{INK}; font-weight:700; border-bottom:2px solid #2563EB; }}"
-        f"QTabBar::tab:hover {{ background:{CLICKABLE_BG}; }}"
-        f"QTabWidget::pane {{ background:{CARD}; border:none; top:0px; }}"
+        f"QTabWidget#ocrSettingsTabs {{ background:{BG}; border:none; }}"
+        "QTabWidget#ocrSettingsTabs::tab-bar { alignment:center; }"
+        f"QTabWidget#ocrSettingsTabs::pane {{ background:{BG}; border:none; top:0; }}"
+        f"QTabBar#ocrSettingsTabBar {{ background:{CARD}; border:1px solid {BORDER}; border-radius:12px; }}"
+        f"QTabBar#ocrSettingsTabBar::tab {{"
+        f" background:transparent; color:{MUTED}; border:1px solid transparent;"
+        " border-radius:8px; margin:4px 3px 5px; padding:0 5px;"
+        " min-height:34px; font-weight:600; }"
+        f"QTabBar#ocrSettingsTabBar::tab:hover:!selected:enabled {{"
+        f" background:{TONAL_HOVER}; color:{INK}; }}"
+        f"QTabBar#ocrSettingsTabBar::tab:selected {{"
+        f" background:{CARD}; color:{ACC_TEXT}; border-color:{ACC}; font-weight:700; }}"
+        f"QTabBar#ocrSettingsTabBar::tab:selected:focus {{ border-color:{ACC_TEXT}; }}"
+        f"QTabBar#ocrSettingsTabBar::tab:disabled {{ color:{DISABLED_FG}; }}"
     )
     # All three settings tabs are scrollable through the outer left pane and
     # show their complete configuration by default.
@@ -220,21 +415,7 @@ def build_ocr_model_settings(tab, top_row, ocr_adapters):
     self._ocr_settings_tabs.addTab(engine_settings_page, "引擎")
     self._ocr_settings_tabs.addTab(layout_settings_page, "分列与组句")
     self._ocr_settings_tabs.addTab(review_settings_page, "逐字审校")
-    # Keep the upper rule outside the tab bar's selected/hover painting.
-    # Native tab backgrounds can otherwise cover just the active tab's span.
-    settings_tabs_host = QWidget()
-    settings_tabs_layout = QVBoxLayout(settings_tabs_host)
-    settings_tabs_layout.setContentsMargins(0, 0, 0, 0)
-    settings_tabs_layout.setSpacing(0)
-    self._ocr_settings_top_rule = QFrame()
-    self._ocr_settings_top_rule.setObjectName("ocrSettingsTopRule")
-    self._ocr_settings_top_rule.setFixedHeight(1)
-    self._ocr_settings_top_rule.setStyleSheet(
-        f"QFrame#ocrSettingsTopRule{{background:{BORDER};border:none;}}"
-    )
-    settings_tabs_layout.addWidget(self._ocr_settings_top_rule)
-    settings_tabs_layout.addWidget(self._ocr_settings_tabs)
-    ll.addWidget(settings_tabs_host)
+    ll.addWidget(self._ocr_settings_tabs)
 
     self._adapter_cards: dict[str, QWidget] = {}
     for aid, _name, _badge_text, _color, _desc, enabled in ocr_adapters:
@@ -941,17 +1122,22 @@ def build_ocr_model_settings(tab, top_row, ocr_adapters):
     self._column_strict_check = QCheckBox("严格防漏：预计列、识别列、文档列和 DOCX 列必须一致")
     self._column_strict_check.setChecked(True)
     settings.addWidget(self._column_strict_check)
-    row = QHBoxLayout()
+    column_actions = QGridLayout()
+    column_actions.setHorizontalSpacing(8)
+    column_actions.setVerticalSpacing(6)
+    column_actions.setColumnStretch(0, 1)
+    column_actions.setColumnStretch(1, 1)
     self._column_preview_btn = QPushButton("👁 预览分列与掩膜")
     self._column_preview_btn.clicked.connect(self._preview_column_split)
-    row.addWidget(self._column_preview_btn)
+    column_actions.addWidget(self._column_preview_btn, 0, 0)
     self._column_detect_btn = QPushButton("🔍 重新检测本地 OCR")
     self._column_detect_btn.clicked.connect(lambda: self._refresh_ocr_runtime_status(show_dialog=True, deep=True))
-    row.addWidget(self._column_detect_btn)
+    column_actions.addWidget(self._column_detect_btn, 0, 1)
     self._column_detect_status = QLabel("")
     self._column_detect_status.setStyleSheet(f"color: {MUTED}; font-size: 10px;")
-    row.addWidget(self._column_detect_status, 1)
-    settings.addLayout(row)
+    self._column_detect_status.setWordWrap(True)
+    column_actions.addWidget(self._column_detect_status, 1, 0, 1, 2)
+    settings.addLayout(column_actions)
     hint = QLabel(
         "两种方式都先建立同一份 Ruby-free 正文可见层。界面可用原页位置检查“分列显示”，"
         "但真正送入 OCR 前都会按当前单列墨迹收紧，并在四边保留安全白边；不会再把整页白底交给模型。"

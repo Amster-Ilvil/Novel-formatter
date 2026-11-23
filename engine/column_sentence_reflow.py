@@ -26,9 +26,10 @@ CLOSING_QUOTES = "」』）】》〉〕］〗〙〛”’\"'"
 STRONG_TERMINALS = "。．！？!?｡!?"
 ELLIPSIS_TERMINALS = ("……", "…", "‥‥", "...")
 DASH_TERMINALS = ("——", "――", "━━", "──")
-REFLOW_VERSION = 10
+REFLOW_VERSION = 11
 
 _BARE_SECTION_MARKER_RE = re.compile(r"^[0-9０-９]{1,3}[.．]?$")
+_FIELD_LABEL_RE = re.compile(r"^[\w・]{1,10}[：:]\s*\S")
 
 TITLE_RE = re.compile(
     r"^(?:序章|終章|プロローグ|エピローグ|後記|あとがき|幕間|"
@@ -245,6 +246,65 @@ def _looks_title(block: Block) -> bool:
         return True
     text = normalize_column_text(block.text)
     return bool(text and TITLE_RE.match(text) and len(text) <= 100)
+
+
+def _column_ink_bounds(block: Block) -> tuple[float, float, float, float] | None:
+    """Pixel position, width and ink extent inside the physical column slot."""
+    meta = block.metadata or {}
+    spans = meta.get("black_ink_content_spans") or ()
+    if not spans:
+        return None
+    try:
+        left = float(meta["column_left"])
+        width = float(meta["column_right"]) - left
+        top = min(float(span[0]) for span in spans)
+        bottom = max(float(span[1]) for span in spans)
+    except (KeyError, IndexError, TypeError, ValueError):
+        return None
+    return (left, width, top, bottom) if width > 0 and bottom > top else None
+
+
+def _field_list_positions(indexed: list[tuple[int, Block]]) -> set[int]:
+    """Find vertically printed lists with multiple aligned label:value columns."""
+    columns = []
+    for pos, block in indexed:
+        bounds = _column_ink_bounds(block) if block.type in BODY_TYPES and len(_source_column_ids(block)) == 1 else None
+        text = normalize_column_text(block.text)
+        columns.append((pos, block, bounds, text, bool(_FIELD_LABEL_RE.match(text))))
+    positions: set[int] = set()
+    i = 0
+    while i < len(columns):
+        pos, first, bounds, _, labelled = columns[i]
+        i += 1
+        if not labelled or bounds is None:
+            continue
+        left, width, top, bottom = bounds
+        if bottom - top > width * 13:
+            continue
+        group = [pos]
+        labels = 1
+        previous_left = left
+        while i < len(columns):
+            candidate_pos, block, candidate_bounds, text, labelled = columns[i]
+            if candidate_bounds is None or not text or _page(block) != _page(first):
+                break
+            left, _, ink_top, ink_bottom = candidate_bounds
+            if not 0 < previous_left - left <= width * 2.5 or ink_bottom - ink_top > width * 13:
+                break
+            aligned_label = labelled and abs(ink_top - top) <= width
+            indented_value = (
+                not labelled and ink_top - top >= width * 1.5
+                and not has_sentence_terminal(text) and not text.startswith(("「", "『"))
+            )
+            if not (aligned_label or indented_value):
+                break
+            group.append(candidate_pos)
+            labels += int(aligned_label)
+            previous_left = left
+            i += 1
+        if labels >= 2:
+            positions.update(group)
+    return positions
 
 
 def _looks_numeric_section_marker(block: Block) -> bool:
@@ -708,9 +768,10 @@ def reflow_columns_into_sentences(
     """Merge sequential OCR columns until a complete sentence is reached.
 
     The pending buffer survives page transitions.  Structural titles terminate
-    the buffer and stay on their own line.  Completion is decided only from the
-    current physical column's final effective character; punctuation inside that
-    column is never used to split it.  ``max_columns`` is a corruption guard.
+    the buffer and stay on their own line. Gemini's locally detected list
+    columns also stay separate. Ordinary prose uses the final effective
+    character as a boundary without splitting inside a physical column.
+    ``max_columns`` is a corruption guard.
     """
     if callable(cancel_check) and cancel_check():
         raise InterruptedError("OCR 已停止")
@@ -737,6 +798,8 @@ def reflow_columns_into_sentences(
     # OCR adapters normally already provide global reading_order, but sorting by
     # page/order makes cross-page behavior deterministic for imported JSON too.
     indexed.sort(key=lambda pair: (_order(pair[1]), pair[0]))
+    source_engine = str(getattr(result.metadata, "source_engine", "") or "").lower()
+    field_positions = _field_list_positions(indexed) if "gemini_ocr" in source_engine else set()
 
     pending: list[Block] = []
     pending_positions: list[int] = []
@@ -836,12 +899,12 @@ def reflow_columns_into_sentences(
             "source_column_ocr_input_profile": source_input_profiles,
             "source_column_ocr_input_profile_sha256": source_profile_hashes,
             "source_column_terminal_flags": [
-                has_sentence_terminal(item) for item in effective_column_texts
+                reason == "field_list_item" or has_sentence_terminal(item) for item in effective_column_texts
             ],
             "atomic_ocr_sentence": True,
             "source_pages": pages,
             "flush_reason": reason,
-            "sentence_terminal": has_sentence_terminal(merged_text),
+            "sentence_terminal": reason == "field_list_item" or has_sentence_terminal(merged_text),
             "terminal_checked_on_last_column_only": True,
             "last_column_text": effective_column_texts[-1],
             "sentence_context_reocr_applied": context_applied,
@@ -859,7 +922,7 @@ def reflow_columns_into_sentences(
                 "sentence_context_reocr_primary_joined": join_column_parts(texts),
                 "sentence_context_reocr_text": context_candidate,
             })
-        if reason in {"title_boundary", "max_columns", "document_end"} and not has_sentence_terminal(texts[-1]):
+        if reason in {"title_boundary", "field_list_boundary", "max_columns", "document_end"} and not has_sentence_terminal(texts[-1]):
             first.metadata["sentence_incomplete_needs_review"] = True
         if reason == "max_columns":
             first.metadata["column_reflow_safety_cap"] = max_columns
@@ -890,7 +953,15 @@ def reflow_columns_into_sentences(
         if loop_index % 32 == 0 and callable(cancel_check) and cancel_check():
             raise InterruptedError("OCR 已停止")
         text = normalize_column_text(block.text)
-        if _looks_numeric_section_marker(block):
+        next_position = indexed[loop_index + 1][0] if loop_index + 1 < len(indexed) else -1
+        marker_geometry = _column_ink_bounds(block) if next_position in field_positions else None
+        detached_list_marker = (
+            marker_geometry is not None and block.type in BODY_TYPES
+            and len(_source_column_ids(block)) == 1 and _BARE_SECTION_MARKER_RE.fullmatch(text)
+            and marker_geometry[3] - marker_geometry[2] <= marker_geometry[1] * 3
+            and _page(block) == _page(indexed[loop_index + 1][1])
+        )
+        if _looks_numeric_section_marker(block) or detached_list_marker:
             flush(reason="section_marker_boundary")
             _mark_numeric_section_marker_atomic(block)
             continue
@@ -945,6 +1016,13 @@ def reflow_columns_into_sentences(
         if block.type not in BODY_TYPES or not text:
             # Page images, blank placeholders and headers do not terminate a
             # sentence; this lets a page-final fragment continue on next page.
+            continue
+
+        if pos in field_positions:
+            flush(reason="field_list_boundary")
+            pending.append(block)
+            pending_positions.append(pos)
+            flush(reason="field_list_item")
             continue
 
         if pending:

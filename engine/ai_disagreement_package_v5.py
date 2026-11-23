@@ -41,6 +41,9 @@ from engine.consensus_entropy import calculate_consensus_entropy
 from engine.adaptive_ocr_ensemble import (
     ModelReliability, decide_ensemble, estimate_model_reliability, model_family,
 )
+from engine.ocr_adjudication_quality_risks import (
+    candidate_contrasts, consensus_scan_reasons, independently_executed, sensitive_contrast,
+)
 from models.document import UnifiedDocument
 from core.multi_ocr_roles import MULTI_OCR_ROLE_SCHEMA, SUPPORTED_MULTI_OCR_ROLE_SCHEMAS
 
@@ -246,8 +249,7 @@ def _candidate_health(items: Sequence[dict]) -> dict[str, dict]:
             role_label_by_model.setdefault(model, str(candidate.get("model_role_label", "") or ""))
             engine_by_model.setdefault(model, str(candidate.get("source_engine", "") or ""))
             granularity_by_model.setdefault(model, str(candidate.get("input_granularity", "") or ""))
-            independently_executed = bool(candidate.get("independently_executed", not candidate.get("seeded_reuse", False)))
-            if not independently_executed:
+            if not independently_executed(candidate):
                 seed_reuse[model] += 1
                 continue
             independent_totals[model] += 1
@@ -407,8 +409,8 @@ def build_disagreement_records(package: dict) -> tuple[list[dict], dict]:
             raw = _candidate_text(candidate)
             canonical, events = canonicalize_standard_japanese(raw)
             key = comparison_key_standard_japanese(canonical) if _usable_text(raw) else ""
-            independently_executed = bool(candidate.get("independently_executed", not candidate.get("seeded_reuse", False)))
-            seeded_reuse = not independently_executed
+            executed = independently_executed(candidate)
+            seeded_reuse = not executed
             candidate_record = {
                 "model_index": int(candidate.get("model_index", candidate_index) or candidate_index),
                 "model": model,
@@ -426,9 +428,9 @@ def build_disagreement_records(package: dict) -> tuple[list[dict], dict]:
                 "placeholder": _is_placeholder(raw),
                 "usable": _usable_text(raw),
                 "seeded_reuse": seeded_reuse,
-                "independently_executed": independently_executed,
+                "independently_executed": executed,
                 "eligible_for_vote": (
-                    independently_executed
+                    executed
                     and bool(health.get(model, {}).get("voting_enabled", True))
                     and _usable_text(raw)
                 ),
@@ -541,6 +543,25 @@ def build_disagreement_records(package: dict) -> tuple[list[dict], dict]:
                 *reason_codes,
             ]))
 
+        current = _existing_authoritative_item_text(item, candidates)
+        scan_reasons = consensus_scan_reasons(current)
+        pages = {g.get("page") for g in item.get("column_geometry") or [] if g.get("page")}
+        if pages and (len(pages) > 1 or item.get("page") not in pages):
+            scan_reasons.append("source_columns_span_or_disagree_with_row_page")
+        if item.get("alignment_repaired") or item.get("alignment_notes"):
+            scan_reasons.append("alignment_requires_visual_review")
+        if any(c.get("rejected_ocr_segments") for c in item.get("physical_column_candidates") or []):
+            scan_reasons.append("rejected_segment_requires_visual_review")
+        if raw_disagreement and any(sensitive_contrast(raw_values[0], value) for value in raw_values[1:]):
+            scan_reasons.append("sensitive_glyph_disagreement")
+        if scan_reasons:
+            if not action_required:
+                accepted_text = current
+                status = "consensus_needs_scan"
+            action_required = True
+            priority = "critical"
+            reason_codes = list(dict.fromkeys([*scan_reasons, *reason_codes]))
+
         # A local adjudication may have already resolved this substantive conflict.
         # Such rows remain in the immutable/all-items index for audit, but must not
         # be re-opened as LLM work.  The local result is an overlay, not new OCR evidence.
@@ -555,6 +576,13 @@ def build_disagreement_records(package: dict) -> tuple[list[dict], dict]:
                 action_required = False
                 priority = "none"
                 reason_codes = list(dict.fromkeys(["local_adjudicated", *reason_codes]))
+        explicit = (package.get("confirmed_review_rows") or {}).get(item_key)
+        if item.get("delete_intentionally") or explicit:
+            accepted_text = str(item.get("edited_text", "") or "")
+            status = "confirmed_review" if explicit else "intentional_delete"
+            action_required = False
+            priority = "none"
+            reason_codes = [status, *reason_codes]
 
         risk_flags = _risk_flags([candidate["raw_text"] for candidate in independent_candidates])
         if action_required and risk_flags:
@@ -594,7 +622,7 @@ def build_disagreement_records(package: dict) -> tuple[list[dict], dict]:
         if action_required and ce_profile.difficulty == "high" and priority not in {"critical"}:
             priority = "high"
             reason_codes.append("high_consensus_entropy_review_priority")
-        provisional = accepted_text or str(item.get("edited_text", item.get("original_fused_text", "")) or "")
+        provisional = accepted_text if accepted_text is not None else str(item.get("edited_text", item.get("original_fused_text", "")) or "")
         canonical_provisional, provisional_events = canonicalize_standard_japanese(provisional)
         if not action_required:
             routing_hint = "frozen_no_external_model"
@@ -638,8 +666,11 @@ def build_disagreement_records(package: dict) -> tuple[list[dict], dict]:
             "column_ids": [str(value) for value in (item.get("column_ids") or []) if str(value)],
             "status": status,
             "accepted_text": accepted_text,
-            "provisional_text": canonical_provisional,
-            "provisional_text_sha256": _sha256_text(canonical_provisional),
+            "scan_check_reasons": scan_reasons,
+            "candidate_contrasts": candidate_contrasts(raw_values) if action_required else [],
+            "provisional_text": provisional,
+            "provisional_text_sha256": _sha256_text(provisional),
+            "canonical_provisional_text": canonical_provisional,
             "model_action_required": action_required,
             "review_priority": priority,
             "routing_hint": routing_hint,
@@ -756,7 +787,7 @@ def build_disagreement_records(package: dict) -> tuple[list[dict], dict]:
             "book_local_reliability_gate": "exclude when at least 30 independent anchors and anchor accuracy below 0.55",
             "correlated_family_vote": "second recognizer from the same OCR family contributes only 0.35 vote",
             "sensitive_two_model_agreement": "requires independent verification before freezing",
-            "normalized_consensus_export_filter": "all usable raw candidates may differ, but identical comparison keys freeze the existing row text and skip cloud export",
+            "normalized_consensus_export_filter": "identical comparison keys freeze the existing row text unless the original scan has to be checked",
             "consensus_entropy": "diagnostic/routing by default; optional ce_auto_freeze is explicit, conservative, and never rewrites OCR text",
             "ordinary_multi_model_conflict": "remains whole-sentence until explicit external-Paddle local adjudication",
             "role_based_evidence": "column/page/sentence/review roles remain distinct evidence sources",
@@ -766,56 +797,21 @@ def build_disagreement_records(package: dict) -> tuple[list[dict], dict]:
     return records, summary
 
 
-def _structure_page_paths(package: dict) -> dict[int, str]:
-    structure = package.get("structure_document") if isinstance(package.get("structure_document"), dict) else {}
-    output: dict[int, str] = {}
-    for index, page in enumerate(structure.get("pages") or []):
-        if not isinstance(page, dict):
-            continue
-        page_no = int(page.get("page_no", page.get("page", index + 1)) or index + 1)
-        path = str(page.get("image_path", "") or "")
-        if path:
-            output[page_no] = path
-    return output
-
-
-def _bbox_pixels(record: dict, width: int, height: int) -> tuple[int, int, int, int] | None:
-    bbox = record.get("source_bbox") or []
-    if isinstance(bbox, dict):
-        bbox = [bbox.get("x", 0), bbox.get("y", 0), bbox.get("w", 0), bbox.get("h", 0)]
-    if not isinstance(bbox, (list, tuple)) or len(bbox) < 4:
-        # Candidate geometry is often more reliable than the fused-item bbox.
-        for candidate in record.get("candidates") or []:
-            raw = candidate.get("bbox") if isinstance(candidate, dict) else None
-            if isinstance(raw, (list, tuple)) and len(raw) >= 4:
-                bbox = raw
-                break
-    if not isinstance(bbox, (list, tuple)) or len(bbox) < 4:
-        return None
-    try:
-        x, y, w, h = [float(value) for value in bbox[:4]]
-    except (TypeError, ValueError):
-        return None
-    if max(abs(x), abs(y), abs(w), abs(h)) <= 2.0:
-        x, y, w, h = x * width, y * height, w * width, h * height
-    margin = max(2, int(round(min(width, height) * 0.003)))
-    left = max(0, int(x) - margin)
-    top = max(0, int(y) - margin)
-    right = min(width, int(x + w + 0.999) + margin)
-    bottom = min(height, int(y + h + 0.999) + margin)
-    if right - left < 2 or bottom - top < 2:
-        return None
-    return left, top, right, bottom
-
-
-def _export_conflict_crops(folder: Path, package: dict, records: Sequence[dict]) -> tuple[dict[str, str], list[dict]]:
+def _export_conflict_crops(folder: Path, package: dict, records: Sequence[dict], primary_doc) -> tuple[dict[str, str], list[dict]]:
     output: dict[str, str] = {}
     omissions: list[dict] = []
-    page_paths = _structure_page_paths(package)
-    try:
-        from PIL import Image
-    except Exception:
-        return output, [{"reason": "pillow_unavailable", "item_count": sum(1 for r in records if r["model_action_required"])}]
+    from engine.multi_ocr_compare import build_fused_document
+    from engine.ocr_image_text_review import _review_layout_sidecar_path, build_review_entries, render_review_image
+    from engine.ocr_roundtrip_package import _comparison_from_package
+    from engine.ocr_visual_batch_adjudicator import _evidence_coverage_issues
+
+    items = package["editable_items"]
+    fused = build_fused_document(
+        primary_doc, _comparison_from_package(package),
+        [str(item.get("edited_text", "") or "") for item in items],
+        delete_flags=[item.get("delete_intentionally") is True for item in items],
+    )
+    entries = {entry.source_row_index: entry for entry in build_review_entries(fused) if entry.source_row_index >= 0}
     evidence_dir = folder / "evidence"
     evidence_dir.mkdir(parents=True, exist_ok=True)
     for record in records:
@@ -823,22 +819,21 @@ def _export_conflict_crops(folder: Path, package: dict, records: Sequence[dict])
             continue
         item_id = record["item_id"]
         page = int(record.get("page", 0) or 0)
-        image_path = Path(page_paths.get(page, "")).expanduser()
-        if not image_path.is_file():
-            omissions.append({"item_id": item_id, "page": page, "reason": "source_page_image_unavailable"})
+        entry = entries.get(record["row_index"])
+        issues = _evidence_coverage_issues(entry) if entry else ["missing_source_regions"]
+        if issues:
+            omissions.append({"item_id": item_id, "page": page, "reason": ",".join(issues)})
             continue
+        filename = f"{record['row_index']:06d}_{hashlib.sha1(item_id.encode('utf-8')).hexdigest()[:10]}.png"
+        target = evidence_dir / filename
         try:
-            with Image.open(image_path) as image:
-                image.load()
-                box = _bbox_pixels(record, image.width, image.height)
-                if box is None:
-                    omissions.append({"item_id": item_id, "page": page, "reason": "bbox_unavailable"})
-                    continue
-                crop = image.crop(box).convert("L")
-                filename = f"{record['row_index']:06d}_{hashlib.sha1(item_id.encode('utf-8')).hexdigest()[:10]}.png"
-                target = evidence_dir / filename
-                crop.save(target, format="PNG", optimize=True, compress_level=9)
-                output[item_id] = f"evidence/{filename}"
+            rendered = render_review_image(entry, target, source_pixels=True)
+            if not rendered or not target.is_file():
+                omissions.append({"item_id": item_id, "page": page, "reason": "source_crop_unavailable"})
+                continue
+            _review_layout_sidecar_path(target).unlink(missing_ok=True)
+            output[item_id] = f"evidence/{filename}"
+            record["scan_pages"] = list(entry.pages or (entry.page,))
         except Exception as exc:
             omissions.append({"item_id": item_id, "page": page, "reason": f"crop_failed:{type(exc).__name__}"})
     return output, omissions
@@ -877,10 +872,10 @@ def _instructions() -> str:
 
     1. 阅读 `02_consensus_summary.json`，确认模型健康状态与 `role_evidence`。逐列、整页、全列和分歧复核是不同证据角色；第三主槽虽保留历史 key `sentence`，实际输入粒度为完整物理列，不得把角色差异抹平。
     2. `04_all_items_index.jsonl` 中标记为 `local_adjudicated` 的条目已经通过本地裁决并冻结，禁止重新裁决；它们不会出现在 `03_conflict_items.jsonl`。
-    3. 逐条查看 `03_conflict_items.jsonl` 的原始候选、角色/引擎、`evidence_groups`、标准日文副本、`conflict_type`、Consensus Entropy、结构化前后文和可用裁切图。
+    3. 先看每条 `evidence_paths` 指向的原始扫描裁片，按物理列从右向左逐字抄录，再用 `candidate_contrasts` 定位差字，核对候选相同的部分。`scan_pages` 是裁片对应的实际原图页。
     4. `seeded_reuse=true` 的候选只是为了保持句结构，**不是独立 OCR 证据，严禁计票**；只使用 `independently_executed=true` 的候选判断。
     5. `consensus_entropy` 只表示模型彼此接近程度，不证明多数一定正确；不得仅凭低熵覆盖图像证据。
-    6. `structural_punctuation_only` / `punctuation_or_whitespace_only` 条目优先保留本地原始标点风格；引号、括号、省略号、中点、横线等结构标点只有图像明确支持时才改。
+    6. 同一行涉及相似汉字、小假名、专名、数字或明显不同于全部候选时，放大原图再独立核对一次。前后文只用来定位疑点。没有清楚的图像证据时保留原文并标记 `source:"uncertain"`，此时 `selected_text` 可留空。
     7. 创建 `decisions.json`，schema 必须是 `{DECISIONS_SCHEMA}`。
     8. 每个冲突 ID 恰好给出一次决定；不得返回冻结 ID。
     9. 运行：
@@ -902,7 +897,7 @@ def _instructions() -> str:
         {{
           "item_id": "row:...",
           "selected_text": "最终日文",
-          "source": "candidate|corrected_from_image|contextual_reconstruction",
+          "source": "candidate|corrected_from_image|uncertain",
           "confidence": 0.98,
           "reason_code": "glyph_and_context_support",
           "evidence": ["evidence/....png"]
@@ -1121,10 +1116,13 @@ def main():
         if item_id not in editable: raise SystemExit(f"未知冲突 ID：{item_id}")
         if item_id in by_id: raise SystemExit(f"重复决定：{item_id}")
         selected = str(row.get("selected_text", ""))
-        if not selected.strip(): raise SystemExit(f"空决定：{item_id}")
+        if row.get("source") != "uncertain" and not selected.strip():
+            raise SystemExit(f"空决定：{item_id}")
         by_id[item_id] = row
     missing = sorted(editable - set(by_id))
     if missing: raise SystemExit(f"尚有 {len(missing)} 个冲突未裁决，首项：{missing[0]}")
+    unresolved = sorted(item_id for item_id, row in by_id.items() if row.get("source") == "uncertain")
+    updates = set(by_id) - set(unresolved)
     skeleton = root / manifest["paths"]["skeleton_epub"]
     output = Path(args.output); output.parent.mkdir(parents=True, exist_ok=True)
     changed = []; found = set(); entries = []
@@ -1140,7 +1138,7 @@ def main():
                     item_id = elem.attrib.get("data-item-id", "")
                     if item_id:
                         found.add(item_id)
-                        if item_id in by_id:
+                        if item_id in updates:
                             selected = str(by_id[item_id]["selected_text"])
                             set_text_preserving_ruby(elem, selected); changed.append({"item_id":item_id,"text_sha256":text_sha(selected)}); touched = True
                         for key in list(elem.attrib):
@@ -1156,7 +1154,7 @@ def main():
             if info.filename == "mimetype": continue
             zi = copy.copy(info); zi.compress_type = zipfile.ZIP_DEFLATED
             zout.writestr(zi, data, compress_type=zipfile.ZIP_DEFLATED, compresslevel=9)
-    audit = {"schema":"novel_formatter.ai_disagreement_apply_audit.v1","package_id":manifest["package_id"],"output":str(output),"decision_count":len(by_id),"changed":changed,"frozen_item_count":len(frozen),"unresolved_count":0}
+    audit = {"schema":"novel_formatter.ai_disagreement_apply_audit.v1","package_id":manifest["package_id"],"output":str(output),"decision_count":len(by_id),"changed":changed,"frozen_item_count":len(frozen),"unresolved_count":len(unresolved),"unresolved_item_ids":unresolved}
     Path(args.audit).write_text(json.dumps(audit, ensure_ascii=False, indent=2), encoding="utf-8")
     print(json.dumps(audit, ensure_ascii=False, indent=2))
 if __name__ == "__main__": main()
@@ -1344,7 +1342,7 @@ def export_ai_disagreement_package_v5(
         finally:
             shutil.rmtree(structure_temp, ignore_errors=True)
 
-        crop_paths, crop_omissions = _export_conflict_crops(folder, package, records)
+        crop_paths, crop_omissions = _export_conflict_crops(folder, package, records, primary_doc)
         for record in records:
             if record["item_id"] in crop_paths:
                 record["evidence_paths"] = [crop_paths[record["item_id"]]]
@@ -1362,6 +1360,8 @@ def export_ai_disagreement_package_v5(
                 "confidence": 0.0, "reason_code": "", "evidence": record["evidence_paths"],
             }
             conflicts.append(conflict)
+        priority_order = {"critical": 0, "high": 1, "medium": 2}
+        conflicts.sort(key=lambda record: (priority_order.get(record["review_priority"], 3), record["row_index"]))
 
         package_id = str(package.get("package_id", "") or hashlib.sha256(os.urandom(32)).hexdigest()[:24])
         structure_sha = str(package.get("structure_sha256", "") or "")

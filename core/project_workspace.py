@@ -1064,6 +1064,47 @@ class ProjectWorkspaceManager:
         )
         return stage_path
 
+    def reset_local_ocr(self) -> Path:
+        """Archive the processed workspace and make the next OCR run start cold."""
+        project = self._require_project()
+        paths = (
+            "artifacts/stages", "artifacts/ocr", "artifacts/compare",
+            "artifacts/cache/ocr_model", "artifacts/checkpoints/ocr",
+            "artifacts/segment_cache", "adjudication",
+        )
+        # Keep the archived object references under revisions so storage
+        # compaction still sees them. Page state and exported files stay live.
+        archive = project / "revisions" / "ocr_resets" / uuid.uuid4().hex
+        archive.mkdir(parents=True)
+        original = self._read_project_payload(project)
+        atomic_write_text(archive / PROJECT_FILE, json.dumps(original, ensure_ascii=False, indent=2))
+        moved = []
+        metadata_updated = False
+        try:
+            for relative in paths:
+                source = project / relative
+                if not source.exists():
+                    continue
+                target = archive / relative
+                target.parent.mkdir(parents=True, exist_ok=True)
+                source.rename(target)
+                moved.append((source, target))
+            payload = dict(original)
+            payload.pop("active_stage", None)
+            payload.pop("document_page_lineage_hash", None)
+            payload.pop("last_run", None)
+            self._touch_project_payload(project, payload)
+            metadata_updated = True
+            ArtifactGraphStore(project).clear_current_paths(paths)
+        except Exception:
+            for source, target in reversed(moved):
+                target.rename(source)
+            if metadata_updated:
+                self._write_project_payload(project, original)
+            raise
+        self._checked_adjudication_journals.clear()
+        return archive
+
     def load_current_stage_document(self, *, require_compatible_pages: bool = True) -> tuple[str, dict] | None:
         project = self._require_project()
         path = project / "artifacts" / "stages" / "current.json"

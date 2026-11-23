@@ -75,6 +75,7 @@ _EXACT_EN = {
     "默认打开设置页": "Default settings tab",
     "引擎": "Engine",
     "分列与组句": "Columns & Sentences",
+    "横排版面": "Horizontal Layout",
     "逐字审校": "Character Review",
     "逐字审校默认启用": "Enable character review by default",
     "逐字审校设置默认展开": "Expand character review settings by default",
@@ -435,6 +436,7 @@ _EXACT_JA = {
     "默认打开设置页": "既定の設定タブ",
     "引擎": "エンジン",
     "分列与组句": "列分割と文結合",
+    "横排版面": "横書きレイアウト",
     "逐字审校": "文字単位校正",
     "逐字审校默认启用": "文字単位校正を既定で有効化",
     "逐字审校设置默认展开": "文字単位校正の設定を既定で展開",
@@ -3661,7 +3663,7 @@ _EXACT_EN.update({
     "分列输入预览 · {page_name} · {column_count} 列": "Column Input Preview · {page_name} · {column_count} columns",
     "已复用当前实时预览页的同一组物理列；": "Reused the same physical columns from the current live-preview page; ",
     "当前页尚无实时分列结果，已按现有参数重新检测；": "No live column result exists for this page, so it was detected again with the current settings; ",
-    "页面：{page_name}。{sync_note}左侧红色实线为检测框、绿色实线为 OCR 输入原像素范围，按日文阅读顺序从右到左编号，共 {column_count} 列；右侧展示当前实际输入：{mode_label}，尺寸 {width}×{height}。绿色输入框之外仍可存在纯白安全槽上下文；目标正文保持原始像素，其他列与 Ruby 均被纸白色隔离。": "Page: {page_name}. {sync_note}On the left, red solid lines are detector boxes and green solid lines show the native-pixel OCR input range. Columns are numbered right-to-left in Japanese reading order ({column_count} total). The right pane shows the actual current input: {mode_label}, size {width}×{height}. Pure-white safe-slot context may remain outside the green input box; target body pixels stay original while other columns and Ruby are isolated with paper white.",
+    "页面：{page_name}。{sync_note}左侧琥珀色虚线为检测框，青绿色实线为 OCR 输入原像素范围，共 {column_count} 列。\n右侧为当前列的实际输入：{mode_label}，尺寸 {width}×{height}。": "Page: {page_name}. {sync_note}Left: amber dashes mark detected columns. Solid teal marks the original pixels used for OCR ({column_count} columns).\nRight: actual input for the current column, {mode_label} ({width}×{height}).",
     "NDLOCR 整列上下文": "NDLOCR full-column context",
     "单列原像素视窗": "Single-column native-pixel viewport",
     "单列 mask 视窗": "Single-column mask viewport",
@@ -3689,7 +3691,7 @@ _EXACT_JA.update({
     "分列输入预览 · {page_name} · {column_count} 列": "列入力プレビュー · {page_name} · {column_count} 列",
     "已复用当前实时预览页的同一组物理列；": "現在のライブプレビューページと同じ物理列を再利用しました。",
     "当前页尚无实时分列结果，已按现有参数重新检测；": "このページにはライブ列結果がないため、現在の設定で再検出しました。",
-    "页面：{page_name}。{sync_note}左侧红色实线为检测框、绿色实线为 OCR 输入原像素范围，按日文阅读顺序从右到左编号，共 {column_count} 列；右侧展示当前实际输入：{mode_label}，尺寸 {width}×{height}。绿色输入框之外仍可存在纯白安全槽上下文；目标正文保持原始像素，其他列与 Ruby 均被纸白色隔离。": "ページ：{page_name}。{sync_note}左側では赤い実線が検出枠、緑の実線がOCR元画素入力範囲です。日本語の読書順に右から左へ番号を付け、全{column_count}列です。右側には現在の実入力：{mode_label}、サイズ {width}×{height} を表示します。緑の入力枠外に純白の安全スロット文脈が残る場合がありますが、対象本文は元画素のまま、他列とRubyは紙白で隔離されます。",
+    "页面：{page_name}。{sync_note}左侧琥珀色虚线为检测框，青绿色实线为 OCR 输入原像素范围，共 {column_count} 列。\n右侧为当前列的实际输入：{mode_label}，尺寸 {width}×{height}。": "ページ：{page_name}。{sync_note}左側の琥珀色の破線は検出枠、青緑色の実線はOCRに使う元画素の範囲です（全{column_count}列）。\n右側は現在の列の実入力です。{mode_label}（{width}×{height}）。",
     "NDLOCR 整列上下文": "NDLOCR 列全体コンテキスト",
     "单列原像素视窗": "単列・元画素ビューポート",
     "单列 mask 视窗": "単列 mask ビューポート",
@@ -4966,12 +4968,12 @@ _EXACT_JA.update({
 })
 
 _EXACT_EN.update({
-    "显示/隐藏右侧实时预览中的红色实线检测框": "Show/hide the red solid detector boxes in the live preview",
-    "显示/隐藏右侧实时预览中的绿色实线 OCR 输入原像素框": "Show/hide the green solid original-pixel OCR input boxes in the live preview",
+    "显示或隐藏琥珀色虚线检测框": "Show or hide amber dashed detector boxes",
+    "显示或隐藏青绿色实线 OCR 输入框": "Show or hide teal solid OCR input boxes",
 })
 _EXACT_JA.update({
-    "显示/隐藏右侧实时预览中的红色实线检测框": "リアルタイムプレビューの赤い実線検出枠を表示/非表示",
-    "显示/隐藏右侧实时预览中的绿色实线 OCR 输入原像素框": "リアルタイムプレビューの緑の実線OCR入力原画素枠を表示/非表示",
+    "显示或隐藏琥珀色虚线检测框": "琥珀色の破線の検出枠を表示または非表示",
+    "显示或隐藏青绿色实线 OCR 输入框": "青緑色の実線のOCR入力枠を表示または非表示",
 })
 
 

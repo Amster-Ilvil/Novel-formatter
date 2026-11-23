@@ -171,13 +171,40 @@ class MultimodalClient:
     def call_json(
         self, prompt: str, image_paths: Iterable[str | Path], *,
         temperature: float = 0.0, reasoning_effort: str | None = None,
-        cancel_check=None,
+        cancel_check=None, single_attempt: bool = False,
     ) -> str:
         images = [str(Path(p)) for p in image_paths]
         if not images:
             raise ValueError("multimodal request requires at least one image")
+        if self.provider == "chatgpt_subscription":
+            # SIWC preview supports images for eligible selected models.
+            # Never silently fall back to a paid API Key on failure.
+            if cancel_check and cancel_check():
+                raise RuntimeError("AI 图文处理已停止")
+            if len(images) > 10:
+                raise MultimodalCapabilityError("单次 ChatGPT 订阅视觉请求最多 10 张图片，请拆分裁决批次。")
+            for image in images:
+                if not Path(image).is_file():
+                    raise MultimodalImageInputError("待裁决图片文件不存在。")
+            from .chatgpt_subscription import chatgpt_subscription_request, ChatGPTSubscriptionError
+            self._record_transport_attempt(retry=False)
+            try:
+                data = chatgpt_subscription_request(
+                    "respond", timeout=int(self.settings.request_timeout),
+                    model=self.settings.model, prompt=prompt,
+                    imagePaths=[str(Path(image).resolve()) for image in images],
+                )
+            except ChatGPTSubscriptionError as exc:
+                # The bridge strips raw prompts, tokens, URLs and network error
+                # bodies from diagnostic output. Do not leak submitted scans.
+                raise MultimodalCapabilityError(str(exc)) from exc
+            result = data.get("text") if isinstance(data, dict) else None
+            if not isinstance(result, str) or not result.strip():
+                raise MultimodalCapabilityError("ChatGPT 视觉裁决没有返回可用文本，请重新检查模型的图像能力。")
+            self._record_usage()
+            return result
         provider = self.provider
-        max_attempts = 3
+        max_attempts = 1 if single_attempt else 3
         last_error: Exception | None = None
         for attempt in range(max_attempts):
             if cancel_check and cancel_check():
@@ -187,7 +214,14 @@ class MultimodalClient:
                 if provider == "anthropic":
                     return self._call_anthropic(prompt, images, temperature)
                 if provider == "gemini":
+                    if single_attempt:
+                        return self._call_gemini(prompt, images, temperature, single_attempt=True)
                     return self._call_gemini(prompt, images, temperature)
+                if single_attempt:
+                    return self._call_openai_compatible(
+                        prompt, images, temperature, reasoning_effort=reasoning_effort,
+                        allow_compatibility_retry=False,
+                    )
                 if reasoning_effort is None:
                     return self._call_openai_compatible(prompt, images, temperature)
                 try:
@@ -363,12 +397,15 @@ class MultimodalClient:
     def _call_openai_compatible(
         self, prompt: str, images: list[str], temperature: float, *,
         reasoning_effort: str | None = None,
+        allow_compatibility_retry: bool = True,
     ) -> str:
         params = self._openai_request_params(prompt, images, temperature, reasoning_effort=reasoning_effort)
         client = self._next_openai_client()
         try:
             response = client.chat.completions.create(**params)
         except Exception as exc:
+            if not allow_compatibility_retry:
+                raise
             # OpenAI-compatible vendors vary in support for JSON mode and
             # temperature/reasoning parameters.  Retry only by removing optional
             # controls; never mutate the image payload or silently fall back to a
@@ -499,53 +536,71 @@ class MultimodalClient:
                     self._gemini_model = genai.GenerativeModel(self.settings.model)
         return self._gemini_model
 
-    def _call_gemini(self, prompt: str, images: list[str], temperature: float) -> str:
-        try:
-            import google.generativeai as genai
-            from PIL import Image
-        except ImportError as exc:
-            raise ImportError("请安装 google-generativeai 和 Pillow") from exc
-        model = self._get_gemini_model()
-        opened = []
-        try:
-            for path in images:
-                image = Image.open(path)
-                image.load()
-                opened.append(image)
-            config_kwargs = {
-                "temperature": float(temperature),
-                "max_output_tokens": int(self.settings.max_tokens or 24000),
-            }
-            if bool(self.settings.json_mode):
-                config_kwargs["response_mime_type"] = "application/json"
-            try:
-                response = model.generate_content(
-                    [prompt, *opened],
-                    generation_config=genai.types.GenerationConfig(**config_kwargs),
-                )
-            except Exception as exc:
-                if "response_mime_type" not in str(exc).lower():
-                    raise
-                config_kwargs.pop("response_mime_type", None)
-                response = model.generate_content(
-                    [prompt, *opened],
-                    generation_config=genai.types.GenerationConfig(**config_kwargs),
-                )
-            usage = getattr(response, "usage_metadata", None)
-            self._record_usage(
-                prompt=getattr(usage, "prompt_token_count", 0) if usage else 0,
-                completion=getattr(usage, "candidates_token_count", 0) if usage else 0,
-                total=getattr(usage, "total_token_count", 0) if usage else 0,
-                cached=getattr(usage, "cached_content_token_count", 0) if usage else 0,
-                reasoning=getattr(usage, "thoughts_token_count", 0) if usage else 0,
-            )
-            return str(getattr(response, "text", "") or "")
-        finally:
-            for image in opened:
-                try:
-                    image.close()
-                except Exception:
-                    pass
+    def _call_gemini(self, prompt: str, images: list[str], temperature: float, *, single_attempt: bool = False) -> str:
+        # Use the same current REST API as structured OCR, without the obsolete
+        # google-generativeai package. No key/image bytes written to disk.
+        from ai.gemini_ocr_transport import GeminiJsonTransport
+        if not hasattr(self, "_gemini_rest_transport"):
+            with self._gemini_model_lock:
+                if not hasattr(self, "_gemini_rest_transport"):
+                    self._gemini_rest_transport = GeminiJsonTransport(
+                        api_key=validate_api_key(self.settings.api_key),
+                        model=self.settings.model,
+                        request_timeout=getattr(self.settings, "request_timeout", 180),
+                        rpm=getattr(self.settings, "rpm_limit", 0),
+                        tpm=getattr(self.settings, "tpm_limit", 0),
+                        rpd=getattr(self.settings, "gemini_rpd_limit", 0),
+                        free_mode=getattr(self.settings, "gemini_free_mode", True),
+                    )
+        transport = self._gemini_rest_transport
+        return transport.generate(
+            prompt, images, schema=None, json_mode=bool(self.settings.json_mode),
+            max_output_tokens=int(self.settings.max_tokens or 24000), temperature=temperature,
+            single_attempt=single_attempt, usage_callback=self._record_usage,
+        )
+
+    def call_json_structured(
+        self, prompt: str, image_paths: Iterable[str | Path], *,
+        response_schema: dict, temperature: float = 0.0,
+        reasoning_effort: str | None = None, cancel_check=None,
+        progress_callback=None, single_attempt: bool = False,
+    ) -> str:
+        """Strict Gemini JSON schema over the official HTTPS REST transport.
+
+        Other provider clients retain their established call_json() contract.
+        The API key remains in memory and is never written to an OCR cache.
+        """
+        if self.provider != "gemini":
+            return self.call_json(prompt, image_paths, temperature=temperature,
+                                  reasoning_effort=reasoning_effort,
+                                  cancel_check=cancel_check, single_attempt=single_attempt)
+        from ai.gemini_ocr_transport import GeminiJsonTransport
+        if not hasattr(self, "_gemini_structured_transport"):
+            with self._gemini_model_lock:
+                if not hasattr(self, "_gemini_structured_transport"):
+                    self._gemini_structured_transport = GeminiJsonTransport(
+                        api_key=validate_api_key(self.settings.api_key),
+                        model=self.settings.model,
+                        request_timeout=getattr(self.settings, "request_timeout", 180),
+                        rpm=getattr(self.settings, "rpm_limit", 0),
+                        tpm=getattr(self.settings, "tpm_limit", 0),
+                        rpd=getattr(self.settings, "gemini_rpd_limit", 0),
+                        free_mode=getattr(self.settings, "gemini_free_mode", True),
+                    )
+        transport = self._gemini_structured_transport
+
+        def on_transport_progress(event: dict) -> None:
+            if str(event.get("event", "")) == "attempt":
+                self._record_transport_attempt(retry=int(event.get("attempt", 1) or 1) > 1)
+            if progress_callback:
+                progress_callback(event)
+
+        return transport.generate(
+            prompt, list(image_paths), schema=response_schema,
+            max_output_tokens=int(self.settings.max_tokens or 12000),
+            cancel_check=cancel_check, progress_callback=on_transport_progress,
+            single_attempt=single_attempt, usage_callback=self._record_usage,
+        )
 
     def close(self) -> None:
         with self._client_lock:

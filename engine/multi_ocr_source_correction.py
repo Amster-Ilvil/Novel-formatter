@@ -1397,6 +1397,7 @@ def _geometry_snapshot(doc: UnifiedDocument) -> dict[str, dict]:
                     result[column_id] = {
                         "column_id": column_id,
                         "page": int(region.get("page", getattr(block, "page", 0)) or 0),
+                        "page_path": str(region.get("page_path", "") or ""),
                         "bbox": [float(value or 0.0) for value in bbox],
                     }
         ids = _column_ids(metadata)
@@ -2595,7 +2596,7 @@ def _ai_visual_review_reasons(task: dict) -> list[str]:
     return list(dict.fromkeys(reasons))
 
 
-def _build_ai_evidence_cost_plan(batch: Sequence[dict], review_passes: dict) -> dict:
+def _build_ai_evidence_cost_plan(batch: Sequence[dict], review_passes: dict, *, scan_first: bool = False) -> dict:
     """Order remaining row review by evidence cost without changing answers."""
     task_by_id = {str(task.get("id", "") or ""): task for task in batch}
     row_ids = [
@@ -2608,6 +2609,8 @@ def _build_ai_evidence_cost_plan(batch: Sequence[dict], review_passes: dict) -> 
     for task_id in row_ids:
         task = task_by_id[task_id]
         reasons = _ai_visual_review_reasons(task)
+        if scan_first:
+            reasons = list(dict.fromkeys([*reasons, "publication_scan_first"]))
         if reasons:
             visual_required.append({
                 "id": task_id,
@@ -2623,7 +2626,7 @@ def _build_ai_evidence_cost_plan(batch: Sequence[dict], review_passes: dict) -> 
             text_first.append(task_id)
     visual_ids = [item["id"] for item in visual_required]
     return {
-        "strategy": "lowest_evidence_cost_first",
+        "strategy": "publication_scan_first" if scan_first else "lowest_evidence_cost_first",
         "anchor_text_first_task_ids": anchor_text_first,
         "text_first_task_ids": text_first,
         "visual_required": visual_required,
@@ -2635,7 +2638,7 @@ def _build_ai_evidence_cost_plan(batch: Sequence[dict], review_passes: dict) -> 
             "visual_required": len(visual_required),
             "row_review": len(row_ids),
         },
-        "contract": "Priority changes review order only. Any text-first row may still open its original image when evidence is insufficient; every visual_required row must inspect source pixels before answering.",
+        "contract": "Inspect source pixels for every visual_required row before answering.",
     }
 
 
@@ -2730,6 +2733,8 @@ def _build_ai_batch_review_passes(
     batch: Sequence[dict],
     batch_groups: Sequence[dict],
     batch_anchors: Sequence[dict],
+    *,
+    scan_first: bool = False,
 ) -> dict:
     """Build a non-overlapping strong-group-first web review plan.
 
@@ -2779,7 +2784,10 @@ def _build_ai_batch_review_passes(
             continue
         term = str(group.get("term", "") or "")
         member_hints = [_ai_group_member_hint(task_by_id[task_id], term) for task_id in task_ids]
-        direct_task_ids = [
+        if scan_first:
+            for hint in member_hints:
+                hint.pop("direct_pick", None)
+        direct_task_ids = [] if scan_first else [
             str(item.get("id", "") or "")
             for item in member_hints
             if bool(item.get("anchor_only")) and isinstance(item.get("direct_pick"), int)
@@ -2802,13 +2810,17 @@ def _build_ai_batch_review_passes(
         if str(task.get("id", "") or "") not in direct
     ]
     return {
-        "strategy": "strong_group_first_then_row",
+        "strategy": "publication_scan_first" if scan_first else "strong_group_first_then_row",
         "group_first": group_first,
         "grouped_task_count": len(assigned),
         "direct_after_group_count": len(direct),
         "row_review_task_ids": row_review_task_ids,
         "row_review_count": len(row_review_task_ids),
-        "contract": "A group decision never replaces row output: write one independent answer per stable task id. direct_pick is usable only after accepting that strong in-book anchor for the group; residual rows still require normal row evidence review.",
+        "contract": (
+            "Book anchors help locate text variants. Inspect each original crop and return one answer per task."
+            if scan_first else
+            "Write one answer per stable task id. Use direct_pick only after confirming the in-book anchor."
+        ),
     }
 
 def _ai_visible_quick_tasks(
@@ -2854,6 +2866,8 @@ def _ai_visible_quick_tasks(
             entry["x"] = anchors
         if task.get("risk"):
             entry["r"] = task.get("risk")
+        if task.get("scan_pages"):
+            entry["scan_pages"] = task["scan_pages"]
         visible.append(entry)
     return visible
 
@@ -2865,6 +2879,7 @@ def _write_ai_quick_bundle(
     payload: dict,
     compact_ai_tasks: Sequence[dict],
     direct_output: bool = False,
+    scan_first: bool = False,
 ) -> dict:
     """Create the GPT-facing adjudication exchange ZIP.
 
@@ -2902,6 +2917,7 @@ def _write_ai_quick_bundle(
         })
     review_batches = []
     batch_size = 40
+    sheet_size = 4 if scan_first else 8
     shared_context_by_id = {str(item.get("id", "")): item for item in shared_context}
     visible_task_by_id = {str(item.get("id", "")): item for item in visible_tasks}
     book_term_aggregate: dict[tuple[str, str], dict] = {}
@@ -2951,8 +2967,8 @@ def _write_ai_quick_bundle(
             }
             for anchor in batch_anchors
         ]
-        review_passes = _build_ai_batch_review_passes(batch, batch_groups, batch_anchors_compact)
-        evidence_cost = _build_ai_evidence_cost_plan(batch, review_passes)
+        review_passes = _build_ai_batch_review_passes(batch, batch_groups, batch_anchors_compact, scan_first=scan_first)
+        evidence_cost = _build_ai_evidence_cost_plan(batch, review_passes, scan_first=scan_first)
         for group in review_passes.get("group_first") or []:
             anchor_id = str(group.get("anchor_id", "") or "")
             term = str(group.get("term", "") or "")
@@ -3010,7 +3026,9 @@ def _write_ai_quick_bundle(
             "anchor_text_first": int((evidence_cost.get("counts") or {}).get("anchor_text_first", 0) or 0),
             "text_first": int((evidence_cost.get("counts") or {}).get("text_first", 0) or 0),
             "visual_required": int((evidence_cost.get("counts") or {}).get("visual_required", 0) or 0),
-            "visual_sheet_count": (int((evidence_cost.get("counts") or {}).get("visual_required", 0) or 0) + 7) // 8,
+            "visual_sheet_count": (
+                sum(bool(item.get("image")) for item in evidence_cost["visual_required"]) + sheet_size - 1
+            ) // sheet_size,
         })
 
     ordered_book_terms = sorted(
@@ -3050,7 +3068,7 @@ def _write_ai_quick_bundle(
                     for candidate in (task.get("c") or [])
                     if isinstance(candidate, dict)
                 ],
-                "i": str(task.get("i", "") or ""),
+                "i": "" if scan_first else str(task.get("i", "") or ""),
             })
         book_term_entries.append({
             "id": term_id,
@@ -3099,6 +3117,7 @@ def _write_ai_quick_bundle(
         "finish_command": "python adjudicate.py finish",
         "full_package": "" if direct_output else output.name,
         "authority_hidden": True,
+        "scan_first": scan_first,
         "physical_column_evidence_in_full_package": False if direct_output else True,
         "start_here": "00_GPT_START_HERE.md",
         "task_path": "04_ai_tasks_compact.jsonl",
@@ -3216,6 +3235,22 @@ def _write_ai_quick_bundle(
 
 最终只交回 `AI_IMPORT.zip`；不要修改原 OCR JSON、图片、manifest 或 `_BINDINGS`。
 """
+    if scan_first:
+        instructions = """# GPT OCR 裁决包
+
+逐批处理 `BATCHES/Bxxx_REVIEW.json`。先打开其中的 `visual_sheets` 或每条 `i` 指向的原始扫描裁片，按打印编号逐条抄写。日文竖排从右往左读列，每列自上而下，忽略振假名。随后用 `c` 和 `diff_hints` 定位差字并核对整句，也要检查候选一致的部分。`scan_pages` 指向实际扫描页。
+
+数字、否定、姓名、相似汉字、小假名、浊点、长横线及跨列接续需要放大核对。仅用包内书内词形和邻句辅助定位。遇到两个模型都错时，按裁片写下完整原文。图像不清、缺列或无法确认时将该条标为未决。保留作者的异体字、口语和可见标点。
+
+运行 `python adjudicate.py status` 检查任务数。往 `AI_OUTPUT/answers.jsonl` 写每条 ID 的一个答案：
+
+- 选现有候选：`{"id":"T00001","pick":0,"confidence":0.99,"reason":"scan_confirmed"}`
+- 图中可读的新文本：`{"id":"T00002","text":"完整正确正文","confidence":0.98,"reason":"corrected_from_image"}`
+- 扫描确认是当前行应删除的非正文：`{"id":"T00003","delete_intentionally":true,"confidence":0.99,"reason":"scan_confirmed_page_noise"}`
+- 证据不足：`{"id":"T00004","unresolved":true}`
+
+原始候选、图像和密封绑定保持原样。运行 `python adjudicate.py validate`，再运行 `python adjudicate.py finish` 生成 `AI_IMPORT.zip`。原始扫描与本地 OCR 是裁决依据。电子版可在结果确定后用于评估。
+"""
     with atomic_output_path(quick_output) as quick_tmp:
         with zipfile.ZipFile(quick_tmp, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=1) as archive:
             archive.writestr("manifest.json", _json_bytes(manifest, pretty=True))
@@ -3231,6 +3266,13 @@ def _write_ai_quick_bundle(
                 "5. 完成后运行 `python adjudicate.py validate` 与 `python adjudicate.py finish`，交回 `AI_IMPORT.zip`。\n\n"
                 "详细规则见 `AGENTS.md`。\n"
             )
+            if scan_first:
+                start_here = (
+                    "# Novel Formatter · GPT 出版裁决\n\n"
+                    "打开 `01_REVIEW_PLAN.json`，依次处理 `BATCHES/Bxxx_REVIEW.json`。"
+                    "每条先看裁片，再用候选和差字定位核对。规则和答案格式见 `AGENTS.md`。\n\n"
+                    "完成后运行 `python adjudicate.py validate` 和 `python adjudicate.py finish`，交回 `AI_IMPORT.zip`。\n"
+                )
             archive.writestr("00_GPT_START_HERE.md", start_here.encode("utf-8"))
             archive.writestr("AGENTS.md", instructions.encode("utf-8"))
             review_plan = {
@@ -3248,9 +3290,9 @@ def _write_ai_quick_bundle(
                 "batch_group_decision_count": batch_group_decision_count,
                 "cross_batch_reused_term_decisions": cross_batch_reused_decisions,
                 "evidence_cost_totals": evidence_cost_totals,
-                "visual_sheet_max_items": 8,
+                "visual_sheet_max_items": sheet_size,
                 "batches": review_batches,
-                "recommended_order": [
+                "recommended_order": ["visual_required_contact_sheets", "global_consistency_audit"] if scan_first else [
                     "book_term_pass_copy_direct_answers",
                     "anchor_text_first",
                     "text_first",
@@ -3339,7 +3381,7 @@ def _write_ai_quick_bundle(
                     }
                     for anchor in batch_anchors
                 ]
-                review_passes = _build_ai_batch_review_passes(batch, batch_groups, batch_anchors_compact)
+                review_passes = _build_ai_batch_review_passes(batch, batch_groups, batch_anchors_compact, scan_first=scan_first)
                 for group in review_passes.get("group_first") or []:
                     book_term_id = book_term_id_by_key.get((
                         str(group.get("anchor_id", "") or ""),
@@ -3349,16 +3391,20 @@ def _write_ai_quick_bundle(
                         group["book_term_id"] = book_term_id
                         group["decision_source"] = "BOOK_TERM_PASS.json"
                         group["fallback_task_ids_if_not_accepted"] = list(group.get("task_ids") or [])
-                review_passes["strategy"] = "book_term_copy_ready_then_b49_hard_error_guard_visual_sheet_dedup"
+                if not scan_first:
+                    review_passes["strategy"] = "book_term_copy_ready_then_b49_hard_error_guard_visual_sheet_dedup"
                 review_passes["book_term_review_path"] = "BOOK_TERM_PASS.json"
                 review_passes["row_review_task_ids_if_all_terms_rejected"] = [
                     str(task.get("id", "") or "") for task in batch if str(task.get("id", "") or "")
                 ]
-                evidence_cost = _build_ai_evidence_cost_plan(batch, review_passes)
-                visual_items = list(evidence_cost.get("visual_required") or [])
+                evidence_cost = _build_ai_evidence_cost_plan(batch, review_passes, scan_first=scan_first)
+                visual_items = [
+                    item for item in evidence_cost["visual_required"]
+                    if item.get("image") and (folder / item["image"]).is_file()
+                ]
                 visual_sheets = []
-                for sheet_number, offset in enumerate(range(0, len(visual_items), 8), start=1):
-                    sheet_items = visual_items[offset:offset + 8]
+                for sheet_number, offset in enumerate(range(0, len(visual_items), sheet_size), start=1):
+                    sheet_items = visual_items[offset:offset + sheet_size]
                     sheet_path = f"VISUAL_REVIEW/B{batch_index:03d}_S{sheet_number:02d}.webp"
                     sheet_bytes = _ai_visual_contact_sheet_bytes(sheet_items, folder)
                     if sheet_bytes:
@@ -3455,6 +3501,7 @@ def _export_conflict_images(
     *,
     progress_callback: ProgressCallback | None = None,
     max_height: int = 1600,
+    native_resolution: bool = False,
 ) -> int:
     """Export compact, lossless review evidence without touching OCR inputs.
 
@@ -3484,14 +3531,25 @@ def _export_conflict_images(
         for column_id, region in _geometry_snapshot(document).items():
             geometry.setdefault(column_id, region)
         for page_no, image_path in _page_paths(document).items():
-            if image_path:
+            if image_path and Path(image_path).is_file():
                 pages.setdefault(page_no, image_path)
+    for region in geometry.values():
+        image_path = str(region.get("page_path", "") or "")
+        if image_path and Path(image_path).is_file():
+            pages.setdefault(region["page"], image_path)
     grouped: dict[int, list[tuple[dict, list[dict]]]] = {}
     for row in rows:
         if not row.get("editable"):
             continue
-        regions = [geometry.get(str(column_id)) for column_id in row.get("column_ids", [])]
+        expected = row.get("column_ids") or []
+        regions = [geometry.get(str(column_id)) for column_id in expected]
         regions = [region for region in regions if isinstance(region, dict)]
+        if native_resolution and len(regions) != len(expected):
+            row.setdefault("evidence_export_errors", []).append({
+                "stage": "scan_lineage", "error_type": "MissingPhysicalColumnGeometry",
+                "message": "Some declared physical columns have no original scan geometry.",
+            })
+            continue
         if not regions:
             continue
         page = int(regions[0].get("page", row.get("page", 0)) or 0)
@@ -3520,16 +3578,18 @@ def _export_conflict_images(
                     for region in regions:
                         x, y, w, h = [float(value or 0.0) for value in region.get("bbox", [0, 0, 0, 0])]
                         boxes.append((x * image.width, y * image.height, (x + w) * image.width, (y + h) * image.height))
-                    left = max(0, int(min(box[0] for box in boxes) - image.width * .012))
-                    top = max(0, int(min(box[1] for box in boxes) - image.height * .012))
-                    right = min(image.width, int(max(box[2] for box in boxes) + image.width * .012))
-                    bottom = min(image.height, int(max(box[3] for box in boxes) + image.height * .012))
+                    pad_x = 1 if native_resolution else image.width * .012
+                    pad_y = 1 if native_resolution else image.height * .012
+                    left = max(0, int(min(box[0] for box in boxes) - pad_x))
+                    top = max(0, int(min(box[1] for box in boxes) - pad_y))
+                    right = min(image.width, int(max(box[2] for box in boxes) + pad_x))
+                    bottom = min(image.height, int(max(box[3] for box in boxes) + pad_y))
                     if right <= left or bottom <= top:
                         continue
                     crop = image.crop((left, top, right, bottom))
                     original_size = tuple(int(value) for value in crop.size)
                     scale = 1.0
-                    if crop.height > max_height:
+                    if not native_resolution and crop.height > max_height:
                         scale = max_height / float(crop.height)
                         resized_width = max(1, int(round(crop.width * scale)))
                         resampling = getattr(getattr(Image, "Resampling", Image), "LANCZOS")
@@ -3544,6 +3604,9 @@ def _export_conflict_images(
                         row["evidence_image"] = target.relative_to(folder).as_posix()
                         row["evidence_image_meta"] = {
                             "profile": "canonical_role_evidence_v5",
+                            "source_pages": [page],
+                            "covered_column_ids": [region["column_id"] for region in regions],
+                            "coverage_complete": len(regions) == len(row.get("column_ids") or []),
                             "source_crop_size": list(original_size),
                             "exported_size": [int(crop.width), int(crop.height)],
                             "scale": round(float(scale), 8),
@@ -3572,17 +3635,19 @@ def _export_conflict_images(
                             if not isinstance(region, dict) or int(region.get("page", page) or page) != page:
                                 continue
                             x, y, w, h = [float(value or 0.0) for value in region.get("bbox", [0, 0, 0, 0])]
-                            c_left = max(0, int(x * image.width - image.width * .006))
-                            c_top = max(0, int(y * image.height - image.height * .006))
-                            c_right = min(image.width, int((x + w) * image.width + image.width * .006))
-                            c_bottom = min(image.height, int((y + h) * image.height + image.height * .006))
+                            pad_x = 1 if native_resolution else image.width * .006
+                            pad_y = 1 if native_resolution else image.height * .006
+                            c_left = max(0, int(x * image.width - pad_x))
+                            c_top = max(0, int(y * image.height - pad_y))
+                            c_right = min(image.width, int((x + w) * image.width + pad_x))
+                            c_bottom = min(image.height, int((y + h) * image.height + pad_y))
                             if c_right <= c_left or c_bottom <= c_top:
                                 continue
                             col_crop = image.crop((c_left, c_top, c_right, c_bottom))
                             col_source_size = tuple(int(value) for value in col_crop.size)
                             col_scale = 1.0
                             try:
-                                if col_crop.height > max_height:
+                                if not native_resolution and col_crop.height > max_height:
                                     col_scale = max_height / float(col_crop.height)
                                     resized_width = max(1, int(round(col_crop.width * col_scale)))
                                     resampling = getattr(getattr(Image, "Resampling", Image), "LANCZOS")
@@ -3685,17 +3750,19 @@ def _export_conflict_images(
                 for row, column_index, column_id, region in specs:
                     try:
                         x, y, w, h = [float(value or 0.0) for value in region.get("bbox", [0, 0, 0, 0])]
-                        c_left = max(0, int(x * image.width - image.width * .006))
-                        c_top = max(0, int(y * image.height - image.height * .006))
-                        c_right = min(image.width, int((x + w) * image.width + image.width * .006))
-                        c_bottom = min(image.height, int((y + h) * image.height + image.height * .006))
+                        pad_x = 1 if native_resolution else image.width * .006
+                        pad_y = 1 if native_resolution else image.height * .006
+                        c_left = max(0, int(x * image.width - pad_x))
+                        c_top = max(0, int(y * image.height - pad_y))
+                        c_right = min(image.width, int((x + w) * image.width + pad_x))
+                        c_bottom = min(image.height, int((y + h) * image.height + pad_y))
                         if c_right <= c_left or c_bottom <= c_top:
                             raise ValueError("empty physical-column evidence crop")
                         col_crop = image.crop((c_left, c_top, c_right, c_bottom))
                         col_source_size = tuple(int(value) for value in col_crop.size)
                         col_scale = 1.0
                         try:
-                            if col_crop.height > max_height:
+                            if not native_resolution and col_crop.height > max_height:
                                 col_scale = max_height / float(col_crop.height)
                                 resized_width = max(1, int(round(col_crop.width * col_scale)))
                                 resampling = getattr(getattr(Image, "Resampling", Image), "LANCZOS")
@@ -3765,7 +3832,7 @@ def _export_conflict_images(
             page_id = int(region.get("page", 0) or 0) if isinstance(region, dict) else 0
             if page_id > 0 and page_id not in page_ids:
                 page_ids.append(page_id)
-        if len(page_ids) <= 1:
+        if len(page_ids) <= 1 and not native_resolution:
             continue
 
         evidence_by_id = {
@@ -3833,7 +3900,7 @@ def _export_conflict_images(
                     "covered_column_ids": list(expected_ids),
                     "coverage_complete": True,
                     "source_pages": list(page_ids),
-                    "cross_page": True,
+                    "cross_page": len(page_ids) > 1,
                     "exported_size": [int(canvas.width), int(canvas.height)],
                     "mode": "L",
                     "format": "PNG",
@@ -3860,6 +3927,14 @@ def _export_conflict_images(
                     strip.close()
                 except Exception:
                     pass
+    if native_resolution:
+        for row in rows:
+            if row.get("editable") and not (row.get("evidence_image_meta") or {}).get("coverage_complete"):
+                partial = row.pop("evidence_image", "")
+                if partial:
+                    (folder / partial).unlink(missing_ok=True)
+                    written -= 1
+                row.pop("evidence_image_meta", None)
     return written
 
 
@@ -4381,6 +4456,7 @@ def export_source_correction_bundle(
     current_row_index: int = 0,
     ruby_overlay_source: UnifiedDocument | dict | None = None,
     bundle_profile: str = "full_with_quick",
+    scan_first: bool = False,
 ) -> dict:
     bundle_profile = str(bundle_profile or "full_with_quick").strip().lower()
     if bundle_profile not in {"full_with_quick", "ai_quick"}:
@@ -4417,7 +4493,7 @@ def export_source_correction_bundle(
     payload["ocr_input_audit"] = input_audit_summary
     payload["evidence_export_profile"] = {
         "name": "canonical_role_evidence_v5_strict",
-        "max_height": 1600,
+        "max_height": None if scan_first else 1600,
         "mode": "L",
         "format": "PNG",
         "ocr_input_unchanged": True,
@@ -4430,7 +4506,8 @@ def export_source_correction_bundle(
         if include_images:
             _report_progress(progress_callback, "生成裁决证据图", 0, 1)
             image_count = _export_conflict_images(
-                folder, documents, payload["rows"], progress_callback=None
+                folder, documents, payload["rows"], progress_callback=None,
+                native_resolution=scan_first,
             )
             _report_progress(progress_callback, "生成裁决证据图", 1, 1)
         else:
@@ -4683,6 +4760,7 @@ def export_source_correction_bundle(
                 "after_candidates": next_candidates,
                 "after2_candidates": next_candidates_2,
                 "img": str(row.get("evidence_image", "") or ""),
+                "scan_pages": list((row.get("evidence_image_meta") or {}).get("source_pages") or []),
                 "cols": list(row.get("column_ids") or []),
                 "status": str(row.get("status", "") or ""),
                 "risk": copy.deepcopy(row.get("common_mode_risk")) if row.get("common_mode_risk") else None,
@@ -4807,12 +4885,14 @@ OCR 模型、不改变原物理列、不重新对齐；原始各模型分歧继�
                 local_zip.unlink(missing_ok=True)
             _report_progress(progress_callback, "压缩逐源纠错包", 1, 1)
             ai_quick_report = _write_ai_quick_bundle(
-                folder, output=output, payload=payload, compact_ai_tasks=compact_ai_tasks
+                folder, output=output, payload=payload, compact_ai_tasks=compact_ai_tasks,
+                scan_first=scan_first,
             )
         else:
             _report_progress(progress_callback, "压缩 GPT 裁决交换包", 0, 1)
             ai_quick_report = _write_ai_quick_bundle(
-                folder, output=output, payload=payload, compact_ai_tasks=compact_ai_tasks, direct_output=True
+                folder, output=output, payload=payload, compact_ai_tasks=compact_ai_tasks,
+                direct_output=True, scan_first=scan_first,
             )
             _report_progress(progress_callback, "压缩 GPT 裁决交换包", 1, 1)
     return {

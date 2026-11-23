@@ -83,7 +83,7 @@ _COMPACT_VIEWPORT_ENGINES = frozenset({
 })
 _CONTEXT_VIEWPORT_ENGINES = frozenset({
     key for key in ("apple_vision", "macocr", "mac_ocr", "macos_ocr", "windows_snipping_ocr", "ndlocr_lite",
-                    "paddle_ocr")
+                    "paddle_ocr", "gemini_ocr")
     if get_ocr_engine_profile(key).viewport_mode == "context"
 })
 
@@ -7469,6 +7469,11 @@ def _iter_column_pages(
             }
         else:
             smart_crop = requested_smart_crop
+        if engine_key == "gemini_ocr":
+            # Send the masked main text. Ruby collection is a separate local pass.
+            isolation_mode = "mask"
+            preserve_body_pixels = False
+            auto_filter_ruby = True
         if isolation_mode == "display":
             # Full-page visibility is an explicit user choice.  Do not let a
             # recognizer's usual compact-viewport preference silently turn it

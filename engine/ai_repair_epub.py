@@ -2444,14 +2444,15 @@ def load_ai_repair_json(
         evidence = decision.get("evidence")
         if evidence is not None and not isinstance(evidence, list):
             raise AIRepairEpubError(f"第 {index + 1} 条 V5 决策 evidence 必须是数组。")
+        decision_source = str(decision.get("source") or "")
         raw_updates.append({
             "item_id": item_id,
             "edited_text": str(decision.get("selected_text") or ""),
             "confidence": decision.get("confidence", ""),
             "reason": str(decision.get("reason_code") or ""),
             "evidence": list(evidence or []),
-            "needs_review": False,
-            "_v5_source": str(decision.get("source") or ""),
+            "needs_review": decision_source == "uncertain",
+            "_v5_source": decision_source,
         })
 
     metadata = {
@@ -2489,6 +2490,13 @@ def load_ai_repair_json(
         if item_id in seen:
             raise AIRepairEpubError(f"AI 修复结果包含重复 ID：{item_id}")
         seen.add(item_id)
+        if raw["_v5_source"] == "uncertain":
+            prepared.append({
+                "item_id": item_id, "edited_text": _current_text(item_map[item_id]),
+                "needs_review": True, "source_uncertain": True,
+                "reason": raw["reason"], "evidence": raw["evidence"],
+            })
+            continue
         edited_text = str(raw.get("edited_text", "") or "")
         delete_intentionally = False
         if not _normalise_plain_text(edited_text):

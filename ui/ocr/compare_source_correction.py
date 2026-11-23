@@ -138,7 +138,7 @@ class OCRCompareSourceCorrectionService:
         recovery_ruby_overlay = self._ruby_overlay_doc
         output_path = str(path)
         self._set_source_correction_busy(
-            True, "正在后台生成单一 GPT OCR 裁决包；已完成裁决保持锁定，只导出剩余待判断项…", lock_workspace=False,
+            True, "正在后台整理分歧、需核验的一致项和原始裁片…", lock_workspace=False,
         )
 
         def worker():
@@ -160,6 +160,7 @@ class OCRCompareSourceCorrectionService:
                     ruby_overlay_source=recovery_ruby_overlay,
                     include_recovery_snapshot=False,
                     bundle_profile="ai_quick",
+                    scan_first=True,
                 )
                 signals.finished.emit(report)
             except Exception as exc:

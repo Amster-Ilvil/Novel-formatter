@@ -320,6 +320,23 @@ class ArtifactGraphStore:
     def current_node(self, alias: str) -> str:
         return str(self.load().get("current", {}).get(str(alias), "") or "")
 
+    def clear_current_paths(self, directories: Iterable[str]) -> None:
+        """Detach archived project paths while retaining their lineage nodes."""
+        prefixes = tuple(f"{path.rstrip('/')}/" for path in directories)
+        with self._write_lock:
+            graph = self.load()
+            current = graph["current"]
+            nodes = graph["nodes"]
+            aliases = [
+                alias for alias, node_id in current.items()
+                if str(nodes.get(node_id, {}).get("path", "")).removeprefix("project://").startswith(prefixes)
+            ]
+            if aliases:
+                for alias in aliases:
+                    current.pop(alias)
+                graph["updated_at"] = now_iso()
+                atomic_write_text(self.path, json.dumps(graph, ensure_ascii=False, indent=2) + "\n")
+
     def lineage(self, node_id: str) -> list[str]:
         graph = self.load()
         nodes = dict(graph.get("nodes") or {})

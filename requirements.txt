@@ -12,6 +12,7 @@ httpx>=0.27,<1
 openai>=1.50,<3
 anthropic>=0.40,<1
 google-generativeai>=0.8,<1
+tzdata; sys_platform == "win32"
 
 # Faster / more accurate matching and token estimation
 diff-match-patch>=20230430

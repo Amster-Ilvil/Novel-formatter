@@ -1438,7 +1438,7 @@ class SystemSettingsTab(QWidget):
 
     def _build_about_page(self) -> QWidget:
         scroll, _page, layout = self._scroll_page()
-        card, box = self._make_card(f"Novel Formatter {VERSION}")
+        card, box = self._make_card("Novel Formatter 2.5")
         summary = QLabel(
             "日文书籍 OCR、逐列与逐字审校、文本修订、Formatter 和出版级 EPUB 导出的统一桌面工作台。"
         )
@@ -1589,8 +1589,9 @@ class SystemSettingsTab(QWidget):
             if index >= 0:
                 engine_combo.setCurrentIndex(index)
         settings_tabs = getattr(tab, "_ocr_settings_tabs", None)
-        if settings_tabs is not None:
-            settings_tabs.setCurrentIndex(max(0, min(settings_tabs.count() - 1, prefs["ocr_settings_tab"])))
+        if settings_tabs is not None and settings_tabs.count():
+            tab_index = max(0, min(settings_tabs.count() - 1, prefs["ocr_settings_tab"]))
+            settings_tabs.setCurrentIndex(tab_index if settings_tabs.isTabEnabled(tab_index) else 0)
         preview = getattr(tab, "_preview_enabled_cb", None)
         if preview is not None:
             preview.setChecked(bool(prefs["ocr_preview_default"]))
